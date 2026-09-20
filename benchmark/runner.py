@@ -218,8 +218,8 @@ def _combine_suites(
     return combined, per_suite
 
 
-def _read_baseline(mode: str) -> dict[str, Any] | None:
-    path = BASELINES_DIR / f"jev_{mode}.json"
+def _read_baseline(mode: str, *, baselines_dir: Path | None = None) -> dict[str, Any] | None:
+    path = (baselines_dir or BASELINES_DIR) / f"jev_{mode}.json"
     if not path.is_file():
         return None
     try:
@@ -228,9 +228,10 @@ def _read_baseline(mode: str) -> dict[str, Any] | None:
         return None
 
 
-def _write_baseline(mode: str, payload: dict[str, Any]) -> None:
-    BASELINES_DIR.mkdir(parents=True, exist_ok=True)
-    (BASELINES_DIR / f"jev_{mode}.json").write_text(
+def _write_baseline(mode: str, payload: dict[str, Any], *, baselines_dir: Path | None = None) -> None:
+    target = baselines_dir or BASELINES_DIR
+    target.mkdir(parents=True, exist_ok=True)
+    (target / f"jev_{mode}.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
 
@@ -245,6 +246,7 @@ def run_benchmark(
     benchmark_run_id: str | None = None,
     write_baseline: bool = True,
     results_dir: Path | None = None,
+    baselines_dir: Path | None = None,
 ) -> dict[str, Any]:
     """跑一轮 Benchmark：逐 case 执行 → 判定 → 聚合 → 落库 → 写基线。
 
@@ -325,8 +327,8 @@ def run_benchmark(
     live_summary = summarize_cases([r for r in results if r["suite"] == LIVE_SUITE])
 
     baseline_compare = None
-    off = _read_baseline("off")
-    on = _read_baseline("on")
+    off = _read_baseline("off", baselines_dir=baselines_dir)
+    on = _read_baseline("on", baselines_dir=baselines_dir)
     if off and on:
         baseline_compare = {
             **jev_comparison(off.get("metrics") or {}, on.get("metrics") or {}),
@@ -400,6 +402,7 @@ def run_benchmark(
                 "metrics": combined,
                 "generated_at": _now(),
             },
+            baselines_dir=baselines_dir,
         )
 
     _write_results(resolved_id, results, metrics_payload, results_dir=results_dir)

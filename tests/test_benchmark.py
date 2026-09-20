@@ -172,6 +172,16 @@ class TestRunnerEndToEnd:
 
         return tmp_path / "results"
 
+    @pytest.fixture()
+    def baselines_dir(self, tmp_path: Path) -> Path:
+        """基线也写临时目录。
+
+        必须这么做：`baselines/` 里是**提交进仓库的对照基线**，测试跑一次 limit=2 的
+        冒烟就把它们覆盖掉，后来的人会拿着一份"2 个用例"的基线当真（真实发生过）。
+        """
+
+        return tmp_path / "baselines"
+
     def test_run_benchmark_persists_rows_and_finishes(
         self, store: TravelPlanStore, results_dir: Path
     ) -> None:
@@ -201,20 +211,23 @@ class TestRunnerEndToEnd:
             assert store.get_run(result["detail"]["run_id"]) is not None
 
     def test_baseline_is_written_and_comparison_appears(
-        self, store: TravelPlanStore, results_dir: Path
+        self, store: TravelPlanStore, results_dir: Path, baselines_dir: Path
     ) -> None:
         off = run_benchmark(
-            store=store, suites=["hard"], limit=2, jev_enabled=False, write_baseline=True, results_dir=results_dir
+            store=store, suites=["hard"], limit=2, jev_enabled=False, write_baseline=True,
+            results_dir=results_dir, baselines_dir=baselines_dir,
         )
         on = run_benchmark(
-            store=store, suites=["hard"], limit=2, jev_enabled=True, write_baseline=True, results_dir=results_dir
+            store=store, suites=["hard"], limit=2, jev_enabled=True, write_baseline=True,
+            results_dir=results_dir, baselines_dir=baselines_dir,
         )
-        assert (Path(__file__).resolve().parents[1] / "benchmark" / "baselines" / "jev_off.json").is_file()
-        assert (Path(__file__).resolve().parents[1] / "benchmark" / "baselines" / "jev_on.json").is_file()
+        assert (baselines_dir / "jev_off.json").is_file()
+        assert (baselines_dir / "jev_on.json").is_file()
 
         # 两份基线都存在之后，后续运行要给出 Jev OFF vs ON 的差值。
         third = run_benchmark(
-            store=store, suites=["hard"], limit=1, jev_enabled=True, write_baseline=False, results_dir=results_dir
+            store=store, suites=["hard"], limit=1, jev_enabled=True, write_baseline=False,
+            results_dir=results_dir, baselines_dir=baselines_dir,
         )
         comparison = (third.get("metrics") or {}).get("baseline_compare")
         assert comparison is not None
