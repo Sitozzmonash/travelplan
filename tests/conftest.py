@@ -17,7 +17,9 @@ import os
 
 import pytest
 
-#: 测试期间必须缺席的 Secret。只列会触发外部调用的那些。
+#: 测试期间必须缺席的 Secret。只列会触发外部调用/外部写入的那些。
+#: `DATABASE_URL` 也在列：若带着它跑测试，默认构造的 `TravelPlanStore()` 会去连真
+#: Neon 并在那里建表 —— 测试既依赖网络，又会污染线上库。测试一律用 tmp_path SQLite。
 OFFLINE_SECRETS = (
     "JEV_API_KEY",
     "TYPESAFE_API_KEY",
@@ -27,6 +29,7 @@ OFFLINE_SECRETS = (
     "TUNIU_API_KEY",
     "TAVILY_API_KEY",
     "TRAVELPLAN_ADMIN_TOKEN",
+    "DATABASE_URL",
 )
 
 

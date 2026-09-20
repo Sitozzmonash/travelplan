@@ -16,6 +16,7 @@ Session 过期（默认 45 分钟）后允许重建；旧 Discovery 结果不再
 
 from __future__ import annotations
 
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Sequence
@@ -310,12 +311,33 @@ def run_discovery(
         session["events"] = events
         started = _now()
 
+        # 每完成一条线就落一次盘：用户在 Discovery 还没跑完时点「开始规划」，
+        # 读到的必须是"已经查好的那部分"，而不是空 —— 这是之前真丢数据的根因
+        # （旧实现只在四条线全部结束时才写一次会话）。
+        def persist_partial(snapshot: dict[str, Any]) -> None:
+            try:
+                partial = _bundle_from(session_id, intent, snapshot, hub)
+                payload = partial.dump()
+                session["transport_candidates"] = payload["outbound"] + payload["inbound"]
+                session["hotel_candidates"] = payload["hotels"]
+                session["place_candidates"] = _candidate_cards(
+                    partial.places, session.get("poi_selections") or {}
+                )
+                session["evidence_summary"] = _evidence_summary_of(partial)
+                session["discovery"] = dict(snapshot.get("stages") or {})
+                session["prefetch"] = payload
+                session["updated_at"] = _now().isoformat()
+                store.save_planning_session(session)
+            except Exception:  # noqa: BLE001 —— 增量落盘失败不该让 Discovery 挂掉
+                return
+
         result = discovery.prefetch(
             hub,
             llm,
             intent,
             hotel_pages=max(1, config.discovery_hotel_pages),
             workers=max(1, config.discovery_workers),
+            on_partial=persist_partial,
         )
         bundle = _bundle_from(session_id, intent, result, hub)
         stages = result.get("stages") or {}
@@ -329,14 +351,7 @@ def run_discovery(
                 "transport_candidates": bundle.dump()["outbound"] + bundle.dump()["inbound"],
                 "hotel_candidates": bundle.dump()["hotels"],
                 "place_candidates": _candidate_cards(bundle.places, session.get("poi_selections") or {}),
-                "evidence_summary": {
-                    "sources_used": len({call.get("source_id") for call in bundle.provider_calls}),
-                    "places_verified": sum(1 for place in bundle.places if place.amap_verified),
-                    "total_candidates": len(bundle.places),
-                    "transport_candidates": len(bundle.outbound) + len(bundle.inbound),
-                    "hotel_candidates": len(bundle.hotels),
-                    "evidence_count": len(bundle.evidences),
-                },
+                "evidence_summary": _evidence_summary_of(bundle),
                 "discovery": stages,
                 "prefetch": bundle.dump(),
                 "degradations": bundle.degradations,
@@ -426,6 +441,19 @@ def _record_provider_calls(store: TravelPlanStore, calls: Sequence[Mapping[str, 
         return store.save_provider_calls(rows)
     except Exception:  # noqa: BLE001 —— 观测写不进去不该让 Discovery 失败
         return 0
+
+
+def _evidence_summary_of(bundle: discovery.PrefetchBundle) -> dict[str, Any]:
+    """Prefetch 摘要：两条路径（增量落盘 / 最终落盘）用同一份口径，避免两个数对不上。"""
+
+    return {
+        "sources_used": len({call.get("source_id") for call in bundle.provider_calls}),
+        "places_verified": sum(1 for place in bundle.places if place.amap_verified),
+        "total_candidates": len(bundle.places),
+        "transport_candidates": len(bundle.outbound) + len(bundle.inbound),
+        "hotel_candidates": len(bundle.hotels),
+        "evidence_count": len(bundle.evidences),
+    }
 
 
 def _bundle_from(session_id: str, intent: TripIntent, result: Mapping[str, Any], hub: Any) -> discovery.PrefetchBundle:
@@ -629,12 +657,16 @@ def start_run(
         # 幂等：重复点「开始规划」不该产生第二条 run
         return {"run_id": session["run_id"], "status": "RUNNING"}
 
+    # Discovery 还在跑时给一个很短的 grace period：期间完成的结果继续合并进来。
+    # 到点仍没完成的线不再阻塞用户 —— 正式流程会对缺失的部分自己补查。
+    session, grace_waited_ms = _await_discovery(store, session_id)
     intent = intent_from_basic(session.get("basic_intent") or {}, session.get("preferences") or {})
     if session.get("poi_selections"):
         intent.place_selections = normalize_place_selections(session["poi_selections"])
     bundle = discovery.PrefetchBundle.load(session.get("prefetch"))
     bundle.session_id = session_id
     bundle.basic_intent = dict(session.get("basic_intent") or {})
+    bundle.grace_waited_ms = grace_waited_ms
 
     query = _compose_query(session)
     run_id = _new_run_id()
@@ -684,6 +716,50 @@ def _start_job(
         )
     except Exception as exc:  # noqa: BLE001 —— 后台线程不能把进程打挂
         store.finish_run(run_id, "failed", error=f"{type(exc).__name__}: {exc}")
+
+
+def _await_discovery(
+    store: TravelPlanStore, session_id: str, *, grace_seconds: float | None = None
+) -> tuple[dict[str, Any], int]:
+    """等 Discovery 一个很短的 grace period，返回 (最新会话, 实际等待毫秒数)。
+
+    只等"正在进行"的情况；已经 READY/PARTIAL/FAILED 或还没开始（PENDING）都立即返回。
+    等待期间反复重读会话行，所以期间完成的线会被自动带进正式 run。
+    """
+
+    config = current_config()
+    budget = (
+        max(0.0, float(grace_seconds))
+        if grace_seconds is not None
+        else max(0.0, float(getattr(config, "discovery_grace_seconds", 3.0) or 0.0))
+    )
+    session = get_session(store, session_id, expire=False)
+    if session is None:
+        return {}, 0
+    started = time.perf_counter()
+    while (
+        session.get("discovery_status") in (DISCOVERY_RUNNING, DISCOVERY_PENDING)
+        and (time.perf_counter() - started) < budget
+    ):
+        time.sleep(min(0.2, max(0.02, budget / 10)))
+        refreshed = get_session(store, session_id, expire=False)
+        if refreshed is None:
+            break
+        session = refreshed
+    waited = int((time.perf_counter() - started) * 1000)
+    if waited:
+        session["events"] = [
+            *(session.get("events") or []),
+            _event(
+                "discovery_grace_waited",
+                f"开始规划时 Discovery 仍在进行，等待 {waited}ms 后带着已完成的部分开始",
+            ),
+        ]
+        try:
+            store.save_planning_session(session)
+        except Exception:  # noqa: BLE001
+            pass
+    return session, waited
 
 
 def _compose_query(session: Mapping[str, Any]) -> str:

@@ -439,6 +439,19 @@ def _apply_poi_detail(place: Place, detail: dict[str, Any]) -> None:
 # ======================================================================
 
 
+def _run_stage(run: Any, name: str, func: Any, args: tuple, report: Any) -> None:
+    """跑一条 Discovery 线，无论成功失败都在结束时上报一次。
+
+    为什么要单独包一层：并行线是"谁先完成谁先可用"，只有每条线结束时立刻上报，
+    用户在等待期间点「开始规划」才能拿到已经完成的那部分（否则要等全部跑完）。
+    """
+
+    try:
+        run(name, func, args)
+    finally:
+        report(name)
+
+
 def _destination(intent: TripIntent) -> str | None:
     for item in intent.destination or []:
         text = coerce_str(item).strip()
@@ -464,6 +477,7 @@ def prefetch(
     *,
     hotel_pages: int = 1,
     workers: int = 4,
+    on_partial: Any | None = None,
 ) -> dict[str, Any]:
     """四条线并行取数，返回给 Planning Session 存草稿的原始结果。
 
@@ -493,26 +507,110 @@ def prefetch(
         except Exception as exc:  # noqa: BLE001 —— 一条线崩了不能带走整个 Discovery
             errors[name] = f"{type(exc).__name__}: {exc}"
 
+    import threading
     import time as _time
 
     # 每条线单独计时：管理端要回答"Discovery 卡在哪一步"，只有总耗时是答不出来的。
+    # 未完成的线在这里用 status=RUNNING 表示 —— 用户中途点「开始规划」时，
+    # 正式 run 要能区分"这条线查过了但没数据"和"这条线还没查完"。
     timings: dict[str, dict[str, Any]] = {
-        name: {"started_at": _iso(), "finished_at": None, "duration_ms": None}
-        for name in destinations
+        name: {
+            "started_at": _iso(),
+            "finished_at": None,
+            "duration_ms": None,
+            "status": "RUNNING",
+            "result_count": 0,
+            "degraded": False,
+            "error": None,
+        }
+        for name in (*destinations, "places")
     }
     started_at = {name: _time.perf_counter() for name in destinations}
+    lock = threading.Lock()
+
+    def finish(name: str, *, status: str, count: int, degraded: bool, error: str | None = None) -> None:
+        """收尾一条线并通知调用方（增量落盘用）。"""
+
+        with lock:
+            timings[name].update(
+                {
+                    "finished_at": _iso(),
+                    "duration_ms": round((_time.perf_counter() - started_at.get(name, _time.perf_counter())) * 1000)
+                    if name in started_at
+                    else None,
+                    "status": status,
+                    "result_count": count,
+                    "degraded": degraded,
+                    "error": error,
+                }
+            )
+        if on_partial is not None:
+            try:
+                on_partial(snapshot())
+            except Exception:  # noqa: BLE001 —— 落盘失败不该毁掉 Discovery
+                pass
+
+    def snapshot() -> dict[str, Any]:
+        with lock:
+            return {
+                "transport": outcomes.get("transport"),
+                "hotels": outcomes.get("hotels"),
+                "social": outcomes.get("social"),
+                "places": outcomes.get("places") or PlaceCandidates(),
+                "errors": dict(errors),
+                "stages": {name: dict(info) for name, info in timings.items()},
+            }
+
+    def report(name: str) -> None:
+        """一条线跑完 → 定状态并通知调用方（顺序无关，谁先完成谁先上报）。"""
+
+        if name == "transport":
+            transport = outcomes.get("transport")
+            finish(
+                name,
+                status="FAILED" if name in errors else ("EMPTY" if not (transport and transport.all_options) else "OK"),
+                count=len(transport.all_options) if transport else 0,
+                degraded=bool(transport and transport.degradations),
+                error=errors.get(name),
+            )
+        elif name == "hotels":
+            hotels = outcomes.get("hotels")
+            finish(
+                name,
+                status="FAILED" if name in errors else ("EMPTY" if not (hotels and hotels.items) else "OK"),
+                count=len(hotels.items) if hotels else 0,
+                degraded=bool(hotels and hotels.degradations),
+                error=errors.get(name),
+            )
+        elif name == "social":
+            social = outcomes.get("social") or SocialEvidence()
+            finish(
+                name,
+                status="FAILED" if name in errors else ("EMPTY" if not social.evidences else "OK"),
+                count=len(social.evidences),
+                degraded=bool(social.degradations),
+                error=errors.get(name),
+            )
+        elif name == "places":
+            places_stage = outcomes.get("places") or PlaceCandidates()
+            finish(
+                name,
+                status="FAILED" if name in errors else ("EMPTY" if not places_stage.places else "OK"),
+                count=len(places_stage.places),
+                degraded=bool(places_stage.degradations),
+                error=errors.get(name),
+            )
 
     with ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="tp-discovery") as pool:
-        futures = [pool.submit(run, name, func, args) for name, (func, args) in destinations.items()]
-        for future in futures:
+        futures = {
+            name: pool.submit(_run_stage, run, name, func, args, report)
+            for name, (func, args) in destinations.items()
+        }
+        for future in futures.values():
             future.result()
-    for name in destinations:
-        timings[name]["duration_ms"] = round((_time.perf_counter() - started_at[name]) * 1000)
-        timings[name]["finished_at"] = _iso()
 
     social: SocialEvidence = outcomes.get("social") or SocialEvidence()
     places = PlaceCandidates()
-    timings["places"] = {"started_at": _iso(), "finished_at": None, "duration_ms": None}
     places_started = _time.perf_counter()
     if social.evidences:
         try:
@@ -521,41 +619,13 @@ def prefetch(
             )
         except Exception as exc:  # noqa: BLE001
             errors["places"] = f"{type(exc).__name__}: {exc}"
-    timings["places"]["duration_ms"] = round((_time.perf_counter() - places_started) * 1000)
-    timings["places"]["finished_at"] = _iso()
+    outcomes["places"] = places
+    started_at["places"] = places_started
+    report("places")
 
     transport: TransportCandidates | None = outcomes.get("transport")
     hotels: HotelCandidates | None = outcomes.get("hotels")
-    stages = {
-        "transport": {
-            **timings["transport"],
-            "status": "FAILED" if "transport" in errors else ("EMPTY" if not (transport and transport.all_options) else "OK"),
-            "result_count": len(transport.all_options) if transport else 0,
-            "degraded": bool(transport and transport.degradations),
-            "error": errors.get("transport"),
-        },
-        "hotels": {
-            **timings["hotels"],
-            "status": "FAILED" if "hotels" in errors else ("EMPTY" if not (hotels and hotels.items) else "OK"),
-            "result_count": len(hotels.items) if hotels else 0,
-            "degraded": bool(hotels and hotels.degradations),
-            "error": errors.get("hotels"),
-        },
-        "social": {
-            **timings["social"],
-            "status": "FAILED" if "social" in errors else ("EMPTY" if not social.evidences else "OK"),
-            "result_count": len(social.evidences),
-            "degraded": bool(social.degradations),
-            "error": errors.get("social"),
-        },
-        "places": {
-            **timings["places"],
-            "status": "FAILED" if "places" in errors else ("EMPTY" if not places.places else "OK"),
-            "result_count": len(places.places),
-            "degraded": bool(places.degradations),
-            "error": errors.get("places"),
-        },
-    }
+    stages = {name: dict(info) for name, info in timings.items()}
     return {
         "transport": transport,
         "hotels": hotels,
@@ -600,6 +670,8 @@ class PrefetchBundle:
     discovery_status: str = "READY"
     #: 分阶段 Discovery 状态（管理端与 Bad Case 都要用它回答"卡在哪一步"）
     discovery: dict[str, Any] = field(default_factory=dict)
+    #: 开始规划时为等 Discovery 而实际等待的毫秒数（0 = 没有在跑，直接开始）
+    grace_waited_ms: int = 0
 
     @property
     def reused(self) -> bool:
@@ -618,6 +690,7 @@ class PrefetchBundle:
             "degradations": list(self.degradations),
             "discovery_status": self.discovery_status,
             "discovery": dict(self.discovery),
+            "grace_waited_ms": self.grace_waited_ms,
         }
 
     @classmethod
@@ -637,6 +710,7 @@ class PrefetchBundle:
             degradations=[coerce_str(item) for item in (data.get("degradations") or []) if coerce_str(item)],
             discovery_status=coerce_str(data.get("discovery_status")) or "READY",
             discovery=dict(data.get("discovery") or {}),
+            grace_waited_ms=int(data.get("grace_waited_ms") or 0),
         )
 
 

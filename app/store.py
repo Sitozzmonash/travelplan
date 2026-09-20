@@ -17,28 +17,22 @@ sources / evidence / plans 的结构由 Provider 决定，随时可能多一个�
 from __future__ import annotations
 
 import json
-import os
-import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
+# 方言差异（占位符 / INSERT OR REPLACE / PRAGMA / 连接池）**全部**在 app/db.py 里，
+# 本模块的方法体继续只写 SQLite 原生 SQL —— 想看"两种库差在哪"，只需要读 app/db.py。
+# `DEFAULT_DB_PATH` / `DB_PATH_ENV` / `default_db_path` 是历史定义、在此再导出，
+# 保持 api 与测试的既有导入路径不变。
+from app.db import (
+    DB_PATH_ENV,
+    DEFAULT_DB_PATH,
+    PostgresBackend,
+    SqliteBackend,
+    default_db_path,
+    resolve_backend,
+)
 from app.models import Decision, Evidence, Place, TripIntent, TripPlan, utcnow
-
-#: 默认库位置：项目根 /data/travelplan.db（PRD §17）。
-DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "travelplan.db"
-
-#: 覆盖库位置的环境变量。
-#: 为什么必须有：容器/系统服务里"代码目录"通常是只读或易失的，真实数据必须落在挂载卷上。
-#: 没有这个开关，`TravelPlanStore()` 会把库写进镜像层 —— 重新部署一次，历史 run、
-#: Bad Case、Benchmark 结果全部消失。
-DB_PATH_ENV = "TRAVELPLAN_DB_PATH"
-
-
-def default_db_path() -> Path:
-    """当前生效的默认库路径（环境变量优先）。"""
-
-    raw = os.environ.get(DB_PATH_ENV, "").strip()
-    return Path(raw) if raw else DEFAULT_DB_PATH
 
 
 #: 统一的 run 状态表达式：`run_progress.status` 优先，缺失时按 `runs.status` 的历史值折算。
@@ -94,6 +88,17 @@ def _loads(text: Any, fallback: Any) -> Any:
         return fallback
 
 
+# ======================================================================
+# SCHEMA：一份 DDL，两边共用
+# ======================================================================
+# 为什么可以共用一份（而不是维护 SQLite / Postgres 两份）：
+#   1. 只用两种方言都支持的语法子集：CREATE TABLE/INDEX IF NOT EXISTS、复合主键、
+#      复合外键、TEXT/INTEGER/REAL、ON CONFLICT（SCHEMA 里本来就没有用到）；
+#   2. 唯二的差异点（`INTEGER PRIMARY KEY AUTOINCREMENT` → identity、`REAL` → DOUBLE
+#      PRECISION）由 app/db.py 的 `translate_postgres_schema()` 在生成 Postgres 版本时
+#      统一替换。在这份字符串里保持 SQLite 写法，SQLite 侧行为与历史版本逐字节一致。
+# 判断依据：主键一律是显式 TEXT（或 (run_id, place_id) 复合），不走 SQLite 的 rowid 语义；
+# 只有 trip_requests / decisions / plan_items 三张自增表依赖 `id` 的递增顺序，由 identity 列承接。
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     run_id          TEXT PRIMARY KEY,
@@ -408,42 +413,64 @@ CREATE TABLE IF NOT EXISTS runtime_config (
 
 
 class TravelPlanStore:
-    """按 run 归档业务证据的 SQLite 封装。
+    """按 run 归档业务证据的封装（SQLite 默认，PostgreSQL/Neon 可选）。
 
-    每次操作开一个短连接（`with self._connect()`）：这个库的写入量是"一次 run 几十行"，
-    连接池带来的复杂度远大于收益，而短连接天然不会把连接泄露到下一次 run。
+    后端选择（见 ``app/db.resolve_backend``）：
+      - 显式传入 ``db_path`` → **一律 SQLite**（测试/Benchmark 传临时库，绝不会写到线上）；
+      - 未传 ``db_path`` 且环境变量 ``DATABASE_URL`` 非空 → Postgres（Neon）；
+      - 否则 → 本地 SQLite（``TRAVELPLAN_DB_PATH`` / ``data/travelplan.db``）。
+
+    SQLite 下每次操作开一个短连接（`with self._connect()`）；Postgres 下由 ``app/db.py``
+    复用进程内共享连接池。对外方法签名与返回值语义在两种后端下完全一致。
     """
 
-    def __init__(self, db_path: str | Path | None = None) -> None:
-        self.db_path = Path(db_path) if db_path is not None else default_db_path()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, db_path: str | Path | None = None, *, database_url: str | None = None) -> None:
+        self._backend: SqliteBackend | PostgresBackend = resolve_backend(db_path, database_url)
+        #: SQLite 时有值；Postgres 下为 None（真实目标见 ``describe()``）。
+        self.db_path: Path | None = getattr(self._backend, "path", None)
         self.init_schema()
+
+    @property
+    def backend_name(self) -> str:
+        """``sqlite`` 或 ``postgres``。"""
+
+        return self._backend.name
+
+    def describe(self) -> dict[str, Any]:
+        """自描述（供 /health 上报后端类型与目标；绝不含用户名/密码）。"""
+
+        return self._backend.describe()
+
+    def close(self) -> None:
+        """释放后端资源（Postgres 连接池）。SQLite 无状态，是空操作；幂等。"""
+
+        self._backend.close()
 
     # ------------------------------------------------------------------
     # 连接与建表
     # ------------------------------------------------------------------
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        # 外键约束打开：evidence → sources、place_evidence → places 的引用完整性
-        # 靠数据库保证，而不是靠调用方自觉。
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+    def _connect(self) -> Any:
+        """取一条连接。SQLite 返回原生 ``sqlite3.Connection``；Postgres 返回翻译层包装。"""
 
-    def _migrate_places_scope(self, conn: sqlite3.Connection) -> None:
+        return self._backend.connect()
+
+    def _migrate_places_scope(self, conn: Any) -> None:
         """把旧的「全局 place_id 主键」表迁到「按 run 建档」的新表。
 
         `CREATE TABLE IF NOT EXISTS` 不会改已存在的表，所以老库必须显式迁一次 ——
         否则它继续用旧主键跑，第二次 run 照样顶掉第一次的 place 行。
         迁移不丢数据：旧行原样搬过去，只有「跨 run 的 place_evidence」被丢掉，
         而那种链接本来就是错的（它把 A run 的证据挂到了 B run 的 place 上）。
+
+        方言无关：用后端自省（SQLite 走 PRAGMA、Postgres 走 information_schema）拿到
+        当前主键列，而不是去解析 ``sqlite_master.sql`` 文本。
         """
-        row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='places'"
-        ).fetchone()
-        if row is None or "PRIMARY KEY (run_id, place_id)" in (row["sql"] or ""):
-            return
+        primary_key = self._backend.table_primary_key(conn, "places")
+        if not primary_key:
+            return  # 表还不存在：交给随后的 CREATE TABLE
+        if len(primary_key) == 2 and set(primary_key) == {"run_id", "place_id"}:
+            return  # 已经是按 run 建档的新表
 
         conn.execute("ALTER TABLE places RENAME TO places_legacy_v1")
         conn.execute("ALTER TABLE place_evidence RENAME TO place_evidence_legacy_v1")
@@ -451,7 +478,7 @@ class TravelPlanStore:
         # 不先删掉的话 SCHEMA 里的 CREATE INDEX IF NOT EXISTS 会因为「名字已被占用」
         # 直接跳过，新表就永远没有索引（旧表被 DROP 时索引也跟着没了）。
         conn.execute("DROP INDEX IF EXISTS idx_places_run")
-        conn.executescript(SCHEMA)
+        conn.executescript(self._backend.schema_ddl(SCHEMA))
         conn.execute(
             "INSERT OR IGNORE INTO places"
             " (run_id, place_id, name, normalized_name, type, lat, lng, address, city,"
@@ -474,27 +501,29 @@ class TravelPlanStore:
         """建表（幂等）。构造函数里就调用，调用方不必记得先 migrate。"""
         with self._connect() as conn:
             self._migrate_places_scope(conn)
-            conn.executescript(SCHEMA)
+            # 同一份 SCHEMA 字符串给两种方言用：DDL 只用两边都支持的子集
+            # （IF NOT EXISTS / 复合主键 / 复合外键 / 普通类型），方言细节由 backend 翻译。
+            conn.executescript(self._backend.schema_ddl(SCHEMA))
             self._migrate_run_source(conn)
             self._migrate_session_prefetch(conn)
 
-    def _migrate_run_source(self, conn: sqlite3.Connection) -> None:
+    def _migrate_run_source(self, conn: Any) -> None:
         """给 `runs` 补 `source` / `source_session_id`（`CREATE TABLE IF NOT EXISTS` 不会改老表）。
 
         为什么需要：管理端要能回答"这次 run 是引导式还是随手一句话跑出来的"，
         并且要能把 Benchmark 用例运行从真实运行列表里过滤掉，否则列表会被它淹没。
         """
 
-        existing = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
+        existing = self._backend.table_columns(conn, "runs")
         if "source" not in existing:
             conn.execute("ALTER TABLE runs ADD COLUMN source TEXT DEFAULT 'quick'")
         if "source_session_id" not in existing:
             conn.execute("ALTER TABLE runs ADD COLUMN source_session_id TEXT")
 
-    def _migrate_session_prefetch(self, conn: sqlite3.Connection) -> None:
+    def _migrate_session_prefetch(self, conn: Any) -> None:
         """给 planning_sessions 补 `prefetch_json`（老库没有这一列）。"""
 
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(planning_sessions)")}
+        columns = self._backend.table_columns(conn, "planning_sessions")
         if columns and "prefetch_json" not in columns:
             conn.execute("ALTER TABLE planning_sessions ADD COLUMN prefetch_json TEXT")
         if columns and "discovery_json" not in columns:

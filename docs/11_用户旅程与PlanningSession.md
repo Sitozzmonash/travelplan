@@ -198,3 +198,53 @@ session_cancelled                                 # DELETE
 - **酒店价格/评分/房型过滤**：`hotel_max_price_per_night` / `hotel_room_type` 会被记录，但 `_hotel_score` 目前不消费它们。
 - **交通/酒店策略权重未接入**：见第 5 节的诚实说明。
 - **Bad Case 类别 `discovery_stale` / `guided_intent_mismatch`**：只定义了类别，当前**没有任何规则产出**（见 [06_BadCase机制.md](06_BadCase机制.md)）。
+
+## Discovery → 正式 Run 的数据交接（grace period）
+
+用户**不必**等 Discovery 全部跑完才能开始规划；系统按下面这套规则交接，任何一种情况都不丢数据、不卡住用户：
+
+```text
+用户点「开始规划」
+→ ① 立即收集当前已经完成的 Prefetch（transport / hotel / social evidence / places）
+→ ② 对仍在 RUNNING 的线给一个很短的 grace period（默认 3 秒，`DISCOVERY_GRACE_SECONDS` 可配）
+→ ③ grace 期间完成的线继续合并进这次 Run
+→ ④ 到点仍未完成的线不再阻塞用户，直接开始
+→ ⑤ 正式 12 步流程对缺失的部分自己补查
+→ ⑥ 已经 Prefetch 成功的部分必须复用，不重复打 Provider
+```
+
+三种输入对应三种结果，都有测试钉住：
+
+| Discovery 状态 | 结果 |
+| --- | --- |
+| 全部完成 | 四条线全部 `reused`，本次 run 不再调用对应 Provider |
+| 部分完成 | 完成的部分 `reused`，没完成的部分由正式 run 补查（`fallback_query`） |
+| 全未完成 / 超时 | 全部 `fallback_query`（补查仍无结果时为 `unavailable`），行程照常产出 |
+
+### 每个阶段都会记录交接结论
+
+`outputs/<run_id>/audit_report.json` 与 `run_metrics` 所在的同一次 run 里，
+`user_journey.discovery` 记录四个阶段各自的交接状态：
+
+```text
+transport: reused | fallback_query | unavailable
+hotels:    reused | fallback_query | unavailable
+social:    reused | fallback_query | unavailable
+places:    reused | fallback_query | unavailable
+```
+
+判定口径（`app/workflow.py:_user_journey_summary`，全部由证据推出，不是标记位）：
+
+- `reused`：Discovery 有该线结果，且本次 run 的调用账本里**没有**对应的查询工具；
+- `fallback_query`：本次 run 自己查了，并且查到了可用结果；
+- `unavailable`：本次 run 自己查了，但仍然没有可用结果（如实暴露，不粉饰）。
+
+`prefetch_stages` 保留原始分阶段状态（status / duration_ms / result_count / degraded），
+`grace_waited_ms` 记录开始规划时实际等待了多久（0 = Discovery 已完成，没有等待）。
+
+### Trace 里怎么看
+
+正式 run 的 `outputs/<run_id>/trace.jsonl` 与 `trace_spans` 表里会多一条 `discovery_handoff` span
+（挂在 `finalize` 下），属性就是四个阶段的交接结论 + `grace_waited_ms`；复制自 Discovery 的
+Provider 调用在 Trace 里状态为 `REUSED`、在 audit 的 `provider_calls` 里带
+「Discovery 阶段已查询，本次 run 复用（未重复调用）」的 note。

@@ -25,3 +25,4 @@ build/
 # Benchmark 逐次结果属于运行产物：baselines/ 才是可复现的基线，results/ 由本地跑出来即可
 benchmark/results/*
 !benchmark/results/.gitkeep
+.neon

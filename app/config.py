@@ -13,6 +13,22 @@ from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
 from typing import Any
 
+#: Postgres（Neon）连接串的环境变量名。
+#: 刻意**不**放进 ``TravelPlanConfig``：该 dataclass 会被 ``public_dict()`` 整份回显到
+#: 管理端，而连接串里含用户名/密码。这里只暴露一个读取函数，凭据永远不进配置快照。
+DATABASE_URL_ENV = "DATABASE_URL"
+
+
+def database_url() -> str | None:
+    """读取 Postgres 连接串；未配置时返回 None（调用方据此走本地 SQLite）。
+
+    只认环境变量：连接串属于"部署环境事实"，不允许被运行时覆盖（``EDITABLE_KEYS``）改写，
+    否则一个手滑的覆盖值就能把线上写到别处去。空串按"未配置"处理。
+    """
+
+    raw = os.environ.get(DATABASE_URL_ENV, "").strip()
+    return raw or None
+
 
 @dataclass(frozen=True, slots=True)
 class TravelPlanConfig:
@@ -60,6 +76,10 @@ class TravelPlanConfig:
     discovery_hotel_pages: int = 3
     #: Discovery 并行取数的线程数（交通/酒店/攻略/抽取四条线）
     discovery_workers: int = 4
+    #: 用户点「开始规划」时，若 Discovery 还在跑，最多再等这么久（秒）。
+    #: 为什么给一个短等待：用户点下去时可能只差一两秒就查完了，等一下能多复用一批候选；
+    #: 但**绝不能久等** —— 等到就带上已完成的部分开始，没完成的部分由正式流程自己补查。
+    discovery_grace_seconds: float = 3.0
 
     @classmethod
     def from_env(cls) -> "TravelPlanConfig":
@@ -135,6 +155,11 @@ class TravelPlanConfig:
             or defaults.discovery_hotel_pages,
             discovery_workers=integer("DISCOVERY_WORKERS", defaults.discovery_workers)
             or defaults.discovery_workers,
+            discovery_grace_seconds=decimal(
+                "DISCOVERY_GRACE_SECONDS", defaults.discovery_grace_seconds
+            )
+            if decimal("DISCOVERY_GRACE_SECONDS", defaults.discovery_grace_seconds) is not None
+            else defaults.discovery_grace_seconds,
         )
 
     def public_dict(self) -> dict[str, Any]:

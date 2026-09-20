@@ -67,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
     app = create_travel_app(output_dir=args.output_dir, debug=args.debug)
     result = run_travel(
         args.message,
+        source="cli",
         user_id=args.user_id,
         thread_id=args.thread_id,
         project_id=args.project_id,

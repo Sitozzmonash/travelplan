@@ -5,5 +5,8 @@ uvicorn[standard]>=0.29
 pydantic>=2.5
 python-dotenv>=1.0
 httpx>=0.27
+# Postgres（Neon）驱动。只在设置了 DATABASE_URL 时才会被 app/db.py 导入；
+# 纯 SQLite 部署无需它，但列在这里保证 Neon 部署开箱可用（binary 免编译）。
+psycopg[binary]>=3.1
 pytest>=8.0
 pytest-asyncio>=0.23

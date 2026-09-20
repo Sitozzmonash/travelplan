@@ -33,7 +33,8 @@ from .config import EDITABLE_KEYS, current_config, set_runtime_overrides, valida
 from .evolution import lever_catalog, run_evolution, tuning_snapshot
 from .models import TripPlan
 from . import sessions
-from .store import TravelPlanStore, default_db_path
+from .db import describe_configured_backend
+from .store import TravelPlanStore
 from .workflow import DEFAULT_OUTPUT_DIR, WORKFLOW_NAME, new_run_id, plan_payload
 
 #: 只允许下载这些产物。白名单而不是拼接路径，避免 `../` 穿越。
@@ -178,14 +179,30 @@ _load_runtime_overrides()
 
 @api.get("/api/v1/health")
 def health() -> dict[str, Any]:
-    """只上报「配了没配」和能不能连库，不回显任何 Key 的值。"""
+    """只上报「配了没配」和能不能连库，不回显任何 Key / 连接串凭据的值。
+
+    `store` 里同时报**后端类型**：SQLite 报本地库路径，Postgres 报脱敏后的
+    `postgresql://***@host/db`（绝不回显用户名/密码）。连库失败时也要如实报
+    "配置目标是哪个后端"，而不是假装一切正常。
+    """
     store_ok = True
     store_error: str | None = None
+    store_info: dict[str, Any] = {}
     try:
-        get_store().init_schema()
+        store = get_store()
+        store.init_schema()
+        store_info = store.describe()
     except Exception as exc:  # noqa: BLE001 —— 健康检查要能报告"库坏了"而不是自己崩
         store_ok = False
         store_error = f"{type(exc).__name__}: {exc}"
+    if not store_info:
+        # 连不上时仍要说清"本该是 sqlite 还是 postgres"，否则线上分不清是哪种故障。
+        try:
+            store_info = describe_configured_backend()
+        except Exception:  # noqa: BLE001 —— 描述失败也不能让 /health 自己 500
+            store_info = {}
+    store_info["ok"] = store_ok
+    store_info["error"] = store_error
 
     configured = {
         name: bool(os.environ.get(name))
@@ -201,7 +218,7 @@ def health() -> dict[str, Any]:
         "status": "ok" if store_ok else "degraded",
         "workflow": WORKFLOW_NAME,
         "project_id": PROJECT_ID,
-        "store": {"ok": store_ok, "path": str(default_db_path()), "error": store_error},
+        "store": store_info,
         "providers_configured": configured,
         "notes": [
             "此接口只报告环境变量是否已配置，不返回值。",

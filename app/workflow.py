@@ -3557,6 +3557,21 @@ def node_finalize(state: TravelState) -> dict:
     # 两者的调用账本此时才完整；Bad Case 的 trace_refs 也在这之后才落库，指向的 span 一定存在。
     _emit_run_spans(state, llm=llm)
     _record_provider_calls(state)
+    if state.get("prefetch") is not None:
+        journey = _user_journey_summary(state, plan)
+        _record_subspan(
+            state,
+            component=SpanKind.PLANNER,
+            name="discovery_handoff",
+            status="SUCCESS",
+            started_at=now_iso(),
+            attributes={
+                "grace_waited_ms": journey.get("grace_waited_ms"),
+                # 一眼看出每条线是复用的还是本次补查的
+                **{key: (info or {}).get("handoff") for key, info in (journey.get("discovery") or {}).items()},
+            },
+            parent_span_id=f"{run_id}:finalize",
+        )
     _record_subspan(
         state,
         component=SpanKind.STORE,
@@ -3726,7 +3741,42 @@ def _user_journey_summary(state: TravelState, plan: TripPlan) -> dict[str, Any]:
     reused = {
         key: (key in bundle_had and not self_queried[key]) for key in ("transport", "hotels", "social", "places")
     }
+    # 每条线的交接结果，三种之一：
+    #   reused          —— 用了 Discovery 已经查好的，本次没有重复打 Provider
+    #   fallback_query  —— 本次自己补查了，并且查到了东西
+    #   unavailable     —— 本次自己补查了，但仍然没有可用结果（要如实说出来）
+    stage_info = dict(getattr(bundle, "discovery", None) or {}) if bundle is not None else {}
+    resolved = {
+        "transport": bool(plan.transport is not None and plan.transport.selected is not None),
+        "hotels": bool(plan.hotel is not None and plan.hotel.selected is not None),
+        "social": bool(state.get("evidences")),
+        "places": bool(state.get("places")),
+    }
+    handoff: dict[str, Any] = {}
+    for key, label in (
+        ("transport", "交通"),
+        ("hotels", "酒店"),
+        ("social", "攻略"),
+        ("places", "地点"),
+    ):
+        if reused[key]:
+            status = "reused"
+        elif resolved[key]:
+            status = "fallback_query"
+        else:
+            status = "unavailable"
+        handoff[key] = {
+            "label": label,
+            "handoff": status,
+            "prefetch_available": key in bundle_had,
+            "queried_in_run": self_queried[key],
+            "resolved": resolved[key],
+            **{k: v for k, v in (stage_info.get(key) or {}).items() if k in ("status", "result_count", "duration_ms", "degraded")},
+        }
     return {
+        # 每个阶段的交接状态（管理端与 Bad Case 都看这个）
+        "discovery": handoff,
+        "grace_waited_ms": int(getattr(bundle, "grace_waited_ms", 0) or 0) if bundle is not None else 0,
         "source": state.get("source") or "quick",
         "source_session_id": state.get("source_session_id"),
         "transport_mode": intent.transport_mode,
@@ -3742,7 +3792,9 @@ def _user_journey_summary(state: TravelState, plan: TripPlan) -> dict[str, Any]:
         "prefetch_reused": reused,
         "prefetch_reused_any": any(reused.values()),
         "prefetch_status": (bundle.discovery_status if bundle is not None else None),
-        "discovery": (bundle.discovery if bundle is not None else {}),
+        # 分阶段原始状态（status/duration/result_count…）保留在 prefetch_stages 下，
+        # "discovery" 留给交接结论（reused/fallback_query/unavailable），避免同名两义。
+        "prefetch_stages": dict(getattr(bundle, "discovery", None) or {}) if bundle is not None else {},
         "rejected_in_plan": selection.rejected_place_intruders(planned_ids, selections),
         "must_missing": selection.must_place_shortfall(
             planned_ids, selections, list(state.get("places") or [])
