@@ -71,15 +71,12 @@ def _discovery_done(session: dict[str, Any]) -> bool:
     states = _discovery_states(session)
     if not states:
         return False
-    for key, state in states.items():
-        upper = state.upper()
-        if key == "discovery_status":
-            if upper in DISCOVERY_SETTLED:
-                return True
-            continue
-        if upper in {"RUNNING", "PENDING", "QUEUED"}:
-            return False
-    return True
+    if "discovery_status" in states:
+        # 标量形态：只有落到终态才算查完。第一版这里写成了"非终态就 continue"，
+        # 循环结束后会 return True —— 于是脚本在 Discovery 刚 RUNNING 时就开跑，
+        # 正式 run 拿不到任何 prefetch，测出来的其实是"没有预取"的那条路径。
+        return states["discovery_status"].upper() in DISCOVERY_SETTLED
+    return all(state.upper() not in {"RUNNING", "PENDING", "QUEUED"} for state in states.values())
 
 
 def main() -> int:
