@@ -62,17 +62,20 @@ def profile(store: TravelPlanStore, run_id: str) -> dict[str, Any]:
         )
     stages.sort(key=lambda item: -item["duration_ms"])
 
-    # Provider / tool：按 (provider, tool) 聚合，看"哪个源最慢、调了几次"
+    # Provider / tool：按 (provider, tool) 聚合，看"哪个源最慢、调了几次"。
+    #
+    # 只数 `tool` span：provider / mcp 是**成组** span，它的窗口是组内多次调用的
+    # min(start)~max(finish)，并发下会覆盖整段墙钟。把它和 tool 一起累加，
+    # 会出现"单次调用合计 293s 而整次 run 只有 78s"这种自相矛盾的数字。
     per_call: dict[str, list[int]] = defaultdict(list)
     status_counts: Counter[str] = Counter()
     for span in spans:
-        if span.get("component") not in ("tool", "provider", "mcp"):
+        if span.get("component") != "tool":
             continue
         attributes = span.get("attributes") or {}
         key = f"{attributes.get('provider') or '?'}/{attributes.get('tool') or span['name']}"
         per_call[key].append(_duration_ms(span))
-        if span.get("component") == "tool":
-            status_counts[str(attributes.get("status") or span["status"])] += 1
+        status_counts[str(attributes.get("status") or span["status"])] += 1
 
     providers = [
         {

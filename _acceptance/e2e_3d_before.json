@@ -1,0 +1,32 @@
+{
+  "run_id": "tp-20260920-214836-5c61d9",
+  "note": "优化前真实 guided run（同上；discovery 也完全串行：交通 247s、地点 372s）",
+  "origin": "北京",
+  "destination": "西安",
+  "days": 3,
+  "discovery_s": null,
+  "plan_s": 1075.2,
+  "total_s": 1075.2,
+  "run_status": "SUCCESS",
+  "counts": {
+    "llm_calls": 7,
+    "jev_calls": 3,
+    "tool_calls": 48,
+    "provider_calls": 48,
+    "route_calls": 8,
+    "poi_calls": 14,
+    "poi_detail_calls": 6,
+    "provider_status": {
+      "UNAVAILABLE": 6,
+      "OK": 34,
+      "TIMEOUT": 2,
+      "FREE_CREDIT_EXHAUSTED": 4,
+      "EMPTY": 2
+    }
+  },
+  "tokens": {
+    "total": 21059,
+    "input": 7924,
+    "output": 13135
+  }
+}

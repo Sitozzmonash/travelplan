@@ -1,0 +1,33 @@
+{
+  "run_id": "tp-20260920-205658-ead2ba",
+  "note": "优化前真实 guided run（旧服务：既没有 prefetch 复用，也没有本轮并发/限流）",
+  "origin": "北京",
+  "destination": "成都",
+  "days": 5,
+  "discovery_s": null,
+  "plan_s": 518.2,
+  "total_s": 518.2,
+  "run_status": "SUCCESS",
+  "counts": {
+    "llm_calls": 7,
+    "jev_calls": 3,
+    "tool_calls": 49,
+    "provider_calls": 49,
+    "route_calls": 9,
+    "poi_calls": 16,
+    "poi_detail_calls": 6,
+    "provider_status": {
+      "OK": 36,
+      "TIMEOUT": 1,
+      "FREE_CREDIT_EXHAUSTED": 3,
+      "UNAVAILABLE": 4,
+      "RATE_LIMIT": 1,
+      "EMPTY": 4
+    }
+  },
+  "tokens": {
+    "total": 31868,
+    "input": 17538,
+    "output": 14330
+  }
+}
