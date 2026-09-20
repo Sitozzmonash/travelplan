@@ -626,6 +626,11 @@ def session_view(session: Mapping[str, Any]) -> dict[str, Any]:
             "hotel_star_note": "数据源当前不返回星级字段，星级筛选已记录但不参与排序；请用「每晚价格上限」或「评分下限」表达预算与品质要求。",
             "hotel_max_price_filter": True,
             "hotel_rating_filter": True,
+            # 「接受换酒店」目前**不影响排程**：行程全程只订一家酒店（价格、预算、
+            # 每日通勤都按这一家算）。与其让按钮承诺做不到的事，不如如实置灰 ——
+            # 选择仍会被记录，但前端要能说明它暂不生效。
+            "hotel_allow_change": False,
+            "hotel_allow_change_note": "当前行程全程只订一家酒店，中途换酒店尚未支持；该选择会记入偏好，但不会改变排程。",
         },
     }
 

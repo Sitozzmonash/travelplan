@@ -320,8 +320,14 @@ function group(places: PlaceCandidate[]): PoiNameGroup {
  * `includeStar: false` 时不再展示「最低星级」——数据源不返回星级时这条过滤不生效，
  * 摘要里也不应该出现一个做不到的承诺。
  */
-export function hotelDetailLabels(hotel: HotelDraft, options: { includeStar?: boolean } = {}): string[] {
+export function hotelDetailLabels(
+  hotel: HotelDraft,
+  options: { includeStar?: boolean; includeAllowChange?: boolean } = {},
+): string[] {
   const includeStar = options.includeStar ?? true;
+  // 行程全程只订一家酒店时不展示「换酒店」：后端 capabilities.hotel_allow_change=false
+  // 时它不参与排程，写进摘要会让人以为这个选择起了作用。
+  const includeAllowChange = options.includeAllowChange ?? true;
   const labels: string[] = [];
   if (hotel.maxPriceSentinel) {
     labels.push(`每晚价格上限：${sentinelLabel(hotel.maxPriceSentinel) ?? hotel.maxPriceSentinel}`);
@@ -347,10 +353,12 @@ export function hotelDetailLabels(hotel: HotelDraft, options: { includeStar?: bo
       labels.push(`房型：${matched ? matched.label : hotel.roomType}`);
     }
   }
-  if (typeof hotel.allowChange === "boolean") {
-    labels.push(`换酒店：${hotel.allowChange ? "可以换" : "不想换"}`);
-  } else if (hotel.allowChange) {
-    labels.push(`换酒店：${sentinelLabel(hotel.allowChange) ?? hotel.allowChange}`);
+  if (includeAllowChange) {
+    if (typeof hotel.allowChange === "boolean") {
+      labels.push(`换酒店：${hotel.allowChange ? "可以换" : "不想换"}`);
+    } else if (hotel.allowChange) {
+      labels.push(`换酒店：${sentinelLabel(hotel.allowChange) ?? hotel.allowChange}`);
+    }
   }
   return labels;
 }
@@ -413,6 +421,8 @@ export function summarize(draft: GuidedDraft, session: SessionView | null): Summ
     // 后端声明星级过滤不可用时，摘要也不展示星级（来源是 Session 的能力声明）。
     hotelExtras: hotelDetailLabels(draft.hotel, {
       includeStar: session?.capabilities.hotel_star_filter !== false,
+      // 同理：「接受换酒店」不生效时不写进摘要，免得用户以为它起了作用。
+      includeAllowChange: session?.capabilities.hotel_allow_change !== false,
     }),
     paceLabel: optionLabel(PACE_OPTIONS, draft.pace) ?? "帮我安排（默认）",
     must: group(must),

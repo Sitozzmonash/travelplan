@@ -285,6 +285,13 @@ function normalizeCapabilities(value: unknown): SessionCapabilities {
       typeof value.hotel_star_filter === "boolean" ? value.hotel_star_filter : null,
     hotel_max_price_filter:
       typeof value.hotel_max_price_filter === "boolean" ? value.hotel_max_price_filter : null,
+    // 白名单式归一化：新增能力字段必须在这里放行，否则会被静默丢掉，
+    // 于是"后端说不可用"变成"前端以为可用"，又长出一个点了没用的按钮。
+    hotel_allow_change:
+      typeof value.hotel_allow_change === "boolean" ? value.hotel_allow_change : null,
+    hotel_star_note: typeof value.hotel_star_note === "string" ? value.hotel_star_note : null,
+    hotel_allow_change_note:
+      typeof value.hotel_allow_change_note === "string" ? value.hotel_allow_change_note : null,
   };
 }
 
@@ -294,6 +301,15 @@ function normalizeCapabilities(value: unknown): SessionCapabilities {
  */
 export function hotelStarFilterAvailable(session: SessionView | null): boolean {
   return session?.capabilities.hotel_star_filter !== false;
+}
+
+/**
+ * 「接受换酒店」是否真的会影响排程。
+ * 后端声明 `hotel_allow_change === false` 时置灰：行程目前全程只订一家酒店，
+ * 选它不会改变任何安排。未声明时保持可用（向后兼容）。
+ */
+export function hotelAllowChangeAvailable(session: SessionView | null): boolean {
+  return session?.capabilities.hotel_allow_change !== false;
 }
 
 /* --------------------- 数值型偏好的哨兵字符串收敛 --------------------- */

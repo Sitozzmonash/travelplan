@@ -16,6 +16,7 @@ import {
   describeSessionError,
   getPlanningSession,
   hasSocialDegradation,
+  hotelAllowChangeAvailable,
   hotelStarFilterAvailable,
   isDiscoverySettled,
   isSessionUnusable,
@@ -66,6 +67,17 @@ function dropStarFilter(patch: SessionPatchInput): SessionPatchInput {
 }
 
 /**
+ * 「接受换酒店」当前不影响排程（全程只订一家）时，从 PATCH 里删掉 `hotel_allow_change`。
+ * 理由同星级：不要提交一个后端不消费、却看起来生效了的偏好。
+ */
+function dropAllowChange(patch: SessionPatchInput): SessionPatchInput {
+  if (!("hotel_allow_change" in patch)) return patch;
+  const next: SessionPatchInput = { ...patch };
+  delete next.hotel_allow_change;
+  return next;
+}
+
+/**
  * Guided 向导（§17）唯一的状态机。
  *
  * 会话生命周期：
@@ -103,6 +115,8 @@ export function GuidedWizard() {
   const isConfirm = step === STEP_META.length - 1;
   // 后端能力声明：false 时禁用「最低星级」并从 PATCH 里删掉该字段。
   const starFilterAvailable = hotelStarFilterAvailable(session);
+  // 「接受换酒店」当前不影响排程（全程只订一家），后端声明不生效时同样置灰 —— 不留假按钮。
+  const allowChangeAvailable = hotelAllowChangeAvailable(session);
 
   useEffect(() => {
     if (!sessionId || settled || unusable || pollStalled) return;
@@ -270,8 +284,10 @@ export function GuidedWizard() {
       setStep(advanceTo);
       return;
     }
-    // 数据源不支持星级过滤时，绝不把 hotel_min_star 提交上去。
-    const effective = starFilterAvailable ? patch : dropStarFilter(patch);
+    // 数据源不支持星级过滤时，绝不把 hotel_min_star 提交上去；
+    // 「接受换酒店」不生效时同理 —— 提交一个后端不消费的偏好只会制造"我选过了"的错觉。
+    let effective = starFilterAvailable ? patch : dropStarFilter(patch);
+    if (!allowChangeAvailable) effective = dropAllowChange(effective);
     // 这次要发的就是最新的 POI 选择时，取消还在等待的防抖同步，避免重复 PATCH。
     if (effective.poi_selections && poiTimer.current) {
       clearTimeout(poiTimer.current);
@@ -460,6 +476,7 @@ export function GuidedWizard() {
                 draft={draft}
                 onChange={patchHotel}
                 hotelStarFilterAvailable={starFilterAvailable}
+                hotelAllowChangeAvailable={allowChangeAvailable}
               />
             ) : null}
             {step === 3 ? (

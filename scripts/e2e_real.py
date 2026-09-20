@@ -41,25 +41,45 @@ TERMINAL = {"SUCCESS", "DEGRADED", "FAILED", "CANCELLED"}
 
 
 def _discovery_states(session: dict[str, Any]) -> dict[str, str]:
-    """把 discovery_status 压成 {stage: state}，兼容 dict/str 两种形态。"""
+    """把 Discovery 状态压成 {stage: state}，兼容三种形态。
 
-    raw = session.get("discovery_status") or {}
-    if not isinstance(raw, dict):
-        return {}
-    states: dict[str, str] = {}
-    for key, value in raw.items():
-        if isinstance(value, dict):
-            states[key] = str(value.get("status") or value.get("state") or "?")
-        else:
-            states[key] = str(value)
-    return states
+    `GET /planning-sessions/{id}` 公开给前端的是**标量** `discovery_status`
+    （COLLECTING / DISCOVERING / READY / PARTIAL / FAILED），分阶段 map 只在
+    管理端视图里。所以这里优先用 map，拿不到就退化成标量。
+    """
+
+    raw = session.get("discovery")
+    if isinstance(raw, dict) and raw:
+        states: dict[str, str] = {}
+        for key, value in raw.items():
+            if isinstance(value, dict):
+                states[key] = str(value.get("status") or value.get("state") or "?")
+            else:
+                states[key] = str(value)
+        return states
+    scalar = session.get("discovery_status")
+    if isinstance(scalar, str) and scalar:
+        return {"discovery_status": scalar}
+    return {}
+
+
+#: Discovery 的终态（标量）。只有这些值才算"查完了"，其余都在进行中。
+DISCOVERY_SETTLED = {"READY", "PARTIAL", "FAILED", "CANCELLED", "EXPIRED"}
 
 
 def _discovery_done(session: dict[str, Any]) -> bool:
     states = _discovery_states(session)
     if not states:
         return False
-    return all(state.upper() not in {"RUNNING", "PENDING", "QUEUED"} for state in states.values())
+    for key, state in states.items():
+        upper = state.upper()
+        if key == "discovery_status":
+            if upper in DISCOVERY_SETTLED:
+                return True
+            continue
+        if upper in {"RUNNING", "PENDING", "QUEUED"}:
+            return False
+    return True
 
 
 def main() -> int:

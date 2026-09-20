@@ -137,6 +137,10 @@ class TestSessionService:
         assert view["preference_labels"]["transport_priority"] == "价格最低"
         assert view["preference_labels"]["pace"] == "帮我安排"
         assert view["capabilities"]["hotel_star_filter"] is False
+        # 「接受换酒店」目前不影响排程（行程全程只订一家），必须如实声明为不可用，
+        # 否则前端会留一个"点了没用"的按钮 —— 这正是 PRD 里反复要消灭的假按钮。
+        assert view["capabilities"]["hotel_allow_change"] is False
+        assert view["capabilities"]["hotel_allow_change_note"]
 
     def test_unknown_values_fall_back_to_auto(self, store: TravelPlanStore):
         session = sessions.create_session(store, {"origin": "北京", "destination": "成都"})

@@ -29,11 +29,21 @@ interface StepHotelProps {
   onChange: (patch: Partial<GuidedDraft["hotel"]>) => void;
   /** 后端能力声明：false 时「最低星级」置灰（数据源不返回星级）。缺省视为可用。 */
   hotelStarFilterAvailable?: boolean;
+  /** 后端能力声明：false 时「接受换酒店」置灰（当前全程只订一家）。缺省视为可用。 */
+  hotelAllowChangeAvailable?: boolean;
 }
 
-export function StepHotel({ draft, onChange, hotelStarFilterAvailable = true }: StepHotelProps) {
+export function StepHotel({
+  draft,
+  onChange,
+  hotelStarFilterAvailable = true,
+  hotelAllowChangeAvailable = true,
+}: StepHotelProps) {
   const hotel = draft.hotel;
-  const details = hotelDetailLabels(hotel, { includeStar: hotelStarFilterAvailable });
+  const details = hotelDetailLabels(hotel, {
+    includeStar: hotelStarFilterAvailable,
+    includeAllowChange: hotelAllowChangeAvailable,
+  });
 
   return (
     <div className="grid gap-6">
@@ -120,11 +130,19 @@ export function StepHotel({ draft, onChange, hotelStarFilterAvailable = true }: 
         />
       </StepSection>
 
-      <StepSection title="接受换酒店吗？" hint="行程跨度大时，换到就近的酒店能减少通勤；不想折腾就固定一家。">
+      <StepSection
+        title="接受换酒店吗？"
+        hint={
+          hotelAllowChangeAvailable
+            ? "行程跨度大时，换到就近的酒店能减少通勤；不想折腾就固定一家。"
+            : "当前行程全程只订一家酒店，中途换酒店尚未支持 —— 选了也不会改变排程，因此这里禁用。"
+        }
+      >
         <ChoiceGrid
           ariaLabel="是否接受换酒店"
           options={ALLOW_CHANGE_OPTIONS}
           value={typeof hotel.allowChange === "boolean" ? hotel.allowChange : null}
+          disabled={!hotelAllowChangeAvailable}
           onChange={(next) => onChange({ allowChange: next })}
           dense
         />
@@ -132,8 +150,15 @@ export function StepHotel({ draft, onChange, hotelStarFilterAvailable = true }: 
           ariaLabel="是否接受换酒店的其他选择"
           options={SENTINEL_OPTIONS}
           value={typeof hotel.allowChange === "string" ? hotel.allowChange : null}
+          disabled={!hotelAllowChangeAvailable}
           onChange={(value) => onChange({ allowChange: value })}
         />
+        {!hotelAllowChangeAvailable ? (
+          <p className="rounded-md bg-muted/60 px-2.5 py-2 text-[11px] leading-5 text-muted-foreground">
+            行程目前全程只订一家酒店，中途换酒店尚未支持。你的选择会被记录，但不会改变排程；
+            想影响住宿请用上面的「酒店策略」与价格上限。
+          </p>
+        ) : null}
       </StepSection>
 
       <p className="rounded-lg bg-muted/50 px-3 py-2.5 text-[11px] leading-5 text-muted-foreground">

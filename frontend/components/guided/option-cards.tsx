@@ -23,6 +23,8 @@ interface ChoiceGridProps<T extends string | number | boolean> {
   columns?: 1 | 2 | 3;
   /** 移动端触摸目标高度：默认大按钮。 */
   dense?: boolean;
+  /** 后端声明该偏好不生效时置灰：可选但点了没用，比"能点却没作用"诚实。 */
+  disabled?: boolean;
 }
 
 export function ChoiceGrid<T extends string | number | boolean>({
@@ -32,6 +34,7 @@ export function ChoiceGrid<T extends string | number | boolean>({
   ariaLabel,
   columns = 2,
   dense = false,
+  disabled = false,
 }: ChoiceGridProps<T>) {
   return (
     <div
@@ -52,6 +55,7 @@ export function ChoiceGrid<T extends string | number | boolean>({
             type="button"
             role="radio"
             aria-checked={selected}
+            disabled={disabled}
             onClick={() => onChange(option.value)}
             className={cn(
               "flex w-full items-start gap-2.5 rounded-xl border px-3.5 text-left transition-colors",
@@ -60,6 +64,7 @@ export function ChoiceGrid<T extends string | number | boolean>({
               selected
                 ? "border-primary/50 bg-accent text-accent-foreground shadow-sm"
                 : "border-border bg-card text-foreground hover:border-primary/30 hover:bg-muted/40",
+              disabled && "cursor-not-allowed opacity-50 hover:border-border",
             )}
           >
             <span className="min-w-0 flex-1">

@@ -147,6 +147,13 @@ export interface SessionEvent {
 export interface SessionCapabilities {
   hotel_star_filter?: boolean | null;
   hotel_max_price_filter?: boolean | null;
+  /**
+   * 「接受换酒店」是否真的影响排程。当前行程全程只订一家酒店，后端给 false；
+   * 前端据此置灰并说明原因，而不是让用户选一个不生效的选项。
+   */
+  hotel_allow_change?: boolean | null;
+  hotel_star_note?: string | null;
+  hotel_allow_change_note?: string | null;
 }
 
 /** GET /api/v1/planning-sessions/{id} 的原始返回（字段可能缺失，必须能降级渲染）。 */
