@@ -16,11 +16,12 @@ import {
 } from "@/components/admin/filter-select";
 import { PageHeader } from "@/components/admin/page-header";
 import { ActionError, ResourceView, SectionEmpty } from "@/components/admin/admin-states";
+import { AdminDetailDialog } from "@/components/admin/detail-dialog";
 import { DescriptionList, PanelSection } from "@/components/admin/metric-list";
 import { StatusBadge } from "@/components/admin/status-badge";
-import { formatNumber, statusLabel } from "@/components/admin/format";
+import { badcaseCategoryLabel, cleanBadcaseSymptom, formatNumber, statusLabel } from "@/components/admin/format";
 import { useAdminResource } from "@/components/admin/use-admin-resource";
-import { SidePanel } from "@/components/side-panel";
+import { formatDateTime } from "@/lib/format";
 import {
   getAdminBadcases,
   patchAdminBadcase,
@@ -110,21 +111,25 @@ export function BadcasesView() {
       key: "symptom",
       header: "症状",
       primary: true,
+      className: "max-w-[22rem]",
       cell: (badcase) => (
-        <span className="line-clamp-2 block max-w-[26rem] text-xs text-foreground">{badcase.symptom}</span>
-      ),
-    },
-    {
-      key: "badcase_id",
-      header: "编号",
-      mobileHidden: true,
-      cell: (badcase) => (
-        <span className="font-mono text-[11px] break-all text-muted-foreground">
-          {badcase.badcase_id}
+        <span
+          className="line-clamp-2 block max-w-[22rem] text-xs text-foreground"
+          title={badcase.symptom || badcaseCategoryLabel(badcase.category)}
+        >
+          {cleanBadcaseSymptom(badcase.symptom, badcase.category)}
         </span>
       ),
     },
-    { key: "category", header: "分类", cell: (badcase) => <span className="text-xs">{badcase.category}</span> },
+    {
+      key: "category",
+      header: "分类",
+      cell: (badcase) => (
+        <span className="whitespace-nowrap text-xs" title={badcase.category}>
+          {badcaseCategoryLabel(badcase.category)}
+        </span>
+      ),
+    },
     { key: "severity", header: "严重度", cell: (badcase) => <StatusBadge status={badcase.severity} /> },
     {
       key: "analysis_status",
@@ -149,13 +154,29 @@ export function BadcasesView() {
       cell: (badcase) => <StatusBadge status={badcase.detected_by} />,
     },
     {
+      key: "badcase_id",
+      header: "编号",
+      mobileHidden: true,
+      className: "max-w-[10rem]",
+      cell: (badcase) => (
+        <span
+          className="block max-w-[10rem] truncate font-mono text-[11px] whitespace-nowrap text-muted-foreground"
+          title={badcase.badcase_id}
+        >
+          {badcase.badcase_id}
+        </span>
+      ),
+    },
+    {
       key: "run_id",
       header: "Run",
       mobileHidden: true,
+      className: "max-w-[12rem]",
       cell: (badcase) => (
         <Link
           href={`/admin/runs/${encodeURIComponent(badcase.run_id)}`}
-          className="font-mono text-[11px] text-primary underline-offset-4 hover:underline"
+          title={badcase.run_id}
+          className="block max-w-[12rem] truncate font-mono text-[11px] whitespace-nowrap text-primary underline-offset-4 hover:underline"
         >
           {badcase.run_id}
         </Link>
@@ -167,7 +188,7 @@ export function BadcasesView() {
       mobileHidden: true,
       cell: (badcase) => (
         <span className="font-mono text-[11px] whitespace-nowrap text-muted-foreground">
-          {badcase.created_at ?? "—"}
+          {formatDateTime(badcase.created_at)}
         </span>
       ),
     },
@@ -300,16 +321,17 @@ export function BadcasesView() {
         )}
       </ResourceView>
 
-      <SidePanel
+      <AdminDetailDialog
         open={selected !== null}
         onOpenChange={(open) => {
           if (!open) setSelected(null);
         }}
-        title={selected ? `问题案例 · ${selected.category}` : "问题案例"}
+        title={selected ? badcaseCategoryLabel(selected.category) : "问题案例"}
         description={selected ? selected.badcase_id : undefined}
+        badge={selected ? <StatusBadge status={selected.severity} /> : undefined}
         footer={
           selected ? (
-            <div className="flex items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <span className="text-[11px] text-muted-foreground">
                 修改会立即 PATCH 到后端，保存后列表会自动刷新。
               </span>
@@ -331,7 +353,7 @@ export function BadcasesView() {
             }}
           />
         ) : null}
-      </SidePanel>
+      </AdminDetailDialog>
     </div>
   );
 }
@@ -402,9 +424,10 @@ function BadcaseDetail({
       <PanelSection title="问题描述">
         <DescriptionList
           items={[
-            { label: "症状", value: badcase.symptom || "—" },
-            { label: "期望", value: badcase.expected || "—" },
-            { label: "实际", value: badcase.actual || "—" },
+            { label: "分类", value: badcaseCategoryLabel(badcase.category) },
+            { label: "症状", value: cleanBadcaseSymptom(badcase.symptom, badcase.category) },
+            { label: "期望", value: badcase.expected || "未返回" },
+            { label: "实际", value: badcase.actual || "未返回" },
           ]}
         />
       </PanelSection>
@@ -414,20 +437,31 @@ function BadcaseDetail({
       <PanelSection title="定位信息">
         <DescriptionList
           items={[
-            { label: "疑似根因", value: badcase.suspected_root_cause || "—" },
+            { label: "疑似根因", value: badcase.suspected_root_cause || "未返回" },
             { label: "根因状态", value: <StatusBadge status={badcase.root_cause_status} /> },
             { label: "发现方式", value: <StatusBadge status={badcase.detected_by} /> },
             { label: "分析状态", value: <StatusBadge status={badcase.analysis_status} /> },
             { label: "修复状态", value: <StatusBadge status={badcase.fixed_status} /> },
-            { label: "引入版本", value: badcase.introduced_in ?? "—" },
-            { label: "修复版本", value: badcase.fixed_in ?? "—" },
+            { label: "引入版本", value: badcase.introduced_in || "未返回" },
+            { label: "修复版本", value: badcase.fixed_in || "未返回" },
             {
               label: "Trace 引用",
               value:
                 badcase.trace_refs.length > 0 ? (
-                  <span className="font-mono text-[11px]">{badcase.trace_refs.join("、")}</span>
+                  <span className="flex flex-wrap gap-x-2 gap-y-1">
+                    {badcase.trace_refs.map((ref) => (
+                      <Link
+                        key={ref}
+                        href={`/admin/runs/${encodeURIComponent(badcase.run_id)}`}
+                        title={`在运行详情里查看 ${ref}`}
+                        className="font-mono text-[11px] break-all text-primary underline-offset-4 hover:underline"
+                      >
+                        {ref}
+                      </Link>
+                    ))}
+                  </span>
                 ) : (
-                  "—"
+                  "未返回"
                 ),
             },
             {
@@ -441,7 +475,7 @@ function BadcaseDetail({
                 </Link>
               ),
             },
-            { label: "登记时间", value: badcase.created_at ?? "—" },
+            { label: "登记时间", value: formatDateTime(badcase.created_at) },
           ]}
         />
       </PanelSection>

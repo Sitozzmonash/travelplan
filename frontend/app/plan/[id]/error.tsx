@@ -5,13 +5,13 @@ import { ArrowLeft } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ErrorState } from "@/components/state-views";
 
-export default function PlanError({ error, reset }: { error: Error; reset: () => void }) {
+export default function PlanError({ reset }: { error: Error; reset: () => void }) {
   return (
     <div className="mx-auto w-full max-w-2xl space-y-4 px-4 py-14 sm:px-6">
       <ErrorState
         title="行程页面加载失败"
         description="页面在渲染行程时出错，本次没有展示可用行程。可以重试，或返回首页重新生成一次。"
-        detail={error.message}
+        detail="如果重试后仍然失败，说明这次生成的行程数据可能不完整。"
         onRetry={reset}
         retryLabel="重试"
       />

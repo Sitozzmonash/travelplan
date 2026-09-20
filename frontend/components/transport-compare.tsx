@@ -39,13 +39,13 @@ export function TransportCompare({
       open={open}
       onOpenChange={onOpenChange}
       title="交通方案比较"
-      description={`共 ${outbound.length + inbound.length} 个候选方案（去程 + 回程）。价格与时间来自 Provider 实时查询，可能变化。`}
+      description={`共 ${outbound.length + inbound.length} 个候选方案（去程 + 回程）。价格与时间来自实时查询，可能变化。`}
       widthClassName="sm:max-w-2xl"
     >
       {!transport || (!transport.selected && !transport.inbound_selected) ? (
         <EmptyState
           title="暂时没有可比较的交通方案"
-          description="本次没有从机票与高铁 Provider 取得可用结果，因此没有可比较的方案。行程中不会包含城际交通安排，你可以稍后重新规划。"
+          description="本次没有从机票与高铁数据源取得可用结果，因此没有可比较的方案。行程中不会包含城际交通安排，你可以稍后重新规划。"
         />
       ) : (
         <Tabs defaultValue="recommended" className="gap-4">

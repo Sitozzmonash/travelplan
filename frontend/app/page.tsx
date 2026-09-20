@@ -1,11 +1,11 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useState } from "react";
-import { CircleAlert, Database, Lock, ShieldCheck, Sparkles } from "lucide-react";
+import { ArrowRight, CircleAlert, Database, Lock, ShieldCheck, Sparkles } from "lucide-react";
 import type { CreatePlanResult, PlanningStepState } from "@/types/api";
 import {
-  API_BASE_URL,
   API_MODE,
   type ApiErrorKind,
   apiErrorKind,
@@ -93,7 +93,20 @@ export default function HomePage() {
         </div>
 
         <div className="mt-8">
-          {phase === "idle" ? <TripSearch onSubmit={runPlanning} /> : null}
+          {phase === "idle" ? (
+            <div className="space-y-3">
+              <TripSearch onSubmit={runPlanning} />
+              <div className="flex justify-center">
+                <Link
+                  href="/guided"
+                  className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-3.5 py-2 text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+                >
+                  不想写一句话？逐步选择偏好
+                  <ArrowRight className="size-3.5" aria-hidden />
+                </Link>
+              </div>
+            </div>
+          ) : null}
 
           {phase === "planning" ? (
             <SectionCard
@@ -106,7 +119,7 @@ export default function HomePage() {
               <PlanningProgress steps={steps} />
               <div className="mt-4 flex items-center justify-between gap-3 border-t border-border/70 pt-3">
                 <p className="text-[11px] leading-5 text-muted-foreground">
-                  规划过程中会依次调用交通、酒店、攻略与路线 Provider，全部完成后自动进入行程工作台。
+                  规划过程中会依次查询交通、酒店、攻略与路线数据源，全部完成后自动进入行程工作台。
                 </p>
                 <Button variant="outline" size="sm" onClick={() => setPhase("idle")}>
                   返回修改
@@ -117,7 +130,7 @@ export default function HomePage() {
 
           {phase === "result" && result ? (
             <SectionCard
-              title={result.status === "DEGRADED" ? "行程已生成，但本次有降级" : "这次没有生成行程"}
+              title={result.status === "DEGRADED" ? "行程已生成，部分信息暂未验证" : "这次没有生成行程"}
               icon={Sparkles}
               description={query ? `需求：${query}` : undefined}
               action={<RunStatusBadge status={result.status} />}
@@ -126,8 +139,8 @@ export default function HomePage() {
               {result.status === "DEGRADED" ? (
                 <>
                   <PartialNotice
-                    title="规划完成，但有阶段返回了降级数据"
-                    description={result.message ?? "部分 Provider 本次只返回了缓存或部分数据，行程仍然可用。"}
+                    title="行程已生成，部分信息暂未验证"
+                    description={result.message ?? "部分数据源本次只返回了缓存或部分数据，行程仍然可用。"}
                     detail="降级会影响个别价格或通勤时间的准确性，出行前请再次确认。"
                   />
                   {result.degradations?.length ? (
@@ -143,14 +156,13 @@ export default function HomePage() {
                 </>
               ) : (
                 <ErrorState
-                  title={result.status === "CANCELLED" ? "这次规划被取消" : "规划在生成过程中失败"}
+                  title={result.status === "CANCELLED" ? "这次规划被取消" : "这次没有生成行程"}
                   description={
-                    result.message ??
-                    (result.status === "CANCELLED"
-                      ? "后端取消了这次规划任务，通常是服务重启或任务被手动终止。可以重新规划一次。"
-                      : "规划服务在生成过程中出错，本次没有产出可用行程。可以重新规划一次。")
+                    result.status === "CANCELLED"
+                      ? "任务在完成前被终止，通常是服务重启或手动停止。本次没有产出可用行程，可以重新规划一次。"
+                      : "规划在生成过程中中断，本次没有产出可用行程。可以重新规划一次。"
                   }
-                  detail={`run_id：${result.run_id}`}
+                  detail={result.message ?? undefined}
                   onRetry={() => runPlanning(query)}
                   retryLabel="重新规划"
                 />
@@ -178,13 +190,12 @@ export default function HomePage() {
                 <UnauthorizedState
                   title="没有权限访问规划服务"
                   description={error ?? "规划服务拒绝了这次请求。"}
-                  detail={`规划服务地址：${API_BASE_URL}`}
+                  detail="请确认当前使用的是有权限的访问地址或凭据，然后重试。"
                 />
               ) : (
                 <ErrorState
                   title="这次没有生成行程"
                   description={error ?? "规划服务没有返回结果，本次没有产出可用行程。"}
-                  detail={`规划服务地址：${API_BASE_URL}`}
                   onRetry={() => runPlanning(query)}
                   retryLabel="重新规划"
                 />
@@ -200,12 +211,12 @@ export default function HomePage() {
           {API_MODE === "mock" ? (
             <>
               <CircleAlert className="size-3" aria-hidden />
-              当前为演示数据模式，行程来自内置示例；接入本地 FastAPI 后即使用真实查询结果。
+              当前为演示数据模式，行程来自内置示例；接入真实查询服务后即使用实时结果。
             </>
           ) : (
             <>
               <Database className="size-3" aria-hidden />
-              已连接规划服务：{API_BASE_URL}
+              已连接真实查询服务，价格与余票为查询时点结果。
             </>
           )}
         </p>
@@ -226,7 +237,7 @@ export default function HomePage() {
           <AboutCard
             icon={Lock}
             title="密钥只留在服务端"
-            description="高德、途牛、TikHub 等 Provider 的 Key 全部由后端持有，前端只读取结构化结果与来源链接。"
+            description="地图、机票、酒店与攻略平台的访问密钥全部由后端持有，页面只读取结构化结果，不接触任何密钥。"
           />
         </div>
         <p className="mt-6 max-w-3xl text-xs leading-6 text-muted-foreground">

@@ -60,7 +60,7 @@ export function DayTabs({ days, activeDayIndex, onChange }: DayTabsProps) {
               <button
                 type="button"
                 onClick={() => scrollBy(-240)}
-                aria-label="向右滚动日期"
+                aria-label="向左滚动日期"
                 className="rounded-md border border-border bg-card p-1 text-muted-foreground hover:text-foreground"
               >
                 <ChevronLeft className="size-3.5" aria-hidden />
@@ -68,7 +68,7 @@ export function DayTabs({ days, activeDayIndex, onChange }: DayTabsProps) {
               <button
                 type="button"
                 onClick={() => scrollBy(240)}
-                aria-label="向左滚动日期"
+                aria-label="向右滚动日期"
                 className="rounded-md border border-border bg-card p-1 text-muted-foreground hover:text-foreground"
               >
                 <ChevronRight className="size-3.5" aria-hidden />

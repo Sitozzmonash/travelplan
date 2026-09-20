@@ -200,22 +200,22 @@ function isReviseResult(value: unknown): value is ReviseResult {
   );
 }
 
-/** 把异常翻译成用户能看懂的解释，不暴露内部堆栈。 */
+/** 把异常翻译成用户能看懂的解释，不暴露内部堆栈、接口地址或英文技术字段。 */
 export function describeApiError(error: unknown): string {
   if (error instanceof ApiError) {
     switch (error.kind) {
       case "not_found":
         return "这个行程编号没有对应的规划结果。它可能已经过期，或者链接不完整。请返回首页重新生成一次。";
       case "endpoint_missing":
-        return `找不到创建规划的接口。请确认后端地址（${API_BASE_URL}）是否正确，或后端是否已部署最新版本。`;
+        return "找不到创建规划的接口。请确认后端已部署最新版本，或联系管理员检查服务地址。";
       case "unauthorized":
-        return "规划服务拒绝了这次请求（401 / 403）。请确认当前环境使用的是有权限的访问地址或凭据，然后重试。";
+        return "规划服务拒绝了这次请求。请确认当前使用的是有权限的访问地址或凭据，然后重试。";
       case "network":
-        return `暂时无法连接规划服务（${API_BASE_URL}）。请确认后端已启动，或稍后重试。`;
+        return "暂时无法连接规划服务。请确认网络正常，或稍后重试。";
       case "timeout":
         return "规划服务超时未返回结果。行程数据量较大时可能发生，请稍后重试。";
       case "invalid":
-        return "规划服务返回的数据结构不完整，因此本次无法展示行程。";
+        return "规划服务返回的数据不完整，因此本次无法展示行程。";
       case "server":
       default:
         return "规划服务在生成过程中出错，本次没有产出可用行程。请稍后重试。";

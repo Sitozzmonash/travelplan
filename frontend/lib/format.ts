@@ -49,6 +49,21 @@ export function formatDateTime(value: string | null | undefined): string {
   return `${formatDate(value)}${clock ? ` ${clock}` : ""}`;
 }
 
+/**
+ * ISO → "2026-10-01 14:32"（用户侧「抓取时间」统一用它）。
+ *
+ * 直接读取字符串里的本地墙钟时间，不做 `new Date()` 时区换算：后端时间戳本身已带
+ * `+08:00`（就是用户所在时区），而服务端渲染与浏览器渲染如果在不同时区就会各算各的，
+ * 造成 hydration 前后文案不一致。这里保持与时区无关，SSR / CSR 输出完全一致。
+ */
+export function formatStamp(value: string | null | undefined): string {
+  if (!value) return "—";
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/);
+  if (match) return `${match[1]}-${match[2]}-${match[3]} ${match[4]}:${match[5]}`;
+  const dateOnly = value.slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(dateOnly) ? dateOnly : value;
+}
+
 export function formatDuration(minutes: number | null | undefined): string {
   if (minutes === null || minutes === undefined) return "—";
   if (minutes < 60) return `${Math.round(minutes)} 分钟`;

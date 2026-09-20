@@ -1419,6 +1419,21 @@ const REASON_DETAIL: Record<string, ReasonDetail> = {
   },
 };
 
+/**
+ * 营业时间：后端在高德 POI 校验时会一并带回。这里只给非 24 小时开放的地点补一份，
+ * 用于演示「安排详情」里的营业时间行；缺失的项前端不会渲染该行（降级为 Partial）。
+ */
+const OPENING_HOURS: Record<string, string> = {
+  "d1-3": "07:00-21:00（鹤鸣茶社）",
+  "d1-5": "11:00-23:30（22:30 停止取号）",
+  "d2-1": "08:00-18:00（17:00 停止入场）",
+  "d2-3": "10:30-21:00（午市 11:30-13:00）",
+  "d3-1": "07:30-18:00（17:00 停止入场）",
+  "d4-2": "08:00-18:00（17:30 停止入园）",
+  "d5-1": "09:00-17:00（周一闭馆）",
+  "d5-3": "11:00-22:00",
+};
+
 for (const day of days) {
   for (const entry of day.items) {
     const detail = REASON_DETAIL[entry.id];
@@ -1426,6 +1441,8 @@ for (const day of days) {
       entry.reason_points = detail.reason_points;
       if (detail.risk_note) entry.risk_note = detail.risk_note;
     }
+    const hours = OPENING_HOURS[entry.id];
+    if (hours) entry.opening_hours = hours;
   }
 }
 

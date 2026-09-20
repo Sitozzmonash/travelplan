@@ -40,7 +40,7 @@ export function PlanningProgress({ steps, className }: PlanningProgressProps) {
               {running ? `正在${running.label}…` : finished >= total ? "规划已完成" : "准备开始规划"}
             </p>
             <p className="mt-1 text-xs text-muted-foreground">
-              已进行 {finished} / {total} 步。每一步都会真实调用后端 Provider，不做推测。
+              已进行 {finished} / {total} 步。每一步都会真实查询数据源，不做推测。
             </p>
           </div>
           <span className="tabular shrink-0 text-xs text-muted-foreground">{percent}%</span>

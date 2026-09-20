@@ -3,7 +3,7 @@
 import type { ReactNode } from "react";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
-import { statusLabel } from "@/components/admin/format";
+import { statusLabel, runSourceLabel } from "@/components/admin/format";
 
 /**
  * 状态色只有一个来源：颜色只表达状态，不做装饰（与用户端 FRONTEND_DESIGN §31 一致）。
@@ -135,5 +135,24 @@ export function SecretBadge({ configured }: { configured: boolean }) {
       onTone="success"
       offTone="warning"
     />
+  );
+}
+
+/**
+ * run 来源徽标：引导式 / 一句话 / 命令行 / Benchmark。
+ * 引导式用 info 色，便于在列表里一眼区分"真实用户旅程"与其它来源。
+ */
+export function SourceTag({
+  source,
+  className,
+}: {
+  source: string | null | undefined;
+  className?: string;
+}) {
+  const tone: AdminTone = source === "guided" ? "info" : "muted";
+  return (
+    <ToneBadge tone={tone} className={cn("text-[0.6875rem]", className)}>
+      <span title={source ?? "未知来源"}>{runSourceLabel(source)}</span>
+    </ToneBadge>
   );
 }

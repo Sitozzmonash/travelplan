@@ -169,7 +169,7 @@ export function ItineraryCard({
               />
             ) : (
               <span className="rounded-md border border-border bg-muted/40 px-2 py-1 text-[11px] text-muted-foreground">
-                无攻略证据 · 数据来自 Provider 实时查询
+                无攻略证据 · 数据来自实时查询
               </span>
             )}
             {item.source_ids.length ? (

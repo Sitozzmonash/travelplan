@@ -338,6 +338,28 @@ class TripIntent(BaseModel):
     hotel_preferences: list[str] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)
 
+    # --- 引导式旅程带来的结构化偏好（app/selection.py 负责解释这些值） ---
+    # 为什么要有结构化字段：把"用户点过的按钮"重新拼成自然语言再解析一遍，等于把用户
+    # 明确表达过的信息交给模型去猜。用户点过的优先级必须高于任何自然语言解析结果。
+    #: train | flight | any | auto
+    transport_mode: str = "auto"
+    #: value | fastest | cheapest | comfort | auto
+    transport_priority: str = "auto"
+    #: few_transfers | no_early | no_red_eye | any_time（多选）
+    transport_constraints: list[str] = Field(default_factory=list)
+    #: value | location | rating | comfort | transit | auto
+    hotel_priority: str = "auto"
+    hotel_max_price_per_night: float | None = None
+    hotel_min_rating: float | None = None
+    hotel_room_type: str | None = None
+    #: yes | no | auto —— 是否接受中途换酒店（当前产品全程只选一家，见 docs/02）
+    hotel_allow_change: str | None = None
+    #: place_id → MUST / WANT / REJECT（缺省即 NEUTRAL）
+    place_selections: dict[str, str] = Field(default_factory=dict)
+    #: 这次规划是谁发起的：quick（一句话）/ guided（引导式）/ cli
+    source: str = "quick"
+    source_session_id: str | None = None
+
     @property
     def nights(self) -> int:
         """住宿晚数 = 天数 - 1，最小 0（当天来回没有住宿）。"""

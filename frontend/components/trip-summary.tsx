@@ -1,6 +1,6 @@
 "use client";
 
-import { BadgeCheck, CalendarDays, CircleAlert, Clock3, MapPin, Users, Wallet } from "lucide-react";
+import { CalendarDays, Clock3, MapPin, Users, Wallet } from "lucide-react";
 import type { TripPlan } from "@/types/plan";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -30,16 +30,15 @@ export function TripSummary({ plan, onOpenAudit, onOpenSources }: TripSummaryPro
   const destination = (intent?.destination ?? []).join(" / ") || "未指定目的地";
   const nights = Math.max(dayList.length - 1, 0);
 
-  const unresolvedErrors = warningList.filter((warning) => !warning.resolved && warning.severity === "error");
-  const resolvedIssues = warningList.filter((warning) => warning.resolved);
+  const unresolved = warningList.filter((warning) => !warning.resolved);
+  const unresolvedErrors = unresolved.filter((warning) => warning.severity === "error");
   const unverifiedLegs = dayList
     .flatMap((day) => day.items)
     .filter((item) => item.travel_from_previous && !item.travel_from_previous.verified);
 
   const budgetWithin = budget?.status === "within_budget";
   const budgetKnown = budget !== undefined && budget.status !== "unknown";
-  const remaining = budget?.remaining ?? null;
-  const feasible = unresolvedErrors.length === 0;
+  const feasible = unresolved.length === 0;
   const routesVerified = unverifiedLegs.length === 0;
 
   const startDate = intent?.start_date ?? null;
@@ -61,8 +60,14 @@ export function TripSummary({ plan, onOpenAudit, onOpenSources }: TripSummaryPro
             </h1>
             <div className="flex flex-wrap items-center gap-1.5">
               <StatusBadge
-                tone={feasible ? "success" : "danger"}
-                label={feasible ? "时间可行" : `${unresolvedErrors.length} 个时间问题未解决`}
+                tone={feasible ? "success" : unresolvedErrors.length ? "danger" : "warning"}
+                label={
+                  feasible
+                    ? "时间可行"
+                    : unresolvedErrors.length
+                      ? `${unresolvedErrors.length} 个时间问题未解决`
+                      : `${unresolved.length} 项待确认`
+                }
               />
               <StatusBadge
                 tone={!budgetKnown ? "muted" : budgetWithin ? "success" : "danger"}
@@ -106,38 +111,13 @@ export function TripSummary({ plan, onOpenAudit, onOpenSources }: TripSummaryPro
 
         <div className="flex shrink-0 flex-wrap items-center gap-2">
           <Button variant="outline" size="sm" onClick={onOpenSources}>
-            来源与查询条件
+            查看全部来源
           </Button>
           <Button variant="outline" size="sm" onClick={onOpenAudit}>
             规划依据
           </Button>
         </div>
       </div>
-
-      {warningList.length ? (
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 border-t border-border/70 bg-muted/30 px-4 py-2.5 text-xs text-muted-foreground sm:px-5">
-          {resolvedIssues.length ? (
-            <span className="inline-flex items-center gap-1.5">
-              <BadgeCheck className="size-3.5 text-success" aria-hidden />
-              <span className="text-foreground/80">{resolvedIssues.length} 个时间冲突已自动修正</span>
-            </span>
-          ) : null}
-          {unverifiedLegs.length ? (
-            <span className="inline-flex items-center gap-1.5">
-              <CircleAlert className="size-3.5 text-warning" aria-hidden />
-              <span>{unverifiedLegs.length} 段路线未取得真实通勤时间，按估算计算</span>
-            </span>
-          ) : null}
-          <span className="inline-flex items-center gap-1.5">
-            <CircleAlert className="size-3.5 text-warning" aria-hidden />
-            部分实时价格可能变化
-          </span>
-          <span className="inline-flex items-center gap-1.5">
-            <CircleAlert className="size-3.5 text-warning" aria-hidden />
-            预算余量 {formatCNY(remaining)}
-          </span>
-        </div>
-      ) : null}
     </section>
   );
 }

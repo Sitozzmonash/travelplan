@@ -13,6 +13,60 @@
 
 export type AdminRecord = Record<string, unknown>;
 
+/* ------------------------------ 通用枚举 ------------------------------ */
+
+/**
+ * run 的来源。
+ * `quick` 一句话、`guided` 引导式、`cli` 命令行、`benchmark` Benchmark 用例。
+ * 旧数据没有该字段时按 `undefined` 处理，展示层回退成「未知来源」。
+ */
+export type AdminRunSource = "quick" | "guided" | "cli" | "benchmark";
+
+export const ADMIN_RUN_SOURCES = ["quick", "guided", "cli", "benchmark"] as const;
+
+export const RUN_SOURCE_LABELS: Record<string, string> = {
+  quick: "一句话",
+  guided: "引导式",
+  cli: "命令行",
+  benchmark: "Benchmark",
+};
+
+/**
+ * BadCase 分类 → 中文标签。
+ * 为什么在前端维护映射：后端 category 是稳定的机器标识（规则名），
+ * 而这一页是给人看的。新增未登记分类时原样显示，不会因为漏配而变成空白。
+ */
+export const BADCASE_CATEGORY_LABELS: Record<string, string> = {
+  route_unverified: "路线未核实",
+  provider_failure: "数据源调用失败",
+  hard_constraint: "硬约束冲突",
+  budget: "超预算",
+  budget_math: "预算算术错误",
+  evidence_gap: "缺少攻略证据",
+  missing_disclosure: "未披露交通/住宿",
+  hallucinated_price: "无来源的实时价",
+  degradation: "能力降级",
+  jev_timeout: "Jev 超时",
+  jev_quota: "Jev 额度不足",
+  jev_invalid_response: "Jev 返回不合法",
+  jev_low_confidence: "Jev 置信度过低",
+  jev_wrong_choice: "Jev 选错方案",
+  jev_unnecessary_replan: "Jev 多余重排",
+  jev_missed_replan: "Jev 漏判重排",
+};
+
+/** 成本来源：`user_price` 表示按用户配置的每百万 token 单价算出，其余为后端定价表。 */
+export type AdminCostSource = "user_price" | "backend" | string;
+
+export interface AdminCostBreakdown {
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cached_tokens: number | null;
+  input_price_per_million: number | null;
+  output_price_per_million: number | null;
+  cached_price_per_million: number | null;
+}
+
 /* ------------------------------ 仪表盘 ------------------------------ */
 
 export interface AdminJevSummary {
@@ -62,17 +116,26 @@ export interface AdminOverview {
 export interface AdminRunSummary {
   run_id: string;
   status: string;
-  original_query: string;
-  created_at: string | null;
-  finished_at: string | null;
-  duration_ms: number | null;
-  total_tokens: number | null;
-  llm_calls: number | null;
-  jev_calls: number | null;
-  tool_calls: number | null;
-  provider_failures: number | null;
-  badcase_count: number | null;
-  cost: number | null;
+  /** 允许缺失：后端由 `COALESCE(original_query, '')` 给出，但旧数据可能整段没有。 */
+  original_query?: string | null;
+  /** 列表行保留创建时间；详情里以 started_at / finished_at 为准。 */
+  created_at?: string | null;
+  /** 结束时间：老记录（没有 run_progress 行）可能没有终态时间。 */
+  finished_at?: string | null;
+  duration_ms?: number | null;
+  /** benchmark 用例运行使用假模型，usage 可能整段为 null。 */
+  total_tokens?: number | null;
+  llm_calls?: number | null;
+  jev_calls?: number | null;
+  tool_calls?: number | null;
+  provider_failures?: number | null;
+  badcase_count?: number | null;
+  cost?: number | null;
+  /** 后端新增：来源（quick / guided / cli / benchmark）与来源会话。 */
+  source?: string | null;
+  source_session_id?: string | null;
+  /** 详情补齐的字段（列表不一定有）：开始时间。 */
+  started_at?: string | null;
 }
 
 export interface AdminRunList {
@@ -83,17 +146,22 @@ export interface AdminRunList {
 }
 
 export interface AdminRunMetrics {
-  duration_ms: number | null;
-  input_tokens: number | null;
-  output_tokens: number | null;
-  cached_tokens: number | null;
-  total_tokens: number | null;
-  llm_calls: number | null;
-  jev_calls: number | null;
-  tool_calls: number | null;
-  provider_failures: number | null;
-  badcase_count: number | null;
-  cost: number | null;
+  duration_ms?: number | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cached_tokens?: number | null;
+  total_tokens?: number | null;
+  llm_calls?: number | null;
+  jev_calls?: number | null;
+  tool_calls?: number | null;
+  provider_failures?: number | null;
+  badcase_count?: number | null;
+  /** 成本：后端没有定价表（cost_source 为 null）时为 null。 */
+  cost?: number | null;
+  cost_currency?: string | null;
+  /** `user_price` 表示按用户配置的每百万 token 单价算出；null 表示未配置。 */
+  cost_source?: AdminCostSource | null;
+  cost_breakdown?: AdminCostBreakdown | null;
 }
 
 export interface AdminStageProgress {
@@ -151,17 +219,98 @@ export interface AdminProviderCall {
 
 export interface AdminJevCall {
   tag: string;
-  decision_type: string;
-  status: string;
-  choice: string | null;
-  confidence: number | null;
-  latency_ms: number | null;
-  model: string | null;
-  fallback: boolean;
-  fallback_reason: string | null;
-  quota: unknown;
-  input_summary: string | null;
-  criteria: unknown;
+  decision_type?: string | null;
+  status?: string | null;
+  choice?: string | null;
+  confidence?: number | null;
+  latency_ms?: number | null;
+  model?: string | null;
+  fallback?: boolean | null;
+  fallback_reason?: string | null;
+  quota?: unknown;
+  input_summary?: string | null;
+  criteria?: unknown;
+  error?: string | null;
+}
+
+/** 一次模型调用。benchmark 用例跑的是假模型，因此多数字段可能为 null。 */
+export interface AdminLlmCall {
+  tag: string;
+  model?: string | null;
+  status?: string | null;
+  duration_ms?: number | null;
+  chars?: number | null;
+  error?: string | null;
+  started_at?: string | null;
+}
+
+/** 阶段详情里的模型调用摘要。 */
+export interface AdminStageLlmCall {
+  tag?: string | null;
+  model?: string | null;
+  status?: string | null;
+  duration_ms?: number | null;
+  chars?: number | null;
+  error?: string | null;
+}
+
+/** 阶段详情里的工具 / 数据源调用摘要。 */
+export interface AdminStageToolCall {
+  provider?: string | null;
+  tool?: string | null;
+  status?: string | null;
+  returned?: unknown;
+  duration_ms?: number | null;
+}
+
+export interface AdminStageTokens {
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cached_tokens?: number | null;
+  total_tokens?: number | null;
+}
+
+/**
+ * 单个阶段的完整明细（`GET /admin/runs/{id}/stages`）。
+ * 所有嵌套字段都按「可能缺失」处理：后端契约是分批补的，缺一段只应降级成空表。
+ */
+export interface AdminStageDetail {
+  stage_id: string;
+  title?: string | null;
+  status?: string | null;
+  message?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  duration_ms?: number | null;
+  steps?: string[] | null;
+  facts?: AdminRecord | null;
+  spans?: AdminTraceSpan[] | null;
+  llm_calls?: AdminStageLlmCall[] | null;
+  tool_calls?: AdminStageToolCall[] | null;
+  tokens?: AdminStageTokens | null;
+}
+
+/** 引导式会话里保存的结构化偏好。 */
+export interface AdminPlaceSelections {
+  must: string[];
+  want: string[];
+  reject: string[];
+}
+
+/**
+ * 这次 run 对应的用户前置选择（引导式旅程）。
+ * 后端在没有引导式会话时返回 null —— 页面必须能显示"这次不是引导式创建的"。
+ */
+export interface AdminUserJourney {
+  source?: string | null;
+  source_session_id?: string | null;
+  transport_mode?: string | null;
+  transport_priority?: string | null;
+  hotel_priority?: string | null;
+  pace?: string | null;
+  place_selections?: AdminPlaceSelections | null;
+  prefetch_reused?: boolean | null;
+  discovery_status?: string | null;
 }
 
 export const BADCASE_ROOT_CAUSE_STATUSES = ["suspected", "verified", "rejected"] as const;
@@ -222,7 +371,10 @@ export interface AdminRunDetail {
   decisions: AdminDecision[];
   provider_calls: AdminProviderCall[];
   jev_calls: AdminJevCall[];
+  llm_calls: AdminLlmCall[];
   badcases: AdminBadcase[];
+  /** 没有引导式来源时后端返回 null（要能优雅显示"这次不是引导式创建的"）。 */
+  user_journey: AdminUserJourney | null;
 }
 
 /* ------------------------------ Benchmark ------------------------------ */
@@ -291,10 +443,18 @@ export interface AdminBenchmarkCaseResult {
   detail: AdminRecord;
 }
 
+/**
+ * Jev OFF / ON 基线对比。
+ *
+ * 历史后端返回的是扁平对象（没有 off / on / delta_pct 三个分组），
+ * 因此三个分组都标成可选；展示层用 `Object.keys(x ?? {})` 兜底，缺一段就退化成空表。
+ */
 export interface AdminBenchmarkBaseline {
-  off: AdminRecord;
-  on: AdminRecord;
-  delta_pct: AdminRecord;
+  off?: AdminRecord | null;
+  on?: AdminRecord | null;
+  delta_pct?: AdminRecord | null;
+  off_generated_at?: string | null;
+  on_generated_at?: string | null;
 }
 
 export interface AdminBenchmarkDetail {
@@ -321,9 +481,82 @@ export interface AdminBenchmarkLaunchResult {
 
 export interface AdminConfig {
   config: AdminRecord;
-  secret_configured: { jev: boolean; admin: boolean };
+  secret_configured: Record<string, boolean>;
   planner_tuning: AdminRecord;
   note: string;
+  /** 允许编辑（非 Secret）的键名。后端没有时为空数组，页面只展示只读快照。 */
+  editable_keys?: string[];
+  /** 运行时覆盖：key → 覆盖值 / 更新时间 / 覆盖人。 */
+  runtime_overrides?: Record<string, AdminConfigOverride>;
+  /** 当前生效的取值（含运行时覆盖）。 */
+  values?: AdminRecord;
+}
+
+export interface AdminConfigOverride {
+  value: unknown;
+  updated_at?: string | null;
+  updated_by?: string | null;
+}
+
+/** PATCH /admin/config 的请求体：只提交被修改的键。 */
+export interface AdminConfigPatch {
+  values: Record<string, unknown>;
+}
+
+/** 配置分组：预算 / Jev / Planner 阈值 / 模型单价；未命中的落到「其他」。 */
+export const ADMIN_CONFIG_GROUPS = [
+  { key: "budget", label: "预算", description: "预算上限与超限处理策略" },
+  { key: "jev", label: "Jev", description: "模型决策层的开关、配额与阈值" },
+  { key: "planner", label: "Planner 阈值", description: "规划器的候选门槛与节奏限制" },
+  { key: "price", label: "模型单价", description: "按每百万 token 计的成本单价" },
+] as const;
+
+/* --------------------------- 引导式会话 --------------------------- */
+
+export interface AdminPlanningSessionSummary {
+  session_id: string;
+  status?: string | null;
+  discovery_status?: string | null;
+  origin?: string | null;
+  destination?: string | null;
+  start_date?: string | null;
+  days?: number | null;
+  travelers?: number | null;
+  budget_total?: number | null;
+  pace?: string | null;
+  transport_priority?: string | null;
+  hotel_priority?: string | null;
+  must_count?: number | null;
+  want_count?: number | null;
+  reject_count?: number | null;
+  run_id?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  expires_at?: string | null;
+}
+
+export interface AdminPlanningSessionList {
+  items: AdminPlanningSessionSummary[];
+  limit: number;
+  offset: number;
+  total: number;
+}
+
+export interface AdminPlanningEvent {
+  at?: string | null;
+  event?: string | null;
+  detail?: string | null;
+}
+
+/** 候选摘要形状由后端决定（可能是对象数组），展示层按 AdminRecord 兜底。 */
+export type AdminPlanningCandidate = AdminRecord;
+
+export interface AdminPlanningSessionDetail extends AdminPlanningSessionSummary {
+  place_candidates?: AdminPlanningCandidate[] | null;
+  transport_candidates?: AdminPlanningCandidate[] | null;
+  hotel_candidates?: AdminPlanningCandidate[] | null;
+  events?: AdminPlanningEvent[] | null;
+  degradations?: string[] | null;
 }
 
 export interface AdminJevHealth {

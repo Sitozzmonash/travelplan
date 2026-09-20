@@ -320,6 +320,41 @@ CREATE TABLE IF NOT EXISTS experiences (
 );
 
 CREATE INDEX IF NOT EXISTS idx_experiences_evolution ON experiences(evolution_run_id, created_at);
+
+-- 引导式旅程的"规划前会话"。
+-- 为什么单独一张表：用户还在点偏好时不该产生正式 Run（关掉页面不等于一次 FAILED），
+-- 而 Discovery 又需要提前把真实候选查出来并缓存给后续正式 Run 复用。
+-- 只有 JSON 列 + 一个状态字段：这是临时会话，不值得为它建十几张表。
+CREATE TABLE IF NOT EXISTS planning_sessions (
+    session_id          TEXT PRIMARY KEY,
+    status              TEXT NOT NULL,
+    discovery_status    TEXT NOT NULL DEFAULT 'PENDING',
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    expires_at          TEXT NOT NULL,
+    basic_intent_json   TEXT,
+    preferences_json    TEXT,
+    poi_selections_json TEXT,
+    transport_json      TEXT,
+    hotels_json         TEXT,
+    places_json         TEXT,
+    evidence_summary_json TEXT,
+    degradations_json   TEXT,
+    events_json         TEXT,
+    prefetch_json       TEXT,
+    error               TEXT,
+    run_id              TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_planning_sessions_updated ON planning_sessions(updated_at);
+
+-- 管理端可运行时修改的非 Secret 配置（覆盖环境变量，落库以便重启后仍在）。
+CREATE TABLE IF NOT EXISTS runtime_config (
+    key         TEXT PRIMARY KEY,
+    value_json  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    updated_by  TEXT
+);
 """
 
 
@@ -391,18 +426,49 @@ class TravelPlanStore:
         with self._connect() as conn:
             self._migrate_places_scope(conn)
             conn.executescript(SCHEMA)
+            self._migrate_run_source(conn)
+            self._migrate_session_prefetch(conn)
+
+    def _migrate_run_source(self, conn: sqlite3.Connection) -> None:
+        """给 `runs` 补 `source` / `source_session_id`（`CREATE TABLE IF NOT EXISTS` 不会改老表）。
+
+        为什么需要：管理端要能回答"这次 run 是引导式还是随手一句话跑出来的"，
+        并且要能把 Benchmark 用例运行从真实运行列表里过滤掉，否则列表会被它淹没。
+        """
+
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
+        if "source" not in existing:
+            conn.execute("ALTER TABLE runs ADD COLUMN source TEXT DEFAULT 'quick'")
+        if "source_session_id" not in existing:
+            conn.execute("ALTER TABLE runs ADD COLUMN source_session_id TEXT")
+
+    def _migrate_session_prefetch(self, conn: sqlite3.Connection) -> None:
+        """给 planning_sessions 补 `prefetch_json`（老库没有这一列）。"""
+
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(planning_sessions)")}
+        if columns and "prefetch_json" not in columns:
+            conn.execute("ALTER TABLE planning_sessions ADD COLUMN prefetch_json TEXT")
 
     # ------------------------------------------------------------------
     # run
     # ------------------------------------------------------------------
 
-    def create_run(self, run_id: str, user_id: str | None = None, original_query: str = "") -> None:
+    def create_run(
+        self,
+        run_id: str,
+        user_id: str | None = None,
+        original_query: str = "",
+        *,
+        source: str = "quick",
+        source_session_id: str | None = None,
+    ) -> None:
         created_at = utcnow().isoformat()
         with self._connect() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO runs (run_id, user_id, created_at, status, original_query)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (run_id, user_id, created_at, "running", original_query),
+                "INSERT OR REPLACE INTO runs"
+                " (run_id, user_id, created_at, status, original_query, source, source_session_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (run_id, user_id, created_at, "running", original_query, source, source_session_id),
             )
             conn.execute(
                 "INSERT OR REPLACE INTO run_progress"
@@ -530,7 +596,15 @@ class TravelPlanStore:
                 (run_id, *values, utcnow().isoformat()),
             )
 
-    def list_runs(self, *, limit: int = 50, offset: int = 0, status: str | None = None) -> list[dict]:
+    def list_runs(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        status: str | None = None,
+        q: str | None = None,
+        include_benchmark: bool = True,
+    ) -> list[dict]:
         """管理端列表只取摘要，不把整份 trace/audit 塞进首页。
 
         `status` 一定是一个字符串：老 run 没有 `run_progress` 行（该表是后加的），
@@ -538,12 +612,25 @@ class TravelPlanStore:
         消费方（管理端）拿到 null 只能整块不渲染，等于白白丢掉列表里其余正常的行。
         """
 
-        where = " WHERE " + _STATUS_EXPR + "=?" if status else ""
-        params: list[Any] = [status] if status else []
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append(f"{_STATUS_EXPR}=?")
+            params.append(status)
+        if q:
+            # 只按 run_id 前缀/子串搜（用户手里只有这个），同时允许搜原始需求文本。
+            clauses.append("(r.run_id LIKE ? OR COALESCE(r.original_query,'') LIKE ?)")
+            params.extend([f"%{q}%", f"%{q}%"])
+        if not include_benchmark:
+            # Benchmark 用例运行（source=benchmark）默认不出现在运行列表里：
+            # 一次评测会产生几十条 run，会把真实 run 挤到后面看不到。
+            clauses.append("COALESCE(r.source, 'quick') <> 'benchmark'")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT r.run_id, r.user_id, r.created_at, r.status AS legacy_status,"
                 f" COALESCE(r.original_query, '') AS original_query, {_STATUS_EXPR} AS status,"
+                " COALESCE(r.source, 'quick') AS source, r.source_session_id,"
                 " p.current_stage, p.message, p.started_at, p.updated_at, p.finished_at,"
                 " m.duration_ms, m.total_tokens, m.llm_calls, m.jev_calls, m.tool_calls, m.provider_failures, m.badcase_count, m.cost"
                 " FROM runs r LEFT JOIN run_progress p ON p.run_id=r.run_id"
@@ -554,15 +641,37 @@ class TravelPlanStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def count_runs(self, *, status: str | None = None) -> int:
-        where = " WHERE " + _STATUS_EXPR + "=?" if status else ""
-        params: list[Any] = [status] if status else []
+    def count_runs(
+        self,
+        *,
+        status: str | None = None,
+        q: str | None = None,
+        include_benchmark: bool = True,
+    ) -> int:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append(f"{_STATUS_EXPR}=?")
+            params.append(status)
+        if q:
+            clauses.append("(r.run_id LIKE ? OR COALESCE(r.original_query,'') LIKE ?)")
+            params.extend([f"%{q}%", f"%{q}%"])
+        if not include_benchmark:
+            clauses.append("COALESCE(r.source, 'quick') <> 'benchmark'")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._connect() as conn:
             return int(
                 conn.execute(
                     "SELECT COUNT(*) AS n FROM runs r LEFT JOIN run_progress p ON p.run_id=r.run_id" + where,
                     params,
                 ).fetchone()["n"]
+            )
+
+    def set_run_source(self, run_id: str, source: str, source_session_id: str | None = None) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE runs SET source=?, source_session_id=? WHERE run_id=?",
+                (source, source_session_id, run_id),
             )
 
     def get_run_metrics(self, run_id: str) -> dict | None:
@@ -1230,3 +1339,147 @@ class TravelPlanStore:
             }
             for row in rows
         ]
+
+    # ------------------------------------------------------------------
+    # planning session（引导式旅程的"规划前会话"）
+    # ------------------------------------------------------------------
+
+    def save_planning_session(self, session: dict[str, Any]) -> str:
+        """整行写入。
+
+        会话是短生命周期草稿，逐字段 UPDATE 只会让代码更难读；而它每次变化都由
+        `app/sessions.py` 统一构造完整快照，所以整行替换反而是最不容易出错的做法。
+        """
+
+        session_id = str(session["session_id"])
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO planning_sessions"
+                " (session_id, status, discovery_status, created_at, updated_at, expires_at,"
+                "  basic_intent_json, preferences_json, poi_selections_json, transport_json,"
+                "  hotels_json, places_json, evidence_summary_json, degradations_json,"
+                "  events_json, prefetch_json, error, run_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    session.get("status") or "COLLECTING",
+                    session.get("discovery_status") or "PENDING",
+                    session.get("created_at") or utcnow().isoformat(),
+                    session.get("updated_at") or utcnow().isoformat(),
+                    session.get("expires_at") or utcnow().isoformat(),
+                    _json(session.get("basic_intent") or {}),
+                    _json(session.get("preferences") or {}),
+                    _json(session.get("poi_selections") or {}),
+                    _json(session.get("transport_candidates") or []),
+                    _json(session.get("hotel_candidates") or []),
+                    _json(session.get("place_candidates") or []),
+                    _json(session.get("evidence_summary") or {}),
+                    _json(session.get("degradations") or []),
+                    _json(session.get("events") or []),
+                    _json(session.get("prefetch") or {}),
+                    session.get("error"),
+                    session.get("run_id"),
+                ),
+            )
+        return session_id
+
+    @staticmethod
+    def _session_row(row: Any) -> dict[str, Any]:
+        return {
+            "session_id": row["session_id"],
+            "status": row["status"],
+            "discovery_status": row["discovery_status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "expires_at": row["expires_at"],
+            "basic_intent": _loads(row["basic_intent_json"], {}),
+            "preferences": _loads(row["preferences_json"], {}),
+            "poi_selections": _loads(row["poi_selections_json"], {}),
+            "transport_candidates": _loads(row["transport_json"], []),
+            "hotel_candidates": _loads(row["hotels_json"], []),
+            "place_candidates": _loads(row["places_json"], []),
+            "evidence_summary": _loads(row["evidence_summary_json"], {}),
+            "degradations": _loads(row["degradations_json"], []),
+            "events": _loads(row["events_json"], []),
+            "prefetch": _loads(row["prefetch_json"], {}),
+            "error": row["error"],
+            "run_id": row["run_id"],
+        }
+
+    def get_planning_session(self, session_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM planning_sessions WHERE session_id=?", (session_id,)
+            ).fetchone()
+        return self._session_row(row) if row is not None else None
+
+    def list_planning_sessions(
+        self, *, limit: int = 50, offset: int = 0, q: str | None = None
+    ) -> tuple[list[dict], int]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if q:
+            clauses.append("(session_id LIKE ? OR COALESCE(run_id,'') LIKE ?)")
+            params.extend([f"%{q}%", f"%{q}%"])
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) AS n FROM planning_sessions" + where, params
+            ).fetchone()["n"]
+            rows = conn.execute(
+                "SELECT * FROM planning_sessions"
+                + where
+                + " ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                [*params, max(1, min(limit, 200)), max(0, offset)],
+            ).fetchall()
+        return [self._session_row(row) for row in rows], int(total)
+
+    def delete_planning_session(self, session_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM planning_sessions WHERE session_id=?", (session_id,))
+
+    def expire_planning_sessions(self, *, now: str | None = None) -> int:
+        """把过期会话标成 EXPIRED。
+
+        不删除：管理端仍要能看到"这个用户开了会话但没走到规划"，删掉就失去了诊断线索。
+        """
+
+        stamp = now or utcnow().isoformat()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE planning_sessions SET status='EXPIRED', updated_at=?"
+                " WHERE expires_at < ? AND status NOT IN ('EXPIRED','CANCELLED','STARTING')",
+                (stamp, stamp),
+            )
+            return int(cursor.rowcount or 0)
+
+    # ------------------------------------------------------------------
+    # runtime config（管理端可编辑的非 Secret 配置）
+    # ------------------------------------------------------------------
+
+    def set_runtime_config(self, key: str, value: Any, *, updated_by: str | None = None) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO runtime_config (key, value_json, updated_at, updated_by)"
+                " VALUES (?, ?, ?, ?)",
+                (key, _json({"value": value}), utcnow().isoformat(), updated_by),
+            )
+
+    def delete_runtime_config(self, key: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM runtime_config WHERE key=?", (key,))
+
+    def list_runtime_config(self) -> dict[str, dict[str, Any]]:
+        """返回 `{key: {value, updated_at, updated_by}}`。"""
+
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM runtime_config ORDER BY key").fetchall()
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            payload = _loads(row["value_json"], {})
+            result[row["key"]] = {
+                "value": payload.get("value") if isinstance(payload, dict) else payload,
+                "updated_at": row["updated_at"],
+                "updated_by": row["updated_by"],
+            }
+        return result

@@ -29,9 +29,10 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from .agent import PROJECT_ID, Route, create_travel_app, run_travel
-from .config import current_config
+from .config import EDITABLE_KEYS, current_config, set_runtime_overrides, validate_override
 from .evolution import lever_catalog, run_evolution, tuning_snapshot
 from .models import TripPlan
+from . import sessions
 from .store import TravelPlanStore, default_db_path
 from .workflow import DEFAULT_OUTPUT_DIR, WORKFLOW_NAME, new_run_id, plan_payload
 
@@ -159,6 +160,20 @@ def _run_background(run_id: str, message: str) -> None:
 # ======================================================================
 # 路由
 # ======================================================================
+
+
+def _load_runtime_overrides() -> None:
+    """启动时把落库的运行时覆盖装载进配置层（重启后仍然生效）。"""
+
+    try:
+        set_runtime_overrides(
+            {key: item["value"] for key, item in get_store().list_runtime_config().items()}
+        )
+    except Exception:  # noqa: BLE001 —— 装载失败就用默认配置启动，不影响服务可用
+        return
+
+
+_load_runtime_overrides()
 
 
 @api.get("/api/v1/health")
@@ -461,14 +476,177 @@ def _jev_health(store: TravelPlanStore, runs: list[dict]) -> dict[str, Any]:
     }
 
 
+# ======================================================================
+# 引导式旅程：Planning Session（无需鉴权 —— 它还不代表一次正式 Run）
+# ======================================================================
+
+
+class CreateSessionRequest(BaseModel):
+    origin: str = Field(min_length=1, description="出发地")
+    destination: str = Field(min_length=1, description="目的地")
+    start_date: str | None = None
+    end_date: str | None = None
+    days: int | None = Field(default=None, ge=1, le=60)
+    travelers: int | None = Field(default=None, ge=1, le=30)
+    budget_total: float | None = None
+
+
+class PatchSessionRequest(BaseModel):
+    transport_mode: str | None = None
+    transport_priority: str | None = None
+    transport_constraints: list[str] | None = None
+    hotel_priority: str | None = None
+    hotel_max_price_per_night: float | None = None
+    hotel_min_rating: float | None = None
+    hotel_room_type: str | None = None
+    hotel_allow_change: str | None = None
+    pace: str | None = None
+    budget_total: float | None = None
+    poi_selections: dict[str, str] | None = None
+
+
+@api.post("/api/v1/planning-sessions", status_code=202)
+def create_planning_session(request: CreateSessionRequest) -> dict[str, Any]:
+    """建会话并**立刻**在后台开始 Discovery（用户还在选偏好时数据已经在查了）。"""
+
+    session = sessions.create_session(
+        get_store(),
+        request.model_dump(exclude_none=True),
+        submit=lambda fn, *args: _RUN_EXECUTOR.submit(fn, *args),
+    )
+    return {
+        "session_id": session["session_id"],
+        "status": session["status"],
+        "discovery_status": session["discovery_status"],
+    }
+
+
+@api.get("/api/v1/planning-sessions/{session_id}")
+def get_planning_session(session_id: str) -> dict[str, Any]:
+    session = sessions.get_session(get_store(), session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"没有 session_id={session_id} 的会话")
+    return sessions.session_view(session)
+
+
+@api.patch("/api/v1/planning-sessions/{session_id}")
+def patch_planning_session(session_id: str, request: PatchSessionRequest) -> dict[str, Any]:
+    session = sessions.patch_session(
+        get_store(), session_id, request.model_dump(exclude_unset=True)
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"没有 session_id={session_id} 的会话")
+    return sessions.session_view(session)
+
+
+@api.delete("/api/v1/planning-sessions/{session_id}")
+def cancel_planning_session(session_id: str) -> dict[str, Any]:
+    session = sessions.cancel_session(get_store(), session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"没有 session_id={session_id} 的会话")
+    return {"session_id": session["session_id"], "status": session["status"]}
+
+
+@api.post("/api/v1/planning-sessions/{session_id}/start", status_code=202)
+def start_planning_session(session_id: str) -> dict[str, Any]:
+    """只有走到这里才创建正式 run_id。"""
+
+    outcome = sessions.start_run(
+        get_store(),
+        session_id,
+        submit=lambda fn, *args: _RUN_EXECUTOR.submit(fn, *args),
+        output_dir=str(_output_dir()),
+    )
+    if outcome.get("error") == "not_found":
+        raise HTTPException(status_code=404, detail=f"没有 session_id={session_id} 的会话")
+    if outcome.get("error") == "session_closed":
+        raise HTTPException(status_code=409, detail="会话已取消或已过期，请重新开始")
+    return outcome
+
+
 @api.get("/api/v1/admin/runs", dependencies=[Depends(require_admin)])
-def admin_runs(limit: int = 50, offset: int = 0, status: str | None = None) -> dict[str, Any]:
+def admin_runs(
+    limit: int = 50,
+    offset: int = 0,
+    status: str | None = None,
+    q: str | None = Query(default=None, description="按 run_id 或原始需求模糊搜索"),
+    include_benchmark: bool = Query(
+        default=False,
+        description="是否包含 Benchmark 用例运行。默认不包含：一次评测会产生几十条 run，"
+        "会把真实运行挤出列表。",
+    ),
+) -> dict[str, Any]:
     store = get_store()
     return {
-        "items": store.list_runs(limit=limit, offset=offset, status=status),
+        "items": store.list_runs(
+            limit=limit, offset=offset, status=status, q=q, include_benchmark=include_benchmark
+        ),
         "limit": limit,
         "offset": offset,
-        "total": store.count_runs(status=status),
+        "total": store.count_runs(status=status, q=q, include_benchmark=include_benchmark),
+    }
+
+
+@api.get("/api/v1/admin/planning-sessions", dependencies=[Depends(require_admin)])
+def admin_planning_sessions(limit: int = 50, offset: int = 0, q: str | None = None) -> dict[str, Any]:
+    """Guided Session 列表：从"用户前置选择"追溯到最终 Run 的入口。"""
+
+    store = get_store()
+    items, total = store.list_planning_sessions(limit=limit, offset=offset, q=q)
+    return {
+        "items": [_admin_session_row(item) for item in items],
+        "limit": limit,
+        "offset": offset,
+        "total": total,
+    }
+
+
+@api.get("/api/v1/admin/planning-sessions/{session_id}", dependencies=[Depends(require_admin)])
+def admin_planning_session_detail(session_id: str) -> dict[str, Any]:
+    store = get_store()
+    session = sessions.get_session(store, session_id, expire=False)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"没有 session_id={session_id} 的会话")
+    view = sessions.session_view(session)
+    view["discovery"] = {
+        "transport_candidates": len(session.get("transport_candidates") or []),
+        "hotel_candidates": len(session.get("hotel_candidates") or []),
+        "place_candidates": len(session.get("place_candidates") or []),
+        "provider_calls": len((session.get("prefetch") or {}).get("provider_calls") or []),
+    }
+    return view
+
+
+def _admin_session_row(session: dict[str, Any]) -> dict[str, Any]:
+    basic = session.get("basic_intent") or {}
+    preferences = session.get("preferences") or {}
+    selections = session.get("poi_selections") or {}
+    counts: dict[str, int] = {"must": 0, "want": 0, "reject": 0}
+    for state in selections.values():
+        key = str(state).lower()
+        if key in counts:
+            counts[key] += 1
+    return {
+        "session_id": session["session_id"],
+        "status": session["status"],
+        "discovery_status": session["discovery_status"],
+        "origin": basic.get("origin"),
+        "destination": basic.get("destination"),
+        "start_date": basic.get("start_date"),
+        "days": basic.get("days"),
+        "travelers": basic.get("travelers"),
+        "budget_total": basic.get("budget_total"),
+        "transport_priority": preferences.get("transport_priority"),
+        "hotel_priority": preferences.get("hotel_priority"),
+        "pace": preferences.get("pace"),
+        "must_count": counts["must"],
+        "want_count": counts["want"],
+        "reject_count": counts["reject"],
+        "place_count": len(session.get("place_candidates") or []),
+        "run_id": session.get("run_id"),
+        "created_at": session.get("created_at"),
+        "updated_at": session.get("updated_at"),
+        "expires_at": session.get("expires_at"),
     }
 
 
@@ -480,8 +658,18 @@ def admin_run_detail(run_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"没有 run_id={run_id} 的运行记录")
     spans = store.get_trace_spans(run_id)
     badcases, _ = store.list_badcases(run_id=run_id, limit=200)
+    progress = store.get_run_progress(run_id) or {}
+    # 起止时间在 run_progress 里（runs 表没有这两列）。合并进 run 对象，
+    # 免得消费方要同时看两张表才知道"到底几点结束的"（曾经因此整天显示"—"）。
+    run = {
+        **run,
+        "started_at": progress.get("started_at"),
+        "finished_at": progress.get("finished_at"),
+    }
     return {
         "run": run,
+        "user_journey": _user_journey(store, run, store.get_plan(run_id)),
+        "stages": _stage_details(store, run_id),
         "metrics": store.get_run_metrics(run_id) or {},
         "progress": store.get_run_progress(run_id),
         "trace": spans,
@@ -630,7 +818,55 @@ def admin_benchmark_detail(benchmark_run_id: str) -> dict[str, Any]:
         "run": run,
         "metrics": groups,
         "case_results": case_results,
-        "baseline_compare": (metrics.get("baseline_compare") if isinstance(metrics, dict) else None),
+        "baseline_compare": _baseline_compare(_benchmark_baselines()),
+    }
+
+
+def _benchmark_baselines() -> tuple[dict[str, Any], dict[str, Any]]:
+    """读两份基线文件；读不到就返回空（页面显示空表，而不是崩）。"""
+
+    try:
+        from benchmark.runner import BASELINES_DIR
+    except Exception:  # noqa: BLE001
+        return {}, {}
+    out: list[dict[str, Any]] = []
+    for mode in ("off", "on"):
+        path = BASELINES_DIR / f"jev_{mode}.json"
+        try:
+            out.append(json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {})
+        except (OSError, ValueError):
+            out.append({})
+    return out[0], out[1]
+
+
+def _baseline_compare(pair: tuple[dict[str, Any], dict[str, Any]]) -> dict[str, Any] | None:
+    """返回契约里的 `{off, on, delta_pct}` 形状。
+
+    历史上这里返回的是扁平结构（quality_delta_with_jev 摊在顶层），而前端按
+    `Object.keys(baseline.off)` 渲染 → 直接抛 "Cannot convert undefined or null to
+    object"，整个 Benchmark 详情页白屏。契约与实现必须对齐，以文档形状为准。
+    """
+
+    off, on = pair
+    off_metrics = dict((off or {}).get("metrics") or {})
+    on_metrics = dict((on or {}).get("metrics") or {})
+    if not off_metrics and not on_metrics:
+        return None
+    keys = sorted(set(off_metrics) | set(on_metrics))
+    delta_pct: dict[str, float | None] = {}
+    for key in keys:
+        base = off_metrics.get(key)
+        current = on_metrics.get(key)
+        if isinstance(base, (int, float)) and isinstance(current, (int, float)) and base:
+            delta_pct[key] = round((current - base) / abs(base) * 100, 2)
+        else:
+            delta_pct[key] = None
+    return {
+        "off": {key: off_metrics.get(key) for key in keys},
+        "on": {key: on_metrics.get(key) for key in keys},
+        "delta_pct": delta_pct,
+        "off_generated_at": (off or {}).get("generated_at"),
+        "on_generated_at": (on or {}).get("generated_at"),
     }
 
 
@@ -691,11 +927,18 @@ def admin_start_benchmark(request: BenchmarkRequest = Body(default=BenchmarkRequ
 # ----------------------------------------------------------------------
 
 
-@api.get("/api/v1/admin/config", dependencies=[Depends(require_admin)])
-def admin_config() -> dict[str, Any]:
+def _config_payload() -> dict[str, Any]:
     config = current_config()
+    store = get_store()
     return {
         "config": config.public_dict(),
+        "values": {**config.public_dict(), **tuning_snapshot()},
+        "editable_keys": sorted(EDITABLE_KEYS),
+        "runtime_overrides": store.list_runtime_config(),
+        "editable_spec": {
+            key: {"kind": spec[0], "min": spec[1], "max": spec[2]}
+            for key, spec in EDITABLE_KEYS.items()
+        },
         "planner_tuning": tuning_snapshot(),
         "secret_configured": {
             "jev": bool(os.environ.get("JEV_API_KEY") or os.environ.get("TYPESAFE_API_KEY")),
@@ -705,8 +948,50 @@ def admin_config() -> dict[str, Any]:
             "tuniu": bool(os.environ.get("TUNIU_API_KEY")),
         },
         "evolution": {"enabled": config.evolution_enabled, "levers": lever_catalog()},
-        "note": "配置来自服务端环境变量；Secret 永不通过 API 回显，这里只报“配了没配”。",
+        "note": (
+            "配置来自服务端环境变量；Secret 永不通过 API 回显，这里只报“配了没配”。"
+            "非 Secret 项可以在本页修改并立即生效，改动落库、重启后仍在；"
+            "Benchmark/Evolution 的对照实验期间，显式环境变量优先于这里的覆盖。"
+        ),
     }
+
+
+@api.get("/api/v1/admin/config", dependencies=[Depends(require_admin)])
+def admin_config() -> dict[str, Any]:
+    return _config_payload()
+
+
+class ConfigPatchRequest(BaseModel):
+    values: dict[str, Any] = Field(default_factory=dict)
+    reset: list[str] = Field(default_factory=list, description="要恢复默认（删除覆盖）的键")
+
+
+@api.patch("/api/v1/admin/config", dependencies=[Depends(require_admin)])
+def admin_update_config(request: ConfigPatchRequest) -> dict[str, Any]:
+    """改非 Secret 的运行时配置。
+
+    校验必须在写入前做：把 JEV_MIN_CONFIDENCE 手滑写成 8（本意 0.8）会让所有 Jev 决策
+    变成低置信度，而线上不会报任何错 —— 只是"突然都不采纳 Jev 了"。
+    """
+
+    store = get_store()
+    applied: dict[str, Any] = {}
+    invalid: dict[str, str] = {}
+    for key, value in request.values.items():
+        try:
+            applied[key] = validate_override(key, value)
+        except ValueError as exc:
+            invalid[str(key)] = str(exc)
+    if invalid:
+        raise HTTPException(status_code=422, detail={"message": "以下配置未通过校验", "errors": invalid})
+    for key, value in applied.items():
+        store.set_runtime_config(key, value, updated_by="admin")
+    for key in request.reset:
+        if key in EDITABLE_KEYS:
+            store.delete_runtime_config(key)
+    # 重新装载：本次进程立刻生效，不必重启
+    set_runtime_overrides({key: item["value"] for key, item in store.list_runtime_config().items()})
+    return _config_payload()
 
 
 @api.get("/api/v1/admin/jev/health", dependencies=[Depends(require_admin)])
@@ -866,6 +1151,114 @@ def get_audit(run_id: str) -> dict[str, Any]:
     import json
 
     return json.loads(audit_path.read_text(encoding="utf-8"))
+
+
+def _stage_details(store: TravelPlanStore, run_id: str) -> list[dict[str, Any]]:
+    """每个阶段的完整明细：步骤、facts、该阶段的工具/模型调用。
+
+    为什么要有这个：`run_stages` 只存摘要，`steps`（人话解释列表）以前只写进
+    audit_report.json，于是管理端点开阶段看不到内容。这里把 trace / 调用账本按阶段
+    归拢，让"这一阶段到底干了什么、花了多少"一次看全。
+    """
+
+    progress = store.get_run_progress(run_id) or {}
+    spans = store.get_trace_spans(run_id)
+    run_metrics = store.get_run_metrics(run_id) or {}
+    audit = _load_audit(run_id)
+    audit_stages = {item.get("id"): item for item in (audit.get("stages") or []) if isinstance(item, dict)}
+
+    rows: list[dict[str, Any]] = []
+    for stage in progress.get("stages") or []:
+        stage_id = stage.get("stage_id")
+        related = [span for span in spans if (span.get("parent_span_id") or "").endswith(f":{stage_id}")]
+        source = audit_stages.get(stage_id) or {}
+        rows.append(
+            {
+                "stage_id": stage_id,
+                "title": source.get("title") or stage_id,
+                "status": stage.get("status"),
+                "message": stage.get("message") or "",
+                "started_at": stage.get("started_at"),
+                "finished_at": stage.get("finished_at"),
+                "duration_ms": _duration_between(stage.get("started_at"), stage.get("finished_at")),
+                "steps": source.get("steps") or [],
+                "facts": stage.get("facts") or {},
+                "tool_calls": [
+                    _span_attributes(span)
+                    for span in related
+                    if span.get("component") in ("tool", "provider", "mcp")
+                ],
+                "llm_calls": [_span_attributes(span) for span in related if span.get("component") == "llm"],
+                "tokens": {
+                    "input_tokens": run_metrics.get("input_tokens"),
+                    "output_tokens": run_metrics.get("output_tokens"),
+                    "cached_tokens": run_metrics.get("cached_tokens"),
+                    "total_tokens": run_metrics.get("total_tokens"),
+                    "note": "token 只能按整次 run 统计：Provider 不按阶段回报用量",
+                },
+            }
+        )
+    return rows
+
+
+def _duration_between(started: str | None, finished: str | None) -> int | None:
+    if not (started and finished):
+        return None
+    from datetime import datetime
+
+    try:
+        return int(
+            (datetime.fromisoformat(finished) - datetime.fromisoformat(started)).total_seconds() * 1000
+        )
+    except ValueError:
+        return None
+
+
+def _load_audit(run_id: str) -> dict[str, Any]:
+    path = _output_dir() / run_id / "audit_report.json"
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _user_journey(store: TravelPlanStore, run: dict[str, Any], stored_plan: dict | None) -> dict[str, Any]:
+    """这次 run 的"用户前置选择"：来源、策略、POI 计数、prefetch 是否复用。
+
+    管理端默认折叠（用户旅程落地任务 §22：适度可见，不做复杂行为分析系统）。
+    """
+
+    session_id = run.get("source_session_id")
+    session = store.get_planning_session(session_id) if session_id else None
+    intent: dict[str, Any] = {}
+    if isinstance(stored_plan, dict) and isinstance(stored_plan.get("plan"), dict):
+        intent = stored_plan["plan"].get("intent") or {}
+    selections = (session or {}).get("poi_selections") or {}
+    return {
+        "source": str(run.get("source") or "quick"),
+        "source_session_id": session_id,
+        "transport_mode": intent.get("transport_mode"),
+        "transport_priority": intent.get("transport_priority"),
+        "hotel_priority": intent.get("hotel_priority"),
+        "pace": intent.get("pace"),
+        "place_selections": {
+            "must": sum(1 for value in selections.values() if str(value).upper() == "MUST"),
+            "want": sum(1 for value in selections.values() if str(value).upper() == "WANT"),
+            "reject": sum(1 for value in selections.values() if str(value).upper() == "REJECT"),
+        },
+        "prefetch_reused": bool((session or {}).get("prefetch")) if session else None,
+        "discovery_status": (session or {}).get("discovery_status"),
+    }
+
+
+@api.get("/api/v1/admin/runs/{run_id}/stages", dependencies=[Depends(require_admin)])
+def admin_run_stages(run_id: str) -> dict[str, Any]:
+    store = get_store()
+    if store.get_run(run_id) is None:
+        raise HTTPException(status_code=404, detail=f"没有 run_id={run_id} 的运行记录")
+    return {"run_id": run_id, "items": _stage_details(store, run_id)}
 
 
 @api.post("/api/v1/plans/{run_id}/revise", response_model=ReviseResponse)

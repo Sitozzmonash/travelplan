@@ -21,14 +21,28 @@ import type {
   AdminBenchmarkLaunchResult,
   AdminBenchmarkRunList,
   AdminConfig,
+  AdminConfigOverride,
+  AdminConfigPatch,
+  AdminCostBreakdown,
   AdminEvolutionLaunchResult,
   AdminEvolutionOverview,
   AdminEvolutionRunDetail,
   AdminJevHealth,
+  AdminLlmCall,
   AdminOverview,
+  AdminPlanningEvent,
+  AdminPlanningSessionDetail,
+  AdminPlanningSessionList,
+  AdminPlanningSessionSummary,
   AdminRecord,
   AdminRunDetail,
   AdminRunList,
+  AdminRunMetrics,
+  AdminRunSummary,
+  AdminStageDetail,
+  AdminStageProgress,
+  AdminStageTokens,
+  AdminTraceSpan,
 } from "@/types/admin";
 
 export const ADMIN_API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
@@ -310,35 +324,177 @@ function hasMetricCounts(record: AdminRecord, keys: readonly string[]): boolean 
   return keys.every((key) => isMetricCount(record[key]));
 }
 
-const RUN_SUMMARY_COUNTS = [
-  "duration_ms",
-  "total_tokens",
-  "llm_calls",
-  "jev_calls",
-  "tool_calls",
-  "provider_failures",
-  "badcase_count",
-] as const;
-
-function isRunSummary(value: unknown): boolean {
-  if (!isRecord(value)) return false;
-  if (!isString(value.run_id) || !isString(value.status)) return false;
-  if (!isString(value.original_query)) return false;
-  if (!hasMetricCounts(value, RUN_SUMMARY_COUNTS)) return false;
-  // cost 允许为 null（后端没有定价表时），其余可空字段只校验存在性。
-  return value.cost === null || isMetricCount(value.cost);
+function toNumberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-function isRunMetrics(value: unknown): boolean {
-  if (!isRecord(value)) return false;
-  if (!hasMetricCounts(value, ["duration_ms", "input_tokens", "output_tokens", "cached_tokens", "total_tokens"])) {
-    return false;
-  }
-  if (!hasMetricCounts(value, ["llm_calls", "jev_calls", "tool_calls", "provider_failures", "badcase_count"])) {
-    return false;
-  }
-  return value.cost === null || isMetricCount(value.cost);
+function toStringOrNull(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
 }
+
+function toArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+/**
+ * run 列表行由 normalizeRunList 归一：只要 run_id / status 是字符串，
+ * 其余字段缺失都降级成「未知／—」，不放大成整页 invalid。
+ */
+function normalizeRunSummary(value: AdminRecord): AdminRunSummary {
+  return {
+    run_id: String(value.run_id),
+    status: String(value.status),
+    original_query: toStringOrNull(value.original_query),
+    created_at: toStringOrNull(value.created_at),
+    finished_at: toStringOrNull(value.finished_at),
+    started_at: toStringOrNull(value.started_at),
+    duration_ms: toNumberOrNull(value.duration_ms),
+    total_tokens: toNumberOrNull(value.total_tokens),
+    llm_calls: toNumberOrNull(value.llm_calls),
+    jev_calls: toNumberOrNull(value.jev_calls),
+    tool_calls: toNumberOrNull(value.tool_calls),
+    provider_failures: toNumberOrNull(value.provider_failures),
+    badcase_count: toNumberOrNull(value.badcase_count),
+    cost: toNumberOrNull(value.cost),
+    source: toStringOrNull(value.source),
+    source_session_id: toStringOrNull(value.source_session_id),
+  };
+}
+
+function normalizeCostBreakdown(value: unknown): AdminCostBreakdown | null {
+  if (!isRecord(value)) return null;
+  return {
+    input_tokens: toNumberOrNull(value.input_tokens),
+    output_tokens: toNumberOrNull(value.output_tokens),
+    cached_tokens: toNumberOrNull(value.cached_tokens),
+    input_price_per_million: toNumberOrNull(value.input_price_per_million),
+    output_price_per_million: toNumberOrNull(value.output_price_per_million),
+    cached_price_per_million: toNumberOrNull(value.cached_price_per_million),
+  };
+}
+
+/** metrics 允许整段缺失（benchmark 用例运行没有 usage）→ 归一成空心对象。 */
+function normalizeRunMetrics(value: unknown): AdminRunMetrics {
+  const record = isRecord(value) ? value : {};
+  return {
+    duration_ms: toNumberOrNull(record.duration_ms),
+    input_tokens: toNumberOrNull(record.input_tokens),
+    output_tokens: toNumberOrNull(record.output_tokens),
+    cached_tokens: toNumberOrNull(record.cached_tokens),
+    total_tokens: toNumberOrNull(record.total_tokens),
+    llm_calls: toNumberOrNull(record.llm_calls),
+    jev_calls: toNumberOrNull(record.jev_calls),
+    tool_calls: toNumberOrNull(record.tool_calls),
+    provider_failures: toNumberOrNull(record.provider_failures),
+    badcase_count: toNumberOrNull(record.badcase_count),
+    cost: toNumberOrNull(record.cost),
+    cost_currency: toStringOrNull(record.cost_currency),
+    cost_source: toStringOrNull(record.cost_source),
+    cost_breakdown: normalizeCostBreakdown(record.cost_breakdown),
+  };
+}
+
+function normalizeStageProgress(value: AdminRecord): AdminStageProgress {
+  return {
+    stage_id: String(value.stage_id ?? value.id ?? ""),
+    title: toStringOrNull(value.title) ?? "",
+    status: toStringOrNull(value.status) ?? "",
+    message: toStringOrNull(value.message),
+    facts: isRecord(value.facts) ? value.facts : null,
+    started_at: toStringOrNull(value.started_at),
+    finished_at: toStringOrNull(value.finished_at),
+  };
+}
+
+function normalizeRunList(payload: unknown): AdminRunList {
+  const record = isRecord(payload) ? payload : {};
+  const items = toArray(record.items).filter(isRecord).map(normalizeRunSummary);
+  return {
+    items,
+    limit: toNumberOrNull(record.limit) ?? items.length,
+    offset: toNumberOrNull(record.offset) ?? 0,
+    total: toNumberOrNull(record.total) ?? items.length,
+  };
+}
+
+function isRunListPayload(value: unknown): value is AdminRecord {
+  return isRecord(value) && Array.isArray(value.items);
+}
+
+function normalizeRunDetail(payload: unknown): AdminRunDetail {
+  const record = isRecord(payload) ? payload : {};
+  const rawRun = isRecord(record.run) ? record.run : {};
+  const rawProgress = isRecord(record.progress) ? record.progress : {};
+  return {
+    run: {
+      ...rawRun,
+      ...normalizeRunSummary({
+        ...rawRun,
+        run_id: rawRun.run_id ?? "",
+        status: rawRun.status ?? "UNKNOWN",
+      }),
+    },
+    metrics: normalizeRunMetrics(record.metrics),
+    progress: {
+      run_id: toStringOrNull(rawProgress.run_id) ?? toStringOrNull(rawRun.run_id) ?? "",
+      status: toStringOrNull(rawProgress.status) ?? "",
+      message: toStringOrNull(rawProgress.message),
+      stages: toArray(rawProgress.stages).filter(isRecord).map(normalizeStageProgress),
+    },
+    trace: toArray(record.trace).filter(isTraceSpan),
+    decisions: toArray(record.decisions).filter(isRecord) as unknown as AdminRunDetail["decisions"],
+    provider_calls: toArray(record.provider_calls).filter(isRecord) as unknown as AdminRunDetail["provider_calls"],
+    jev_calls: toArray(record.jev_calls).filter(isRecord) as unknown as AdminRunDetail["jev_calls"],
+    llm_calls: toArray(record.llm_calls).filter(isRecord) as unknown as AdminLlmCall[],
+    badcases: toArray(record.badcases).filter(isBadcase),
+    user_journey: isRecord(record.user_journey)
+      ? (record.user_journey as AdminRunDetail["user_journey"])
+      : null,
+  };
+}
+
+function isRunDetailPayload(value: unknown): value is AdminRecord {
+  return isRecord(value) && isRecord(value.run) && isString(value.run.run_id);
+}
+
+function normalizeStageDetail(value: AdminRecord): AdminStageDetail {
+  return {
+    stage_id: String(value.stage_id ?? value.id ?? ""),
+    title: toStringOrNull(value.title),
+    status: toStringOrNull(value.status),
+    message: toStringOrNull(value.message),
+    started_at: toStringOrNull(value.started_at),
+    finished_at: toStringOrNull(value.finished_at),
+    duration_ms: toNumberOrNull(value.duration_ms),
+    steps: toArray(value.steps).filter(isString),
+    facts: isRecord(value.facts) ? value.facts : null,
+    spans: toArray(value.spans).filter(isTraceSpan),
+    llm_calls: toArray(value.llm_calls).filter(isRecord) as unknown as AdminStageDetail["llm_calls"],
+    tool_calls: toArray(value.tool_calls).filter(isRecord) as unknown as AdminStageDetail["tool_calls"],
+    tokens: isRecord(value.tokens) ? (value.tokens as unknown as AdminStageTokens) : null,
+  };
+}
+
+/**
+ * 阶段接口的响应体兼容三种写法：裸数组、`{stages: [...]}`、单个阶段对象。
+ * 契约只固定了「每个阶段」的形状，没有固定信封，因此这里全部接受。
+ */
+function normalizeStageList(payload: unknown): AdminStageDetail[] {
+  if (Array.isArray(payload)) return payload.filter(isRecord).map(normalizeStageDetail);
+  if (isRecord(payload)) {
+    if (Array.isArray(payload.stages)) {
+      return payload.stages.filter(isRecord).map(normalizeStageDetail);
+    }
+    if (isString(payload.stage_id)) return [normalizeStageDetail(payload)];
+  }
+  return [];
+}
+
+function isStagePayload(value: unknown): value is AdminRecord | unknown[] {
+  return isRecord(value) || Array.isArray(value);
+}
+
+/* ------------------------------ 仪表盘 ------------------------------ */
 
 function isOverview(value: unknown): value is AdminOverview {
   if (!isRecord(value)) return false;
@@ -351,13 +507,7 @@ function isOverview(value: unknown): value is AdminOverview {
   return isArray(benchmark.latest_suites);
 }
 
-function isRunList(value: unknown): value is AdminRunList {
-  if (!isRecord(value)) return false;
-  if (!isArray(value.items) || !value.items.every(isRunSummary)) return false;
-  return isCount(value.limit) && isCount(value.offset) && isCount(value.total);
-}
-
-function isTraceSpan(value: unknown): boolean {
+function isTraceSpan(value: unknown): value is AdminTraceSpan {
   if (!isRecord(value)) return false;
   return isString(value.span_id) && isString(value.name) && isString(value.component) && isString(value.status);
 }
@@ -366,16 +516,6 @@ function isBadcase(value: unknown): value is AdminBadcase {
   if (!isRecord(value)) return false;
   if (!isString(value.badcase_id) || !isString(value.category) || !isString(value.severity)) return false;
   return isArray(value.trace_refs) && isString(value.analysis_status) && isString(value.fixed_status);
-}
-
-function isRunDetail(value: unknown): value is AdminRunDetail {
-  if (!isRecord(value)) return false;
-  if (!isRecord(value.run) || !isString(value.run.run_id)) return false;
-  if (!isRunMetrics(value.metrics)) return false;
-  if (!isRecord(value.progress) || !isArray(value.progress.stages)) return false;
-  if (!isArray(value.trace) || !value.trace.every(isTraceSpan)) return false;
-  if (!isArray(value.decisions) || !isArray(value.provider_calls) || !isArray(value.jev_calls)) return false;
-  return isArray(value.badcases) && value.badcases.every(isBadcase);
 }
 
 function isBadcaseList(value: unknown): value is AdminBadcaseList {
@@ -422,9 +562,39 @@ function isBenchmarkDetail(value: unknown): value is AdminBenchmarkDetail {
   );
 }
 
-function isConfig(value: unknown): value is AdminConfig {
-  if (!isRecord(value)) return false;
-  return isRecord(value.config) && isRecord(value.planner_tuning) && isRecord(value.secret_configured);
+function isConfigPayload(value: unknown): value is AdminRecord {
+  return isRecord(value);
+}
+
+/**
+ * 配置归一：`values` / `editable_keys` / `runtime_overrides` 都是后端新加字段，
+ * 缺了也照样返回一份能渲染的最小结构（旧后端返回 config/planner_tuning 时仍可用）。
+ */
+function normalizeConfig(payload: unknown): AdminConfig {
+  const record = isRecord(payload) ? payload : {};
+  const overrides: Record<string, AdminConfigOverride> = {};
+  if (isRecord(record.runtime_overrides)) {
+    for (const [key, raw] of Object.entries(record.runtime_overrides)) {
+      if (isRecord(raw)) {
+        overrides[key] = {
+          value: raw.value,
+          updated_at: toStringOrNull(raw.updated_at),
+          updated_by: toStringOrNull(raw.updated_by),
+        };
+      }
+    }
+  }
+  return {
+    config: isRecord(record.config) ? record.config : {},
+    planner_tuning: isRecord(record.planner_tuning) ? record.planner_tuning : {},
+    secret_configured: isRecord(record.secret_configured)
+      ? (record.secret_configured as Record<string, boolean>)
+      : {},
+    note: toStringOrNull(record.note) ?? "",
+    editable_keys: toArray(record.editable_keys).filter(isString),
+    runtime_overrides: overrides,
+    values: isRecord(record.values) ? record.values : {},
+  };
 }
 
 function isJevHealth(value: unknown): value is AdminJevHealth {
@@ -435,6 +605,79 @@ function isJevHealth(value: unknown): value is AdminJevHealth {
     isString(value.status) &&
     isString(value.quota_source)
   );
+}
+
+/* --------------------------- 引导式会话 --------------------------- */
+
+function normalizePlanningSessionSummary(value: AdminRecord): AdminPlanningSessionSummary {
+  return {
+    session_id: String(value.session_id),
+    status: toStringOrNull(value.status),
+    discovery_status: toStringOrNull(value.discovery_status),
+    origin: toStringOrNull(value.origin),
+    destination: toStringOrNull(value.destination),
+    start_date: toStringOrNull(value.start_date),
+    days: toNumberOrNull(value.days),
+    travelers: toNumberOrNull(value.travelers),
+    budget_total: toNumberOrNull(value.budget_total),
+    pace: toStringOrNull(value.pace),
+    transport_priority: toStringOrNull(value.transport_priority),
+    hotel_priority: toStringOrNull(value.hotel_priority),
+    must_count: toNumberOrNull(value.must_count),
+    want_count: toNumberOrNull(value.want_count),
+    reject_count: toNumberOrNull(value.reject_count),
+    run_id: toStringOrNull(value.run_id),
+    created_at: toStringOrNull(value.created_at),
+    updated_at: toStringOrNull(value.updated_at),
+    expires_at: toStringOrNull(value.expires_at),
+  };
+}
+
+function normalizePlanningSessionList(payload: unknown): AdminPlanningSessionList {
+  const record = isRecord(payload) ? payload : {};
+  const items = toArray(record.items)
+    .filter(isRecord)
+    .filter((item) => isString(item.session_id))
+    .map(normalizePlanningSessionSummary);
+  return {
+    items,
+    limit: toNumberOrNull(record.limit) ?? items.length,
+    offset: toNumberOrNull(record.offset) ?? 0,
+    total: toNumberOrNull(record.total) ?? items.length,
+  };
+}
+
+function isPlanningSessionListPayload(value: unknown): value is AdminRecord {
+  return isRecord(value) && Array.isArray(value.items);
+}
+
+function normalizePlanningEvent(value: AdminRecord): AdminPlanningEvent {
+  return {
+    at: toStringOrNull(value.at),
+    event: toStringOrNull(value.event),
+    detail: toStringOrNull(value.detail),
+  };
+}
+
+function normalizePlanningSessionDetail(payload: unknown): AdminPlanningSessionDetail {
+  const record = isRecord(payload) ? payload : {};
+  const base = normalizePlanningSessionSummary({
+    ...record,
+    session_id: record.session_id ?? "",
+  });
+  return {
+    ...record,
+    ...base,
+    place_candidates: toArray(record.place_candidates).filter(isRecord),
+    transport_candidates: toArray(record.transport_candidates).filter(isRecord),
+    hotel_candidates: toArray(record.hotel_candidates).filter(isRecord),
+    events: toArray(record.events).filter(isRecord).map(normalizePlanningEvent),
+    degradations: toArray(record.degradations).filter(isString),
+  };
+}
+
+function isPlanningSessionDetailPayload(value: unknown): value is AdminRecord {
+  return isRecord(value) && isString(value.session_id);
 }
 
 function isEvolutionOverview(value: unknown): value is AdminEvolutionOverview {
@@ -478,21 +721,67 @@ export interface AdminRunsQuery {
   limit: number;
   offset: number;
   status?: string;
+  /** run_id 搜索：精确或子串，后端负责匹配。 */
+  q?: string;
+  /** 是否包含 Benchmark 用例运行；默认 false（它们会淹没真实运行）。 */
+  includeBenchmark?: boolean;
 }
 
 export function getAdminRuns(query: AdminRunsQuery): Promise<AdminRunList> {
-  return adminRequest<AdminRunList>("/api/v1/admin/runs", {
+  return adminRequest<AdminRecord>("/api/v1/admin/runs", {
     method: "GET",
-    query: { limit: query.limit, offset: query.offset, status: query.status },
-    validate: isRunList,
-  });
+    query: {
+      limit: query.limit,
+      offset: query.offset,
+      status: query.status,
+      q: query.q,
+      // 只在需要时发送 true：默认 false 时省略参数，兼容不接受该参数的旧后端。
+      include_benchmark: query.includeBenchmark ? "true" : undefined,
+    },
+    validate: isRunListPayload,
+  }).then(normalizeRunList);
 }
 
 export function getAdminRun(runId: string): Promise<AdminRunDetail> {
-  return adminRequest<AdminRunDetail>(`/api/v1/admin/runs/${encodeURIComponent(runId)}`, {
+  return adminRequest<AdminRecord>(`/api/v1/admin/runs/${encodeURIComponent(runId)}`, {
     method: "GET",
-    validate: isRunDetail,
-  });
+    validate: isRunDetailPayload,
+  }).then(normalizeRunDetail);
+}
+
+/**
+ * 阶段明细。响应体兼容裸数组 / `{stages}` / 单阶段对象，
+ * 归一后始终返回数组，缺字段降级成空表。
+ */
+export function getAdminRunStages(runId: string): Promise<AdminStageDetail[]> {
+  return adminRequest<AdminRecord | unknown[]>(
+    `/api/v1/admin/runs/${encodeURIComponent(runId)}/stages`,
+    { method: "GET", validate: isStagePayload },
+  ).then(normalizeStageList);
+}
+
+export interface AdminPlanningSessionsQuery {
+  limit: number;
+  offset: number;
+  /** session_id / run_id 搜索：后端支持时透传，前端再做一次兜底过滤。 */
+  q?: string;
+}
+
+export function getAdminPlanningSessions(
+  query: AdminPlanningSessionsQuery,
+): Promise<AdminPlanningSessionList> {
+  return adminRequest<AdminRecord>("/api/v1/admin/planning-sessions", {
+    method: "GET",
+    query: { limit: query.limit, offset: query.offset, q: query.q },
+    validate: isPlanningSessionListPayload,
+  }).then(normalizePlanningSessionList);
+}
+
+export function getAdminPlanningSession(sessionId: string): Promise<AdminPlanningSessionDetail> {
+  return adminRequest<AdminRecord>(
+    `/api/v1/admin/planning-sessions/${encodeURIComponent(sessionId)}`,
+    { method: "GET", validate: isPlanningSessionDetailPayload },
+  ).then(normalizePlanningSessionDetail);
 }
 
 export interface AdminBadcasesQuery {
@@ -554,7 +843,19 @@ export function launchAdminBenchmark(
 }
 
 export function getAdminConfig(): Promise<AdminConfig> {
-  return adminRequest<AdminConfig>("/api/v1/admin/config", { method: "GET", validate: isConfig });
+  return adminRequest<AdminRecord>("/api/v1/admin/config", {
+    method: "GET",
+    validate: isConfigPayload,
+  }).then(normalizeConfig);
+}
+
+/** 保存非 Secret 的配置项；后端返回与 GET 相同的结构，前端据此刷新。 */
+export function patchAdminConfig(patch: AdminConfigPatch): Promise<AdminConfig> {
+  return adminRequest<AdminRecord>("/api/v1/admin/config", {
+    method: "PATCH",
+    body: patch,
+    validate: isConfigPayload,
+  }).then(normalizeConfig);
 }
 
 export function getAdminJevHealth(): Promise<AdminJevHealth> {

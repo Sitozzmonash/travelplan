@@ -69,7 +69,7 @@ function PlanPoll({ runId, onRetry }: { runId: string; onRetry: () => void }) {
         <ErrorState
           title="这次规划没有完成"
           description={error}
-          detail={`run_id：${runId}`}
+          detail={`行程编号：${runId}`}
           onRetry={onRetry}
           retryLabel="继续查询"
         />
@@ -81,11 +81,11 @@ function PlanPoll({ runId, onRetry }: { runId: string; onRetry: () => void }) {
     <div className="mx-auto max-w-3xl space-y-4">
       <LoadingState
         title="行程仍在生成中"
-        description="这个 run 还没有结束，页面会每几秒查询一次状态，完成后自动展示行程。"
+        description="这次规划还没有结束，页面会每几秒查询一次状态，完成后自动展示行程。"
         detail="长行程需要依次查询交通、酒店、攻略、地点与路线，请保持页面打开。"
       />
       <div className="flex items-center justify-between gap-3">
-        <p className="text-xs text-muted-foreground">规划进度（来自后端 Workflow 的真实节点）</p>
+        <p className="text-xs text-muted-foreground">规划进度（来自真实规划流程的节点）</p>
         <RunStatusBadge status="RUNNING" />
       </div>
       <PlanningProgress steps={steps} />

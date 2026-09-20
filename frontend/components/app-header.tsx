@@ -35,14 +35,6 @@ export function AppHeader() {
           <Button variant="ghost" size="sm" nativeButton={false} render={<Link href="/#about" />}>
             关于项目
           </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            nativeButton={false}
-            render={<a href="https://github.com/" target="_blank" rel="noreferrer" />}
-          >
-            GitHub
-          </Button>
         </nav>
       </div>
     </header>

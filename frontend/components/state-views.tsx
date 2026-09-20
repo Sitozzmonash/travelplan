@@ -206,14 +206,17 @@ export function UnauthorizedState({ title, description, detail, className }: Una
 const RUN_STATUS_META: Record<RunStatus, { label: string; className: string }> = {
   RUNNING: { label: "生成中", className: "bg-info-subtle text-info-subtle-foreground" },
   SUCCESS: { label: "已完成", className: "bg-success-subtle text-success-subtle-foreground" },
-  DEGRADED: { label: "已完成（降级）", className: "bg-warning-subtle text-warning-subtle-foreground" },
-  FAILED: { label: "生成失败", className: "bg-danger-subtle text-danger-subtle-foreground" },
-  CANCELLED: { label: "已取消", className: "bg-muted text-muted-foreground" },
+  DEGRADED: {
+    label: "已完成 · 部分信息暂未验证",
+    className: "bg-warning-subtle text-warning-subtle-foreground",
+  },
+  FAILED: { label: "未生成行程", className: "bg-danger-subtle text-danger-subtle-foreground" },
+  CANCELLED: { label: "已取消规划", className: "bg-muted text-muted-foreground" },
 };
 
 /** run 的真实状态（RUNNING / SUCCESS / DEGRADED / FAILED / CANCELLED），不把它折叠成一个笼统的「完成」。 */
 export function RunStatusBadge({ status, className }: { status: RunStatus; className?: string }) {
-  const meta = RUN_STATUS_META[status];
+  const meta = RUN_STATUS_META[status] ?? RUN_STATUS_META.SUCCESS;
   return (
     <span
       className={cn("inline-flex items-center rounded-md px-2 py-0.5 text-[11px] font-medium", meta.className, className)}

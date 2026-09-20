@@ -35,7 +35,7 @@ from typing import Annotated, Any, TypedDict
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from app import planner
+from app import planner, selection
 from app.badcase import BadCaseContext, detect_badcases, summarize as summarize_badcases
 from app.config import current_config
 from app.decision.jev import JevClient
@@ -235,6 +235,12 @@ class TravelState(TypedDict, total=False):
     jev: JevClient
     #: 子 span 记录口（component 由调用方给）。观测失败不影响规划。
     record_span: Any
+    #: 引导式：用户确认过的结构化意图（有它就不再让模型猜一遍）
+    intent_override: TripIntent | None
+    #: Discovery 已查好的候选（本轮只记录是否携带，复用见 docs/10 的待办）
+    prefetch: Any
+    source: str
+    source_session_id: str | None
 
     # --- 解析结果 ---
     intent: TripIntent
@@ -1005,6 +1011,38 @@ def node_parse_intent(state: TravelState) -> dict:
     llm = state["llm"]
     store = state["store"]
 
+    # 引导式：用户已经逐项确认过出发地/目的地/日期/人数/偏好，直接采用。
+    # 让模型再猜一遍用户刚点过的按钮，等于把确定性信息降级成概率信息
+    # （用户旅程落地任务 §12①：结构化数据的优先级高于自然语言解析）。
+    override = state.get("intent_override")
+    if override is not None:
+        intent = override
+        pace, pace_reason = selection.resolve_pace_with_reason(intent)
+        intent.pace = pace
+        store.save_trip_request(run_id, query, intent)
+        summary = (
+            f"引导式：直接采用用户确认的结构化信息"
+            f"（来源会话 {state.get('source_session_id') or '—'}）；{pace_reason}"
+        )
+        return {
+            "intent": intent,
+            "status": STATUS_CONTINUE,
+            "decisions": [
+                _decision(run_id, DecisionStatus.PASS, "parse_intent",
+                          ["GUIDED_INTENT", "USER_CONFIRMED"], summary,
+                          {"source": "guided", "pace": pace})
+            ],
+            "timeline": [_stamp("parse_intent", summary)],
+            "stages": [
+                _stage("parse_intent", "理解需求", summary, [
+                    f"目的地：{'、'.join(intent.destination) or '未指定'}",
+                    f"日期：{intent.start_date.isoformat() if intent.start_date else '未指定'}，"
+                    f"{intent.days} 天，{intent.travelers} 人",
+                    pace_reason,
+                ], 来源="引导式")
+            ],
+        }
+
     degradations: list[str] = []
     rules = _rule_based_intent(query)
     backfilled: list[str] = []
@@ -1774,6 +1812,16 @@ def node_score_candidates(state: TravelState) -> dict:
         score, score_detail = planner.score_candidate(
             place, trust, risk, intent.preferences, fit, place_evidences
         )
+        # 用户点过的"必去/想去"必须真的改变结果，而不是只写进一句文案。
+        bonus, bonus_reason = selection.preference_bonus(place, intent.place_selections or {})
+        if bonus:
+            score += bonus
+            score_detail = {
+                **score_detail,
+                "score": round(score, 2),
+                "user_bonus": bonus,
+                "basis": f"{score_detail.get('basis', '')}；{bonus_reason}",
+            }
         candidate_scores[place.place_id] = score_detail
 
     def _score_of(place: Place) -> float:
@@ -3483,6 +3531,10 @@ def execute_travel_run(
     jev: JevClient | None = None,
     run_id: str | None = None,
     emit: Any | None = None,
+    intent: TripIntent | None = None,
+    prefetch: Any | None = None,
+    source: str = "quick",
+    source_session_id: str | None = None,
 ) -> RunResult:
     """跑完一次完整规划：12 步固定流程 + 落库 + 写 `outputs/<run_id>/` 产物。
 
@@ -3494,7 +3546,13 @@ def execute_travel_run(
     """
     resolved_run_id = run_id or new_run_id()
     resolved_store = store or TravelPlanStore()
-    resolved_store.create_run(resolved_run_id, user_id=user_id, original_query=query)
+    resolved_store.create_run(
+        resolved_run_id,
+        user_id=user_id,
+        original_query=query,
+        source=source,
+        source_session_id=source_session_id,
+    )
     started = time.perf_counter()
 
     def progress_hook(
@@ -3654,6 +3712,10 @@ def execute_travel_run(
         "llm": resolved_llm,
         "jev": resolved_jev,
         "record_span": record_span,
+        "intent_override": intent,
+        "prefetch": prefetch,
+        "source": source,
+        "source_session_id": source_session_id,
         "progress_hook": progress_hook,
         "decisions": [],
         "timeline": [],

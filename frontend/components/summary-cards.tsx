@@ -122,7 +122,7 @@ export function SummaryCards({
         )}
       </SummaryCard>
 
-      <SummaryCard icon={ShieldCheck} title="可信度" onClick={onOpenTrust} actionLabel="查看来源与依据">
+      <SummaryCard icon={ShieldCheck} title="可信度" onClick={onOpenTrust} actionLabel="查看来源">
         <ul className="grid gap-1 text-xs text-muted-foreground">
           <li className="tabular">使用 {sourcesUsed} 条来源</li>
           <li className="tabular">{placesVerified} 个地点已验证</li>

@@ -5,8 +5,8 @@ import { useEffect, useState } from "react";
 import type { AuditReport } from "@/types/api";
 import type { DecisionStatus } from "@/types/plan";
 import { type ApiErrorKind, apiErrorKind, describeApiError, getArtifactUrl, getAudit, USE_MOCK_API } from "@/lib/api";
-import { formatDateTime, formatProviderQuery } from "@/lib/format";
-import { SourceBadge } from "@/components/source-badge";
+import { formatProviderQuery, formatStamp } from "@/lib/format";
+import { providerLabel, sourceStatusLabel, TONE_CHIP, type DisplayTone } from "@/lib/display";
 import { EmptyState, ErrorState, LoadingState, UnauthorizedState } from "@/components/state-views";
 import { SidePanel } from "@/components/side-panel";
 import { cn } from "@/lib/utils";
@@ -35,9 +35,38 @@ const STATUS_LABELS: Record<DecisionStatus | string, string> = {
   REJECT: "已排除",
 };
 
+const PROVIDER_STATUS_TONES: Record<string, DisplayTone> = {
+  成功: "success",
+  部分可用: "warning",
+  失败: "danger",
+  超时: "warning",
+  无数据: "muted",
+};
+
+const ENTITY_PREFIX: Record<string, string> = {
+  place: "地点",
+  transport: "交通",
+  hotel: "酒店",
+  flight: "航班",
+  train: "车次",
+  food: "餐饮",
+  attraction: "景点",
+};
+
+/** `place:武侯祠` → `地点 · 武侯祠`；没有前缀时原样返回，避免露出机器标识。 */
+function entityLabel(entityId: string): string {
+  const index = entityId.indexOf(":");
+  if (index < 0) return entityId;
+  const prefix = entityId.slice(0, index);
+  const name = entityId.slice(index + 1) || prefix;
+  const label = ENTITY_PREFIX[prefix];
+  return label ? `${label} · ${name}` : name;
+}
+
 /**
  * 规划依据（Audit Drawer，FRONTEND_DESIGN §21）。
- * 产品化展示：链路、决策、Provider 调用、时间线与产物下载入口。
+ * 产品化展示：链路、决策、数据源调用、时间线与产物下载入口。
+ * 页面只出现中文文案，不展示 run_id、工具名、英文决策码等工程字段。
  */
 export function AuditDrawer({ open, onOpenChange, runId }: AuditDrawerProps) {
   const [state, setState] = useState<{
@@ -81,8 +110,8 @@ export function AuditDrawer({ open, onOpenChange, runId }: AuditDrawerProps) {
       title="规划依据"
       description={
         report
-          ? `run_id ${report.run_id} · 生成于 ${formatDateTime(report.generated_at)}`
-          : "展示本次规划是怎么得出结论的，不包含任何 API Key 或工程内部日志。"
+          ? `展示这次规划是怎么得出结论的 · 生成于 ${formatStamp(report.generated_at)}`
+          : "展示本次规划是怎么得出结论的，不包含任何密钥或工程内部日志。"
       }
       widthClassName="sm:max-w-2xl"
       footer={
@@ -100,7 +129,7 @@ export function AuditDrawer({ open, onOpenChange, runId }: AuditDrawerProps) {
                   title={
                     disabled
                       ? USE_MOCK_API
-                        ? "演示数据未接入后端产物，接入 FastAPI 后可下载"
+                        ? "演示数据未接入产物下载"
                         : "该产物本次未生成"
                       : `下载 ${artifact.filename}`
                   }
@@ -126,7 +155,7 @@ export function AuditDrawer({ open, onOpenChange, runId }: AuditDrawerProps) {
       {loading ? (
         <LoadingState
           title="正在读取本次规划的依据"
-          description="读取决策记录、Provider 调用与产物清单，不会包含任何 API Key。"
+          description="读取决策记录、数据源调用与产物清单，不会包含任何密钥。"
         />
       ) : error ? (
         errorKind === "unauthorized" ? (
@@ -193,67 +222,60 @@ export function AuditDrawer({ open, onOpenChange, runId }: AuditDrawerProps) {
                     >
                       {STATUS_LABELS[decision.status] ?? decision.status}
                     </span>
-                    <span className="min-w-0 break-all text-xs font-medium text-foreground">
-                      {decision.entity_id}
+                    <span className="min-w-0 break-words text-xs font-medium text-foreground">
+                      {entityLabel(decision.entity_id)}
                     </span>
-                    <span className="text-[11px] text-muted-foreground">{decision.agent_or_stage}</span>
                   </div>
                   <p className="mt-1.5 text-xs leading-5 text-muted-foreground">{decision.reason_text}</p>
-                  {decision.reason_codes.length ? (
-                    <p className="mt-1.5 flex flex-wrap gap-1">
-                      {decision.reason_codes.map((code) => (
-                        <span key={code} className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                          {code}
-                        </span>
-                      ))}
-                    </p>
-                  ) : null}
                 </div>
               ))}
             </div>
           </section>
 
           <section className="space-y-2.5">
-            <h3 className="text-xs font-medium text-muted-foreground">Provider 调用</h3>
-            {/* 用卡片 + 定义列表而不是表格：4 列表格在 375px 下必然横向溢出，
-                展开成「标题 + 键值对」后任何宽度都能读。 */}
+            <h3 className="text-xs font-medium text-muted-foreground">数据源调用</h3>
+            {/* 用卡片 + 定义列表而不是表格：4 列表格在 375px 下必然横向溢出。 */}
             <ul className="space-y-2">
-              {report.provider_calls.map((call, index) => (
-                <li
-                  key={`${call.provider}-${call.tool}-${index}`}
-                  className="rounded-lg border border-border/80 bg-card px-3.5 py-3"
-                >
-                  <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5">
-                    <div className="flex min-w-0 flex-wrap items-center gap-2">
-                      <SourceBadge provider={call.provider} status={call.status} />
-                      <span className="min-w-0 break-all text-xs text-muted-foreground">{call.tool}</span>
-                    </div>
-                    <span className="tabular shrink-0 text-xs text-foreground">
-                      返回 {call.returned ?? "—"}
-                      {call.duration_ms ? (
-                        <span className="text-[11px] text-muted-foreground"> · {call.duration_ms} ms</span>
-                      ) : null}
-                    </span>
-                  </div>
-
-                  <dl className="mt-2 grid gap-1 text-[11px] leading-5">
-                    <div className="flex gap-2">
-                      <dt className="w-14 shrink-0 text-muted-foreground">查询条件</dt>
-                      <dd className="min-w-0 break-all text-foreground/90">{formatProviderQuery(call.query)}</dd>
-                    </div>
-                    {call.note ? (
-                      <div className="flex gap-2">
-                        <dt className="w-14 shrink-0 text-muted-foreground">说明</dt>
-                        <dd className="min-w-0 text-warning-subtle-foreground">{call.note}</dd>
+              {report.provider_calls.map((call, index) => {
+                const statusLabel = sourceStatusLabel(call.status);
+                const tone = PROVIDER_STATUS_TONES[statusLabel] ?? "muted";
+                return (
+                  <li
+                    key={`${call.provider}-${index}`}
+                    className="rounded-lg border border-border/80 bg-card px-3.5 py-3"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5">
+                      <div className="flex min-w-0 flex-wrap items-center gap-2">
+                        <span className="text-xs font-medium text-foreground">{providerLabel(call.provider)}</span>
+                        <span className={cn("rounded px-1.5 py-0.5 text-[11px]", TONE_CHIP[tone])}>{statusLabel}</span>
                       </div>
-                    ) : null}
-                  </dl>
-                </li>
-              ))}
+                      <span className="tabular shrink-0 text-xs text-foreground">
+                        返回 {call.returned ?? "—"}
+                        {call.duration_ms ? (
+                          <span className="text-[11px] text-muted-foreground"> · 用时 {call.duration_ms} ms</span>
+                        ) : null}
+                      </span>
+                    </div>
+
+                    <dl className="mt-2 grid gap-1 text-[11px] leading-5">
+                      <div className="flex gap-2">
+                        <dt className="w-14 shrink-0 text-muted-foreground">查询条件</dt>
+                        <dd className="min-w-0 break-all text-foreground/90">{formatProviderQuery(call.query)}</dd>
+                      </div>
+                      {call.note ? (
+                        <div className="flex gap-2">
+                          <dt className="w-14 shrink-0 text-muted-foreground">说明</dt>
+                          <dd className="min-w-0 text-warning-subtle-foreground">{call.note}</dd>
+                        </div>
+                      ) : null}
+                    </dl>
+                  </li>
+                );
+              })}
             </ul>
             {report.provider_calls.some((call) => call.status !== "OK") ? (
               <p className="text-[11px] leading-5 text-muted-foreground">
-                标记为降级的调用使用了缓存或部分可用数据，行程中对应部分会单独标注。
+                标记为「部分可用」的调用使用了缓存或部分数据，行程中对应部分会单独标注。
               </p>
             ) : null}
           </section>
@@ -296,7 +318,7 @@ export function AuditDrawer({ open, onOpenChange, runId }: AuditDrawerProps) {
           </section>
 
           <p className="text-[11px] leading-5 text-muted-foreground">
-            页面只读取后端保存的决策记录与产物清单；Provider Key、请求签名等敏感信息不会返回给前端。
+            页面只读取后端保存的决策记录与产物清单，访问密钥、请求签名等敏感信息不会返回给前端。
           </p>
         </div>
       ) : (
@@ -308,4 +330,3 @@ export function AuditDrawer({ open, onOpenChange, runId }: AuditDrawerProps) {
     </SidePanel>
   );
 }
-

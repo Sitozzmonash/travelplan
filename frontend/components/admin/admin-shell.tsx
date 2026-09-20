@@ -7,6 +7,7 @@ import {
   Activity,
   ArrowLeft,
   Bug,
+  Compass,
   FlaskConical,
   LayoutDashboard,
   ListChecks,
@@ -72,6 +73,7 @@ const NAV_GROUPS: { label: string; items: AdminNavItem[] }[] = [
     items: [
       { href: "/admin", label: "仪表盘", icon: LayoutDashboard, exact: true },
       { href: "/admin/runs", label: "运行记录", icon: ListChecks },
+      { href: "/admin/sessions", label: "引导式会话", icon: Compass },
       { href: "/admin/badcases", label: "问题案例", icon: Bug },
     ],
   },

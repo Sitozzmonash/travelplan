@@ -23,7 +23,7 @@ export function EvidenceBadge({ evidenceCount, trust, adRisk, onClick, className
       <span className="tabular">{evidenceCount} 条证据</span>
       <span className="text-border">|</span>
       <span className={cn("tabular", TONE_TEXT[trustTone(trustValue)])}>
-        Trust {trustValue ?? "—"}
+        可信度 {trustValue ?? "—"}
       </span>
       <span className="text-border">|</span>
       <span className={cn("tabular", TONE_TEXT[adRiskTone(riskValue)])}>
@@ -93,7 +93,7 @@ export function TrustChip({ trust, adRisk, className }: TrustChipProps) {
     <div className={cn("flex flex-wrap gap-1.5", className)}>
       <span className={cn("rounded px-1.5 py-0.5 text-[11px]", TONE_CHIP[trustTone(trustValue)])}>
         {trustLabel(trustValue)}
-        {trustValue !== null ? ` · Trust ${trustValue}` : ""}
+        {trustValue !== null ? ` · 可信度 ${trustValue}` : ""}
       </span>
       <span className={cn("rounded px-1.5 py-0.5 text-[11px]", TONE_CHIP[adRiskTone(riskValue)])}>
         {adRiskLabel(riskValue)}

@@ -204,9 +204,9 @@ function HotelOptionCard({
       {typeof option.trust_score === "number" ? (
         <div className="mt-2.5 max-w-xs">
           <ScoreRow
-            label="可信度（Provider 评分与点评综合）"
+            label="可信度（平台评分与点评综合）"
             score={option.trust_score}
-            caption="由后端根据 Provider 评分、点评数量与内容一致性计算。"
+            caption="由后端根据平台评分、点评数量与内容一致性计算。"
             tone="trust"
           />
         </div>

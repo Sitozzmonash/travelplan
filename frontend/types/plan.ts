@@ -161,6 +161,8 @@ export interface ItineraryItem {
   reason: string;
   /** 推荐原因拆解（Evidence Drawer 的 ✓ 列表），由后端给出。 */
   reason_points?: string[];
+  /** 营业时间（若有），由后端在 POI 校验时带回；缺失时前端不展示该行。 */
+  opening_hours?: string | null;
   /** 风险说明（Evidence Drawer 的风险段），由后端给出。 */
   risk_note?: string;
   evidence_ids: string[];

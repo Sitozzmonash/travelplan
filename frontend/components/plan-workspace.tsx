@@ -5,6 +5,7 @@ import { useCallback, useMemo, useState } from "react";
 import type { ReviseRequest, ReviseResult } from "@/types/api";
 import type { Evidence, ItineraryItem, MapPoint, TripPlan } from "@/types/plan";
 import { getEvidence, revisePlan } from "@/lib/api";
+import { buildSourceRecords, providerLabel, recordsForItem, sourceStatusLabel } from "@/lib/display";
 import { formatDuration } from "@/lib/format";
 import { AuditDrawer } from "@/components/audit-drawer";
 import { BudgetCard } from "@/components/budget-card";
@@ -17,13 +18,12 @@ import { MobileNav } from "@/components/mobile-nav";
 import { PlaceDetailDrawer } from "@/components/place-detail-drawer";
 import { ReviseDialog, type ReviseTarget } from "@/components/revise-dialog";
 import { SectionCard } from "@/components/section-card";
-import { SourcesDrawer } from "@/components/sources-drawer";
+import { SourcesDrawer, SourcesSummary } from "@/components/sources-drawer";
 import { PartialNotice } from "@/components/state-views";
 import { SummaryCards } from "@/components/summary-cards";
 import { TransportCompare } from "@/components/transport-compare";
 import { TravelMap } from "@/components/travel-map";
 import { TripSummary } from "@/components/trip-summary";
-import { providerLabel } from "@/components/source-badge";
 
 interface PlanWorkspaceProps {
   plan: TripPlan;
@@ -91,7 +91,7 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
     () =>
       Object.entries(plan.transport?.provider_status ?? {})
         .filter(([, status]) => status !== "OK")
-        .map(([provider, status]) => `${providerLabel(provider)}（${status}）`),
+        .map(([provider, status]) => `${providerLabel(provider)}（${sourceStatusLabel(status)}）`),
     [plan.transport],
   );
 
@@ -100,11 +100,9 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
     [plan, evidenceItem],
   );
 
-  const sourcesOfItem = useCallback(
-    (item: ItineraryItem | null) =>
-      item ? sources.filter((source) => item.source_ids.includes(source.source_id)) : [],
-    [sources],
-  );
+  /** 「谁、什么时候、提供了什么数据」的来源记录：摘要区与抽屉共用同一份。 */
+  const sourceRecords = useMemo(() => buildSourceRecords(plan), [plan]);
+  const placeRecords = useMemo(() => recordsForItem(sourceRecords, placeItem), [sourceRecords, placeItem]);
 
   function openEvidence(item: ItineraryItem) {
     setEvidenceItem(item);
@@ -189,10 +187,9 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
                 selectedItemId={selectedItemId}
                 lockedItemIds={lockedItemIds}
                 onSelectItem={(item) => {
+                  // 点开一条安排 = 查看它的完整详情（推荐理由 / 停留 / 路线 / 价格 / 证据 / 风险）。
                   setSelectedItemId(item.id);
-                  if (typeof item.lat === "number" && typeof item.lng === "number") {
-                    document.getElementById("map")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-                  }
+                  openDetail(item);
                 }}
                 onOpenEvidence={openEvidence}
                 onOpenDetail={openDetail}
@@ -260,6 +257,8 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
             <TransportSummary plan={plan} />
           </SectionCard>
 
+          <SourcesSummary records={sourceRecords} onOpenAll={() => openSources()} />
+
           {warnings.filter((warning) => !warning.resolved).length ? (
             <div className="flex items-start gap-2 rounded-xl border border-warning/25 bg-warning-subtle/70 px-3.5 py-3 text-xs leading-5">
               <CircleAlert className="mt-0.5 size-3.5 shrink-0 text-warning-subtle-foreground" aria-hidden />
@@ -316,8 +315,8 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
         item={placeItem}
         day={day}
         dayLabel={dayLabel}
-        sources={sourcesOfItem(placeItem)}
-        evidence={placeItem ? getEvidence(plan, placeItem.evidence_ids) : []}
+        evidenceRecords={placeRecords.evidence}
+        sourceRecords={placeRecords.sources}
         onOpenEvidence={() => {
           setPlaceOpen(false);
           if (placeItem) {
@@ -330,7 +329,7 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
       <SourcesDrawer
         open={sourcesOpen}
         onOpenChange={setSourcesOpen}
-        sources={sources}
+        records={sourceRecords}
         generatedAt={plan.generated_at}
         highlightSourceId={highlightSourceId}
       />

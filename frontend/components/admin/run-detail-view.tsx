@@ -2,54 +2,82 @@
 
 import Link from "next/link";
 import { useState } from "react";
-import { ArrowLeft, Bug, Coins, Cpu, GitBranch, RefreshCw, Share2, Sparkles, Wrench } from "lucide-react";
+import {
+  ArrowLeft,
+  Bug,
+  ChevronRight,
+  Coins,
+  Cpu,
+  GitBranch,
+  RefreshCw,
+  Share2,
+  Sparkles,
+  Wrench,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { AdminTable, type AdminColumn } from "@/components/admin/admin-table";
 import { CollapsibleSection } from "@/components/admin/collapsible-section";
 import { PageHeader } from "@/components/admin/page-header";
-import { ResourceView, SectionEmpty } from "@/components/admin/admin-states";
+import { InlineError, ResourceView, SectionEmpty, SectionSkeleton } from "@/components/admin/admin-states";
+import { AdminDetailDialog, KeyValueList } from "@/components/admin/detail-dialog";
 import { DescriptionList, MetricList } from "@/components/admin/metric-list";
 import { StatCard } from "@/components/admin/stat-card";
-import { StatusBadge, ToneBadge } from "@/components/admin/status-badge";
+import { SourceTag, StatusBadge, ToneBadge } from "@/components/admin/status-badge";
 import { TraceTree } from "@/components/admin/trace-tree";
 import {
-  formatCost,
+  badcaseCategoryLabel,
+  cleanBadcaseSymptom,
+  formatCostWithCurrency,
   formatDurationMs,
   formatLatency,
   formatMetricValue,
   formatNumber,
   formatRatio,
-  formatTokens,
+  formatTokenCount,
+  formatUnitPrice,
   statusLabel,
 } from "@/components/admin/format";
 import { useAdminResource } from "@/components/admin/use-admin-resource";
-import { getAdminRun } from "@/lib/admin-api";
-import { formatProviderQuery } from "@/lib/format";
+import {
+  getAdminRun,
+  getAdminRunStages,
+  type AdminApiError,
+} from "@/lib/admin-api";
+import { formatDateTime, formatProviderQuery } from "@/lib/format";
 import type {
   AdminBadcase,
+  AdminCostBreakdown,
   AdminDecision,
   AdminJevCall,
+  AdminLlmCall,
   AdminProviderCall,
   AdminRunDetail,
+  AdminStageDetail,
+  AdminStageLlmCall,
+  AdminStageProgress,
+  AdminStageTokens,
   AdminTraceSpan,
 } from "@/types/admin";
 
 /**
  * 运行详情。
  *
- * 默认展开的只有「Trace」和「阶段」：它们是回答"这次运行到底卡在哪"的最短路径。
- * LLM / Jev / Provider / Token / 决策链 / Bad Case 都是可选的深入材料，默认折叠，
- * 避免一屏塞进几十行表格让人找不到重点。
+ * 默认展开的只有 Trace 与阶段这两块「回答运行卡在哪」的最短路径；
+ * 所有明细（阶段详情、LLM / Jev 调用、Bad Case）都以弹窗呈现，主页面只留摘要。
  */
 export function RunDetailView({ runId }: { runId: string }) {
   const resource = useAdminResource<AdminRunDetail>(`admin-run:${runId}`, () => getAdminRun(runId));
+  // 阶段明细来自独立端点，404/未实现时只影响「阶段」这一块，不会让整页失败。
+  const stages = useAdminResource<AdminStageDetail[]>(`admin-run-stages:${runId}`, () =>
+    getAdminRunStages(runId),
+  );
 
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
         title="运行详情"
-        description="Trace 按 span 的父子关系展开；阶段来自后端 workflow 的落库进度。"
+        description="Trace 按 span 的父子关系展开；阶段来自后端 workflow 的落库进度。点击任意一行查看完整明细。"
         badge={
           <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] break-all text-muted-foreground">
             {runId}
@@ -57,7 +85,14 @@ export function RunDetailView({ runId }: { runId: string }) {
         }
         actions={
           <div className="flex items-center gap-1.5">
-            <Button variant="outline" size="sm" onClick={resource.reload}>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                resource.reload();
+                stages.reload();
+              }}
+            >
               <RefreshCw />
               刷新
             </Button>
@@ -70,15 +105,29 @@ export function RunDetailView({ runId }: { runId: string }) {
       />
 
       <ResourceView resource={resource} loadingRows={6}>
-        {(data) => <RunDetailBody data={data} />}
+        {(data) => <RunDetailBody data={data} stages={stages} />}
       </ResourceView>
     </div>
   );
 }
 
-function RunDetailBody({ data }: { data: AdminRunDetail }) {
+function RunDetailBody({
+  data,
+  stages,
+}: {
+  data: AdminRunDetail;
+  stages: ReturnType<typeof useAdminResource<AdminStageDetail[]>>;
+}) {
   const { run, metrics, progress } = data;
-  const llmSpans = data.trace.filter(isLlmSpan);
+  const llmCalls = data.llm_calls.length > 0 ? data.llm_calls : deriveLlmCalls(data.trace);
+  const stageRows =
+    stages.data && stages.data.length > 0 ? stages.data : progress.stages.map(progressToStage);
+
+  const tokensMissing =
+    metrics.input_tokens === null &&
+    metrics.output_tokens === null &&
+    metrics.cached_tokens === null &&
+    metrics.total_tokens === null;
 
   return (
     <div className="flex flex-col gap-4">
@@ -87,6 +136,7 @@ function RunDetailBody({ data }: { data: AdminRunDetail }) {
           <CardTitle className="flex flex-wrap items-center gap-2">
             <span>概览</span>
             <StatusBadge status={run.status} />
+            <SourceTag source={run.source} />
           </CardTitle>
           <CardDescription className="break-words whitespace-pre-wrap">
             {run.original_query || "后端没有记录原始请求文本。"}
@@ -95,7 +145,12 @@ function RunDetailBody({ data }: { data: AdminRunDetail }) {
         <CardContent className="flex flex-col gap-4">
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
             <StatCard label="总耗时" value={formatDurationMs(metrics.duration_ms)} />
-            <StatCard label="总 Token" value={formatTokens(metrics.total_tokens)} icon={Coins} />
+            <StatCard
+              label="总 Token"
+              value={metrics.total_tokens === null ? "未知" : formatTokenCount(metrics.total_tokens)}
+              icon={Coins}
+              hint={metrics.total_tokens === null ? "后端未返回 usage" : undefined}
+            />
             <StatCard label="LLM 调用" value={formatNumber(metrics.llm_calls)} icon={Cpu} />
             <StatCard label="Jev 调用" value={formatNumber(metrics.jev_calls)} icon={Sparkles} />
             <StatCard label="工具调用" value={formatNumber(metrics.tool_calls)} icon={Wrench} />
@@ -112,14 +167,34 @@ function RunDetailBody({ data }: { data: AdminRunDetail }) {
             />
             <StatCard
               label="成本"
-              value={formatCost(metrics.cost)}
-              hint={metrics.cost === null ? "后端没有给出该次运行的定价" : "按后端定价表折算"}
+              value={formatCostWithCurrency(metrics.cost, metrics.cost_currency)}
+              hint={
+                metrics.cost_source === "user_price"
+                  ? "按「系统配置」里的每百万 token 单价计算"
+                  : metrics.cost_source
+                    ? "按后端定价计算"
+                    : "未配置单价"
+              }
             />
           </div>
           <DescriptionList
             items={[
-              { label: "开始", value: run.created_at ?? "—" },
-              { label: "结束", value: run.finished_at ?? "—" },
+              { label: "开始", value: formatDateTime(run.started_at ?? run.created_at) },
+              { label: "结束", value: formatDateTime(run.finished_at) },
+              { label: "来源", value: <SourceTag source={run.source} /> },
+              {
+                label: "来源会话",
+                value: run.source_session_id ? (
+                  <Link
+                    href={`/admin/sessions?q=${encodeURIComponent(run.source_session_id)}`}
+                    className="font-mono text-primary underline-offset-4 hover:underline"
+                  >
+                    {run.source_session_id}
+                  </Link>
+                ) : (
+                  "无（这次不是引导式创建的）"
+                ),
+              },
               { label: "进度状态", value: progress.status ? statusLabel(progress.status) : "—" },
               { label: "进度说明", value: progress.message || "后端没有给出说明" },
             ]}
@@ -127,44 +202,38 @@ function RunDetailBody({ data }: { data: AdminRunDetail }) {
         </CardContent>
       </Card>
 
+      <CostPanel metrics={metrics} />
+
       <Card>
         <CardHeader>
           <CardTitle>阶段</CardTitle>
           <CardDescription>
-            workflow 的 {progress.stages.length} 个阶段，按后端记录顺序展示。
+            workflow 的 {stageRows.length} 个阶段；点击任意阶段查看步骤、事实、工具 / 模型调用与 Token。
           </CardDescription>
         </CardHeader>
         <CardContent>
-          {progress.stages.length === 0 ? (
+          {stages.error ? (
+            <InlineError
+              title="阶段明细没能加载"
+              description="阶段端点可能尚未部署或暂时不可用；下面的阶段摘要来自运行详情，仍然可以查看。"
+              detail={(stages.error as AdminApiError).detail}
+              onRetry={stages.reload}
+              className="mb-3"
+            />
+          ) : null}
+          {stages.loading && !stages.data ? (
+            <SectionSkeleton rows={3} />
+          ) : stageRows.length === 0 ? (
             <SectionEmpty
               title="没有阶段进度"
               description="这次运行没有写入阶段记录，因此看不到分步进度。Trace 里通常仍有更细的 span。"
             />
           ) : (
-            <ol className="flex flex-col gap-2.5">
-              {progress.stages.map((stage) => (
-                <li
-                  key={stage.stage_id}
-                  className="rounded-lg border border-border p-2.5"
-                >
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-xs font-medium text-foreground">{stage.title || stage.stage_id}</span>
-                    <StatusBadge status={stage.status} />
-                    <span className="tabular ml-auto text-[11px] text-muted-foreground">
-                      {formatDurationMs(durationBetween(stage.started_at, stage.finished_at))}
-                    </span>
-                  </div>
-                  {stage.message ? (
-                    <p className="mt-1.5 text-xs leading-5 break-words text-muted-foreground">
-                      {stage.message}
-                    </p>
-                  ) : null}
-                  {stage.facts && Object.keys(stage.facts).length > 0 ? (
-                    <MetricList metrics={stage.facts} className="mt-2" />
-                  ) : null}
-                </li>
+            <ul className="flex flex-col gap-2.5">
+              {stageRows.map((stage) => (
+                <StageRow key={stage.stage_id} stage={stage} runMetrics={metrics} />
               ))}
-            </ol>
+            </ul>
           )}
         </CardContent>
       </Card>
@@ -173,7 +242,7 @@ function RunDetailBody({ data }: { data: AdminRunDetail }) {
         <CardHeader>
           <CardTitle>Trace</CardTitle>
           <CardDescription>
-            共 {data.trace.length} 个 span；根节点是 parent_span_id 为空的 span。点击行可展开属性与错误。
+            共 {data.trace.length} 个 span；根节点是 parent_span_id 为空的 span。点击任意 span 查看完整属性与错误。
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -183,24 +252,11 @@ function RunDetailBody({ data }: { data: AdminRunDetail }) {
 
       <CollapsibleSection
         title="LLM 调用"
-        description="从 Trace 中筛出的模型调用 span（判定依据见下方说明）"
-        count={llmSpans.length}
+        description="模型调用的标签、模型、状态、耗时与字符数"
+        count={llmCalls.length}
         icon={Cpu}
       >
-        {llmSpans.length === 0 ? (
-          <SectionEmpty
-            title="Trace 里没有识别到 LLM span"
-            description="管理台的 LLM 区块由 Trace 派生：component / name 含 llm、model、agent、planner、critic 等关键字，或 span 属性里带 model、*_tokens 字段。"
-            hint="如果后端为此单独返回了列表，请更新契约，管理台会改成直接展示。"
-          />
-        ) : (
-          <div className="flex flex-col gap-3">
-            <AdminTable columns={LLM_COLUMNS} rows={llmSpans} getRowKey={(span) => span.span_id} />
-            <p className="text-[11px] leading-4 text-muted-foreground">
-              说明：LLM 调用由 Trace 派生（当前契约的 run 详情没有独立字段）。
-            </p>
-          </div>
-        )}
+        <LlmCallList calls={llmCalls} />
       </CollapsibleSection>
 
       <CollapsibleSection
@@ -235,17 +291,15 @@ function RunDetailBody({ data }: { data: AdminRunDetail }) {
       </CollapsibleSection>
 
       <CollapsibleSection title="Token 明细" description="输入 / 输出 / 缓存的拆分" count="4 项" icon={Coins}>
-        <MetricList
-          metrics={{
-            input_tokens: metrics.input_tokens,
-            output_tokens: metrics.output_tokens,
-            cached_tokens: metrics.cached_tokens,
-            total_tokens: metrics.total_tokens,
-          }}
-        />
-        <p className="mt-2 text-[11px] text-muted-foreground">
-          缓存 Token 由后端统计；前端只展示，不做二次推算。
-        </p>
+        <TokenBreakdown tokens={metrics} />
+      </CollapsibleSection>
+
+      <CollapsibleSection
+        title="引导式来源"
+        description="这次 run 对应的用户前置选择（没有就是不是引导式创建的）"
+        icon={GitBranch}
+      >
+        <UserJourneySection data={data} />
       </CollapsibleSection>
 
       <CollapsibleSection
@@ -268,98 +322,491 @@ function RunDetailBody({ data }: { data: AdminRunDetail }) {
           </Button>
         }
       >
-        <BadcaseList badcases={data.badcases} />
+        <RunBadcaseList badcases={data.badcases} />
       </CollapsibleSection>
+
+      {tokensMissing ? (
+        <p className="text-[11px] text-muted-foreground">
+          提示：本次运行没有 usage（Benchmark 用例运行使用假模型），因此 Token 与成本都显示为「未知」。
+        </p>
+      ) : null}
     </div>
   );
 }
 
-/**
- * LLM span 判定。
- * 为什么用启发式：契约给的是通用 trace，没有标记 span 类型；
- * 关键字 + token 属性同时判断，误判成本很低（只是一个可折叠列表）。
- */
-const LLM_HINTS = ["llm", "model", "agent", "planner", "critic", "router", "judge", "reason"];
-const LLM_ATTRIBUTE_HINTS = [
-  "model",
-  "input_tokens",
-  "output_tokens",
-  "prompt_tokens",
-  "completion_tokens",
-  "total_tokens",
-];
+/* ------------------------------ 成本 ------------------------------ */
 
-function isLlmSpan(span: AdminTraceSpan): boolean {
-  const component = span.component.toLowerCase();
-  const name = span.name.toLowerCase();
-  if (LLM_HINTS.some((hint) => component.includes(hint) || name.includes(hint))) return true;
-  const attributes = span.attributes ?? {};
-  return LLM_ATTRIBUTE_HINTS.some((key) => key in attributes);
+function CostPanel({ metrics }: { metrics: AdminRunDetail["metrics"] }) {
+  const [open, setOpen] = useState(false);
+  const breakdown = metrics.cost_breakdown ?? null;
+  const hasPrices =
+    breakdown !== null &&
+    (breakdown.input_price_per_million !== null ||
+      breakdown.output_price_per_million !== null ||
+      breakdown.cached_price_per_million !== null);
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex flex-wrap items-center gap-2">
+          <span>成本</span>
+          {metrics.cost_source === "user_price" ? (
+            <ToneBadge tone="info">按用户单价</ToneBadge>
+          ) : null}
+        </CardTitle>
+        <CardDescription>成本由后端计算；管理台只展示拆分，不做二次折算。</CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        {metrics.cost_source === null ? (
+          <div className="rounded-lg border border-warning/30 bg-warning-subtle px-3.5 py-3 text-xs leading-5 text-warning-subtle-foreground">
+            未配置单价（去「系统配置」里填每百万 token 单价）
+            <Button
+              variant="outline"
+              size="xs"
+              className="ml-2 align-middle"
+              nativeButton={false}
+              render={<Link href="/admin/config" />}
+            >
+              打开系统配置
+            </Button>
+          </div>
+        ) : (
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="tabular text-lg font-semibold text-foreground">
+              {formatCostWithCurrency(metrics.cost, metrics.cost_currency)}
+            </span>
+            {metrics.cost_currency ? (
+              <span className="text-[11px] text-muted-foreground">货币：{metrics.cost_currency}</span>
+            ) : null}
+            {hasPrices ? (
+              <Button variant="outline" size="xs" onClick={() => setOpen(true)}>
+                查看成本明细
+              </Button>
+            ) : null}
+          </div>
+        )}
+
+        {!hasPrices && metrics.cost_source !== null ? (
+          <p className="text-[11px] text-muted-foreground">
+            后端没有给出 cost_breakdown，因此无法展示单价与 token 的乘积拆分。
+          </p>
+        ) : null}
+      </CardContent>
+
+      <AdminDetailDialog
+        open={open}
+        onOpenChange={setOpen}
+        title="成本明细"
+        description={`${formatCostWithCurrency(metrics.cost, metrics.cost_currency)} · 每百万 token 单价`}
+      >
+        {breakdown ? <CostBreakdownDetail breakdown={breakdown} currency={metrics.cost_currency} /> : null}
+      </AdminDetailDialog>
+    </Card>
+  );
 }
 
-function durationBetween(startedAt: string | null, finishedAt: string | null): number | null {
-  if (!startedAt || !finishedAt) return null;
-  const start = Date.parse(startedAt);
-  const end = Date.parse(finishedAt);
-  if (Number.isNaN(start) || Number.isNaN(end) || end < start) return null;
-  return end - start;
+function CostBreakdownDetail({
+  breakdown,
+  currency,
+}: {
+  breakdown: AdminCostBreakdown;
+  currency: string | null | undefined;
+}) {
+  const rows: { key: string; label: string; tokens: number | null; price: number | null }[] = [
+    {
+      key: "input",
+      label: "输入 Token",
+      tokens: breakdown.input_tokens,
+      price: breakdown.input_price_per_million,
+    },
+    {
+      key: "output",
+      label: "输出 Token",
+      tokens: breakdown.output_tokens,
+      price: breakdown.output_price_per_million,
+    },
+    {
+      key: "cached",
+      label: "命中缓存 Token",
+      tokens: breakdown.cached_tokens,
+      price: breakdown.cached_price_per_million,
+    },
+  ];
+  return (
+    <table className="w-full border-collapse text-xs">
+      <thead>
+        <tr className="border-b border-border text-muted-foreground">
+          <th className="py-1.5 text-left font-medium">项目</th>
+          <th className="py-1.5 text-right font-medium">Token</th>
+          <th className="py-1.5 text-right font-medium">单价</th>
+          <th className="py-1.5 text-right font-medium">小计</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((row) => (
+          <tr key={row.key} className="border-b border-border/60 last:border-0">
+            <td className="py-1.5 text-foreground">{row.label}</td>
+            <td className="tabular py-1.5 text-right text-foreground">{formatTokenCount(row.tokens)}</td>
+            <td className="tabular py-1.5 text-right text-muted-foreground">
+              {formatUnitPrice(row.price, currency)}
+            </td>
+            <td className="tabular py-1.5 text-right text-foreground">
+              {formatSubtotal(row.tokens, row.price, currency)}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
 }
 
-const LLM_COLUMNS: AdminColumn<AdminTraceSpan>[] = [
+function formatSubtotal(
+  tokens: number | null,
+  price: number | null,
+  currency: string | null | undefined,
+): string {
+  if (tokens === null || price === null) return "未知";
+  return formatCostWithCurrency((tokens * price) / 1_000_000, currency);
+}
+
+/* ------------------------------ 阶段 ------------------------------ */
+
+function StageRow({
+  stage,
+  runMetrics,
+}: {
+  stage: AdminStageDetail;
+  runMetrics: AdminRunDetail["metrics"];
+}) {
+  const [open, setOpen] = useState(false);
+  const duration = stage.duration_ms ?? durationBetween(stage.started_at, stage.finished_at);
+  const steps = stage.steps ?? [];
+  const facts = stage.facts ?? null;
+  const toolCalls = stage.tool_calls ?? [];
+  const llmCalls = stage.llm_calls ?? [];
+
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={() => setOpen(true)}
+        className="flex w-full min-w-0 flex-wrap items-center gap-2 rounded-lg border border-border p-2.5 text-left hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+      >
+        <span className="text-xs font-medium text-foreground">{stage.title || stage.stage_id}</span>
+        <StatusBadge status={stage.status} />
+        <span className="tabular ml-auto text-[11px] text-muted-foreground">{formatDurationMs(duration)}</span>
+        <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+        {stage.message ? (
+          <span className="line-clamp-1 w-full text-xs leading-5 break-words text-muted-foreground">
+            {stage.message}
+          </span>
+        ) : null}
+      </button>
+
+      <AdminDetailDialog
+        open={open}
+        onOpenChange={setOpen}
+        title={stage.title || stage.stage_id}
+        description={stage.stage_id}
+        badge={<StatusBadge status={stage.status} />}
+      >
+        <KeyValueList
+          entries={[
+            { key: "started", label: "开始", value: <span className="font-mono">{formatDateTime(stage.started_at)}</span> },
+            { key: "finished", label: "结束", value: <span className="font-mono">{formatDateTime(stage.finished_at)}</span> },
+            { key: "duration", label: "耗时", value: formatDurationMs(duration) },
+          ]}
+        />
+
+        {stage.message ? (
+          <section className="flex flex-col gap-1">
+            <h3 className="text-xs font-medium text-foreground">说明</h3>
+            <p className="text-xs leading-5 break-words whitespace-pre-wrap text-muted-foreground">
+              {stage.message}
+            </p>
+          </section>
+        ) : null}
+
+        <section className="flex flex-col gap-2">
+          <h3 className="text-xs font-medium text-foreground">步骤</h3>
+          {steps.length === 0 ? (
+            <p className="text-xs text-muted-foreground">这个阶段没有记录步骤。</p>
+          ) : (
+            <ol className="flex list-decimal flex-col gap-1 pl-5 text-xs leading-5 text-foreground">
+              {steps.map((step, index) => (
+                <li key={`${index}-${step}`} className="break-words">
+                  {step}
+                </li>
+              ))}
+            </ol>
+          )}
+        </section>
+
+        <section className="flex flex-col gap-2">
+          <h3 className="text-xs font-medium text-foreground">事实</h3>
+          <MetricList metrics={facts} emptyText="这个阶段没有记录事实。" />
+        </section>
+
+        <section className="flex flex-col gap-2">
+          <h3 className="text-xs font-medium text-foreground">工具调用（{toolCalls.length}）</h3>
+          {toolCalls.length === 0 ? (
+            <p className="text-xs text-muted-foreground">这个阶段没有工具调用。</p>
+          ) : (
+            <AdminTable
+              columns={STAGE_TOOL_COLUMNS}
+              rows={toolCalls}
+              getRowKey={(call) => `${call.provider ?? ""}-${call.tool ?? ""}-${call.status ?? ""}-${call.duration_ms ?? ""}`}
+            />
+          )}
+        </section>
+
+        <section className="flex flex-col gap-2">
+          <h3 className="text-xs font-medium text-foreground">模型调用（{llmCalls.length}）</h3>
+          {llmCalls.length === 0 ? (
+            <p className="text-xs text-muted-foreground">这个阶段没有模型调用。</p>
+          ) : (
+            <AdminTable
+              columns={STAGE_LLM_COLUMNS}
+              rows={llmCalls}
+              getRowKey={(call) => `${call.tag ?? ""}-${call.model ?? ""}-${call.status ?? ""}-${call.duration_ms ?? ""}`}
+            />
+          )}
+        </section>
+
+        <section className="flex flex-col gap-2">
+          <h3 className="text-xs font-medium text-foreground">该阶段 Token 与成本</h3>
+          <TokenBreakdown tokens={stage.tokens} />
+          <StageCost tokens={stage.tokens} breakdown={runMetrics.cost_breakdown ?? null} currency={runMetrics.cost_currency} />
+        </section>
+      </AdminDetailDialog>
+    </li>
+  );
+}
+
+function StageCost({
+  tokens,
+  breakdown,
+  currency,
+}: {
+  tokens: AdminStageTokens | null | undefined;
+  breakdown: AdminCostBreakdown | null;
+  currency: string | null | undefined;
+}) {
+  if (!tokens || !breakdown) {
+    return (
+      <p className="text-[11px] text-muted-foreground">
+        未配置单价（去
+        <Link href="/admin/config" className="mx-1 text-primary underline-offset-4 hover:underline">
+          系统配置
+        </Link>
+        里填每百万 token 单价），或后端未返回该阶段 usage。
+      </p>
+    );
+  }
+  const parts = [
+    { tokens: tokens.input_tokens, price: breakdown.input_price_per_million },
+    { tokens: tokens.output_tokens, price: breakdown.output_price_per_million },
+    { tokens: tokens.cached_tokens, price: breakdown.cached_price_per_million },
+  ];
+  let total = 0;
+  let known = false;
+  for (const part of parts) {
+    if (part.tokens !== null && part.tokens !== undefined && part.price !== null && part.price !== undefined) {
+      total += (part.tokens * part.price) / 1_000_000;
+      known = true;
+    }
+  }
+  if (!known) {
+    return <p className="text-[11px] text-muted-foreground">未配置单价，无法估算该阶段成本。</p>;
+  }
+  return (
+    <p className="text-xs text-foreground">
+      估算成本：
+      <span className="tabular font-medium">{formatCostWithCurrency(total, currency)}</span>
+      <span className="ml-2 text-[11px] text-muted-foreground">按 run 的每百万 token 单价估算</span>
+    </p>
+  );
+}
+
+const STAGE_TOOL_COLUMNS: AdminColumn<NonNullable<AdminStageDetail["tool_calls"]>[number]>[] = [
   {
-    key: "name",
-    header: "调用",
+    key: "provider",
+    header: "Provider / 工具",
     primary: true,
-    cell: (span) => (
+    cell: (call) => (
       <div className="min-w-0">
-        <p className="truncate text-xs font-medium text-foreground" title={span.name}>
-          {span.name}
+        <p className="truncate text-xs font-medium text-foreground" title={call.provider ?? undefined}>
+          {call.provider || "未知来源"}
         </p>
-        <p className="font-mono text-[10px] text-muted-foreground">{span.component}</p>
+        <p className="truncate font-mono text-[10px] text-muted-foreground">{call.tool || "未知工具"}</p>
       </div>
     ),
   },
-  { key: "status", header: "状态", cell: (span) => <StatusBadge status={span.status} /> },
+  { key: "status", header: "状态", cell: (call) => <StatusBadge status={call.status ?? null} /> },
   {
-    key: "model",
-    header: "模型",
-    mobileHidden: true,
-    cell: (span) => (
-      <span className="font-mono text-[11px] break-all">{formatMetricValue(span.attributes?.model)}</span>
-    ),
-  },
-  {
-    key: "tokens",
-    header: "Token",
+    key: "returned",
+    header: "返回",
     align: "right",
-    cell: (span) => (
-      <span className="tabular text-xs">
-        {formatTokens(
-          typeof span.attributes?.total_tokens === "number" ? span.attributes.total_tokens : null,
-        )}
-      </span>
-    ),
+    cell: (call) => <span className="tabular text-xs">{formatMetricValue(call.returned)}</span>,
   },
   {
     key: "duration",
     header: "耗时",
     align: "right",
-    cell: (span) => <span className="tabular text-xs">{formatDurationMs(span.duration_ms)}</span>,
-  },
-  {
-    key: "error",
-    header: "错误",
-    mobileHidden: true,
-    cell: (span) =>
-      span.error ? (
-        <span className="text-[11px] break-words text-danger-subtle-foreground">{span.error}</span>
-      ) : (
-        <span className="text-[11px] text-muted-foreground">—</span>
-      ),
+    cell: (call) => <span className="tabular text-xs">{formatDurationMs(call.duration_ms)}</span>,
   },
 ];
 
-export function JevCallList({ calls }: { calls: AdminJevCall[] }) {
+const STAGE_LLM_COLUMNS: AdminColumn<AdminStageLlmCall>[] = [
+  {
+    key: "tag",
+    header: "标签",
+    primary: true,
+    cell: (call) => (
+      <span className="block max-w-[14rem] truncate font-mono text-xs text-foreground" title={call.tag ?? undefined}>
+        {call.tag || "未命名"}
+      </span>
+    ),
+  },
+  {
+    key: "model",
+    header: "模型",
+    cell: (call) => (
+      <span className="block max-w-[12rem] truncate font-mono text-[11px] text-muted-foreground" title={call.model ?? undefined}>
+        {missingOr(call.model)}
+      </span>
+    ),
+  },
+  { key: "status", header: "状态", cell: (call) => <StatusBadge status={call.status ?? null} /> },
+  {
+    key: "chars",
+    header: "字符数",
+    align: "right",
+    cell: (call) => <span className="tabular text-xs">{formatNumber(call.chars)}</span>,
+  },
+  {
+    key: "duration",
+    header: "耗时",
+    align: "right",
+    cell: (call) => <span className="tabular text-xs">{formatDurationMs(call.duration_ms)}</span>,
+  },
+];
+
+function progressToStage(stage: AdminStageProgress): AdminStageDetail {
+  return {
+    stage_id: stage.stage_id,
+    title: stage.title,
+    status: stage.status,
+    message: stage.message,
+    started_at: stage.started_at,
+    finished_at: stage.finished_at,
+    duration_ms: durationBetween(stage.started_at, stage.finished_at),
+    steps: [],
+    facts: stage.facts,
+    spans: [],
+    llm_calls: [],
+    tool_calls: [],
+    tokens: null,
+  };
+}
+
+/* ------------------------------ Token ------------------------------ */
+
+function TokenBreakdown({ tokens }: { tokens: AdminStageTokens | AdminRunDetail["metrics"] | null | undefined }) {
+  const rows = [
+    { key: "input", label: "输入 Token", value: tokens?.input_tokens },
+    { key: "output", label: "输出 Token", value: tokens?.output_tokens },
+    { key: "cached", label: "命中缓存 Token", value: tokens?.cached_tokens },
+    { key: "total", label: "总 Token", value: tokens?.total_tokens },
+  ];
+  const allMissing = rows.every((row) => row.value === null || row.value === undefined);
+  if (allMissing) {
+    return (
+      <SectionEmpty
+        title="未知（后端未返回 usage）"
+        description="这次运行没有记录 Token 用量。Benchmark 用例运行使用假模型，通常就没有 usage。"
+      />
+    );
+  }
+  return (
+    <dl className="grid gap-x-5 gap-y-2 sm:grid-cols-2 lg:grid-cols-3">
+      {rows.map((row) => (
+        <div key={row.key} className="flex items-baseline justify-between gap-3 border-b border-border/60 pb-1.5">
+          <dt className="text-xs text-muted-foreground">{row.label}</dt>
+          <dd className="tabular text-right text-xs font-medium text-foreground">
+            {formatTokenCount(row.value)}
+          </dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+/* ------------------------------ LLM / Jev ------------------------------ */
+
+function LlmCallList({ calls }: { calls: AdminLlmCall[] }) {
+  const [selected, setSelected] = useState<AdminLlmCall | null>(null);
+  if (calls.length === 0) {
+    return (
+      <SectionEmpty
+        title="这次运行没有 LLM 调用"
+        description="可能本次规划没有触发模型调用（例如全部命中缓存），或者 Trace 里没有 component=llm 的 span。"
+      />
+    );
+  }
+  return (
+    <>
+      <ul className="flex flex-col gap-2">
+        {calls.map((call, index) => (
+          <li key={`${call.tag}-${index}`}>
+            <button
+              type="button"
+              onClick={() => setSelected(call)}
+              className="flex w-full min-w-0 items-center gap-2 rounded-lg border border-border px-2.5 py-2 text-left hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+            >
+              <span className="min-w-0 flex-1 truncate font-mono text-xs text-foreground" title={call.tag}>
+                {call.tag || "未命名"}
+              </span>
+              <StatusBadge status={call.status ?? null} />
+              <span className="tabular shrink-0 text-[11px] text-muted-foreground">
+                {formatDurationMs(call.duration_ms)}
+              </span>
+              <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+            </button>
+          </li>
+        ))}
+      </ul>
+
+      <AdminDetailDialog
+        open={selected !== null}
+        onOpenChange={(open) => (open ? null : setSelected(null))}
+        title={selected?.tag || "LLM 调用"}
+        badge={<StatusBadge status={selected?.status ?? null} />}
+      >
+        {selected ? (
+          <KeyValueList
+            entries={[
+              { key: "tag", label: "标签", value: <span className="font-mono">{missingOr(selected.tag)}</span> },
+              { key: "model", label: "模型", value: <span className="font-mono">{missingOr(selected.model)}</span> },
+              { key: "status", label: "状态", value: <StatusBadge status={selected.status ?? null} /> },
+              { key: "duration", label: "耗时", value: formatDurationMs(selected.duration_ms) },
+              { key: "chars", label: "字符数", value: formatNumber(selected.chars) },
+              {
+                key: "started",
+                label: "开始时间",
+                value: <span className="font-mono">{formatDateTime(selected.started_at)}</span>,
+              },
+              { key: "error", label: "错误", value: <ErrorText value={selected.error} /> },
+            ]}
+          />
+        ) : null}
+      </AdminDetailDialog>
+    </>
+  );
+}
+
+function JevCallList({ calls }: { calls: AdminJevCall[] }) {
+  const [selected, setSelected] = useState<AdminJevCall | null>(null);
   if (calls.length === 0) {
     return (
       <SectionEmpty
@@ -369,49 +816,72 @@ export function JevCallList({ calls }: { calls: AdminJevCall[] }) {
     );
   }
   return (
-    <ul className="flex flex-col gap-2.5">
-      {calls.map((call, index) => (
-        <li key={`${call.tag}-${index}`} className="rounded-lg border border-border p-2.5">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
-              {call.tag}
-            </span>
-            <span className="text-xs font-medium text-foreground">{call.decision_type}</span>
-            <StatusBadge status={call.status} />
-            {call.fallback ? <ToneBadge tone="warning">已 fallback</ToneBadge> : null}
-            <span className="tabular ml-auto text-[11px] text-muted-foreground">
-              {formatLatency(call.latency_ms)}
-            </span>
-          </div>
-          <DescriptionList
-            className="mt-2"
-            items={[
-              { label: "模型", value: call.model ?? "—" },
+    <>
+      <ul className="flex flex-col gap-2">
+        {calls.map((call, index) => (
+          <li key={`${call.tag}-${index}`}>
+            <button
+              type="button"
+              onClick={() => setSelected(call)}
+              className="flex w-full min-w-0 flex-wrap items-center gap-2 rounded-lg border border-border px-2.5 py-2 text-left hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+            >
+              <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                {call.tag}
+              </span>
+              <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground">
+                {missingOr(call.decision_type)}
+              </span>
+              <StatusBadge status={call.status ?? null} />
+              {call.fallback ? <ToneBadge tone="warning">已 fallback</ToneBadge> : null}
+              <span className="tabular shrink-0 text-[11px] text-muted-foreground">
+                {formatLatency(call.latency_ms)}
+              </span>
+              <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+            </button>
+          </li>
+        ))}
+      </ul>
+
+      <AdminDetailDialog
+        open={selected !== null}
+        onOpenChange={(open) => (open ? null : setSelected(null))}
+        title={selected?.decision_type ? `${selected.decision_type}` : "Jev 调用"}
+        description={selected?.tag}
+        badge={selected ? <StatusBadge status={selected.status ?? null} /> : undefined}
+      >
+        {selected ? (
+          <KeyValueList
+            entries={[
+              { key: "tag", label: "标签", value: <span className="font-mono">{missingOr(selected.tag)}</span> },
+              { key: "type", label: "决策类型", value: missingOr(selected.decision_type) },
+              { key: "status", label: "状态", value: <StatusBadge status={selected.status ?? null} /> },
+              { key: "model", label: "模型", value: <span className="font-mono">{missingOr(selected.model)}</span> },
+              { key: "choice", label: "输出选择", value: missingOr(selected.choice) },
+              { key: "confidence", label: "置信度", value: formatConfidence(selected.confidence) },
+              { key: "latency", label: "时延", value: formatLatency(selected.latency_ms) },
               {
-                label: "输出选择",
-                value: call.choice ?? "—",
+                key: "fallback",
+                label: "fallback",
+                value: selected.fallback ? <ToneBadge tone="warning">已触发</ToneBadge> : "未触发",
               },
               {
-                label: "置信度",
-                value:
-                  call.confidence === null || call.confidence === undefined
-                    ? "—"
-                    : formatRatio(call.confidence),
-              },
-              { label: "输入摘要", value: call.input_summary ?? "—" },
-              { label: "判定标准", value: formatMetricValue(call.criteria) },
-              { label: "配额", value: formatMetricValue(call.quota) },
-              {
+                key: "fallback_reason",
                 label: "fallback 原因",
-                value: call.fallback ? call.fallback_reason ?? "后端未给出原因" : "未触发",
+                value: missingOr(selected.fallback_reason),
               },
+              { key: "quota", label: "配额", value: missingOr(formatMetricValue(selected.quota)) },
+              { key: "input_summary", label: "输入摘要", value: missingOr(selected.input_summary) },
+              { key: "criteria", label: "判定标准", value: missingOr(formatMetricValue(selected.criteria)) },
+              { key: "error", label: "错误", value: <ErrorText value={selected.error} /> },
             ]}
           />
-        </li>
-      ))}
-    </ul>
+        ) : null}
+      </AdminDetailDialog>
+    </>
   );
 }
+
+/* ------------------------------ Provider / 决策 / BadCase ------------------------------ */
 
 const PROVIDER_COLUMNS: AdminColumn<AdminProviderCall>[] = [
   {
@@ -456,7 +926,7 @@ const PROVIDER_COLUMNS: AdminColumn<AdminProviderCall>[] = [
     mobileHidden: true,
     cell: (call) => (
       <span className="font-mono text-[11px] whitespace-nowrap text-muted-foreground">
-        {call.fetched_at ?? "—"}
+        {formatDateTime(call.fetched_at)}
       </span>
     ),
   },
@@ -519,8 +989,8 @@ function DecisionList({ decisions }: { decisions: AdminDecision[] }) {
   );
 }
 
-function BadcaseList({ badcases }: { badcases: AdminBadcase[] }) {
-  const [openId, setOpenId] = useState<string | null>(null);
+function RunBadcaseList({ badcases }: { badcases: AdminBadcase[] }) {
+  const [selected, setSelected] = useState<AdminBadcase | null>(null);
 
   if (badcases.length === 0) {
     return (
@@ -536,44 +1006,163 @@ function BadcaseList({ badcases }: { badcases: AdminBadcase[] }) {
     );
   }
   return (
-    <ul className="flex flex-col gap-2.5">
-      {badcases.map((badcase) => {
-        const expanded = openId === badcase.badcase_id;
-        return (
-          <li key={badcase.badcase_id} className="rounded-lg border border-border p-2.5">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-xs font-medium text-foreground">{badcase.category}</span>
+    <>
+      <ul className="flex flex-col gap-2">
+        {badcases.map((badcase) => (
+          <li key={badcase.badcase_id}>
+            <button
+              type="button"
+              onClick={() => setSelected(badcase)}
+              className="flex w-full min-w-0 flex-wrap items-center gap-2 rounded-lg border border-border px-2.5 py-2 text-left hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+            >
+              <span className="shrink-0 text-xs font-medium text-foreground">
+                {badcaseCategoryLabel(badcase.category)}
+              </span>
+              <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+                {cleanBadcaseSymptom(badcase.symptom, badcase.category)}
+              </span>
               <StatusBadge status={badcase.severity} />
               <StatusBadge status={badcase.analysis_status} />
-              <StatusBadge status={badcase.fixed_status} />
-              <StatusBadge status={badcase.detected_by} />
-              <Button
-                variant="ghost"
-                size="xs"
-                className="ml-auto"
-                onClick={() => setOpenId(expanded ? null : badcase.badcase_id)}
-              >
-                {expanded ? "收起" : "展开"}
-              </Button>
-            </div>
-            <p className="mt-1.5 text-xs leading-5 break-words text-muted-foreground">{badcase.symptom}</p>
-            {expanded ? (
-              <DescriptionList
-                className="mt-2"
-                items={[
-                  { label: "期望", value: badcase.expected || "—" },
-                  { label: "实际", value: badcase.actual || "—" },
-                  { label: "疑似根因", value: badcase.suspected_root_cause || "—" },
-                  { label: "根因状态", value: statusLabel(badcase.root_cause_status) },
-                  { label: "Trace 引用", value: badcase.trace_refs.join("、") || "—" },
-                  { label: "引入版本", value: badcase.introduced_in ?? "—" },
-                  { label: "修复版本", value: badcase.fixed_in ?? "—" },
-                ]}
-              />
-            ) : null}
+              <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+            </button>
           </li>
-        );
-      })}
-    </ul>
+        ))}
+      </ul>
+
+      <AdminDetailDialog
+        open={selected !== null}
+        onOpenChange={(open) => (open ? null : setSelected(null))}
+        title={selected ? badcaseCategoryLabel(selected.category) : "问题案例"}
+        description={selected?.badcase_id}
+        badge={selected ? <StatusBadge status={selected.severity} /> : undefined}
+        footer={
+          <Button variant="outline" size="sm" nativeButton={false} render={<Link href="/admin/badcases" />}>
+            去问题案例页处理
+          </Button>
+        }
+      >
+        {selected ? (
+          <DescriptionList
+            items={[
+              { label: "症状", value: cleanBadcaseSymptom(selected.symptom, selected.category) },
+              { label: "期望", value: selected.expected || "未返回" },
+              { label: "实际", value: selected.actual || "未返回" },
+              { label: "疑似根因", value: selected.suspected_root_cause || "未返回" },
+              { label: "根因状态", value: <StatusBadge status={selected.root_cause_status} /> },
+              { label: "发现方式", value: <StatusBadge status={selected.detected_by} /> },
+              { label: "分析状态", value: <StatusBadge status={selected.analysis_status} /> },
+              { label: "修复状态", value: <StatusBadge status={selected.fixed_status} /> },
+              { label: "引入版本", value: selected.introduced_in || "未返回" },
+              { label: "修复版本", value: selected.fixed_in || "未返回" },
+              { label: "登记时间", value: formatDateTime(selected.created_at) },
+            ]}
+          />
+        ) : null}
+      </AdminDetailDialog>
+    </>
   );
+}
+
+/* ------------------------------ 引导式来源 ------------------------------ */
+
+function UserJourneySection({ data }: { data: AdminRunDetail }) {
+  const journey = data.user_journey;
+  if (!journey) {
+    return (
+      <SectionEmpty
+        title="这次不是引导式创建的"
+        description="后端没有返回 user_journey，说明这次运行来自一句话、命令行或 Benchmark，而不是引导式旅程。"
+      />
+    );
+  }
+  const selections = journey.place_selections;
+  return (
+    <DescriptionList
+      items={[
+        { label: "来源", value: <SourceTag source={journey.source} /> },
+        {
+          label: "来源会话",
+          value: journey.source_session_id ? (
+            <Link
+              href={`/admin/sessions?q=${encodeURIComponent(journey.source_session_id)}`}
+              className="font-mono text-primary underline-offset-4 hover:underline"
+            >
+              {journey.source_session_id}
+            </Link>
+          ) : (
+            "未返回"
+          ),
+        },
+        { label: "交通方式", value: missingOr(journey.transport_mode) },
+        { label: "交通偏好", value: missingOr(journey.transport_priority) },
+        { label: "住宿偏好", value: missingOr(journey.hotel_priority) },
+        { label: "节奏", value: missingOr(journey.pace) },
+        { label: "发现状态", value: missingOr(journey.discovery_status) },
+        {
+          label: "复用预取",
+          value: journey.prefetch_reused === null || journey.prefetch_reused === undefined
+            ? "未返回"
+            : journey.prefetch_reused
+              ? "是"
+              : "否",
+        },
+        { label: "必去", value: selections && selections.must.length > 0 ? selections.must.join("、") : "无" },
+        { label: "想去", value: selections && selections.want.length > 0 ? selections.want.join("、") : "无" },
+        { label: "排除", value: selections && selections.reject.length > 0 ? selections.reject.join("、") : "无" },
+      ]}
+    />
+  );
+}
+
+/* ------------------------------ 工具函数 ------------------------------ */
+
+function ErrorText({ value }: { value: string | null | undefined }) {
+  if (!value) return <span className="text-muted-foreground">未返回</span>;
+  return <span className="font-mono text-[11px] break-words text-danger-subtle-foreground">{value}</span>;
+}
+
+/** null / undefined / 空串统一成「未返回」，避免弹窗里出现空白行。 */
+function missingOr(value: string | null | undefined): string {
+  if (value === null || value === undefined || value.trim().length === 0) return "未返回";
+  return value;
+}
+
+function formatConfidence(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "未返回";
+  return formatRatio(value);
+}
+
+function durationBetween(startedAt: string | null | undefined, finishedAt: string | null | undefined): number | null {
+  if (!startedAt || !finishedAt) return null;
+  const start = Date.parse(startedAt);
+  const end = Date.parse(finishedAt);
+  if (Number.isNaN(start) || Number.isNaN(end) || end < start) return null;
+  return end - start;
+}
+
+/** 契约新增了 llm_calls；旧后端没有时从 trace 兜底派生，避免整块消失。 */
+function deriveLlmCalls(spans: AdminTraceSpan[]): AdminLlmCall[] {
+  const hints = ["llm", "model", "agent", "planner", "critic", "router", "judge", "reason"];
+  const attributeHints = ["model", "input_tokens", "output_tokens", "prompt_tokens", "completion_tokens", "total_tokens"];
+  const calls: AdminLlmCall[] = [];
+  for (const span of spans) {
+    const component = span.component.toLowerCase();
+    const name = span.name.toLowerCase();
+    const attributes = span.attributes ?? {};
+    const hit =
+      hints.some((hint) => component.includes(hint) || name.includes(hint)) ||
+      attributeHints.some((key) => key in attributes);
+    if (!hit) continue;
+    const totalTokens = attributes.total_tokens;
+    calls.push({
+      tag: span.name,
+      model: typeof attributes.model === "string" ? attributes.model : null,
+      status: span.status,
+      duration_ms: span.duration_ms,
+      chars: typeof totalTokens === "number" ? totalTokens : null,
+      error: span.error,
+      started_at: span.started_at,
+    });
+  }
+  return calls;
 }

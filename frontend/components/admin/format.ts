@@ -6,7 +6,7 @@
  * （毫秒、Token、调用次数、比例）。混在一起会让两边都变得难以维护。
  */
 
-import type { AdminRecord } from "@/types/admin";
+import { BADCASE_CATEGORY_LABELS, RUN_SOURCE_LABELS, type AdminRecord } from "@/types/admin";
 
 /** 计数：后端理应给数字；真给了 null 时显示占位符，而不是 "NaN"。 */
 export function formatNumber(value: number | null | undefined, fraction = 0): string {
@@ -233,4 +233,166 @@ export function formatUnknown(value: unknown): string {
 /** 过滤掉值为空的对象，用于「有内容才渲染」的判断。 */
 export function countEntries(record: AdminRecord | null | undefined): number {
   return record ? Object.keys(record).length : 0;
+}
+
+/* ------------------------------ 成本 ------------------------------ */
+
+const CURRENCY_SYMBOLS: Record<string, string> = {
+  CNY: "¥",
+  RMB: "¥",
+  USD: "$",
+  EUR: "€",
+  JPY: "¥",
+};
+
+/** 成本：未知货币时把代码缀在后面，不用猜测符号。 */
+export function formatCostWithCurrency(
+  value: number | null | undefined,
+  currency: string | null | undefined,
+): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "未知";
+  if (value === 0) return "0";
+  const symbol = currency ? CURRENCY_SYMBOLS[currency.toUpperCase()] : undefined;
+  const amount = value.toFixed(value < 0.01 ? 5 : 4);
+  if (symbol) return `${symbol}${amount}`;
+  return currency ? `${amount} ${currency}` : amount;
+}
+
+/** 每百万 token 单价：数值精度到 4 位，未配置时明确写「未配置」。 */
+export function formatUnitPrice(
+  value: number | null | undefined,
+  currency: string | null | undefined,
+): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "未配置";
+  return `${formatCostWithCurrency(value, currency)} / 百万 token`;
+}
+
+/** Token 计数：后端未返回 usage 时显示「未知」，而不是一个孤零零的「—」。 */
+export function formatTokenCount(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "未知";
+  return formatNumber(value);
+}
+
+/** BadCase 分类的中文标签；未登记的分类原样返回，便于对照后端规则名。 */
+export function badcaseCategoryLabel(category: string | null | undefined): string {
+  if (!category) return "未分类";
+  return BADCASE_CATEGORY_LABELS[category] ?? category;
+}
+
+/**
+ * BadCase 症状清洗。
+ * 后端 symptom 常带机器前缀（如 `route_unverified:15 段路线未核实`），
+ * 直接展示会让人读不懂。这里剥掉 ASCII 标识符前缀，保留人话部分；
+ * 剥完为空时回退到分类中文标签。
+ */
+export function cleanBadcaseSymptom(
+  symptom: string | null | undefined,
+  category?: string | null,
+): string {
+  const text = (symptom ?? "").trim();
+  if (!text) return badcaseCategoryLabel(category);
+  const stripped = text.replace(/^[A-Za-z][\w./-]*\s*[:：]\s*/, "").trim();
+  return stripped.length > 0 ? stripped : badcaseCategoryLabel(category);
+}
+
+/** run 来源的中文标签。 */
+export function runSourceLabel(source: string | null | undefined): string {
+  if (!source) return "未知来源";
+  return RUN_SOURCE_LABELS[source] ?? source;
+}
+
+/* ------------------------------ Trace 属性 ------------------------------ */
+
+interface TraceAttributeSpec {
+  label: string;
+  unit?: string;
+  kind?: "count" | "percent" | "money" | "text";
+}
+
+/**
+ * Trace span attributes 的内部中文键 → 友好标签 + 单位。
+ * 为什么需要它：后端把「入选」「候选数」这类内部统计名直接写进 span 属性，
+ * 操作员看到的是一串没有单位、没有说明的机器字段。
+ * 未登记的键原样透传（见 formatTraceAttributeKey），保证新字段不会消失。
+ */
+const TRACE_ATTRIBUTE_SPECS: Record<string, TraceAttributeSpec> = {
+  入选: { label: "入选地点", unit: " 个", kind: "count" },
+  剔除: { label: "剔除地点", unit: " 个", kind: "count" },
+  候选数: { label: "候选方案数", unit: " 个", kind: "count" },
+  数据源调用: { label: "外部调用次数", unit: " 次", kind: "count" },
+  模型调用: { label: "模型调用次数", unit: " 次", kind: "count" },
+  决策数: { label: "决策条数", unit: " 条", kind: "count" },
+  天数: { label: "天数", unit: " 天", kind: "count" },
+  安排数: { label: "安排数", unit: " 项", kind: "count" },
+  问题数: { label: "问题数", unit: " 个", kind: "count" },
+  已修订: { label: "已修订", unit: " 个", kind: "count" },
+  未解决: { label: "未解决", unit: " 个", kind: "count" },
+  门票价格数: { label: "门票价格数", unit: " 条", kind: "count" },
+  规则决策: { label: "规则决策", unit: " 条", kind: "count" },
+  模型决策: { label: "模型决策", unit: " 条", kind: "count" },
+  Jev决策: { label: "Jev 决策", unit: " 条", kind: "count" },
+  BadCase数: { label: "Bad Case 数", unit: " 条", kind: "count" },
+  置信度: { label: "置信度", kind: "percent" },
+  选用: { label: "选用", kind: "text" },
+  选定: { label: "选定", kind: "text" },
+  路线成功: { label: "路线成功", unit: " 段", kind: "count" },
+  路线失败: { label: "路线失败", unit: " 段", kind: "count" },
+  证据条数: { label: "证据条数", unit: " 条", kind: "count" },
+  航班候选: { label: "航班候选", unit: " 个", kind: "count" },
+  火车候选: { label: "火车候选", unit: " 个", kind: "count" },
+  地图候选: { label: "地图候选", unit: " 个", kind: "count" },
+  平台数: { label: "平台数", unit: " 个", kind: "count" },
+  去重后: { label: "去重后", unit: " 个", kind: "count" },
+  有证据: { label: "有证据", unit: " 项", kind: "count" },
+  真实花费: { label: "真实花费", kind: "money" },
+  估算花费: { label: "估算花费", kind: "money" },
+  高德状态: { label: "高德状态", kind: "text" },
+  数据源状态: { label: "数据源状态", kind: "text" },
+  状态: { label: "状态", kind: "text" },
+  决策: { label: "决策", kind: "text" },
+};
+
+/** 未登记的键原样返回；登记过的换成友好标签。 */
+export function formatTraceAttributeKey(key: string): string {
+  return TRACE_ATTRIBUTE_SPECS[key]?.label ?? key;
+}
+
+const TRACE_VALUE_MAX = 160;
+
+function truncateText(text: string): string {
+  return text.length > TRACE_VALUE_MAX ? `${text.slice(0, TRACE_VALUE_MAX)}…` : text;
+}
+
+/**
+ * Trace 属性值：计数加千分位与单位，置信度按比例，花费带货币符号，
+ * 长文本 / 长数组截断。未知键走 formatMetricValue（也带千分位）。
+ */
+export function formatTraceAttributeValue(key: string, value: unknown): string {
+  const spec = TRACE_ATTRIBUTE_SPECS[key];
+  if (!spec) return formatMetricValue(value);
+  if (value === null || value === undefined) return "未返回";
+
+  if (spec.kind === "count" || spec.kind === "money") {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      if (spec.kind === "money") return `¥${formatNumber(value, 2)}`;
+      return `${formatNumber(value)}${spec.unit ?? ""}`;
+    }
+    return truncateText(formatMetricValue(value));
+  }
+
+  if (spec.kind === "percent") {
+    if (typeof value === "number" && Number.isFinite(value)) return formatRatio(value);
+    return truncateText(formatMetricValue(value));
+  }
+
+  return truncateText(formatMetricValue(value));
+}
+
+/** 完整属性的 pretty JSON，用于 Trace / 明细弹窗。 */
+export function prettyJson(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
 }

@@ -13,6 +13,7 @@ import { BooleanBadge, StatusBadge } from "@/components/admin/status-badge";
 import { formatMetricKey, formatMetricValue, formatNumber } from "@/components/admin/format";
 import { useAdminResource } from "@/components/admin/use-admin-resource";
 import { getAdminBenchmarkRun } from "@/lib/admin-api";
+import { formatDateTime } from "@/lib/format";
 import {
   BENCHMARK_DIMENSIONS,
   BENCHMARK_SUITES,
@@ -196,7 +197,7 @@ function BenchmarkDetailBody({ data }: { data: AdminBenchmarkDetail }) {
       <CollapsibleSection
         title="原始运行指标"
         description="run.metrics 的原始键值（未分组）"
-        count={Object.keys(run.metrics).length}
+        count={Object.keys(run.metrics ?? {}).length}
       >
         <MetricList metrics={run.metrics} />
       </CollapsibleSection>
@@ -205,8 +206,8 @@ function BenchmarkDetailBody({ data }: { data: AdminBenchmarkDetail }) {
 }
 
 function CaseResultCard({ result }: { result: AdminBenchmarkCaseResult }) {
-  const metricsCount = Object.keys(result.metrics).length;
-  const detailCount = Object.keys(result.detail).length;
+  const metricsCount = Object.keys(result.metrics ?? {}).length;
+  const detailCount = Object.keys(result.detail ?? {}).length;
   return (
     <li className="rounded-lg border border-border p-2.5">
       <div className="flex flex-wrap items-center gap-2">
@@ -235,15 +236,20 @@ interface BaselineRow {
 }
 
 function buildBaselineRows(baseline: AdminBenchmarkBaseline): BaselineRow[] {
+  // 后端历史上返回过扁平对象（没有 off / on / delta_pct 分组），
+  // 因此这里对每个分组都做 `?? {}` 兜底：缺一段就退化成空表，而不是整页崩溃。
+  const off = baseline.off ?? {};
+  const on = baseline.on ?? {};
+  const delta = baseline.delta_pct ?? {};
   const keys = new Set<string>();
-  for (const key of Object.keys(baseline.off)) keys.add(key);
-  for (const key of Object.keys(baseline.on)) keys.add(key);
-  for (const key of Object.keys(baseline.delta_pct)) keys.add(key);
+  for (const key of Object.keys(off)) keys.add(key);
+  for (const key of Object.keys(on)) keys.add(key);
+  for (const key of Object.keys(delta)) keys.add(key);
   return [...keys].map((key) => ({
     key,
-    off: baseline.off[key],
-    on: baseline.on[key],
-    delta: baseline.delta_pct[key],
+    off: off[key],
+    on: on[key],
+    delta: delta[key],
   }));
 }
 
@@ -280,12 +286,23 @@ function BaselineCompare({ baseline }: { baseline: AdminBenchmarkBaseline }) {
     return (
       <SectionEmpty
         title="基线对比为空"
-        description="后端返回了 baseline_compare，但三个分组都是空对象，因此没有可对比的指标。"
+        description="后端返回了 baseline_compare，但 off / on / delta_pct 三个分组都没有可对比的指标（也可能是旧版后端返回的扁平对象）。"
+        hint="这不影响页面其余部分；等后端按契约回填三个分组后，这里会自动出现逐项对比。"
       />
     );
   }
   return (
     <div className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-[11px] text-muted-foreground">
+        <span>
+          Jev OFF 生成于：
+          <span className="font-mono text-foreground">{formatDateTime(baseline.off_generated_at)}</span>
+        </span>
+        <span>
+          Jev ON 生成于：
+          <span className="font-mono text-foreground">{formatDateTime(baseline.on_generated_at)}</span>
+        </span>
+      </div>
       <AdminTable columns={BASELINE_COLUMNS} rows={rows} getRowKey={(row) => row.key} />
       <p className="text-[11px] leading-4 text-muted-foreground">
         变化值直接来自后端的 delta_pct，管理台不做方向判断：耗时与错误的上升是坏消息，通过率的上升是好消息，

@@ -65,7 +65,7 @@ export default async function PlanPage({ params }: PageProps<"/plan/[id]">) {
         <span className="flex min-w-0 items-center gap-2 text-[11px] text-muted-foreground">
           {progress ? <RunStatusBadge status={progress.status} className="shrink-0" /> : null}
           <span className="truncate">
-            {API_MODE === "mock" ? "演示数据模式" : "已连接规划服务"} · run_id {id}
+            {API_MODE === "mock" ? "演示数据模式" : "真实查询结果"} · 行程编号 {id}
           </span>
         </span>
       </div>
@@ -75,9 +75,9 @@ export default async function PlanPage({ params }: PageProps<"/plan/[id]">) {
       {progress?.status === "FAILED" ? (
         <div className="mx-auto max-w-2xl space-y-4">
           <ErrorState
-            title="这次规划在生成过程中失败"
-            description={progress.error ?? progress.message ?? "后端没有给出具体原因，可以重新发起一次规划。"}
-            detail={`run_id：${id}`}
+            title="这次没有生成行程"
+            description="规划在生成过程中中断，本次没有产出可用行程。可以重新发起一次规划。"
+            detail={progress.message ?? undefined}
           />
           <BackHomeLink />
         </div>
@@ -91,9 +91,9 @@ export default async function PlanPage({ params }: PageProps<"/plan/[id]">) {
               这次规划已被取消
             </div>
             <p className="mt-2 max-w-prose text-xs leading-5 text-muted-foreground">
-              {progress.message ?? "后端终止了这个 run，通常是服务重启或任务被手动取消。本次没有产出可用行程。"}
+              {progress.message ?? "任务在完成前被终止，通常是服务重启或手动停止。本次没有产出可用行程。"}
             </p>
-            <p className="mt-1.5 text-[11px] leading-5 text-muted-foreground/80">run_id：{id}</p>
+            <p className="mt-1.5 text-[11px] leading-5 text-muted-foreground/80">行程编号：{id}</p>
           </div>
           <BackHomeLink />
         </div>
@@ -103,8 +103,8 @@ export default async function PlanPage({ params }: PageProps<"/plan/[id]">) {
         <div className="space-y-5">
           {progress?.status === "DEGRADED" ? (
             <PartialNotice
-              title="这次规划有降级"
-              description={progress.message ?? "部分 Provider 本次只返回了缓存或部分数据，行程仍然可用。"}
+              title="行程已生成，部分信息暂未验证"
+              description={progress.message ?? "部分数据源本次只返回了缓存或部分数据，行程仍然可用。"}
               detail="降级会影响个别价格或通勤时间的准确性，出行前请再次确认。"
             />
           ) : null}
@@ -118,13 +118,13 @@ export default async function PlanPage({ params }: PageProps<"/plan/[id]">) {
             <UnauthorizedState
               title="没有权限打开这个行程"
               description={error ?? "规划服务拒绝了这次请求。"}
-              detail={`run_id：${id}`}
+              detail={`行程编号：${id}`}
             />
           ) : (
             <ErrorState
               title="无法打开这个行程"
               description={error ?? "这个行程编号没有对应的规划结果。"}
-              detail={`run_id：${id}`}
+              detail={`行程编号：${id}`}
             />
           )}
           <BackHomeLink />
