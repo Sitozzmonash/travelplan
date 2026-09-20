@@ -511,9 +511,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         write_baseline=not args.no_baseline,
     )
     metrics = run.get("metrics") or {}
+    live_smoke = metrics.get("live_smoke") or {}
+    live_count = int(live_smoke.get("case_count") or 0)
+    # 确定性例数与 Live 例数必须分开报：只跑 `--suite live_smoke --live` 时确定性例数是 0，
+    # 只打一行 "cases=0 passed=0" 会让人以为什么都没跑（实际跑了一条 8 分钟的真实链路）。
     print(
         f"[benchmark] {run['benchmark_run_id']} status={run['status']} "
-        f"cases={run.get('case_count')} passed={run.get('passed')} failed={run.get('failed')}"
+        f"确定性 {run.get('case_count')} 例（通过 {run.get('passed')}，失败 {run.get('failed')}）"
+        + (
+            f"｜Live Smoke {live_count} 例（通过 {live_smoke.get('passed')}，失败 {live_smoke.get('failed')}）"
+            if live_count
+            else ""
+        )
     )
     for dimension, values in (metrics.get("groups") or {}).items():
         shown = "，".join(
@@ -526,8 +535,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"  Jev OFF→ON: quality_delta={baseline.get('quality_delta_with_jev')} "
             f"latency_delta_ms={baseline.get('latency_delta_with_jev')}"
         )
+    if metrics.get("skipped"):
+        print(f"  跳过（需要 Jev，本轮 Jev 关闭）：{'、'.join(metrics['skipped'])}")
     print(f"[benchmark] 生产库默认位置（本次未写入）：{default_db_path()}  env={os.environ.get('TRAVELPLAN_DB_PATH') or '(未设置)'}")
-    return 0 if not run.get("failed") else 1
+    failures = int(run.get("failed") or 0) + int(live_smoke.get("failed") or 0)
+    return 0 if not failures else 1
 
 
 if __name__ == "__main__":  # pragma: no cover —— CLI 入口
