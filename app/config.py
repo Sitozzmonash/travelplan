@@ -140,6 +140,10 @@ class TravelPlanConfig:
     #: 抽取类（extract_places）：输入已截断，但**一批里有多篇** —— 预算要按整批给，
     #: 不能按单篇给。按单篇给（75s）在 4 篇一批时会偶发打满，一次超时就丢掉整批地点。
     llm_timeout_extract_seconds: float = 120.0
+    #: 批抽取超时后的**单篇重试**预算。批内各篇本来是互相独立的，一批超时不代表每篇都失败，
+    #: 所以批失败时按单篇重试一次，把"一次慢调用损失 2 篇"降级成"每篇各自决定成败"。
+    #: 给得紧（45s）是有意的：重试是为了**救回证据**，不是为了无限延长等待。
+    llm_timeout_extract_retry_seconds: float = 45.0
     #: 批评类（critic）：规则批评已经先跑过，模型批评等不到就降级，不拖垮整次 run
     llm_timeout_critic_seconds: float = 90.0
     #: 成文类（final_answer）：用户直接读的正文，留足
@@ -320,6 +324,10 @@ class TravelPlanConfig:
                 "LLM_TIMEOUT_EXTRACT_SECONDS", defaults.llm_timeout_extract_seconds
             )
             or defaults.llm_timeout_extract_seconds,
+            llm_timeout_extract_retry_seconds=decimal(
+                "LLM_TIMEOUT_EXTRACT_RETRY_SECONDS", defaults.llm_timeout_extract_retry_seconds
+            )
+            or defaults.llm_timeout_extract_retry_seconds,
             llm_timeout_critic_seconds=decimal(
                 "LLM_TIMEOUT_CRITIC_SECONDS", defaults.llm_timeout_critic_seconds
             )
@@ -458,6 +466,7 @@ EDITABLE_KEYS: dict[str, tuple[str, float | None, float | None]] = {
     "TICKET_TIMEOUT_SECONDS": ("float", 2.0, 300.0),
     "LLM_TIMEOUT_SECONDS": ("float", 5.0, 600.0),
     "LLM_TIMEOUT_EXTRACT_SECONDS": ("float", 5.0, 600.0),
+    "LLM_TIMEOUT_EXTRACT_RETRY_SECONDS": ("float", 5.0, 600.0),
     "LLM_TIMEOUT_CRITIC_SECONDS": ("float", 5.0, 600.0),
     "LLM_TIMEOUT_FINAL_SECONDS": ("float", 5.0, 600.0),
     # 抽取与攻略规模
@@ -614,6 +623,7 @@ def llm_timeout_for_tag(tag: str, config: TravelPlanConfig | None = None) -> flo
     prefix = base.split(":", 1)[0]
     field = {
         "extract_places": "llm_timeout_extract_seconds",
+        "extract_places_retry": "llm_timeout_extract_retry_seconds",
         "critic": "llm_timeout_critic_seconds",
         "final_answer": "llm_timeout_final_seconds",
     }.get(prefix)
@@ -647,6 +657,7 @@ PERFORMANCE_CONFIG_KEYS: tuple[str, ...] = (
     "ticket_timeout_seconds",
     "llm_timeout_seconds",
     "llm_timeout_extract_seconds",
+    "llm_timeout_extract_retry_seconds",
     "llm_timeout_critic_seconds",
     "llm_timeout_final_seconds",
     "extract_evidence_limit",

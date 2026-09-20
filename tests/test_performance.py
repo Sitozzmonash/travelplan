@@ -244,3 +244,102 @@ class TestDigestNarrowingKeepsJsonValid:
         assert _apply_narrowing(original, 0) is original
         assert "days_dropped" not in original
 
+
+
+class TestBatchedExtractionRetry:
+    """批抽取超时后必须按单篇重试，而不是让一次慢调用带走整批证据。
+
+    这是实测撞到的：4 篇一批时整批在 120s 预算上打满，4 条证据的地点一起丢。
+    批内各篇本来是互相独立的，所以"整批失败"不该等于"每篇都失败"。
+    """
+
+    class _SlowBatchLLM:
+        """整批（多条证据）必超时，单篇必成功：模拟"模型只是慢，不是不会抽"。"""
+
+        def __init__(self) -> None:
+            self.tags: list[str] = []
+
+        def invoke_json(self, system: str, user: str, *, tag: str = ""):
+            from app.llm import LLMResult
+
+            self.tags.append(tag)
+            ids = [
+                line.split("：", 1)[1].strip()
+                for line in user.splitlines()
+                if line.startswith("### 证据 id：") and line.split("：", 1)[1].strip()
+            ]
+            if len(ids) > 1:
+                return LLMResult(status="TIMEOUT", tag=tag, error="整批太慢", duration_ms=1)
+            return LLMResult(
+                status="OK",
+                tag=tag,
+                duration_ms=1,
+                value={
+                    "results": [
+                        {"evidence_id": item_id, "places": [{"name": f"{item_id} 抽出的地点"}]}
+                        for item_id in ids
+                    ]
+                },
+            )
+
+    @staticmethod
+    def _evidence(item_id: str):
+        from app.models import Evidence
+
+        return Evidence(
+            id=item_id,
+            provider="xhs",
+            source_type="social",
+            title=f"{item_id} 标题",
+            text="正文足够长，满足抽取的最小长度要求，用来触发模型抽取这条分支。" * 2,
+        )
+
+    def test_timed_out_batch_is_retried_per_evidence(self) -> None:
+        from app.discovery import extract_places_from_evidences
+
+        llm = self._SlowBatchLLM()
+        items, degradations = extract_places_from_evidences(
+            llm, [self._evidence("e1"), self._evidence("e2")]
+        )
+
+        # 重试生效：两篇各自被抽出来了，而不是整批一起丢
+        assert {item["evidence_id"] for item in items} == {"e1", "e2"}
+        # 重试用的是**单篇**标签（因此拿到更紧的预算），并且留下了降级说明
+        assert any(tag.startswith("extract_places_retry") for tag in llm.tags)
+        assert any("按单篇重试" in note for note in degradations)
+
+    def test_successful_batch_is_not_retried(self) -> None:
+        from app.discovery import extract_places_from_evidences
+        from app.llm import LLMResult
+
+        class _OkLLM:
+            def __init__(self) -> None:
+                self.tags: list[str] = []
+
+            def invoke_json(self, system: str, user: str, *, tag: str = ""):
+                self.tags.append(tag)
+                ids = [
+                    line.split("：", 1)[1].strip()
+                    for line in user.splitlines()
+                    if line.startswith("### 证据 id：") and line.split("：", 1)[1].strip()
+                ]
+                return LLMResult(
+                    status="OK",
+                    tag=tag,
+                    duration_ms=1,
+                    value={
+                        "results": [
+                            {"evidence_id": item_id, "places": [{"name": "一次就抽到"}]}
+                            for item_id in ids
+                        ]
+                    },
+                )
+
+        llm = _OkLLM()
+        items, degradations = extract_places_from_evidences(
+            llm, [self._evidence("e1"), self._evidence("e2")]
+        )
+        assert len(items) == 2
+        assert degradations == []
+        # 没有发出任何重试调用（不重复问模型同一件事）
+        assert not any(tag.startswith("extract_places_retry") for tag in llm.tags)

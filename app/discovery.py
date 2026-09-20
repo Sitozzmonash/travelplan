@@ -467,18 +467,22 @@ def extract_places_from_evidences(
     if not targets:
         return [], []
 
+    extracted: list[dict[str, Any]] = []
+    degradations: list[str] = []
     batch_size = max(1, int(cfg.extract_batch_size))
-    batches: list[tuple[list[str], str]] = []
-    for start in range(0, len(targets), batch_size):
-        chunk = targets[start : start + batch_size]
-        payload = "\n\n".join(
+    single_payload: dict[str, str] = {
+        evidence.id: (
             f"### 证据 id：{evidence.id}\n"
             f"标题：{evidence.title}\n"
             f"来源：{evidence.provider}/{evidence.source_type}\n"
             f"正文：\n{evidence.text[: cfg.extract_text_chars]}"
-            for evidence in chunk
         )
-        batches.append(([evidence.id for evidence in chunk], payload))
+        for evidence in targets
+    }
+    batches: list[tuple[list[str], str]] = []
+    for start in range(0, len(targets), batch_size):
+        chunk = targets[start : start + batch_size]
+        batches.append(([evidence.id for evidence in chunk], "\n\n".join(single_payload[e.id] for e in chunk)))
 
     batch_results = invoke_json_in_batches(
         llm,
@@ -488,8 +492,34 @@ def extract_places_from_evidences(
         max_workers=cfg.llm_max_concurrency,
     )
 
+    # 批超时不该连带丢掉批里**所有**证据：批内各篇本来就是互相独立的。
+    # 所以整批失败且批里不止一篇时，按单篇**重试一次**（预算更紧），把
+    # "一次慢调用损失 2 篇"降级成"最坏情况下每篇各自决定成败"。
+    # 只重试"整批失败"的情形：单篇批失败了重试不会有不同结果。
+    retry_batches = [
+        ([item_id], single_payload[item_id])
+        for ids, response in batch_results
+        if len(ids) > 1 and not (response.ok and isinstance(response.value, dict))
+        for item_id in ids
+    ]
+    if retry_batches:
+        degraded_notes = [
+            f"证据 {'、'.join(ids)} 的批量抽取未成功（{response.status}），已按单篇重试一次"
+            for ids, response in batch_results
+            if len(ids) > 1 and not (response.ok and isinstance(response.value, dict))
+        ]
+        degradations.extend(degraded_notes)
+        batch_results = list(batch_results) + [
+            *invoke_json_in_batches(
+                llm,
+                system=EXTRACT_PLACES_BATCH_PROMPT,
+                batches=retry_batches,
+                tag="extract_places_retry",
+                max_workers=cfg.llm_max_concurrency,
+            )
+        ]
+
     extracted: list[dict[str, Any]] = []
-    degradations: list[str] = []
     known_ids = {evidence.id for evidence in targets}
     # 按**批的定义顺序**消费：并发与批大小都不会改变抽出来的地点顺序。
     for ids, response in batch_results:
