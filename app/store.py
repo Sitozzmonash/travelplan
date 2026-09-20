@@ -582,6 +582,32 @@ class TravelPlanStore:
                 (canonical, "规划已结束", finished_at, finished_at, error, run_id),
             )
 
+    def cancel_orphan_runs(self, *, reason: str) -> list[str]:
+        """把上一个进程遗留的 `RUNNING` run 收敛成 `CANCELLED`，返回被收敛的 run_id。
+
+        为什么必须有：run 执行器是"同进程后台线程"语义。容器被重启（Render 免费层会在
+        512Mi OOM 之后重启）时线程随进程消失，`run_progress.status` 就永远停在 RUNNING，
+        前端会一直轮询 —— 实测一次 OOM 之后积了 3 条这样的 run。
+
+        进程刚启动时不可能有正在跑的 run，所以这里查到的 RUNNING **一定是孤儿**。
+        只动状态、不删数据：Evidence / Trace / 产物都留着，便于排查。
+        """
+
+        finished_at = utcnow().isoformat()
+        with self._connect() as conn:
+            rows = conn.execute("SELECT run_id FROM run_progress WHERE status='RUNNING'").fetchall()
+            run_ids = [str(row["run_id"]) for row in rows]
+            if not run_ids:
+                return []
+            conn.execute(
+                "UPDATE run_progress SET status='CANCELLED', message=?, updated_at=?, finished_at=?, error=?"
+                " WHERE status='RUNNING'",
+                (reason, finished_at, finished_at, reason),
+            )
+            # 兼容旧 API 的小写状态列，两处口径必须一致，否则管理端会自相矛盾。
+            conn.execute("UPDATE runs SET status='cancelled' WHERE status='running'")
+        return run_ids
+
     # ------------------------------------------------------------------
     # 运行状态、Trace 与管理端摘要
     # ------------------------------------------------------------------

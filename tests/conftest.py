@@ -67,6 +67,28 @@ def no_mcp_subprocesses():
         os.environ[DISABLE_MCP_ENV] = saved
 
 
+@pytest.fixture(autouse=True, scope="session")
+def no_orphan_sweep_on_startup():
+    """测试期间不跑"启动收敛孤儿 run"。
+
+    那条逻辑会在 FastAPI 启动事件里把 `run_progress` 里所有 RUNNING 改成 CANCELLED。
+    TestClient 会触发启动事件，而多数用例的 store 是替身（安全），但少数用例
+    （比如验证未配 Token 时 503 的那条）用的是真 `get_store()` —— 它会写到开发库
+    `data/travelplan.db`。测试不该顺手改别人的数据，所以整体关掉；
+    需要验证收敛行为本身的用例自己 delenv 打开。
+    """
+
+    from app.api import SKIP_ORPHAN_SWEEP_ENV
+
+    saved = os.environ.get(SKIP_ORPHAN_SWEEP_ENV)
+    os.environ[SKIP_ORPHAN_SWEEP_ENV] = "1"
+    yield
+    if saved is None:
+        os.environ.pop(SKIP_ORPHAN_SWEEP_ENV, None)
+    else:
+        os.environ[SKIP_ORPHAN_SWEEP_ENV] = saved
+
+
 @pytest.fixture(autouse=True)
 def no_paid_jev_calls(monkeypatch):
     """即使某个用例自己设置了 JEV_API_KEY，也不能让它变成一次真实调用。

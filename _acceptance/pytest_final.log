@@ -1,129 +1,21 @@
 ........................................................................ [  7%]
-........................................................................ [ 15%]
-........................................................................ [ 23%]
-............F........................................................... [ 30%]
-........................................................................ [ 38%]
-........................................................................ [ 46%]
-........................................................................ [ 53%]
-........................................................................ [ 61%]
-........................................................................ [ 69%]
-........................................................................ [ 76%]
-........................................................................ [ 84%]
-........................................................................ [ 92%]
-..........................................................F....F.F...... [ 99%]
-.                                                                        [100%]
-================================== FAILURES ===================================
-__ TestSocialQueryHandoff.test_discovery_records_planned_and_served_queries ___
-
-self = <tests.test_discovery_handoff.TestSocialQueryHandoff object at 0x0000022EF4C073D0>
-tmp_path = WindowsPath('C:/Users/Sito/AppData/Local/Temp/pytest-of-Sito/pytest-529/test_discovery_records_planned0')
-
-        # 一条都没搜过时，需要的就是全部
-        assert PrefetchBundle().missing_social_queries(["成都 攻略"]) == ["成都 攻略"]
-    
-    def test_discovery_records_planned_and_served_queries(self, tmp_path):
-        store = make_store(tmp_path / "t.db")
-        intent, result, hub = _discover_all(store)
-        social = result["social"]
-        assert social.queries, "完成的 Discovery 必须记录它实际使用的检索词"
->       assert social.served_queries, "完成的 Discovery 必须记录真正发起过的检索词"
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-E       AssertionError: assert [] == ['成都 攻略', '成都 美食', '成都 必去']
-E         
-E         Right contains 3 more items, first extra item: '成都 攻略'
-E         Use -v to get more diff
-
-tests\test_discovery_handoff.py:255: AssertionError
-__ TestExecuteTravelRunEndToEnd.test_what_the_workflow_did_with_the_fake_hub __
-
-self = <tests.test_workflow.TestExecuteTravelRunEndToEnd object at 0x0000022EF4F96DD0>
-store = <app.store.TravelPlanStore object at 0x0000022EF8DA9450>
-tmp_path = WindowsPath('C:/Users/Sito/AppData/Local/Temp/pytest-of-Sito/pytest-529/test_what_the_workflow_did_wit0')
-
-    """断言代码"用替身做了什么"，而不是断言"某个网络调用成功了"。"""
-    hub = make_hub(store)
-    
-    result = self._run(store, tmp_path, hub=hub)
-    
-    assert hub.calls.count("search_trains") == 2  # 去程 + 回程
->   assert hub.calls.count("search_flights") == 2
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-E   AssertionError: assert 0 == 2
-E    +  where 0 = <built-in method count of list object at 0x0000022EF8DB7180>('search_trains')
-E    +    where <built-in method count of list object at 0x0000022EF8DB7180> = ['search_flights', 'search_flights', 'search_hotels', 'search_xiaohongshu', 'search_xiaohongshu', 'search_xiaohongshu', ...].count
-E    +      where ['search_flights', 'search_flights', 'search_hotels', 'search_xiaohongshu', 'search_xiaohongshu', 'search_xiaohongshu', ...] = <tests.test_workflow.FakeHub object at 0x0000022EF8CAFB90>.calls
-
-tests\test_workflow.py:1544: AssertionError
-___ TestExecuteTravelRunEndToEnd.test_empty_data_sources_degrade_truthfully ___
-
-self = <tests.test_workflow.TestExecuteTravelRunEndToEnd object at 0x0000022EF4FA0AD0>
-store = <app.store.TravelPlanStore object at 0x0000022EF75C8C10>
-tmp_path = WindowsPath('C:/Users/Sito/AppData/Local/Temp/pytest-of-Sito/pytest-529/test_empty_data_sources_degrad0')
-
-    """数据源全空时：行程照排，但价格必须标成未知，而不是补一个"合理值"。"""
-    empty = FakeHub(store=store, run_id=RUN_ID, pois=_pois(), ticket_price=None)
-    
-    result = self._run(store, tmp_path, hub=empty)
-    
-    assert result.status == STATUS_COMPLETED
-    assert result.plan is not None
-    assert result.plan.transport.selected is None
-    assert result.plan.transport.provider_status["去程火车"] == "EMPTY"
->   assert result.plan.hotel.selected is None
-E   AssertionError: assert 'UNAVAILABLE' == 'EMPTY'
-E     
-E     - EMPTY
-E     + UNAVAILABLE
-
-tests\test_workflow.py:1678: AssertionError
-_ TestExecuteTravelRunEndToEnd.test_an_off_date_outbound_reaches_plan_warnings _
-
-self = <tests.test_workflow.TestExecuteTravelRunEndToEnd object at 0x0000022EF4FA1710>
-store = <app.store.TravelPlanStore object at 0x0000022EF8CFD910>
-tmp_path = WindowsPath('C:/Users/Sito/AppData/Local/Temp/pytest-of-Sito/pytest-529/test_an_off_date_outbound_reac0')
-
-    """完整链路：比选发现日期不符 → state.warnings → plan.warnings。
-    
-    单测只证明 `_off_date_issues` 会造出这条 issue；这里证明它真的走完
-    check_feasibility → plan_payload → plan.warnings，而不是在中间被丢掉。
-    （回归背景：12306 查 10-02 返回 09-30/10-01 的车次，比选只看价格就选中了它。）
-    """
-    hub = make_hub(store)
-    # 去程只剩"早一天发车"这一个候选（航班清空，否则它与日期无关的算法会赢）。
-    hub.trains[("北京", "成都")] = [
-        _train(
-            "D203",
-            price=780.0,
-            duration=450,
-            origin_station="北京西",
-            destination_station="成都东",
-            departure_at=datetime(2026, 9, 30, 8, 0),
-            arrival_at=datetime(2026, 9, 30, 16, 0),
-        )
-    ]
-    hub.flights[("北京", "成都")] = []
-    
-    result = self._run(store, tmp_path, hub=hub)
-    
-    assert result.plan is not None
-    assert result.plan.transport.selected is not None
->   assert result.plan.transport.selected.train_no == "D203"
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-E   AssertionError: assert None is not None
-E    +  where None = TransportPlan(selected=None, alternatives=[], inbound_selected=FlightOption(provider='tuniu', source_id=None, source_u...or_to_door_minutes=None, provider_status={'去程火车': 'UNAVAILABLE', '去程航班': 'EMPTY', '回程火车': 'UNAVAILABLE', '回程航班': 'OK'}).selected
-E    +    where TransportPlan(selected=None, alternatives=[], inbound_selected=FlightOption(provider='tuniu', source_id=None, source_u...or_to_door_minutes=None, provider_status={'去程火车': 'UNAVAILABLE', '去程航班': 'EMPTY', '回程火车': 'UNAVAILABLE', '回程航班': 'OK'}) = TripPlan(run_id='tp-test-run', query='10月1日从北京去成都玩3天，两个人，预算6000，喜欢美食', intent=TripIntent(destination=['成都'], origin='北...d_issues': ['缺少去程交通披露']}, timestamp=datetime.datetime(2026, 9, 20, 15, 13, 51, 302160, tzinfo=datetime.timezone.utc))]).transport
-E    +      where TripPlan(run_id='tp-test-run', query='10月1日从北京去成都玩3天，两个人，预算6000，喜欢美食', intent=TripIntent(destination=['成都'], origin='北...d_issues': ['缺少去程交通披露']}, timestamp=datetime.datetime(2026, 9, 20, 15, 13, 51, 302160, tzinfo=datetime.timezone.utc))]) = RunResult(run_id='tp-test-run', status='completed', plan=TripPlan(run_id='tp-test-run', query='10月1日从北京去成都玩3天，两个人，预算60...可用的大交通候选（12306 UNAVAILABLE / 途牛航班 EMPTY），行程按「无跨城交通」排，首日不受抵达时间约束', '检索词退化为规则组合', '质量门要求重排，但没有第二份候选方案可用；已如实记录，不凭空生成新行程']).plan
-
-tests\test_workflow.py:1726: AssertionError
+........................................................................ [ 14%]
+........................................................................ [ 22%]
+........................................................................ [ 29%]
+........................................................................ [ 37%]
+........................................................................ [ 44%]
+........................................................................ [ 52%]
+........................................................................ [ 59%]
+........................................................................ [ 67%]
+........................................................................ [ 74%]
+........................................................................ [ 82%]
+........................................................................ [ 89%]
+........................................................................ [ 97%]
+............................                                             [100%]
 ============================== warnings summary ===============================
 ..\..\..\miniconda3\Lib\site-packages\starlette\testclient.py:40
   D:\miniconda3\Lib\site-packages\starlette\testclient.py:40: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.
     _PortalFactoryType = typing.Callable[[], typing.ContextManager[anyio.abc.BlockingPortal]]
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-=========================== short test summary info ===========================
-FAILED tests/test_discovery_handoff.py::TestSocialQueryHandoff::test_discovery_records_planned_and_served_queries
-FAILED tests/test_workflow.py::TestExecuteTravelRunEndToEnd::test_what_the_workflow_did_with_the_fake_hub
-FAILED tests/test_workflow.py::TestExecuteTravelRunEndToEnd::test_empty_data_sources_degrade_truthfully
-FAILED tests/test_workflow.py::TestExecuteTravelRunEndToEnd::test_an_off_date_outbound_reaches_plan_warnings
-4 failed, 933 passed, 1 warning in 291.96s (0:04:51)
+964 passed, 1 warning in 230.98s (0:03:50)

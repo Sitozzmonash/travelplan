@@ -1,0 +1,24 @@
+{
+  "origin": "北京",
+  "destination": "成都",
+  "start_date": "2026-10-01",
+  "days": 5,
+  "travelers": 2,
+  "budget_total": 6000.0,
+  "waited_for_discovery": true,
+  "session_id": "ps-20260920-153839-9ff266",
+  "discovery_s": 208.5,
+  "discovery_states": {
+    "discovery_status": "READY"
+  },
+  "place_candidates": 20,
+  "transport_candidates": 35,
+  "hotel_candidates": 8,
+  "run_id": "tp-20260920-234208-8d33af",
+  "run_status": "SUCCESS",
+  "run_message": "规划已结束",
+  "run_error": null,
+  "plan_s": 123.4,
+  "total_s": 331.8,
+  "timed_out": false
+}

@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from typing import Any
+from datetime import date, datetime
+from typing import Any, Mapping
 
 from app.models import TripPlan
 
@@ -565,8 +566,109 @@ def _journey_cases(ctx: BadCaseContext) -> list[dict[str, Any]]:
                 )
             )
 
-    # 7) 引导式的目的地与最终行程不一致（会话被改过、或意图被覆盖）。
+    # 7) 引导式的目的地/日期与最终行程不一致（会话被改过、或意图被覆盖）。
+    #
+    #    这一条与下面第 8 条都是**回归哨兵**：按当前设计它们不该被触发 ——
+    #    基础信息不允许 PATCH（`PATCHABLE_FIELDS` 白名单），Guided 的 intent 也直接由
+    #    会话字段构造、不再经模型解析。留着它们是为了让"哪天有人加了一条能改基础信息的
+    #    路径"立刻变成一条 Bad Case，而不是等人肉发现"拿着成都的攻略排了重庆"。
+    mismatch = _intent_mismatch(journey)
+    if mismatch:
+        cases.append(
+            _case(
+                ctx,
+                category=CATEGORY_GUIDED_INTENT_MISMATCH,
+                severity=SEVERITY_HIGH,
+                symptom=f"guided_intent_mismatch:{'/'.join(item[0] for item in mismatch)}",
+                expected="正式规划用的 intent 必须等于用户在会话里确认过的结构化基础信息",
+                actual="；".join(f"{field}: 确认={before!r} → 实际={after!r}" for field, before, after in mismatch),
+                suspected_root_cause=(
+                    "有人加了一条能改基础信息的路径（例如把 origin/destination/start_date/days 放进可 PATCH 字段），"
+                    "或 Guided 的 intent 又被模型重新解析了一遍"
+                ),
+                trace_refs=[ref],
+            )
+        )
+
+    # 8) 复用的却是**另一次行程**的 Discovery（最容易造成"行程张冠李戴"）。
+    #    比第 7 条更严重：不只是意图不一致，而是真的把别人的数据用上了。
+    stale = _stale_prefetch(journey)
+    if stale:
+        cases.append(
+            _case(
+                ctx,
+                category=CATEGORY_DISCOVERY_STALE,
+                severity=SEVERITY_HIGH,
+                symptom=f"discovery_stale:{'/'.join(item[0] for item in stale)}",
+                expected="复用的 Prefetch 必须属于本次行程（同目的地、同出发日期）",
+                actual="；".join(f"{field}: 预取={before!r} → 本次={after!r}" for field, before, after in stale),
+                suspected_root_cause=(
+                    "Discovery 结果在基础信息变化后没有被判废，仍被正式 run 复用"
+                    "（旧 session 的 prefetch 串到了新行程上）"
+                ),
+                trace_refs=[ref, f"{ctx.run_id}:search_intercity_transport"],
+            )
+        )
+
     return cases
+
+
+#: 要逐字段比对的字段名。会话的 `basic_intent` 与 run 的 `planned_intent` 用同名键，
+#: 所以这里只需要一份名单，不必再维护一张映射表。
+_INTENT_FIELDS = ("destination", "start_date", "days", "travelers")
+
+
+def _intent_mismatch(journey: Mapping[str, Any]) -> list[tuple[str, Any, Any]]:
+    """会话确认的基础信息 vs 本次 run 的意图，逐字段比对（只返回不一致的）。"""
+
+    confirmed = dict(journey.get("confirmed_basic_intent") or {})
+    planned = dict(journey.get("planned_intent") or {})
+    if not confirmed or not planned:
+        return []
+    mismatched: list[tuple[str, Any, Any]] = []
+    for field in _INTENT_FIELDS:
+        before = _normalize_intent_value(confirmed.get(field))
+        after = _normalize_intent_value(planned.get(field))
+        if before != after:
+            mismatched.append((field, confirmed.get(field), planned.get(field)))
+    return mismatched
+
+
+def _stale_prefetch(journey: Mapping[str, Any]) -> list[tuple[str, Any, Any]]:
+    """复用了 Prefetch，而它的目的地/出发日期与本次行程不同 —— 数据张冠李戴。"""
+
+    if not journey.get("prefetch_reused_any"):
+        return []
+    return [
+        (field, before, after)
+        for field, before, after in _intent_mismatch(journey)
+        if field in ("destination", "start_date")
+    ]
+
+
+def _normalize_intent_value(value: Any) -> Any:
+    """把两侧口径拉平再比：日期统一成字符串、数字统一成 int、空值统一成 None。
+
+    不做归一化会怎样：`date(2026,10,1)` 与 `"2026-10-01"`、`2` 与 `"2"` 会被判成不一致，
+    于是哨兵天天误报 —— 误报的哨兵等于没有哨兵。
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    return text
 
 
 def _must_missing_reasons(ctx: BadCaseContext, missing: list[str]) -> str:

@@ -136,16 +136,24 @@ def main() -> int:
     print(f"[t0] session {session_id} 已创建，后台 Discovery 开始")
 
     # ---- 等 Discovery（模拟用户在前端选偏好花掉的时间）----
-    discovery_deadline = time.monotonic() + args.discovery_timeout
     session: dict[str, Any] = {}
-    while True:
+    if not args.wait_discovery:
+        # `--no-wait-discovery` 测的是"用户马上点开始规划"那条路径：此时 Discovery 还在跑，
+        # 正式 run 拿不到 prefetch，必须自己把交通/酒店/攻略/地点全查一遍。
+        # 这个分支以前漏了 —— 轮询循环无条件执行，于是"不等 Discovery"其实一直在等，
+        # 测出来的两条路径是同一个数字（一个静默失效的开关比没有这个开关更糟）。
+        print("[t0.5] --no-wait-discovery：立刻开始规划，不等 Discovery")
         session = client.get(f"/api/v1/planning-sessions/{session_id}").json()
-        if _discovery_done(session):
-            break
-        if time.monotonic() > discovery_deadline:
-            print("[warn] Discovery 超时，按「仍未完成」继续（应退化为补查，不算失败）")
-            break
-        time.sleep(POLL_INTERVAL_S)
+    else:
+        discovery_deadline = time.monotonic() + args.discovery_timeout
+        while True:
+            session = client.get(f"/api/v1/planning-sessions/{session_id}").json()
+            if _discovery_done(session):
+                break
+            if time.monotonic() > discovery_deadline:
+                print("[warn] Discovery 超时，按「仍未完成」继续（应退化为补查，不算失败）")
+                break
+            time.sleep(POLL_INTERVAL_S)
     t1 = time.monotonic()
     states = _discovery_states(session)
     result["discovery_s"] = round(t1 - t0, 1)

@@ -152,3 +152,95 @@ class TestCapsAreConfigDriven:
         # 不要求每个 Provider 都不一样，但绝不能是"所有 Provider 一个值"的偷懒做法：
         # 至少有两个不同的预算，说明它们是分别调过的。
         assert len(set(timeouts.values())) >= 2
+
+
+class TestToolLevelBudgets:
+    """同一个 Provider 下不同 Tool 的预算必须能分别设（门票 vs 拉列表差一个量级）。"""
+
+    def test_ticket_budget_is_tighter_than_the_provider_budget(self) -> None:
+        from app.config import current_config, tool_timeout
+
+        config = current_config()
+        override = tool_timeout("tuniu", "tuniu_search_scenic_tickets")
+        assert override is not None, "门票必须有自己的预算，否则一次挂死就独占整次 run"
+        assert override == config.ticket_timeout_seconds
+        # 它必须**更紧**：共用途牛那份预算就等于没设。
+        assert override < config.tuniu_timeout_seconds
+
+    def test_tools_without_an_override_report_none(self) -> None:
+        from app.config import tool_timeout
+
+        # 返回 None（而不是悄悄回退成 Provider 预算）是有意的：让调用方明确表达
+        # "这次没有 Tool 级覆盖"，避免两处各自回退、把"实际用了哪个值"埋掉。
+        assert tool_timeout("tuniu", "tuniu_search_hotels") is None
+        assert tool_timeout("amap", "search_poi") is None
+
+
+class TestPerTagLlmBudgets:
+    """模型预算按用途收紧，但**绝不能**超过调用方给的硬上限。"""
+
+    def test_tag_budget_tightens_below_the_cap(self) -> None:
+        from app.config import current_config
+        from app.llm import LLM
+
+        llm = LLM(model=None, timeout=600.0)
+        config = current_config()
+        assert llm._budget_for("critic") == config.llm_timeout_critic_seconds
+        # 前缀匹配：`extract_places:<evidence id>` 也要命中 extract_places 那一份预算。
+        assert llm._budget_for("extract_places:ev-3") == config.llm_timeout_extract_seconds
+        # 没归类的 tag 用默认预算。
+        assert llm._budget_for("query_expansion") == config.llm_timeout_seconds
+
+    def test_caller_supplied_cap_always_wins(self) -> None:
+        from app.llm import LLM
+
+        # 10s 是调用方给的硬上限；按用途的预算只能在它之下收紧，不能把它放大。
+        llm = LLM(model=None, timeout=10.0)
+        assert llm._budget_for("critic") == 10.0
+        assert llm._budget_for("final_answer") == 10.0
+
+
+class TestDigestNarrowingKeepsJsonValid:
+    """给模型的 digest 超预算时要**按结构**瘦身，绝不能把 JSON 从中间切断。"""
+
+    @staticmethod
+    def _digest() -> dict:
+        return {
+            "days": [
+                {
+                    "day_index": index,
+                    "items": [
+                        {"id": f"d{index}-i{item}", "reason": "很长的理由" * 40}
+                        for item in range(9)
+                    ],
+                }
+                for index in range(9)
+            ],
+            "budget": {"projected_total": 1.0, "breakdown": {"hotel": 1.0}, "breakdown_price_type": {"hotel": "real"}},
+        }
+
+    def test_narrowing_levels_keep_the_payload_serialisable(self) -> None:
+        import json
+
+        from app.workflow import DIGEST_DAYS, DIGEST_ITEMS_PER_DAY, _apply_narrowing
+
+        for level in (1, 2, 3):
+            narrowed = _apply_narrowing(self._digest(), level)
+            # 每一级都必须仍然是一份合法 JSON（这正是"不按字符切断"的全部意义）。
+            assert json.loads(json.dumps(narrowed, ensure_ascii=False, default=str))
+
+        final = _apply_narrowing(self._digest(), 3)
+        assert len(final["days"]) == DIGEST_DAYS
+        assert final["days_dropped"] == 3
+        assert len(final["days"][0]["items"]) == DIGEST_ITEMS_PER_DAY
+        assert final["days"][0]["items_dropped"] == 5
+        # 明细被裁掉时预算只留汇总，避免"看不见的部分被当成不存在"。
+        assert "breakdown" not in final["budget"]
+
+    def test_level_zero_leaves_the_digest_untouched(self) -> None:
+        from app.workflow import _apply_narrowing
+
+        original = self._digest()
+        assert _apply_narrowing(original, 0) is original
+        assert "days_dropped" not in original
+

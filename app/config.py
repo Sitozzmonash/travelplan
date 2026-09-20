@@ -151,7 +151,10 @@ class TravelPlanConfig:
     #: 单篇攻略送给模型的正文上限（字符）。攻略正文动辄上万字，全量送进去既慢又噪声大。
     extract_text_chars: int = 1200
     #: 一次模型调用合并几篇攻略。批内共享同一份 prompt，把"每篇一次往返"压成"每批一次"。
-    extract_batch_size: int = 4
+    #: 为什么是 2 而不是更大：批越大，一次慢调用牵走的地点越多 —— 实测 4 篇一批时
+    #: 整批在 120s 预算上打满超时，4 条证据的地点一起丢（`extract_places:b0 TIMEOUT`）。
+    #: 批小一半、两批并发，墙钟仍≈最慢那一批，而"一次超时只损失 2 篇"。
+    extract_batch_size: int = 2
     #: 一次 run 最多保留多少条攻略/网页证据
     evidence_max: int = 40
     #: 社媒检索最多用几个 query

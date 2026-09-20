@@ -166,12 +166,18 @@ def fetch_transport_candidates(hub: ProviderHub, intent: TripIntent, *, reason_o
 
     # 四个任务按固定顺序定义，`parallel_map` 保证结果同序 —— 去程火车、去程航班、
     # 回程火车、回程航班。谁先返回不参与任何决策。
+    #
+    # 火车走**对冲**（与正式 run 同一套逻辑）：12306 是主源，但实测单次能打到 90s 预算
+    # 上限（Discovery 里两次超时就是 180s），而它慢的时候途牛往往早就回来了。
+    # 对冲让主源慢时提前采用备胎，而不是"盯到 90s 再串行等途牛" —— 那正是用户在前端
+    # 选偏好时白白多等的那两分钟。
+    hedge = bool(cfg.transport_hedge_enabled)
     tasks: list[Any] = [
-        lambda: hub.search_trains(origin, destination, start),
+        lambda: hub.search_trains(origin, destination, start, hedge=hedge),
         lambda: hub.search_flights(origin, destination, start, travelers=travelers),
     ]
     if has_back:
-        tasks.append(lambda: hub.search_trains(destination, origin, back))
+        tasks.append(lambda: hub.search_trains(destination, origin, back, hedge=hedge))
         tasks.append(lambda: hub.search_flights(destination, origin, back, travelers=travelers))
     outcomes = parallel_map(tasks, max_workers=cfg.provider_max_concurrency, thread_prefix="tp-disc-transport")
 

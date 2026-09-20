@@ -1,0 +1,24 @@
+{
+  "origin": "北京",
+  "destination": "西安",
+  "start_date": "2026-10-01",
+  "days": 3,
+  "travelers": 2,
+  "budget_total": 4500.0,
+  "waited_for_discovery": true,
+  "session_id": "ps-20260920-155313-eb93e5",
+  "discovery_s": 181.6,
+  "discovery_states": {
+    "discovery_status": "PARTIAL"
+  },
+  "place_candidates": 20,
+  "transport_candidates": 80,
+  "hotel_candidates": 8,
+  "run_id": "tp-20260920-235614-943308",
+  "run_status": "DEGRADED",
+  "run_message": "规划完成，但部分能力已降级",
+  "run_error": null,
+  "plan_s": 60.2,
+  "total_s": 241.8,
+  "timed_out": false
+}

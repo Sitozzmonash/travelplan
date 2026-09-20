@@ -457,10 +457,20 @@ def _reuse_result(options: list[Any], model: type, provider: str) -> Any:
     """
 
     items = [option for option in options if isinstance(option, model)]
+    # 数据源一律以**候选自带**的 provider 为准，不用调用方传进来的那一个：
+    # 火车可能来自 12306，也可能是 12306 不可用（或慢到对冲提前提交）后由途牛提供的。
+    # 写死 "12306" 会让审计把途牛的数据说成 12306 的一手数据 —— 这正是"来源必须可回答"
+    # 要防的那类错误。调用方传的值只在候选没带 provider 时兜底。
+    actual_provider = provider
+    for option in items:
+        candidate = coerce_str(getattr(option, "provider", "")).strip()
+        if candidate:
+            actual_provider = candidate
+            break
     return SimpleNamespace(
         status="REUSED" if items else "EMPTY",
         items=items,
-        provider=provider,
+        provider=actual_provider,
         degraded=False,
     )
 
@@ -5016,11 +5026,35 @@ def _user_journey_summary(state: TravelState, plan: TripPlan) -> dict[str, Any]:
         for entry in _provider_call_rows(state.get("hub"))
     }
     # 这些工具一旦出现在本次 run 的账本里，就说明它自己又查了一遍。
+    #
+    # 匹配的是**真实 Tool 名**，而且要把两套命名都列上：Discovery 走插件自带的工具名
+    # （`flight` / `hotel` / `xiaohongshu`），正式 run 走 Hub 的包装名
+    # （`tuniu_search_flights` / `search_xiaohongshu`），火车还多一个 MCP 的
+    # `railway_12306_get-tickets`。上一版这里写的是 `search_trains` 这类 **Hub 方法名**，
+    # 三类名字里一个都匹配不上 —— 后果是"本次真的补查了交通"会被审计写成
+    # "复用了 Discovery"，读的人据此以为预取生效，实际那次 run 白等了一遍 Provider。
+    tools_of_line = {
+        "transport": {
+            "get-tickets",
+            "railway_12306_get-tickets",
+            "tuniu_search_trains",
+            "flight",
+            "tuniu_search_flights",
+        },
+        "hotels": {"hotel", "tuniu_search_hotels"},
+        "social": {
+            "xiaohongshu",
+            "search_xiaohongshu",
+            "search_xhs_via_mediacrawler",
+            "douyin",
+            "search_douyin",
+            "search_douyin_via_mediacrawler",
+            "web_search",
+        },
+        "places": {"search_poi"},
+    }
     self_queried = {
-        "transport": bool({"search_trains", "search_flights"} & ran_itself),
-        "hotels": "search_hotels" in ran_itself,
-        "social": bool({"search_xiaohongshu", "search_douyin", "web_search"} & ran_itself),
-        "places": "search_poi" in ran_itself,
+        key: bool(names & ran_itself) for key, names in tools_of_line.items()
     }
     reused = {
         key: (key in bundle_had and not self_queried[key]) for key in ("transport", "hotels", "social", "places")
@@ -5083,6 +5117,21 @@ def _user_journey_summary(state: TravelState, plan: TripPlan) -> dict[str, Any]:
         "must_missing": selection.must_place_shortfall(
             planned_ids, selections, list(state.get("places") or [])
         ),
+        # 会话确认时的结构化基础信息 vs 本次 run 实际用的 intent。
+        #
+        # 两者**本该永远一致**：Guided 的 intent 直接由会话字段构造（`intent_from_basic`），
+        # 不再经模型解析，而基础信息也不允许 PATCH。所以这两块数据是给 Bad Case 当
+        # **回归哨兵**用的 —— 一旦谁加了一条能改基础信息、或让模型再解析一次 intent 的
+        # 路径，我们不用等人肉发现"拿着成都的攻略排了重庆"。
+        "confirmed_basic_intent": (
+            dict(getattr(bundle, "basic_intent", None) or {}) if bundle is not None else {}
+        ),
+        "planned_intent": {
+            "destination": _destination(intent),
+            "start_date": intent.start_date.isoformat() if intent.start_date else None,
+            "days": intent.days,
+            "travelers": intent.travelers,
+        },
     }
 
 

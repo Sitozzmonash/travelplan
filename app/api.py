@@ -20,8 +20,9 @@ import hmac
 import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,10 +51,47 @@ ARTIFACTS: dict[str, str] = {
 #: 前端开发服务器默认端口。生产部署应改成真实域名。
 DEFAULT_CORS_ORIGINS = ("http://localhost:3000", "http://127.0.0.1:3000")
 
+#: 置为真值时跳过"启动收敛孤儿 run"。测试用它避免在装配期写共享库。
+SKIP_ORPHAN_SWEEP_ENV = "TRAVELPLAN_SKIP_ORPHAN_SWEEP"
+
+#: 进程被重启（Render 免费层会在 512Mi OOM 后重启）时，跑在后台线程里的 run 随进程消失，
+#: 状态就永远停在 RUNNING，前端会一直转圈。启动时收敛一次，前端立刻能看到 CANCELLED
+#: （前端本来就有这个状态的文案："通常是服务重启或任务被手动取消"）。
+ORPHAN_RUN_REASON = "服务重启导致本次运行中断（进程内的 Run 执行器随进程结束），请重新发起规划"
+
+
+def _converge_orphan_runs() -> None:
+    """启动时把上一进程遗留的 RUNNING 收敛成 CANCELLED。"""
+
+    if os.environ.get(SKIP_ORPHAN_SWEEP_ENV, "").strip().lower() in {"1", "true", "yes", "on"}:
+        return
+    try:
+        cancelled = get_store().cancel_orphan_runs(reason=ORPHAN_RUN_REASON)
+    except Exception:  # noqa: BLE001 —— 收敛失败不能拖住服务启动
+        return
+    if cancelled:
+        print(
+            f"[travelplan] 已把上次进程遗留的 {len(cancelled)} 条 RUNNING 收敛为 CANCELLED："
+            f"{', '.join(cancelled[:5])}"
+        )
+
+
+@asynccontextmanager
+async def _lifespan(_app: Any) -> AsyncIterator[None]:
+    """启动期只做一件事：收敛上一进程遗留的孤儿 run。
+
+    用 lifespan 而不是 `@api.on_event`：后者在 FastAPI 里已经废弃，新代码不该再引入。
+    """
+
+    _converge_orphan_runs()
+    yield
+
+
 api = FastAPI(
     title="TravelPlan API",
     version="0.1.0",
     description="中国国内旅行规划 Agent：Evidence First, LLM Second。",
+    lifespan=_lifespan,
 )
 
 
