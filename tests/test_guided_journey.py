@@ -152,6 +152,39 @@ class TestSessionService:
         assert patched["preferences"]["hotel_priority"] == "auto"
         assert patched["preferences"]["pace"] == "auto"
 
+    def test_base_intent_is_immutable_so_discovery_cannot_go_stale(self, store: TravelPlanStore):
+        """基础信息不允许通过 PATCH 改 —— 这是"Discovery 不会串味"的唯一防线。
+
+        改了目的地却复用上一轮 Discovery，就会拿着成都的攻略去排重庆的行程。
+        现在的做法是**结构上不允许**（白名单里没有 origin/destination/start_date/days），
+        所以这个用例锁的是"白名单别被加宽"：一旦有人加进去，这条断言会先炸。
+        需要换目的地时前端重新 POST 一个 session，Discovery 自然重跑。
+        """
+
+        session = sessions.create_session(
+            store, {"origin": "北京", "destination": "成都", "start_date": "2026-10-01", "days": 3}
+        )
+        patched = sessions.patch_session(
+            store,
+            session["session_id"],
+            {
+                "destination": "重庆",
+                "origin": "上海",
+                "days": 10,
+                "start_date": "2027-01-01",
+                "pace": "packed",
+            },
+        )
+        assert patched is not None
+
+        basic = patched["basic_intent"]
+        assert basic["destination"] == "成都"
+        assert basic["origin"] == "北京"
+        assert basic["days"] == 3
+        assert basic["start_date"] == "2026-10-01"
+        # 白名单内的字段照常生效：不是"整个 PATCH 都被拒了"。
+        assert patched["preferences"]["pace"] == "packed"
+
     def test_start_creates_exactly_one_run_and_is_idempotent(self, store: TravelPlanStore):
         session = sessions.create_session(
             store, {"origin": "北京", "destination": "成都", "start_date": "2026-10-01", "days": 5}
