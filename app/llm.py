@@ -23,6 +23,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +68,11 @@ class LLMResult:
     model: str = ""
     tag: str = ""
     duration_ms: int | None = None
+    #: 这次调用的**真实**起止时刻（UTC ISO）。为什么要记：Trace 里的 llm span 是
+    #: finalize 之后统一转录的，如果只有 duration 而没有起始时刻，时间轴会把所有模型
+    #: 调用画在 run 的最末尾 —— 排查"到底是哪个节点在等模型"时完全看不出来。
+    started_at: str | None = None
+    finished_at: str | None = None
     #: 模型侧回报的 token 用量。取不到就是 None —— 宁可让上游不显示，也不填 0 冒充。
     usage: dict[str, Any] | None = None
 
@@ -88,6 +94,8 @@ class LLMResult:
             "model": self.model,
             "status": self.status,
             "duration_ms": self.duration_ms,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
             "error": self.error,
             "chars": len(self.text or ""),
         }
@@ -256,7 +264,12 @@ class LLM:
             EventType.LLM_STARTED,
             {"model": self._model_name, "tag": tag},
         )
+        # 起止时刻在**唯一收口点**盖上：`_invoke` 有 4 个 return 分支，
+        # 逐个分支写时间戳一定会漏一个。
+        started_at = datetime.now(timezone.utc).isoformat()
         result = self._invoke(system, user, tag=tag)
+        result.started_at = started_at
+        result.finished_at = datetime.now(timezone.utc).isoformat()
         self._emit(
             EventType.LLM_FINISHED,
             {

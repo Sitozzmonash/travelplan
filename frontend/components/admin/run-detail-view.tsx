@@ -20,8 +20,14 @@ import { AdminTable, type AdminColumn } from "@/components/admin/admin-table";
 import { CollapsibleSection } from "@/components/admin/collapsible-section";
 import { PageHeader } from "@/components/admin/page-header";
 import { InlineError, ResourceView, SectionEmpty, SectionSkeleton } from "@/components/admin/admin-states";
-import { AdminDetailDialog, KeyValueList } from "@/components/admin/detail-dialog";
+import { AdminDetailDialog, JsonBlock, KeyValueList } from "@/components/admin/detail-dialog";
 import { DescriptionList, MetricList } from "@/components/admin/metric-list";
+import {
+  RunPerformanceSummary,
+  handoffPresentation,
+  readGraceWaitedMs,
+  readHandoffRows,
+} from "@/components/admin/run-performance";
 import { StatCard } from "@/components/admin/stat-card";
 import { SourceTag, StatusBadge, ToneBadge } from "@/components/admin/status-badge";
 import { TraceTree } from "@/components/admin/trace-tree";
@@ -203,6 +209,15 @@ function RunDetailBody({
       </Card>
 
       <CostPanel metrics={metrics} />
+
+      <RunPerformanceSummary
+        metrics={metrics}
+        stages={stageRows}
+        trace={data.trace}
+        llmCalls={llmCalls}
+        jevCalls={data.jev_calls}
+        journey={data.user_journey}
+      />
 
       <Card>
         <CardHeader>
@@ -1065,8 +1080,18 @@ function RunBadcaseList({ badcases }: { badcases: AdminBadcase[] }) {
 
 /* ------------------------------ 引导式来源 ------------------------------ */
 
+/**
+ * 引导式来源 + Discovery 交接。
+ *
+ * 「交接」回答一个具体问题：正式 run 里，交通 / 酒店 / 攻略 / 地点这四条线
+ * 到底是复用了预取（reused）、本次补查了（fallback_query），还是补查后仍然没结果（unavailable）。
+ * 数据优先取 `user_journey.discovery`；后端尚未把该字段接进 API 时，退回 Trace 里的
+ * `discovery_handoff` span（workflow 落库，属性名就是这四条线）。
+ */
 function UserJourneySection({ data }: { data: AdminRunDetail }) {
   const journey = data.user_journey;
+  const [stagesOpen, setStagesOpen] = useState(false);
+
   if (!journey) {
     return (
       <SectionEmpty
@@ -1075,44 +1100,176 @@ function UserJourneySection({ data }: { data: AdminRunDetail }) {
       />
     );
   }
-  const selections = journey.place_selections;
+
+  const handoffRows = readHandoffRows(journey, data.trace);
+  const graceWaitedMs = readGraceWaitedMs(journey, data.trace);
+  const prefetchStages = journey.prefetch_stages ?? null;
+  const prefetchStageEntries = prefetchStages ? Object.entries(prefetchStages) : [];
+
   return (
-    <DescriptionList
-      items={[
-        { label: "来源", value: <SourceTag source={journey.source} /> },
-        {
-          label: "来源会话",
-          value: journey.source_session_id ? (
-            <Link
-              href={`/admin/sessions?q=${encodeURIComponent(journey.source_session_id)}`}
-              className="font-mono text-primary underline-offset-4 hover:underline"
-            >
-              {journey.source_session_id}
-            </Link>
-          ) : (
-            "未返回"
-          ),
-        },
-        { label: "交通方式", value: missingOr(journey.transport_mode) },
-        { label: "交通偏好", value: missingOr(journey.transport_priority) },
-        { label: "住宿偏好", value: missingOr(journey.hotel_priority) },
-        { label: "节奏", value: missingOr(journey.pace) },
-        { label: "发现状态", value: missingOr(journey.discovery_status) },
-        {
-          label: "复用预取",
-          value: journey.prefetch_reused === null || journey.prefetch_reused === undefined
-            ? "未返回"
-            : journey.prefetch_reused
-              ? "是"
-              : "否",
-        },
-        { label: "必去", value: selections && selections.must.length > 0 ? selections.must.join("、") : "无" },
-        { label: "想去", value: selections && selections.want.length > 0 ? selections.want.join("、") : "无" },
-        { label: "排除", value: selections && selections.reject.length > 0 ? selections.reject.join("、") : "无" },
-      ]}
-    />
+    <div className="flex flex-col gap-4">
+      <DescriptionList
+        items={[
+          { label: "来源", value: <SourceTag source={journey.source} /> },
+          {
+            label: "来源会话",
+            value: journey.source_session_id ? (
+              <Link
+                href={`/admin/sessions?q=${encodeURIComponent(journey.source_session_id)}`}
+                className="font-mono text-primary underline-offset-4 hover:underline"
+              >
+                {journey.source_session_id}
+              </Link>
+            ) : (
+              "未返回"
+            ),
+          },
+          { label: "交通方式", value: missingOr(journey.transport_mode) },
+          { label: "交通偏好", value: missingOr(journey.transport_priority) },
+          { label: "住宿偏好", value: missingOr(journey.hotel_priority) },
+          { label: "节奏", value: missingOr(journey.pace) },
+          { label: "发现状态", value: missingOr(journey.discovery_status ?? journey.prefetch_status) },
+          { label: "复用预取", value: prefetchReusedText(journey.prefetch_reused) },
+          { label: "必去", value: formatPlaceCount(journey.place_selections?.must) },
+          { label: "想去", value: formatPlaceCount(journey.place_selections?.want) },
+          { label: "排除", value: formatPlaceCount(journey.place_selections?.reject) },
+        ]}
+      />
+
+      <section className="flex flex-col gap-2">
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <h3 className="text-xs font-medium text-foreground">Discovery 交接</h3>
+          <span className="text-[11px] text-muted-foreground">
+            Discovery 等待：{formatGraceWaited(graceWaitedMs)}
+          </span>
+        </div>
+        {handoffRows === null ? (
+          <p className="text-xs leading-5 text-muted-foreground">
+            后端没有返回每条线的交接结论（user_journey.discovery 与 Trace 的 discovery_handoff 都缺失），
+            无法判断哪些部分复用了预取。
+          </p>
+        ) : (
+          <ul className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            {handoffRows.map((row) => {
+              const presentation = handoffPresentation(row.handoff);
+              return (
+                <li
+                  key={row.key}
+                  className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border px-3 py-2"
+                >
+                  <span className="text-xs font-medium text-foreground">{row.label}</span>
+                  <span title={presentation.description}>
+                    <ToneBadge tone={presentation.tone} className="text-[0.6875rem]">
+                      <span title={row.handoff ?? "未返回"}>{presentation.label}</span>
+                    </ToneBadge>
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+
+        {prefetchStages ? (
+          <div>
+            <Button variant="outline" size="xs" onClick={() => setStagesOpen(true)}>
+              查看预取原始数据
+              <ChevronRight />
+            </Button>
+          </div>
+        ) : (
+          <p className="text-[11px] text-muted-foreground">
+            预取原始数据：后端本次没有返回 prefetch_stages，无法展开各线原始状态。
+          </p>
+        )}
+      </section>
+
+      <AdminDetailDialog
+        open={stagesOpen}
+        onOpenChange={setStagesOpen}
+        title="预取原始数据"
+        description="Discovery 各线原始状态（status / 耗时 / 结果数 / 降级）"
+      >
+        {prefetchStageEntries.length === 0 ? (
+          <p className="text-xs text-muted-foreground">后端没有返回 prefetch_stages。</p>
+        ) : (
+          <ul className="flex flex-col gap-2">
+            {prefetchStageEntries.map(([key, stage]) => (
+              <li key={key} className="flex flex-col gap-1.5 rounded-lg border border-border px-3 py-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs font-medium text-foreground">{stageLabel(key)}</span>
+                  <StatusBadge status={stage?.status ?? null} />
+                  {stage?.degraded ? <ToneBadge tone="warning">已降级</ToneBadge> : null}
+                </div>
+                <dl className="grid grid-cols-1 gap-x-5 gap-y-1 sm:grid-cols-3">
+                  <StageFact label="耗时" value={formatDurationMs(stage?.duration_ms)} />
+                  <StageFact
+                    label="结果数"
+                    value={stage?.result_count === null || stage?.result_count === undefined ? "—" : formatNumber(stage.result_count)}
+                  />
+                  <StageFact label="错误" value={stage?.error ? stage.error : "无"} />
+                </dl>
+              </li>
+            ))}
+          </ul>
+        )}
+        <section className="flex flex-col gap-2">
+          <h3 className="text-xs font-medium text-foreground">原始 JSON</h3>
+          <JsonBlock value={prefetchStages ?? {}} />
+        </section>
+      </AdminDetailDialog>
+    </div>
   );
 }
+
+function StageFact({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-baseline justify-between gap-2 border-b border-border/60 pb-1 sm:border-0 sm:pb-0">
+      <dt className="shrink-0 text-[11px] text-muted-foreground">{label}</dt>
+      <dd className="min-w-0 text-right text-[11px] break-words text-foreground">{value}</dd>
+    </div>
+  );
+}
+
+const STAGE_LABELS: Record<string, string> = {
+  transport: "交通",
+  hotels: "酒店",
+  social: "攻略",
+  places: "地点",
+};
+
+function stageLabel(key: string): string {
+  return STAGE_LABELS[key] ?? key;
+}
+
+/**
+ * 复用预取的文案：旧口径是布尔，新口径是「每条线的布尔」。
+ * 两种都要能读，否则后端一改口径这里就会显示成「是」（对象恒真）。
+ */
+function prefetchReusedText(value: boolean | Record<string, boolean> | null | undefined): string {
+  if (value === null || value === undefined) return "未返回";
+  if (typeof value === "boolean") return value ? "是" : "否";
+  const entries = Object.entries(value);
+  if (entries.length === 0) return "未返回";
+  const reused = entries.filter(([, reusedFlag]) => reusedFlag).length;
+  return `${reused} / ${entries.length} 条线复用（${entries
+    .map(([key, flag]) => `${stageLabel(key)}${flag ? "✓" : "✗"}`)
+    .join("、")}）`;
+}
+
+/** 交接等待：0 表示 Discovery 已经完成，无需等待。 */
+function formatGraceWaited(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "未返回";
+  if (value <= 0) return "无需等待（Discovery 已完成）";
+  return `等待 ${formatDurationMs(value)}`;
+}
+
+/** 用户选择：旧接口给名称数组，新接口给计数。 */
+function formatPlaceCount(value: string[] | number | null | undefined): string {
+  if (value === null || value === undefined) return "无";
+  if (typeof value === "number") return value > 0 ? `${formatNumber(value)} 个` : "无";
+  return value.length > 0 ? value.join("、") : "无";
+}
+
 
 /* ------------------------------ 工具函数 ------------------------------ */
 

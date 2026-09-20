@@ -107,6 +107,9 @@ def test_create_travel_app_hands_the_workflow_to_superharness(monkeypatch: pytes
         captured.update(kwargs)
         return "STUBBED-RUNNER"
 
+    # 全局 conftest 为了不让测试拉起 `npx 12306-mcp` 子进程，默认关掉了 MCP 注册；
+    # 这个用例验证的正是"MCP 清单被原样传给 SuperHarness"，所以在本用例内打开。
+    monkeypatch.delenv("TRAVELPLAN_DISABLE_MCP", raising=False)
     monkeypatch.setattr("app.agent.create_harness_app", fake_create_harness_app)
 
     from app.agent import create_travel_app

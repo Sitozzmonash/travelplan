@@ -27,23 +27,30 @@ import operator
 import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, Callable, Mapping, Sequence, TypedDict
 
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from app import planner, selection
 from app.badcase import BadCaseContext, detect_badcases, summarize as summarize_badcases
-from app.config import current_config, current_tuning
+from app.config import (
+    current_config,
+    current_tuning,
+    performance_config_snapshot,
+    provider_timeouts,
+)
 from app.decision.jev import JevClient
 from app.decision.planner_decision import (
     DECISION_PLAN_CHOICE,
     DECISION_QUALITY_GATE,
     DECISION_TRADEOFF,
+    QualityGate,
     choose_plan,
     quality_gate,
     resolve_tradeoff,
@@ -79,7 +86,25 @@ from app.prompts import (
     INTENT_PARSE_PROMPT,
     RESEARCH_QUERY_EXPANSION_PROMPT,
 )
-from app.observability import SpanKind, now_iso, span_id
+from app.observability import (
+    MARK_CACHE_HIT,
+    MARK_DUPLICATE_QUERY,
+    MARK_FALLBACK_QUERY,
+    MARK_PREFETCH_REUSED,
+    MARK_PROVIDER_CALLED,
+    MARK_PROVIDER_TIMEOUT,
+    MARK_ROUTE_CACHE_HIT,
+    MARK_ROUTE_REQUESTED,
+    MARK_ROUTE_SKIPPED,
+    CallLedger,
+    SpanKind,
+    call_with_deadline,
+    finish_iso,
+    now_iso,
+    query_key,
+    span_id,
+    start_iso,
+)
 from app.providers import ProviderHub, default_mcp_servers, lnglat
 from app.store import TravelPlanStore
 from app.version import travelplan_commit
@@ -102,8 +127,10 @@ STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
 STATUS_NEEDS_CLARIFICATION = "needs_clarification"
 
-#: 一次 run 的抓取预算。全部写成具名常量，是为了让"为什么这次只查了 3 个攻略"
-#: 能在审计里直接回答，而不是散落在代码里的魔数。
+#: 一次 run 的抓取预算。**这些数字现在是 app/config.py 的默认值的历史镜像**：
+#: 实际生效的值一律从 `current_config()` 读（Part D：散落的写死数字要收到 config 里，
+#: 才能通过环境变量 / 管理端在不重启服务的前提下调整）。这里保留同名常量只是为了
+#: 让"默认是多少"在节点代码旁边一眼可见，节点里不再直接使用它们。
 SOCIAL_QUERY_LIMIT = 3
 WEB_QUERY_LIMIT = 2
 MAX_EVIDENCE = 40
@@ -115,6 +142,12 @@ POI_DETAIL_LIMIT = 6
 TICKET_LOOKUP_LIMIT = 3
 MAX_ROUTE_LOOKUPS = 14
 MAX_TRANSPORT_ALTERNATIVES = 4
+
+#: 路线查询的"坐标初筛"阈值（Part D §7）：两点直线距离超过这个值就判定为非相邻路段，
+#: 不做市内路线查询。60km 是"市内交通"与"跨城移动"的分界 —— 一天的行程本来就不该
+#: 出现跨城往返，真出现了也是排程问题，不该拿市内路线预算去掩盖它。
+#: 被跳过的段进 Trace（route_skipped），行程里仍按"未核实"处理，绝不用估算冒充实测。
+ROUTE_MAX_LEG_METERS = 60_000.0
 
 #: 偏好词不能直接当高德检索词："拍照" 在成都搜出来的是摄影工作室、"夜景" 搜出来的是
 #: 灯具店。只保留能搜到**地点**的词，需要换词的走这张映射。
@@ -242,6 +275,11 @@ class TravelState(TypedDict, total=False):
     prefetch: Any
     #: 从 Discovery 过户到本 run 的调用（审计用；已标 reused）
     adopted_calls: list[dict[str, Any]]
+    #: 查询键复用账本（Part C）。**它是一个句柄，不是普通数据**：LangGraph 的 channel
+    #: 只在节点返回同名键时才更新，就地改 `state["ledger"]` 不会传到下一个节点
+    #: （实测：下一个节点看到的还是 None）。所以必须在初始 state 里传入**同一个对象**，
+    #: 各节点只改它内部计数，不替换它 —— 这样"整趟 run 只查一次"与全局计数才成立。
+    ledger: Any
     source: str
     source_session_id: str | None
 
@@ -314,6 +352,95 @@ def _stamp(stage: str, text: str) -> dict[str, Any]:
     return {"at": utcnow().isoformat(), "stage": stage, "text": text}
 
 
+# ==================================================
+# 受控并发（Part A）
+# ==================================================
+# 为什么不是 asyncio：整条链路（ProviderHub / planner / store）都是**同步**的，
+# Provider 调用本身是阻塞 IO。为了并发把它们全改成 async 会波及每一个调用点，
+# 而收益只是"少几个线程"。ThreadPoolExecutor 在这里是投入产出比最高、也最不容易
+# 出错的做法（Discovery 的 prefetch 已经这么做了）。
+#
+# 三条硬规矩：
+#   1. 并发上限**只能**来自 app/config.py，节点里不许自己写死数字；
+#   2. 结果按**任务定义顺序**收集（键是显式 label，不是完成顺序），所以同一份输入
+#      永远得到同一份输出 —— 并发绝不能让行程变得不可复现；
+#   3. 上限=1 时退化成纯串行，测试与"保守部署"都能拿它当开关。
+
+
+def _run_parallel(
+    tasks: Sequence[tuple[str, Callable[[], Any]]],
+    *,
+    limit: int,
+    thread_prefix: str = "tp-parallel",
+) -> dict[str, Any]:
+    """并发执行互不依赖的取数任务，返回 ``{label: 结果}``（**顺序确定**）。
+
+    单个任务抛异常时不吞掉：等所有任务都收完，再抛**任务定义顺序里第一个**异常 ——
+    这等同于串行版本会在哪一步炸，不会因为并发就换一个异常冒出来。异常之前的兄弟任务
+    已经跑完并被丢弃，但它们的调用仍然留在 Provider 账本里（可追溯）。
+    """
+
+    if not tasks:
+        return {}
+    workers = max(1, int(limit or 1))
+    if workers == 1 or len(tasks) == 1:
+        return {label: fn() for label, fn in tasks}
+
+    results: dict[str, Any] = {}
+    failure: BaseException | None = None
+    with ThreadPoolExecutor(
+        max_workers=min(workers, len(tasks)), thread_name_prefix=thread_prefix
+    ) as pool:
+        futures = [(label, pool.submit(fn)) for label, fn in tasks]
+        for label, future in futures:
+            try:
+                results[label] = future.result()
+            except BaseException as exc:  # noqa: BLE001 —— 收完再按顺序抛第一个
+                failure = failure or exc
+                results[label] = None
+    if failure is not None:
+        raise failure
+    return results
+
+
+def _first_bad_status(results: Mapping[str, Any], key: str = "status") -> str:
+    """按任务顺序取第一个非 OK 状态；全 OK（或没有结果）时返回 "OK"。
+
+    为什么不是"最后一个状态"：串行版本记的就是"第一个出问题的那次调用"，
+    并发下必须保持同一个口径，否则降级文案会随线程调度变化。
+    """
+
+    for item in results.values():
+        status = getattr(item, key, None)
+        if status and status != "OK":
+            return str(status)
+    return "OK"
+
+
+def _skip_span(
+    state: TravelState,
+    *,
+    name: str,
+    parent_stage: str,
+    attributes: dict[str, Any],
+) -> None:
+    """记录一条"**因为不需要而跳过**"的 span（Part D：route_skipped / poi_skipped）。
+
+    跳过与失败是两件事：跳过是"这一步本来就不该做"（用户已排除 / 超过 Planner 上限），
+    失败是"做了但没拿到"。混在一起会让"验证覆盖率下降"看起来像 Provider 故障。
+    """
+
+    _record_subspan(
+        state,
+        component=SpanKind.PLANNER,
+        name=name,
+        status="SKIPPED",
+        started_at=now_iso(),
+        attributes=attributes,
+        parent_span_id=f"{state['run_id']}:{parent_stage}",
+    )
+
+
 #: 让 Jev 比较的候选方案数上限。
 #: 给多了摘要变长、判断质量下降（还会挤占它 1.5s 的超时预算），给少了没有比较价值。
 MAX_PLAN_CANDIDATES = 5
@@ -352,6 +479,208 @@ def _reuse_result(options: list[Any], model: type, provider: str) -> Any:
     )
 
 
+# ==================================================
+# 查询键复用账本与 Provider 兜底超时（Part C / E）
+# ==================================================
+
+
+def _ledger(state: TravelState) -> CallLedger:
+    """取本次 run 的查询键账本（没有就现建一个，节点不依赖调用方一定传了）。"""
+
+    ledger = state.get("ledger")
+    if ledger is None:
+        ledger = CallLedger(scope=str(state.get("run_id") or "run"))
+        state["ledger"] = ledger
+    return ledger
+
+
+def _trains_query_key(origin: str, destination: str, day: Any) -> str:
+    """12306 火车查询的键（与 `ProviderHub.search_trains` 的实际参数一一对应）。"""
+
+    return query_key(
+        "12306", "railway_12306_get-tickets",
+        origin=str(origin), destination=str(destination), date=str(day),
+    )
+
+
+def _flights_query_key(origin: str, destination: str, day: Any) -> str:
+    """途牛航班查询的键。"""
+
+    return query_key(
+        "tuniu", "tuniu_search_flights",
+        origin=str(origin), destination=str(destination), date=str(day),
+    )
+
+
+def _hotels_query_key(city: str, check_in: Any, page: int) -> str:
+    """途牛酒店查询的键（翻页也是不同的键，第 1 页与第 3 页不是同一个请求）。"""
+
+    return query_key("tuniu", "tuniu_search_hotels", destination=str(city), date=str(check_in), page=page)
+
+
+def _poi_query_key(keyword: str, region: str, page: int = 1) -> str:
+    return query_key("amap", "search_poi", destination=str(region), query=str(keyword), page=page)
+
+
+def _route_query_key(origin: Sequence[float], destination: Sequence[float], city: str | None) -> str:
+    """路线查询的键：坐标 + 城市 + 模式。"""
+
+    return query_key(
+        "amap", "route",
+        origin=f"{round(float(origin[0]), 4)},{round(float(origin[1]), 4)}",
+        destination=f"{round(float(destination[0]), 4)},{round(float(destination[1]), 4)}",
+        extra={"city": city or ""},
+    )
+
+
+def _route_with_ledger(
+    hub: Any,
+    ledger: CallLedger,
+    key: str,
+    label: str,
+    start: Sequence[float],
+    end: Sequence[float],
+    city: str | None,
+) -> Any:
+    """查一段市内路线，同一个键在一次 run 内只真的打一次高德（Part C）。
+
+    命中复用记 ``route_cache_hit``，真实发起记 ``route_requested``（发起前已记）——
+    管理端因此能直接回答"这几段路线是查出来的还是复用的"。
+    """
+
+    value, reused = ledger.fetch(
+        key,
+        lambda: hub.route(start, end, "transit", city=city),
+        detail=f"路线 {label}",
+    )
+    if reused:
+        ledger.mark(key, MARK_ROUTE_CACHE_HIT, label)
+    return value
+
+
+def _ticket_query_key(scenic_name: str) -> str:
+    return query_key("tuniu", "tuniu_search_scenic_tickets", query=str(scenic_name))
+
+
+def _remember_reused_trains(
+    state: TravelState,
+    ledger: CallLedger,
+    origin: str,
+    destination: str,
+    day: Any,
+    options: Sequence[Any],
+    direction: str,
+) -> None:
+    """登记"这一趟火车查询在 Discovery 已经查过"（Part C 的 prefetch_reused 标记）。
+
+    登记之后，同一个键在本次 run 内再被请求时会命中 cache_hit 而不是再打一次 12306。
+    """
+
+    key = _trains_query_key(origin, destination, day)
+    ledger.remember(
+        key,
+        _reuse_result(list(options), TrainOption, "12306"),
+        marker=MARK_PREFETCH_REUSED,
+        detail=f"{direction} 火车复用 Discovery",
+    )
+
+
+def _remember_reused_flights(
+    state: TravelState,
+    ledger: CallLedger,
+    origin: str,
+    destination: str,
+    day: Any,
+    options: Sequence[Any],
+    direction: str,
+    travelers: int,
+) -> None:
+    """登记"这一趟航班查询在 Discovery 已经查过"。"""
+
+    key = _flights_query_key(origin, destination, day)
+    ledger.remember(key, _reuse_result(list(options), FlightOption, "tuniu"), marker=MARK_PREFETCH_REUSED,
+                    detail=f"{direction} 航班复用 Discovery")
+
+
+def _provider_timeout(provider: str) -> float:
+    """这个 Provider 本次的预算（秒）。Part E：每个 Provider 一份，来自 config。"""
+
+    return float(provider_timeouts().get(provider, 60.0))
+
+
+def _discovery_already_extracted(state: TravelState, bundle: Any) -> bool:
+    """这批证据是不是**已经在 Discovery 阶段抽过地点**了（Part F）。
+
+    两个条件同时成立才算：
+      1. Discovery 的 place_extraction 那条线已经跑完（不是 RUNNING / PENDING）——
+         还在跑的时候它可能只处理了一部分证据，此时复用会丢地点；
+      2. 本次 run 手里的证据就是 Discovery 抓到的那一批（按 evidence id 判定）——
+         正式 run 自己补查过攻略时，那批新正文没有被抽过，必须抽。
+
+    只有两个条件都成立，才是"同一份内容不做第二遍"，可以直接跳过模型调用。
+    """
+
+    if bundle is None:
+        return False
+    stage = dict(getattr(bundle, "discovery", None) or {}).get("places") or {}
+    if str(stage.get("status") or "").upper() in {"", "RUNNING", "PENDING"}:
+        return False
+    reused_ids = {ev.id for ev in (getattr(bundle, "evidences", None) or [])}
+    current_ids = {ev.id for ev in (state.get("evidences") or [])}
+    return bool(current_ids) and current_ids <= reused_ids
+
+
+def _timeout_result(provider: str, tool: str, note: str, status: str = "TIMEOUT") -> Any:
+    """超时/失败时的**空结果**（与 ProviderResult 同形）。
+
+    绝不用估算值或旧数据填充：返回空集 + 一条降级说明，让下游如实降级。
+    """
+
+    return SimpleNamespace(
+        status=status,
+        items=[],
+        provider=provider,
+        error=note,
+        calls=[],
+        degraded=True,
+        tool=tool,
+    )
+
+
+def _bounded_provider_call(
+    state: TravelState,
+    *,
+    provider: str,
+    tool: str,
+    func: Callable[[], Any],
+    timeout: float | None = None,
+    status: str = "TIMEOUT",
+) -> tuple[Any, str]:
+    """给一次阻塞的 Provider 调用加兜底预算，返回 ``(结果, 降级说明)``。
+
+    为什么节点层还要兜一层（ProviderHub 已经按 Provider 配置了超时）：`search_trains`
+    这类**复合**调用内部可能连着打两个源，单看某一个 Provider 的预算盖不住它；
+    而且一旦 Provider 那边没有按预期收敛（SDK 内部超时失效、MCP 子进程僵住），
+    这一层能保证"整趟 run 不会被一个源拖死"。
+
+    超时不会被当成异常抛出，也**不会**产生任何编造的数据：返回空结果 + 一条降级，
+    由调用方走自己的 fallback（换源 / 披露 / 规则估算 + verified=False）。
+    """
+
+    budget = float(timeout if timeout is not None else _provider_timeout(provider))
+    value, timed_out, error = call_with_deadline(func, timeout=budget, label=f"{provider}/{tool}")
+    ledger = _ledger(state)
+    if timed_out:
+        ledger.mark(MARK_PROVIDER_TIMEOUT, MARK_FALLBACK_QUERY, f"{provider}/{tool} 超过 {budget:g}s")
+        note = f"{provider} 的 {tool} 超过 {budget:g}s 未返回，本次按超时处理（未用估算值代替）"
+        return _timeout_result(provider, tool, note, status=status), note
+    if error:
+        ledger.mark(MARK_FALLBACK_QUERY, MARK_FALLBACK_QUERY, f"{provider}/{tool} 失败：{error}")
+        note = f"{provider} 的 {tool} 调用失败（{error}），本次按不可用处理"
+        return _timeout_result(provider, tool, note, status="UNAVAILABLE"), note
+    return value, ""
+
+
 def _record_subspan(
     state: TravelState,
     *,
@@ -362,9 +691,13 @@ def _record_subspan(
     attributes: dict[str, Any] | None = None,
     parent_span_id: str | None = None,
     error: str | None = None,
+    finished_at: str | None = None,
+    suffix: str | None = None,
 ) -> None:
     """写一条业务级子 span（component 分类见 observability.SpanKind）。
 
+    ``suffix`` 用来区分**同名但不同实例**的 span（比如同一个 tool 的第 3 次调用）：
+    span_id 是主键，不带 suffix 的重复写入会让后一条覆盖前一条。
     观测永远不能反过来弄坏规划：拿不到 recorder、或写库失败，都只是少一条诊断记录。
     """
 
@@ -377,10 +710,14 @@ def _record_subspan(
             name=name,
             status=status,
             started_at=started_at,
-            finished_at=now_iso(),
+            # 结束时刻**必须**由调用方给出或按 duration 推出：Provider / 模型的 span 是
+            # 事后统一转录的，用 now_iso() 会让每条子 span 都"跑到 run 结束"
+            # （实测出现过每个 Provider 都显示 280~400s 的假象）。
+            finished_at=finished_at or now_iso(),
             attributes=attributes or {},
             parent_span_id=parent_span_id,
             error=error,
+            suffix=suffix,
         )
     except Exception:
         return
@@ -1249,19 +1586,106 @@ def node_search_transport(state: TravelState) -> dict:
     start = intent.start_date
     back = _last_date(intent)
     travelers = max(1, intent.travelers)
+    # 并发上限来自 config（Part A）：绝不在节点里写死数字，也绝不无限并发打 Provider。
+    cfg = current_config()
+    ledger = _ledger(state)
+    degradations: list[str] = []
+    # 一次 `search_trains` 内部可能先打 12306、失败再打途牛，所以它的兜底预算必须
+    # 覆盖两个源；其余（航班）只有途牛一个源。
+    transport_budget = _provider_timeout("12306") + _provider_timeout("tuniu")
 
     # 引导式把 Discovery 已经查到的候选带进来了。复用时**不重复打 12306/途牛**，
     # 但仍然按用户最终选的排序策略重新比选（偏好可能是在 Prefetch 之后才定的）。
     bundle = state.get("prefetch")
     reuse_transport = bool(bundle is not None and (bundle.outbound or bundle.inbound))
+    has_back = back is not None and back >= start
+
+    # 四条互不依赖的查询（去程火车 / 去程航班 / 回程火车 / 回程航班）一起发出去。
+    # 串行做这四件事实测吃掉 210s（Part H 的 Before）；它们之间没有任何依赖关系，
+    # 唯一的理由就是"以前是顺序写的"。
     if reuse_transport:
         out_trains = _reuse_result(bundle.outbound, TrainOption, "12306")
         out_flights = _reuse_result(bundle.outbound, FlightOption, "tuniu")
+        in_trains = _reuse_result(bundle.inbound, TrainOption, "12306")
+        in_flights = _reuse_result(bundle.inbound, FlightOption, "tuniu")
+        # 状态照抄复用结果的真实状态（REUSED / EMPTY），**不**统一写成 "REUSED" ——
+        # "Discovery 查过但没查到"与"Discovery 查到了"必须分得清。
+        provider_status["去程火车"] = out_trains.status
+        provider_status["去程航班"] = out_flights.status
+        # 把复用的结果按查询键登记进账本：这样"同一个查询在本次 run 里再问一次"
+        # 会命中 cache_hit，而不是又打一遍 12306/途牛（Part C 要消灭的正是这件事）。
+        for direction, date_value, options in (
+            ("outbound", start, bundle.outbound),
+            ("inbound", back, bundle.inbound),
+        ):
+            if date_value is None:
+                continue
+            _remember_reused_trains(state, ledger, origin, destination, date_value, options, direction)
+            _remember_reused_flights(state, ledger, origin, destination, date_value, options, direction, travelers)
     else:
-        out_trains = hub.search_trains(origin, destination, start)
-        out_flights = hub.search_flights(origin, destination, start, travelers=travelers)
-    provider_status["去程火车"] = out_trains.status
-    provider_status["去程航班"] = out_flights.status
+        notes: dict[str, str] = {}
+
+        def _leg(label: str, provider: str, tool: str, func: Callable[[], Any], budget: float) -> Callable[[], Any]:
+            """一个"带兜底预算 + 记降级"的取数任务（供并发执行）。"""
+
+            def run() -> Any:
+                value, note = _bounded_provider_call(
+                    state, provider=provider, tool=tool, func=func, timeout=budget
+                )
+                if note:
+                    notes[label] = note
+                return value
+
+            return run
+
+        queries: list[tuple[str, Callable[[], Any]]] = [
+            (
+                "去程火车",
+                _leg(
+                    "去程火车", "12306", "search_trains",
+                    lambda: hub.search_trains(origin, destination, start), transport_budget,
+                ),
+            ),
+            (
+                "去程航班",
+                _leg(
+                    "去程航班", "tuniu", "search_flights",
+                    lambda: hub.search_flights(origin, destination, start, travelers=travelers),
+                    _provider_timeout("tuniu"),
+                ),
+            ),
+        ]
+        if has_back:
+            queries.append(
+                (
+                    "回程火车",
+                    _leg(
+                        "回程火车", "12306", "search_trains",
+                        lambda: hub.search_trains(destination, origin, back), transport_budget,
+                    ),
+                )
+            )
+            queries.append(
+                (
+                    "回程航班",
+                    _leg(
+                        "回程航班", "tuniu", "search_flights",
+                        lambda: hub.search_flights(destination, origin, back, travelers=travelers),
+                        _provider_timeout("tuniu"),
+                    ),
+                )
+            )
+        fetched = _run_parallel(queries, limit=cfg.provider_max_concurrency, thread_prefix="tp-transport")
+        out_trains = fetched["去程火车"]
+        out_flights = fetched["去程航班"]
+        in_trains = fetched.get("回程火车")
+        in_flights = fetched.get("回程航班")
+        provider_status["去程火车"] = out_trains.status
+        provider_status["去程航班"] = out_flights.status
+        # 降级文案按**任务定义顺序**收集：谁先超时不影响用户看到的那条说明。
+        degradations.extend(
+            notes[label] for label in ("去程火车", "去程航班", "回程火车", "回程航班") if label in notes
+        )
 
     outbound, out_alts, out_reason, out_scores = _select_transport(
         [*out_trains.items, *out_flights.items], direction="outbound", intent=intent
@@ -1269,28 +1693,23 @@ def node_search_transport(state: TravelState) -> dict:
 
     inbound = in_alts = None
     in_reason = ""
-    if back is not None and back >= start:
-        if reuse_transport:
-            in_trains = _reuse_result(bundle.inbound, TrainOption, "12306")
-            in_flights = _reuse_result(bundle.inbound, FlightOption, "tuniu")
-        else:
-            in_trains = hub.search_trains(destination, origin, back)
-            in_flights = hub.search_flights(destination, origin, back, travelers=travelers)
-        provider_status["回程火车"] = in_trains.status
-        provider_status["回程航班"] = in_flights.status
+    if has_back:
         if reuse_transport:
             in_reason = "复用 Discovery 已查到的回程候选（未重复查询）"
         elif back == start:
             in_reason = "当天往返，回程与去程同一天查询"
+        provider_status["回程火车"] = in_trains.status  # type: ignore[union-attr]
+        provider_status["回程航班"] = in_flights.status  # type: ignore[union-attr]
         inbound, in_alts, in_reason, _ = _select_transport(
-            [*in_trains.items, *in_flights.items], direction="inbound", intent=intent
+            [*in_trains.items, *in_flights.items], direction="inbound", intent=intent  # type: ignore[union-attr]
         )
     else:
         provider_status["回程火车"] = "SKIPPED"
         provider_status["回程航班"] = "SKIPPED"
         in_reason = "没有确定的返程日期，未查询回程"
 
-    degradations: list[str] = []
+    # 注意：`degradations` 在函数开头就已初始化（超时/失败的降级要留在里面），
+    # 这里只往后追加，**不能**重新赋空列表把它清掉。
     if outbound is None:
         degradations.append(
             f"去程没有可用的大交通候选（12306 {out_trains.status} / 途牛航班 {out_flights.status}），"
@@ -1418,19 +1837,81 @@ def node_search_hotels(state: TravelState) -> dict:
     # 复用 Discovery 的候选。它比正式 run 多翻了几页（见 discovery.fetch_hotel_candidates），
     # 所以候选池更宽 —— 这是"酒店怎么老是那么贵"的正解：扩大可选范围，而不是改打分口径。
     bundle = state.get("prefetch")
+    ledger = _ledger(state)
+    degradations: list[str] = []
+    hotel_note = ""
     if bundle is not None and bundle.hotels:
         result = SimpleNamespace(items=list(bundle.hotels), status="REUSED", provider="tuniu")
+        # 登记复用：同一个酒店查询在本次 run 里再被请求会命中账本，不再打途牛（Part C）。
+        ledger.remember(
+            _hotels_query_key(destination, check_in, 1),
+            result,
+            marker=MARK_PREFETCH_REUSED,
+            detail="酒店候选复用 Discovery",
+        )
     else:
-        result = hub.search_hotels(destination, check_in, check_out, travelers=max(1, intent.travelers))
+        # 兜底预算来自 config（Part E）：途牛偶发劣化时，宁可如实降级也不能拖死整次 run。
+        result, hotel_note = _bounded_provider_call(
+            state,
+            provider="tuniu",
+            tool="search_hotels",
+            func=lambda: hub.search_hotels(destination, check_in, check_out, travelers=max(1, intent.travelers)),
+            timeout=_provider_timeout("tuniu"),
+        )
+        if hotel_note:
+            degradations.append(hotel_note)
+
+    # --- Part E 的酒店 fallback 链：途牛 EMPTY / timeout → 后备来源（联网证据）→ 明确披露 ---
+    # 关键：**绝不**因为途牛没数据就编一个酒店或价格。后备来源只提供"住哪个区域"这类
+    # 可核对的证据，价格仍然留空（预算里如实写明未取得报价）。
+    hotel_evidence_note = ""
+    steps_extra: list[str] = []
+    if not result.items:
+        web = hub.web_search(f"{destination} 住宿 区域 推荐 交通方便", max_results=5)
+        if web.items:
+            ledger.mark(destination, MARK_FALLBACK_QUERY, "途牛无候选，改用联网证据提供住宿区域")
+            payload = web.items[0]
+            hotel_evidence_note = (
+                "途牛未返回可用住宿候选，已改用联网证据说明住宿区域"
+                f"（{coerce_str(payload.get('title'), '网页结果')}）；"
+                "没有用估算价格代替，住宿费用不计入预算"
+            )
+            steps_extra.append(hotel_evidence_note)
+            _record_subspan(
+                state,
+                component=SpanKind.TOOL,
+                name="hotel_fallback_web",
+                status="SUCCESS",
+                # started_at 是 `_record_subspan` 的必填参数：漏传会让"途牛返回空 →
+                # 走联网兜底"这条**常见**路径直接抛 TypeError 把整次 run 打挂，
+                # 而它本该只是一次降级。调用就发生在这里，用这里的时刻。
+                started_at=now_iso(),
+                attributes={
+                    "provider": "tavily",
+                    "tool": "web_search",
+                    "fallback": MARK_FALLBACK_QUERY,
+                    "title": coerce_str(payload.get("title"), "网页结果")[:120],
+                    "url": coerce_str(payload.get("url")) or None,
+                    "reason": f"途牛酒店 {result.status}",
+                },
+                parent_span_id=f"{state['run_id']}:search_hotels",
+            )
+        else:
+            ledger.mark(destination, MARK_FALLBACK_QUERY, "途牛与联网证据都没有住宿信息")
+            hotel_evidence_note = (
+                f"途牛未返回可用住宿候选（{result.status}），联网证据也没有可用信息；"
+                "本次没有住宿候选，住宿费用不计入预算，也没有用估算价格代替"
+            )
+            steps_extra.append(hotel_evidence_note)
+
     selected, alternatives, reason = _select_hotel(
         list(result.items), intent, anchor=_hotel_anchor(state)
     )
     if getattr(result, "status", "") == "REUSED":
         reason = f"复用 Discovery 候选（{len(result.items)} 个，已翻页扩大范围）—— {reason}"
 
-    degradations: list[str] = []
     if selected is None:
-        reason = (
+        reason = hotel_evidence_note or (
             f"途牛酒店查询未返回可用候选（{result.status}），本次没有住宿候选；"
             "住宿费用不计入预算，也没有用估算价格代替"
         )
@@ -1453,6 +1934,7 @@ def node_search_hotels(state: TravelState) -> dict:
         f"途牛酒店查询：{result.status}，{len(result.items)} 个候选",
         f"入住 {check_in.isoformat()} → 退房 {check_out.isoformat()}",
         "比选口径：每晚价格、评分、住宿偏好命中；价格是「起价」，预算按真实单价相乘",
+        *steps_extra,
     ]
     if selected is not None:
         steps.append(f"选定：{selected.name}")
@@ -1505,6 +1987,9 @@ def node_search_social(state: TravelState) -> dict:
         # 攻略正文不会因为用户改偏好而变，直接复用 Discovery 抓到的证据，不重复检索
         # （省下的是一次可能几十秒的社交源往返）。
         reused_evidences = sorted(bundle.evidences, key=lambda item: item.id)
+        _ledger(state).mark(
+            "social", MARK_PREFETCH_REUSED, f"{len(reused_evidences)} 条攻略证据复用 Discovery（未重复检索）"
+        )
         summary = f"复用 Discovery 已抓到的 {len(reused_evidences)} 条攻略证据（未重复检索）"
         return {
             "evidences": reused_evidences,
@@ -1549,9 +2034,32 @@ def node_search_social(state: TravelState) -> dict:
     evidences: list[Evidence] = []
     notes: list[str] = []
     platforms: dict[str, int] = {}
+    cfg = current_config()
+    ledger = _ledger(state)
 
-    for keyword in queries[:SOCIAL_QUERY_LIMIT]:
-        social = hub.search_xiaohongshu(keyword)
+    # 社交检索之间互不依赖（都是"关键词 → 攻略"），所以受控并发；但**排序按检索词顺序**
+    # 合并，`MAX_EVIDENCE` 截断点因此与串行版本完全一致（可复现）。
+    social_keywords = list(queries[:SOCIAL_QUERY_LIMIT])
+    social_results = _run_parallel(
+        [
+            (
+                keyword,
+                (lambda kw=keyword: ledger.fetch(
+                    query_key("tikhub", "search_xiaohongshu", query=kw),
+                    lambda kw=kw: hub.search_xiaohongshu(kw),
+                    detail=f"小红书「{kw}」",
+                )[0]),
+            )
+            for keyword in social_keywords
+        ],
+        limit=cfg.provider_max_concurrency,
+        thread_prefix="tp-social",
+    )
+    for keyword in social_keywords:
+        social = social_results.get(keyword)
+        if social is None:
+            notes.append(f"小红书「{keyword}」：调用失败（已按无结果处理）")
+            continue
         platforms["小红书"] = platforms.get("小红书", 0) + len(social.items)
         evidences.extend(social.items)
         if not social.items:
@@ -1560,13 +2068,37 @@ def node_search_social(state: TravelState) -> dict:
             break
 
     if not any(ev.provider == "xhs" for ev in evidences) and destination:
-        douyin = hub.search_douyin(f"{destination} 旅游")
+        # 依赖关系：先看小红书结果，空了才回退抖音（不能并发）。
+        douyin = ledger.fetch(
+            query_key("tikhub", "search_douyin", query=f"{destination} 旅游"),
+            lambda: hub.search_douyin(f"{destination} 旅游"),
+            detail="抖音回退",
+        )[0]
         platforms["抖音"] = platforms.get("抖音", 0) + len(douyin.items)
         evidences.extend(douyin.items)
         notes.append(f"小红书没有返回可用攻略，回退抖音查询：{douyin.status}")
 
-    for keyword in queries[:WEB_QUERY_LIMIT]:
-        web = hub.web_search(keyword, max_results=5)
+    web_keywords = list(queries[:WEB_QUERY_LIMIT])
+    web_results = _run_parallel(
+        [
+            (
+                keyword,
+                (lambda kw=keyword: ledger.fetch(
+                    query_key("tavily", "web_search", query=kw),
+                    lambda kw=kw: hub.web_search(kw, max_results=5),
+                    detail=f"网页搜索「{kw}」",
+                )[0]),
+            )
+            for keyword in web_keywords
+        ],
+        limit=cfg.provider_max_concurrency,
+        thread_prefix="tp-web",
+    )
+    for keyword in web_keywords:
+        web = web_results.get(keyword)
+        if web is None:
+            notes.append(f"网页搜索「{keyword}」：调用失败（已按无结果处理）")
+            continue
         if web.items:
             platforms["网页"] = platforms.get("网页", 0) + len(web.items)
         else:
@@ -1628,13 +2160,17 @@ def node_search_social(state: TravelState) -> dict:
 # ==================================================
 
 
-def _keyword_candidates(intent: TripIntent, queries: list[str]) -> list[str]:
+def _keyword_candidates(intent: TripIntent, queries: list[str], *, limit: int | None = None) -> list[str]:
     """除攻略抽取之外，直接用高德按关键词搜 POI。
 
     两个来源互补：攻略能捞到"本地人常去"的小店，关键词能保证"必去景点"不会因为
     攻略没写而完全缺席。两者都只是**候选**，是否入选由 Trust / Ad Risk 决定。
+
+    ``limit`` 不传时读 config（POI_QUERY_LIMIT）—— 每个关键词都是一次真实的高德调用，
+    这个数直接换成钱与时间。
     """
     destination = _destination(intent) or ""
+    cap = max(1, int(limit if limit is not None else current_config().poi_query_limit))
     names = ["景点", "博物馆", "公园", "步行街", "古镇"]
     for preference in intent.preferences[:4]:
         word = PREFERENCE_POI_QUERY.get(preference, preference)
@@ -1647,7 +2183,7 @@ def _keyword_candidates(intent: TripIntent, queries: list[str]) -> list[str]:
             continue
         if cleaned and cleaned not in names:
             names.append(cleaned)
-    return names[:POI_QUERY_LIMIT]
+    return names[:cap]
 
 
 def node_extract_places(state: TravelState) -> dict:
@@ -1667,11 +2203,21 @@ def node_extract_places(state: TravelState) -> dict:
     for evidence in state.get("evidences", []):
         provider_mentions.extend(evidence.place_mentions)
 
-    llm_targets = [
-        evidence
-        for evidence in state.get("evidences", [])
-        if not evidence.place_mentions and len(evidence.text) >= 40
-    ][:EXTRACT_EVIDENCE_LIMIT]
+    bundle = state.get("prefetch")
+    # Part F：Guided 模式下这批证据**在 Discovery 阶段已经抽过一遍**了。
+    # 只要那一步已经跑完（不是仍在 RUNNING），就不该拿同一批文本再调一次模型 ——
+    # 实测 4 次串行抽取要 60s 以上，而它只会得出同一个结论。复用结论不是"少做一步"，
+    # 而是"同一份内容不做第二遍"，因此这里即使抽不出地点也照常跳过并如实说明。
+    reused_extraction = _discovery_already_extracted(state, bundle)
+    llm_targets = (
+        []
+        if reused_extraction
+        else [
+            evidence
+            for evidence in state.get("evidences", [])
+            if not evidence.place_mentions and len(evidence.text) >= 40
+        ][:EXTRACT_EVIDENCE_LIMIT]
+    )
     for evidence in llm_targets:
         result = llm.invoke_json(
             EXTRACT_PLACES_PROMPT,
@@ -1686,7 +2232,10 @@ def node_extract_places(state: TravelState) -> dict:
         else:
             degradations.append(degraded_note(result, f"证据 {evidence.id} 的地点抽取被跳过"))
 
-    if llm_targets:
+    if reused_extraction:
+        _ledger(state).mark("extract_places", MARK_PREFETCH_REUSED, "地点抽取复用 Discovery 结论（未重复调用模型）")
+        extraction_note = "这批攻略在 Discovery 阶段已经抽过地点，本次不再对同一批证据调用模型（Part F）"
+    elif llm_targets:
         extraction_note = (
             f"有 {len(llm_targets)} 条攻略走了模型抽取地点，"
             f"{len(state.get('evidences', [])) - len(llm_targets)} 条直接用数据源自带的 place_mentions"
@@ -1696,7 +2245,6 @@ def node_extract_places(state: TravelState) -> dict:
 
     # --- 1.5) 引导式：复用 Discovery 已经查好的地点候选 ---
     # 用户点过的"不感兴趣"在这里就必须消失：再往后走只会让它有机会被排进行程。
-    bundle = state.get("prefetch")
     if bundle is not None and bundle.places:
         outcome = selection.apply_user_place_preferences(
             bundle.places, intent.place_selections or {}
@@ -1751,32 +2299,46 @@ def node_extract_places(state: TravelState) -> dict:
             ],
         }
 
-    # --- 2) 高德 POI 搜索 ---
+    # --- 2) 高德 POI 搜索（受控并发，Part A）---
+    cfg = current_config()
     keywords = _keyword_candidates(intent, state.get("queries") or _fallback_queries(intent))
     places: list[Place] = []
     seen_ids: set[str] = set()
     poi_status = "OK"
-    searched = 0
 
-    def add_poi(keyword: str) -> None:
-        nonlocal poi_status
-        result = hub.search_poi(keyword, destination, page_size=POI_PAGE_SIZE, type_hint="attraction")
-        poi_status = result.status if poi_status == "OK" else poi_status
+    # 关键词表：攻略里提到的地名 / 模型抽出的地名 / 兜底关键词。
+    # DISCOVERY_MAX_PLACES 管的是**原始候选**总量（Part D）：先把两个来源合并去重再截断，
+    # 避免"同一家店在两条攻略里出现 → 查两遍高德"。
+    raw_names: list[str] = []
+    for name in [
+        *provider_mentions[: cfg.poi_query_limit],
+        *[coerce_str(item.get("name")) for item in extracted[: cfg.poi_query_limit]],
+    ]:
+        cleaned = coerce_str(name).strip()
+        if cleaned and cleaned not in raw_names:
+            raw_names.append(cleaned)
+    raw_names = raw_names[: cfg.discovery_max_places]
+    search_terms = [*raw_names, *keywords]
+    searched = len(search_terms)
+
+    def search_one(term: str) -> Any:
+        return hub.search_poi(term, destination, page_size=cfg.poi_page_size, type_hint="attraction")
+
+    results = _run_parallel(
+        [(term, (lambda term=term: search_one(term))) for term in search_terms],
+        limit=cfg.provider_max_concurrency,
+        thread_prefix="tp-poi",
+    )
+    # 去重必须按**任务定义顺序**做，不能用完成顺序：同一份攻略在两路并发下
+    # 先返回哪个是不确定的，按完成顺序去重会让 first-wins 的字段在不同 run 里抖动。
+    for term in search_terms:
+        result = results[term]
         for place in result.items:
             if place.place_id in seen_ids:
                 continue
             seen_ids.add(place.place_id)
             places.append(place)
-
-    for name in provider_mentions[:POI_QUERY_LIMIT]:
-        add_poi(name)
-        searched += 1
-    for item in extracted[:POI_QUERY_LIMIT]:
-        add_poi(coerce_str(item.get("name")))
-        searched += 1
-    for keyword in keywords:
-        add_poi(keyword)
-        searched += 1
+    poi_status = _first_bad_status(results)
 
     if not places and destination:
         # 高德确实没返回任何 POI：如实降级，不用模型编地点。
@@ -1836,24 +2398,149 @@ def node_extract_places(state: TravelState) -> dict:
 # ==================================================
 
 
+def _deep_verify_places(
+    state: TravelState,
+    places: Sequence[Place],
+    *,
+    limit: int,
+    selections: Mapping[str, str],
+) -> tuple[list[Place], list[dict[str, Any]]]:
+    """挑出值得做深度验证（POI 详情 + 路线）的地点，并给出每个被跳过点的原因。
+
+    规则（Part D：不要深度验证最终不会使用的点）：
+      * 用户 REJECT 的点**绝不**查高德、绝不查门票 —— 它已经被硬排除了，再花钱验证
+        它既是浪费，也是"用户说不要还被查"的观感问题；
+      * MUST / WANT 的点**无条件**深度验证（用户明确要的点，宁可多花几次调用）；
+      * 其余 NEUTRAL 用 Trust 分排序取到 ``PLANNER_POI_LIMIT`` 为止 —— 规格要求
+        "高分 NEUTRAL"才做深度验证。Trust 与 ``score_candidates`` 的入选口径同源，
+        所以"能被排进去的点"和"被深度验证的点"不会南辕北辙。
+
+    返回 (要验证的点, 跳过记录)。跳过记录进 Trace，让"这个点为什么没被验证"能直接回答。
+    """
+
+    linked = _link_evidence(list(state.get("evidences") or []), list(places))
+    selected: list[Place] = []
+    skipped: list[dict[str, Any]] = []
+    for place in places:
+        if selection.selection_of(place, selections) in (selection.MUST, selection.WANT):
+            selected.append(place)
+    selected_ids = {place.place_id for place in selected}
+
+    def _trust_of(place: Place) -> float:
+        trust, _ = planner.trust_score(
+            place, linked.get(place.place_id, []), amap_verified=place.amap_verified
+        )
+        return float(trust)
+
+    neutral = [place for place in places if place.place_id not in selected_ids]
+    # 排序键带 place_id 兜底：同名同分也不能靠字典顺序碰运气，否则并发下
+    # "哪 15 个点被深度验证"会随输入噪声变化（同分不同名时曾真的抖过）。
+    neutral.sort(key=lambda place: (-_trust_of(place), place.name, place.place_id))
+
+    room = max(0, int(limit) - len(selected))
+    for index, place in enumerate(neutral):
+        if index < room:
+            selected.append(place)
+            continue
+        skipped.append(
+            {
+                "place_id": place.place_id,
+                "name": place.name,
+                "reason": (
+                    "USER_REJECT" if selection.selection_of(place, selections) == selection.REJECT else "PLANNER_LIMIT"
+                ),
+                "reason_text": (
+                    "用户明确表示不感兴趣，已硬排除，不再做深度验证"
+                    if selection.selection_of(place, selections) == selection.REJECT
+                    else f"Trust {_trust_of(place):.0f} 未进前 {int(limit)}，按 Planner 上限跳过深度验证"
+                ),
+            }
+        )
+    return selected, skipped
+
+
+def _station_to_hotel_minutes(
+    hub: Any, station: str, hotel: Any, city: str | None
+) -> int | None:
+    """车站/机场 → 酒店 的真实接驳分钟数（含入住缓冲）；取不到就返回 None。
+
+    抽成独立函数是为了让"去程/回程两段"能并发：原来这段逻辑嵌在 for 循环里，
+    想并发只能复制一遍（复制出来的两份迟早会不一致）。
+    """
+
+    geo = hub.geocode(coerce_str(station), city=city)
+    if not (geo.ok and geo.items):
+        return None
+    coords = (
+        coerce_float(geo.items[0].get("longitude") or geo.items[0].get("lng")),
+        coerce_float(geo.items[0].get("latitude") or geo.items[0].get("lat")),
+    )
+    if coords[0] is None or coords[1] is None:
+        return None
+    route = hub.route(coords, (hotel.lng, hotel.lat), "transit", city=city)
+    if route.ok and route.items and route.items[0].duration_minutes is not None:
+        return route.items[0].duration_minutes + planner.HOTEL_CHECKIN_MINUTES
+    return None
+
+
 def node_verify_poi_and_routes(state: TravelState) -> dict:
     hub = state["hub"]
     intent = state["intent"]
     places = list(state.get("places", []))
+    selections = intent.place_selections or {}
     destination = _destination(intent) or ""
     degradations: list[str] = []
+    cfg = current_config()
+
+    # --- 0) 只对"可能进最终行程"的点做深度验证（Part D）---
+    deep_places, skipped = _deep_verify_places(
+        state, places, limit=cfg.planner_poi_limit, selections=selections
+    )
+    deep_ids = {place.place_id for place in deep_places}
+    route_skipped = [item for item in skipped if item["reason"] == "USER_REJECT"]
+    limit_skipped = [item for item in skipped if item["reason"] == "PLANNER_LIMIT"]
+    if skipped:
+        _skip_span(
+            state,
+            name="route_skipped",
+            parent_stage="verify_poi_and_routes",
+            attributes={
+                "reason": "USER_REJECT" if route_skipped else "PLANNER_LIMIT",
+                "reason_text": (
+                    "用户明确排除的地点不查高德、不查门票"
+                    if route_skipped
+                    else f"超过 Planner 深度候选上限 {cfg.planner_poi_limit}"
+                ),
+                "skipped": len(skipped),
+                "user_rejected": len(route_skipped),
+                "over_limit": len(limit_skipped),
+                "planner_poi_limit": cfg.planner_poi_limit,
+                "places": skipped[:20],
+            },
+        )
 
     # --- 1) 补营业时间（可行性判定要用，PRD §22）---
-    detail_calls = 0
+    # 受益于并发的正是这一段与下一段：一条一条串行查（实测 6 次详情 + 9 段路线 ≈ 58s）
+    # 和一起发出去，拿到的是同一批数据。
+    detail_targets = [
+        place
+        for place in places
+        if place.place_id in deep_ids and not place.opening_hours and place.amap_verified
+    ][: cfg.poi_detail_limit]
+    detail_results = _run_parallel(
+        [
+            (place.place_id, (lambda place=place: hub.poi_detail(place.place_id)))
+            for place in detail_targets
+        ],
+        limit=cfg.poi_verify_max_concurrency,
+        thread_prefix="tp-poi-detail",
+    )
+    detail_calls = len(detail_targets)
     detail_failures = 0
-    for place in places:
-        if place.opening_hours or not place.amap_verified:
-            continue
-        if detail_calls >= POI_DETAIL_LIMIT:
-            break
-        detail_calls += 1
-        result = hub.poi_detail(place.place_id)
-        if result.ok and result.items:
+    # 回填按目标顺序做：并发只影响"谁先回来"，不影响"结果写进哪一行"。
+    for place in detail_targets:
+        result = detail_results[place.place_id]
+        if result is not None and result.ok and result.items:
             item = result.items[0]
             place.opening_hours = coerce_str(item.get("opening_hours")) or place.opening_hours
             place.address = coerce_str(item.get("address")) or place.address
@@ -1872,18 +2559,70 @@ def node_verify_poi_and_routes(state: TravelState) -> dict:
     if hotel is not None and hotel.lat is not None and hotel.lng is not None:
         hotel_coords = (hotel.lat, hotel.lng)
 
-    ordered = planner.order_by_proximity(places, hotel_coords)
+    ordered = planner.order_by_proximity(deep_places, hotel_coords)
     routes: dict[Any, RouteOption] = {}
     route_ok = 0
     route_fail = 0
+    ledger = _ledger(state)
+    # 只查"相邻一段"，**不做** POI × POI 全连接（Part D §7）。上限来自 config：
+    # MAX_ROUTE_LOOKUPS 就是"最多查几段"。旧实现用 len(routes)（每段成功会写正反两条
+    # 记录）当计数器，等于把配置的预算悄悄砍了一半；这里改成按调用次数计。
+    #
+    # 两条护栏（Part D §7 的"坐标初筛 → 只查真正可能相邻的腿"）：
+    #   * 缺坐标的腿不查（查了也无从发起）；
+    #   * 直线距离超过 ROUTE_MAX_LEG_METERS 的腿判定为"非相邻"，不做市内路线查询 ——
+    #     预算留给真正相邻的腿，而不是被一条跨城的腿吃掉。
+    # 被跳过的腿**不是**被静默丢掉：进 Trace（route_skipped）+ 有一条明确说明，
+    # 行程里仍然按"未核实"处理，绝不用估算值冒充实测。
+    pair_tasks: list[tuple[str, Callable[[], Any]]] = []
+    pair_order: list[tuple[Place, Place]] = []
+    leg_skipped: list[dict[str, Any]] = []
+    attempted = 0
     for origin, target in zip(ordered, ordered[1:]):
-        if len(routes) >= MAX_ROUTE_LOOKUPS:
-            break
         start, end = lnglat(origin), lnglat(target)
+        label = f"{origin.name} → {target.name}"
         if start is None or end is None:
+            leg_skipped.append({"leg": label, "reason": "NO_COORDS", "reason_text": "缺少坐标，无法发起路线查询"})
+            ledger.mark(label, MARK_ROUTE_SKIPPED, "缺少坐标")
             continue
-        result = hub.route(start, end, "transit", city=destination or None)
-        if result.ok and result.items:
+        distance = planner.haversine_meters((origin.lat, origin.lng), (target.lat, target.lng))
+        if distance is not None and distance > ROUTE_MAX_LEG_METERS:
+            leg_skipped.append(
+                {
+                    "leg": label,
+                    "reason": "TOO_FAR",
+                    "reason_text": f"直线 {distance / 1000:.0f}km，判定为非相邻路段（不做全连接查询）",
+                }
+            )
+            ledger.mark(label, MARK_ROUTE_SKIPPED, f"直线 {distance / 1000:.0f}km 超过 {ROUTE_MAX_LEG_METERS / 1000:.0f}km 初筛阈值")
+            continue
+        if attempted >= cfg.max_route_lookups:
+            leg_skipped.append(
+                {"leg": label, "reason": "BUDGET", "reason_text": f"超过 MAX_ROUTE_LOOKUPS={cfg.max_route_lookups} 上限"}
+            )
+            ledger.mark(label, MARK_ROUTE_SKIPPED, "超过 MAX_ROUTE_LOOKUPS 上限")
+            continue
+        attempted += 1
+        key = _route_query_key(start, end, destination or None)
+        ledger.mark(key, MARK_ROUTE_REQUESTED, label)
+        pair_order.append((origin, target))
+        pair_tasks.append(
+            (
+                f"{origin.place_id}->{target.place_id}",
+                (
+                    lambda start=start, end=end, key=key, label=label: _route_with_ledger(
+                        hub, ledger, key, label, start, end, destination or None
+                    )
+                ),
+            )
+        )
+    route_results = _run_parallel(
+        pair_tasks, limit=cfg.route_max_concurrency, thread_prefix="tp-route"
+    )
+    for origin, target in pair_order:
+        key = f"{origin.place_id}->{target.place_id}"
+        result = route_results[key]
+        if result is not None and result.ok and result.items:
             option = result.items[0]
             option.origin_place_id = origin.place_id
             option.destination_place_id = target.place_id
@@ -1894,9 +2633,31 @@ def node_verify_poi_and_routes(state: TravelState) -> dict:
             route_fail += 1
 
     # --- 3) 机场/车站 → 酒店的真实接驳（PRD §24 的"额外接驳"）---
+    # 两段（去程/回程）互不依赖，一起发出去。
     outbound_transfer: int | None = None
     inbound_transfer: int | None = None
     transport_plan = state.get("transport_plan")
+    if leg_skipped:
+        # 被初筛/预算挡下来的段必须显式留痕：跳过不等于查过了，也不等于没发生。
+        _skip_span(
+            state,
+            name="route_skipped_legs",
+            parent_stage="verify_poi_and_routes",
+            attributes={
+                "reason": MARK_ROUTE_SKIPPED,
+                "skipped": len(leg_skipped),
+                "no_coords": sum(1 for item in leg_skipped if item["reason"] == "NO_COORDS"),
+                "over_limit": sum(1 for item in leg_skipped if item["reason"] == "BUDGET"),
+                "too_far": sum(1 for item in leg_skipped if item["reason"] == "TOO_FAR"),
+                "max_route_lookups": cfg.max_route_lookups,
+                "legs": leg_skipped[:20],
+            },
+        )
+        degradations.append(
+            f"{len(leg_skipped)} 段相邻路线没有查询（坐标缺失 / 非相邻初筛 / 超过上限 "
+            f"{cfg.max_route_lookups} 段），这些段在行程里按未核实处理"
+        )
+    transfer_tasks: list[tuple[str, Callable[[], Any]]] = []
     if hotel is not None and hotel_coords is not None and transport_plan is not None:
         for attr, setter in (("selected", "out"), ("inbound_selected", "in")):
             option = getattr(transport_plan, attr, None)
@@ -1909,22 +2670,21 @@ def node_verify_poi_and_routes(state: TravelState) -> dict:
             )
             if not station:
                 continue
-            geo = hub.geocode(coerce_str(station), city=destination or None)
-            if not (geo.ok and geo.items):
-                continue
-            coords = (
-                coerce_float(geo.items[0].get("longitude") or geo.items[0].get("lng")),
-                coerce_float(geo.items[0].get("latitude") or geo.items[0].get("lat")),
+            transfer_tasks.append(
+                (
+                    setter,
+                    (
+                        lambda station=station: _station_to_hotel_minutes(
+                            hub, station, hotel, destination or None
+                        )
+                    ),
+                )
             )
-            if coords[0] is None or coords[1] is None:
-                continue
-            route = hub.route(coords, (hotel.lng, hotel.lat), "transit", city=destination or None)
-            if route.ok and route.items and route.items[0].duration_minutes is not None:
-                minutes = route.items[0].duration_minutes + planner.HOTEL_CHECKIN_MINUTES
-                if setter == "out":
-                    outbound_transfer = minutes
-                else:
-                    inbound_transfer = minutes
+    transfer_results = _run_parallel(
+        transfer_tasks, limit=cfg.route_max_concurrency, thread_prefix="tp-transfer"
+    )
+    outbound_transfer = transfer_results.get("out")
+    inbound_transfer = transfer_results.get("in")
 
     if outbound_transfer is not None and transport_plan is not None:
         _annotate_transfer_minutes(transport_plan.selected, outbound_transfer)
@@ -1948,11 +2708,20 @@ def node_verify_poi_and_routes(state: TravelState) -> dict:
         degradations.append("去程车站/机场到酒店的真实接驳时间未取得，门到门时长按具名常量估算")
 
     steps = [
-        f"高德 POI 详情查询 {detail_calls} 次（补营业时间/地址）",
-        f"路线查询：成功 {route_ok} 段、失败 {route_fail} 段（上限 {MAX_ROUTE_LOOKUPS} 段）",
+        f"高德 POI 详情查询 {detail_calls} 次（补营业时间/地址，并发上限 {cfg.poi_verify_max_concurrency}）",
+        f"路线查询：成功 {route_ok} 段、失败 {route_fail} 段"
+        f"（上限 {cfg.max_route_lookups} 段，并发上限 {cfg.route_max_concurrency}）",
         "路线按「酒店附近 → 由近及远」顺序计算，与后续排程的地理聚类口径一致",
         f"高德整体状态：{amap_status}",
     ]
+    if skipped:
+        steps.append(
+            f"深度验证候选 {len(deep_places)} 个（Planner 上限 {cfg.planner_poi_limit}）："
+            f"跳过 {len(skipped)} 个 —— 用户已排除 {len(route_skipped)} 个"
+            f"（不查高德、不查门票）、超出上限 {len(limit_skipped)} 个（不查路线）"
+        )
+    if route_fail:
+        steps.append("失败的路线在行程里标为未核实，没有用估算值冒充实测")
     if outbound_transfer is not None:
         steps.append(f"去程 车站/机场 → 酒店 真实接驳 {outbound_transfer} 分钟（含入住）")
     if inbound_transfer is not None:
@@ -1977,6 +2746,9 @@ def node_verify_poi_and_routes(state: TravelState) -> dict:
                 路线成功=route_ok,
                 路线失败=route_fail,
                 高德状态=amap_status,
+                深度候选=len(deep_places),
+                跳过=len(skipped),
+                用户排除跳过=len(route_skipped),
             )
         ],
     }
@@ -2062,13 +2834,31 @@ def node_score_candidates(state: TravelState) -> dict:
     store.save_decisions_bulk(run_id, decisions)
 
     # --- 门票：候选排序后才知道哪些景点值得查价（PRD §23 的门票要用真实价）---
+    # 用户 REJECT 的点在循环开始前就已经被 `apply_user_place_preferences` 硬排除了，
+    # 所以这里**不可能**给用户说"不要"的点查门票；再叠一层断言式的过滤，
+    # 是为了让这条约束在代码里看得见（而不是只靠上游一个变量名）。
+    cfg = current_config()
     ticket_prices: dict[str, float] = {}
-    ticket_attempts = 0
-    for place in sorted(places, key=lambda item: -trust_scores.get(item.place_id, 0.0)):
-        if ticket_attempts >= TICKET_LOOKUP_LIMIT:
-            break
-        ticket_attempts += 1
-        result = hub.search_scenic_tickets(place.name)
+    ticket_candidates = [
+        place
+        for place in sorted(
+            places, key=lambda item: (-trust_scores.get(item.place_id, 0.0), item.name, item.place_id)
+        )
+        if selection.selection_of(place, intent.place_selections or {}) != selection.REJECT
+    ][: cfg.ticket_lookup_limit]
+    ticket_attempts = len(ticket_candidates)
+    ticket_results = _run_parallel(
+        [
+            (place.place_id, (lambda place=place: hub.search_scenic_tickets(place.name)))
+            for place in ticket_candidates
+        ],
+        limit=cfg.provider_max_concurrency,
+        thread_prefix="tp-ticket",
+    )
+    for place in ticket_candidates:
+        result = ticket_results[place.place_id]
+        if result is None:
+            continue
         for item in result.items:
             price = coerce_float(
                 item.get("price") or item.get("min_price") or (item.get("prices") or {}).get("min")
@@ -2198,8 +2988,19 @@ def node_build_plan(state: TravelState) -> dict:
     )
 
     jev = state.get("jev")
+    # Part F：只把**通过硬约束复核**的候选交给 Jev 选。两种收益：
+    #   1. 不再让 Jev 去选一份 Python 随后必然否决的方案（那是白花一次调用 + 一条
+    #      "Jev 选错"的假信号）；
+    #   2. 硬约束可行的候选只剩一份时，`choose_plan` 直接返回该方案、**不调用 Jev** ——
+    #      Python 已经唯一决定了，"选择"只是浪费一次调用与 1.5s 预算。
+    # 一份可行的都没有时退回全部候选：那是排程本身有问题，应该照旧让 Jev 参与并如实记录。
+    viable_candidates = [
+        candidate
+        for candidate in candidates
+        if not planner.hard_constraint_violations(candidate.days, intent, outbound=outbound)
+    ] or candidates
     choice = choose_plan(
-        candidates,
+        viable_candidates,
         intent,
         jev=jev,
         recorder=_span_recorder(state),
@@ -2209,6 +3010,7 @@ def node_build_plan(state: TravelState) -> dict:
         ),
     )
     chosen = choice.candidate
+    single_viable = len(viable_candidates) == 1 and len(candidates) > 1
 
     recheck_started = now_iso()
     violations = planner.hard_constraint_violations(chosen.days, intent, outbound=outbound)
@@ -2236,6 +3038,10 @@ def node_build_plan(state: TravelState) -> dict:
         steps.append(
             f"Top-{len(candidates)} 候选："
             + "、".join(f"{c.label}({c.variant})" for c in candidates)
+        )
+    if single_viable:
+        steps.append(
+            f"通过硬约束的候选只有 {viable_candidates[0].label} 一份，Python 已唯一确定，未为此调用 Jev"
         )
     steps.append(f"方案选择：{choice.reason}")
     if choice.rejected:
@@ -2681,18 +3487,38 @@ def _jev_review(
     steps: list[str] = []
     degradations: list[str] = []
 
-    # --- B. 关键 Trade-off ---
+    # --- Part F：Jev 只在"真的需要在若干合法方案之间做取舍"时才调用 ---
+    # 两个跳过条件都是**可证明无损**的，不是"为了省一次调用而拍脑袋"：
+    #   * 硬约束可行的候选只有当前这一份 → Python 已经唯一决定了，问 Jev 也只有一个答案；
+    #   * 没有第二份可替换的候选 → 就算 Jev 说 REPLAN，Python 也无处可换（只会产出一条
+    #     "无法重排"的降级），质量门的结论由硬问题数量直接定死。
+    viable = [
+        candidate
+        for candidate in candidates
+        if not planner.hard_constraint_violations(candidate.days, intent, outbound=outbound)
+    ]
     alternatives = [
-        candidate for candidate in candidates if current is None or candidate.label != current.label
+        candidate
+        for candidate in viable
+        if current is None or candidate.label != current.label
     ][:3]
+    # --- B. 关键 Trade-off ---
     tradeoff = resolve_tradeoff(
         current=current or _candidate_of(plan, state),
         alternatives=alternatives,
         intent=intent,
-        jev=jev,
+        jev=jev if alternatives else None,
         recorder=recorder,
         parent_span_id=parent,
     )
+    if not alternatives:
+        steps.append("只有一份通过硬约束的候选方案，Python 已唯一确定；本次没有为此调用 Jev")
+        _skip_span(
+            state,
+            name="jev_tradeoff_skipped",
+            parent_stage="critic_and_revise",
+            attributes={"reason": "no_alternative_candidate", "candidates": len(candidates), "viable": len(viable)},
+        )
     if tradeoff.jev_record is not None and tradeoff.jev_record.get("attempted"):
         jev_calls.append(tradeoff.jev_record)
     decisions.append(
@@ -2708,6 +3534,8 @@ def _jev_review(
     steps.append(f"关键取舍：{tradeoff.reason}")
 
     # --- C. Planner Quality Gate ---
+    # 质量门**无条件**经过（既有契约：Jev 说 KEEP 但有硬问题时必须能记成 missed_replan）。
+    # 这里不做"看起来不需要判断就跳过"的优化 —— 跳过它等于放弃最有价值的一类 Bad Case。
     hard_issues = _hard_issue_texts(plan)
     quality = state.get("quality") or planner.plan_quality(plan.days, intent)
     gate = quality_gate(
@@ -2841,11 +3669,23 @@ def node_critic_revise(state: TravelState) -> dict:
         amap_status=state.get("amap_status", "OK"),
     )
 
-    critic_result = llm.invoke_json(
-        CRITIC_PROMPT,
-        json.dumps(_plan_digest(plan), ensure_ascii=False, default=str)[:24000],
-        tag="critic",
-    )
+    # --- 模型 Critic 与 Jev 是两个**互不依赖**的调用，一起发出去（Part F） ---
+    # 为什么不串行：两者输入同为"当前这份计划"，谁都不消费对方的输出；实测 critic 一次
+    # 可以吃掉 26~110s（纯模型抖动），串行等于把这几十秒白白加在墙钟上。
+    # 唯一有依赖的一处（"重排后 critic 意见已对不上新行程"）在两者都收完之后再补一句，
+    # 因此结论与串行版本完全一致，只是不再互相等。
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="tp-critic") as pool:
+        critic_future = pool.submit(
+            llm.invoke_json,
+            CRITIC_PROMPT,
+            json.dumps(_plan_digest(plan), ensure_ascii=False, default=str)[:24000],
+            tag="critic",
+        )
+        # llm_decisions 先传空：它是 critic 的输出，此刻还没算出来；收完之后再补那句提示。
+        review_future = pool.submit(_jev_review, state, plan, llm_decisions=[])
+        critic_result = critic_future.result()
+        review = review_future.result()
+
     critic: dict[str, Any] = {"status": critic_result.status, "verdict": "", "issues": [], "confidence": None}
     llm_decisions: list[Decision] = []
     if critic_result.ok and isinstance(critic_result.value, dict):
@@ -2876,8 +3716,13 @@ def node_critic_revise(state: TravelState) -> dict:
     else:
         critic_degradations = [degraded_note(critic_result, "本次只有规则 Critic 参与")]
 
-    # --- Jev：关键 Trade-off + 质量门（接管任务 §4B §4C） ---
-    review = _jev_review(state, plan, llm_decisions=llm_decisions)
+    # 换方案后 LLM Critic 的意见已经对不上新行程，如实说明而不是继续沿用
+    # （与串行版本同一句话，只是改在两者都收完之后补）。
+    if review.swapped is not None and llm_decisions:
+        review.degradations = [
+            *review.degradations,
+            "重排后模型 Critic 的意见对应的是被替换的方案，仅供参考",
+        ]
     critic_degradations = [*critic_degradations, *review.degradations]
 
     decisions = [*rule_decisions, *llm_decisions, *review.decisions]
@@ -3145,7 +3990,12 @@ def _write_artifacts(
 
 
 def _provider_call_rows(hub: Any) -> list[dict[str, Any]]:
-    """Provider 调用账本 → audit / Bad Case 共用的行结构。"""
+    """Provider 调用账本 → audit / Bad Case / Trace 共用的行结构。
+
+    ``cached`` 与 ``fallback`` 必须带出来（Part C）：它们是"这次调用是复用的、
+    还是本次真实发出、还是主源失败后的备选"的唯一事实来源。少带一个，Trace 与
+    provider_calls 表就只能靠文案猜。
+    """
 
     rows: list[dict[str, Any]] = []
     for entry in hub.audit_entries() if hub is not None else []:
@@ -3159,10 +4009,180 @@ def _provider_call_rows(hub: Any) -> list[dict[str, Any]]:
                 "duration_ms": entry.get("duration_ms"),
                 "fetched_at": entry.get("fetched_at"),
                 "source_id": entry.get("source_id"),
+                "cached": bool(entry.get("cached")),
+                "fallback": bool(entry.get("fallback")),
                 "note": "；".join(entry.get("notes") or []) or entry.get("error") or None,
             }
         )
     return rows
+
+
+def _span_duration_ms(span: Mapping[str, Any]) -> int:
+    """一条 span 的真实耗时（毫秒）。优先信 attributes.duration_ms（账本原始值）。"""
+
+    value = (span.get("attributes") or {}).get("duration_ms")
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    started, finished = span.get("started_at"), span.get("finished_at")
+    if not (started and finished):
+        return 0
+    try:
+        return max(
+            0,
+            int(
+                (datetime.fromisoformat(str(finished)) - datetime.fromisoformat(str(started))).total_seconds()
+                * 1000
+            ),
+        )
+    except ValueError:
+        return 0
+
+
+def _performance_summary(state: TravelState, *, metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """本次 run 的性能摘要（Part M 的数据侧）。
+
+    为什么同时写进 ``run_metrics`` 之外的 ``metrics.json``：``run_metrics`` 的表结构是
+    固定的（12 个列，另一个 agent 在改 Postgres，列不能动），而性能要看的东西远不止
+    12 个数（阶段耗时、每个 Provider 的平均/最大耗时、route/poi 调用数、cache hit、
+    prefetch 复用、fallback、并发上限快照）。所以把它作为一个 **额外的 JSON 段落**
+    落在 ``outputs/<run_id>/metrics.json`` 的 ``performance`` 里：管理端与
+    ``scripts/profile_run.py`` 都能直接读到，不需要再去猜。
+    """
+
+    run_id = str(state.get("run_id") or "")
+    store = state.get("store")
+    spans: list[dict[str, Any]] = []
+    if store is not None and run_id:
+        try:
+            spans = list(store.get_trace_spans(run_id))
+        except Exception:  # noqa: BLE001 —— 性能摘要是诊断，读不到不能毁掉产物
+            spans = []
+
+    stages = [
+        {
+            "stage_id": span.get("name"),
+            "status": span.get("status"),
+            "duration_ms": _span_duration_ms(span),
+        }
+        for span in spans
+        if span.get("component") == str(SpanKind.WORKFLOW)
+    ]
+    stages.sort(key=lambda item: -int(item["duration_ms"]))
+
+    # Provider：本 run 真实发出的调用 + 从 Discovery 过户来的（复用）
+    run_rows = _provider_call_rows(state.get("hub"))
+    adopted_rows = list(state.get("adopted_calls") or [])
+    per_tool: dict[str, dict[str, Any]] = {}
+    for entry, reused in [(row, False) for row in run_rows] + [(row, True) for row in adopted_rows]:
+        key = f"{entry.get('provider') or '?'}/{entry.get('tool') or '?'}"
+        bucket = per_tool.setdefault(
+            key,
+            {
+                "key": key,
+                "calls": 0,
+                "total_ms": 0,
+                "max_ms": 0,
+                "reused": 0,
+                "cached": 0,
+                "fallback": 0,
+                "failures": 0,
+            },
+        )
+        duration = entry.get("duration_ms")
+        duration_ms = int(duration) if isinstance(duration, (int, float)) else 0
+        bucket["calls"] += 1
+        bucket["total_ms"] += duration_ms
+        bucket["max_ms"] = max(bucket["max_ms"], duration_ms)
+        bucket["reused"] += 1 if reused else 0
+        bucket["cached"] += 1 if entry.get("cached") else 0
+        bucket["fallback"] += 1 if entry.get("fallback") else 0
+        bucket["failures"] += 1 if str(entry.get("status")) not in {"OK", "REUSED"} else 0
+    providers = sorted(per_tool.values(), key=lambda item: -int(item["total_ms"]))
+    for bucket in providers:
+        bucket["avg_ms"] = round(bucket["total_ms"] / bucket["calls"]) if bucket["calls"] else 0
+
+    def _tool_calls(tool: str) -> int:
+        """某个 tool 的调用次数（键的形状是 ``provider/tool``，按最后一段精确匹配）。"""
+
+        return sum(
+            int(bucket["calls"])
+            for bucket in providers
+            if str(bucket["key"]).rsplit("/", 1)[-1] == tool
+        )
+
+    ledger_summary: dict[str, int] = {}
+    ledger = state.get("ledger")
+    if ledger is not None:
+        try:
+            ledger_summary = dict(ledger.summary())
+        except Exception:  # noqa: BLE001
+            ledger_summary = {}
+
+    # 管理端 Run Detail 的「性能摘要」按这几个**扁平键**读取（见 frontend
+    # components/admin/run-performance.tsx 的 SUMMARY_MS_KEYS）。这里在同一份 trace 上
+    # 汇总，保证"页面上的数"与"trace 里的数"同源；缺的维度不编，直接 0。
+    stage_ms = {
+        str(item.get("stage_id")): int(item.get("duration_ms") or 0) for item in stages
+    }
+    llm_ms = sum(
+        _span_duration_ms(span) for span in spans if span.get("component") == str(SpanKind.LLM)
+    )
+    jev_ms = sum(
+        _span_duration_ms(span) for span in spans if span.get("component") == str(SpanKind.JEV)
+    )
+    route_ms = sum(
+        _span_duration_ms(span)
+        for span in spans
+        if span.get("component") == str(SpanKind.TOOL)
+        and str((span.get("attributes") or {}).get("tool") or span.get("name")) == "route"
+    )
+    prefetch_reused = len(adopted_rows)
+    cache_hits = sum(1 for row in run_rows if row.get("cached"))
+    fallbacks = sum(1 for row in run_rows if row.get("fallback"))
+
+    return {
+        "run_id": run_id,
+        "total_ms": metrics.get("duration_ms"),
+        "total_duration_ms": metrics.get("duration_ms"),
+        "stages": stages,
+        "providers": providers,
+        "provider_calls": len(run_rows),
+        "prefetch_reused_calls": prefetch_reused,
+        "route_calls": _tool_calls("route"),
+        "poi_calls": _tool_calls("search_poi"),
+        "poi_detail_calls": _tool_calls("get_poi_detail"),
+        "ticket_calls": _tool_calls("search_scenic_tickets"),
+        "cache_hits": cache_hits,
+        "fallbacks": fallbacks,
+        "tool_status": {
+            status: sum(1 for row in run_rows if str(row.get("status")) == status)
+            for status in sorted({str(row.get("status")) for row in run_rows})
+            if status
+        },
+        "ledger": ledger_summary,
+        "llm_calls": metrics.get("llm_calls"),
+        "jev_calls": metrics.get("jev_calls"),
+        # --- 管理端扁平键（与上面是同一份数字，只是换个读法）---
+        "transport_ms": stage_ms.get("search_intercity_transport", 0),
+        "hotel_ms": stage_ms.get("search_hotels", 0),
+        # Discovery 的两条线在这里（攻略 + 地点抽取）；用户在前端等的是它们的复用效果。
+        "discovery_ms": stage_ms.get("search_social_guides", 0)
+        + stage_ms.get("extract_and_normalize_places", 0),
+        "poi_verify_ms": stage_ms.get("verify_poi_and_routes", 0),
+        "route_ms": route_ms,
+        "planner_ms": stage_ms.get("score_candidates", 0) + stage_ms.get("build_initial_plan", 0),
+        "llm_ms": llm_ms,
+        "jev_ms": jev_ms,
+        "prefetch_reused": prefetch_reused,
+        "fallback_count": fallbacks,
+        "verification": {
+            "deep_verified_places": len(state.get("routes") or {}) // 2,
+            "route_skipped": ledger_summary.get("route_skipped", 0),
+            "amap_status": state.get("amap_status"),
+        },
+        # 并发上限 / 取数上限 / 超时的快照：管理端要能回答"这次是在什么配置下跑的"。
+        "config": performance_config_snapshot(),
+    }
 
 
 def _jev_signals(state: TravelState) -> dict[str, str]:
@@ -3386,7 +4406,10 @@ def _record_provider_calls(state: TravelState) -> int:
                 "duration_ms": entry.get("duration_ms"),
                 "returned": entry.get("returned"),
                 "error": (entry.get("note") or "")[:400] or None,
-                "fallback": False,
+                # Part C/E：真实来自 Provider 账本（12306→途牛、TikHub→MediaCrawler），
+                # 不再恒为 False —— 恒为 False 会让 Provider Health 的 fallback_count
+                # 永远显示 0，等于把"主源经常不可用"这件事藏起来。
+                "fallback": bool(entry.get("fallback")),
                 "query": {
                     key: value
                     for key, value in (entry.get("query") or {}).items()
@@ -3416,9 +4439,13 @@ def _emit_run_spans(state: TravelState, *, llm: Any) -> None:
     已经在运行过程中被完整记下。在这里逐条转录成 span，不需要给每个调用点包一层回调，
     也不会因为某个调用点忘了埋点就丢数据。
 
-    层级：workflow 节点 → provider（或 mcp）→ tool。tool span 的 id 与 Bad Case 的
-    ``trace_refs`` 一致（``{run}:provider:{provider}:{tool}``），所以从 Bad Case 能直接
+    层级：workflow 节点 → provider（或 mcp）→ tool。tool span 的 id 前缀与 Bad Case 的
+    ``trace_refs``（``{run}:provider:{provider}:{tool}``）一致，所以从 Bad Case 能直接
     跳到那条 span。
+
+    **时间必须来自账本，不能来自"落盘时刻"**：这段代码在 finalize 之后才跑，用
+    ``now_iso()`` 当 finished_at 会让每一条子 span 都"跑到 run 结束"（实测把 5.5s 的
+    途牛调用画成 370s）。所以一律用 ``started_at + duration_ms`` 反推。
     """
 
     run_id = state["run_id"]
@@ -3426,9 +4453,29 @@ def _emit_run_spans(state: TravelState, *, llm: Any) -> None:
     def parent_for(stage: str | None) -> str | None:
         return f"{run_id}:{stage}" if stage else None
 
+    def span_window(entry: Mapping[str, Any]) -> tuple[str, str]:
+        """账本条目 → (started_at, finished_at)。缺 duration 时才退回当前时刻。"""
+
+        started = str(entry.get("fetched_at") or now_iso())
+        return started, finish_iso(started, entry.get("duration_ms"))
+
+    entries = [*_provider_call_rows(state.get("hub")), *list(state.get("adopted_calls") or [])]
+    # 先算每个 Provider / MCP 分组的真实时间窗：分组 span 的时间必须是它**所有**子调用的
+    # 并集，否则管理端甘特图上"分组条"会短于它自己的子条。
+    group_windows: dict[str, tuple[str, str]] = {}
+    for entry in entries:
+        provider = str(entry.get("provider") or "unknown")
+        server = MCP_BACKED_PROVIDERS.get(provider)
+        group_id = span_id(run_id, SpanKind.MCP if server else SpanKind.PROVIDER, server or provider)
+        started, finished = span_window(entry)
+        window = group_windows.get(group_id)
+        if window is None:
+            group_windows[group_id] = (started, finished)
+        else:
+            group_windows[group_id] = (min(window[0], started), max(window[1], finished))
+
     emitted_groups: set[str] = set()
-    adopted = list(state.get("adopted_calls") or [])
-    for entry in [*_provider_call_rows(state.get("hub")), *adopted]:
+    for entry in entries:
         provider = str(entry.get("provider") or "unknown")
         tool = str(entry.get("tool") or "unknown")
         stage = PROVIDER_STAGE_MAP.get(tool)
@@ -3436,15 +4483,30 @@ def _emit_run_spans(state: TravelState, *, llm: Any) -> None:
         group_component = SpanKind.MCP if server else SpanKind.PROVIDER
         group_name = server or provider
         group_id = span_id(run_id, group_component, group_name)
+        started, finished = span_window(entry)
+        reused = bool(entry.get("reused"))
+        cached = bool(entry.get("cached"))
+        fallback = bool(entry.get("fallback"))
+        status = str(entry.get("status") or "")
         if group_id not in emitted_groups:
             emitted_groups.add(group_id)
+            group_started, group_finished = group_windows.get(group_id, (started, finished))
             _record_subspan(
                 state,
                 component=group_component,
                 name=group_name,
                 status="SUCCESS",
-                started_at=str(entry.get("fetched_at") or now_iso()),
-                attributes={"provider": provider, "transport": "mcp stdio" if server else "http"},
+                started_at=group_started,
+                finished_at=group_finished,
+                attributes={
+                    "provider": provider,
+                    "transport": "mcp stdio" if server else "http",
+                    "calls": sum(
+                        1
+                        for item in entries
+                        if str(item.get("provider") or "unknown") == provider
+                    ),
+                },
                 parent_span_id=parent_for(stage),
             )
         _record_subspan(
@@ -3452,35 +4514,47 @@ def _emit_run_spans(state: TravelState, *, llm: Any) -> None:
             component=SpanKind.TOOL,
             name=tool,
             # 单个 tool 的成败就是它自己的状态；成组状态由管理端按子 span 聚合。
-            status=(
-                "SUCCESS"
-                if entry.get("status") == "OK"
-                else ("REUSED" if entry.get("reused") else "WARNING")
-            ),
-            started_at=str(entry.get("fetched_at") or now_iso()),
+            status="SUCCESS" if status == "OK" else ("REUSED" if reused else "WARNING"),
+            started_at=started,
+            finished_at=finished,
+            # Part C：管理端与 profiler 要能直接回答"哪些是复用的、哪些是本次调的、
+            # 哪些走了 fallback"，所以四个标记必须落在 span 属性上（不是只写进文案）。
             attributes={
                 "provider": provider,
                 "tool": tool,
-                "status": entry.get("status"),
-                "reused_from_discovery": bool(entry.get("reused")),
+                "status": status,
+                "cache_hit": cached,
+                "prefetch_reused": reused,
+                "provider_called": not (cached or reused),
+                "fallback_query": fallback,
+                # 保留旧字段名，管理端与既有 Bad Case 规则读的是它。
+                "reused_from_discovery": reused,
                 "returned": entry.get("returned"),
                 "duration_ms": entry.get("duration_ms"),
                 "query": entry.get("query"),
                 "source_id": entry.get("source_id"),
                 "note": entry.get("note"),
             },
+            # 每次调用一条独立的 span：同名 tool 的多次调用如果共用一个 span_id，
+            # 后写的会把先写的顶掉（INSERT OR REPLACE），于是 16 次 search_poi 在
+            # Trace 里只剩 1 条 —— profiler 数出来的 route/poi 调用数全是错的。
+            suffix=str(entry.get("source_id") or ""),
             parent_span_id=group_id,
-            error=None if entry.get("status") == "OK" else str(entry.get("note") or entry.get("status")),
+            error=None if status == "OK" else str(entry.get("note") or status),
         )
 
-    for index, entry in enumerate(llm.audit_entries() if llm is not None else []):
+    for entry in llm.audit_entries() if llm is not None else []:
         tag = str(entry.get("tag") or "unnamed")
+        # LLM 账本现在带真实起止时刻（app/llm.py:invoke）；没有就按 duration 反推。
+        llm_started = str(entry.get("started_at") or start_iso(entry.get("finished_at"), entry.get("duration_ms")))
+        llm_finished = str(entry.get("finished_at") or finish_iso(llm_started, entry.get("duration_ms")))
         _record_subspan(
             state,
             component=SpanKind.LLM,
             name=tag,
             status="SUCCESS" if entry.get("status") == "OK" else "WARNING",
-            started_at=now_iso(),
+            started_at=llm_started,
+            finished_at=llm_finished,
             attributes={
                 "tag": tag,
                 "model": entry.get("model"),
@@ -4033,17 +5107,19 @@ def execute_travel_run(
         attributes: dict[str, Any],
         parent_span_id: str | None = None,
         error: str | None = None,
+        suffix: str | None = None,
     ) -> None:
         """业务级子 span（planner / jev / llm / provider / budget / feasibility / critic / store）。
 
-        span_id 由 (component, name) 决定，因此 Bad Case 能引用一个**稳定可查**的 id，
-        而不是一段描述性文字。
+        span_id 由 (component, name[, suffix]) 决定，因此 Bad Case 能引用一个**稳定可查**的
+        id，而不是一段描述性文字。``suffix`` 用于"同名多次"的 span（同一个 tool 的第 N 次调用、
+        多个 Jev 问题）：span_id 是主键，不带 suffix 的重复写入会把前一条顶掉。
         """
 
         try:
             resolved_store.save_trace_span(
                 resolved_run_id,
-                span_id(resolved_run_id, component, name),
+                span_id(resolved_run_id, component, name, suffix=suffix),
                 component=str(component),
                 name=name,
                 status=status,
@@ -4114,6 +5190,29 @@ def execute_travel_run(
                 "cached_price_per_million": price_cached,
             },
         }
+        # Part H：把性能摘要落到两个**已经存在**的出口，不需要新接口：
+        #   1. `metrics["performance_summary"]` → outputs/<run_id>/metrics.json（机器可读）；
+        #   2. 一条 `performance_summary` span → GET /admin/runs/{id} 的 `trace`（管理端
+        #      Run Detail 直接就能看到，不需要新增 endpoint）。
+        # 字段名对齐管理端「性能摘要」读的键（transport_ms / provider_calls / cache_hits…），
+        # 所以页面上的数字与这里、与 trace 里的数字是同一份来源，不会各说各话。
+        try:
+            summary = _performance_summary(state=final if final else state, metrics=metrics)
+            summary["total_ms"] = metrics.get("duration_ms")
+            summary["total_duration_ms"] = metrics.get("duration_ms")
+            metrics["performance_summary"] = summary
+            resolved_store.save_trace_span(
+                resolved_run_id,
+                f"{resolved_run_id}:store:performance_summary",
+                component=str(SpanKind.STORE),
+                name="performance_summary",
+                status="SUCCESS",
+                started_at=start_iso(utcnow().isoformat(), metrics.get("duration_ms")),
+                finished_at=utcnow().isoformat(),
+                attributes=summary,
+            )
+        except Exception:  # noqa: BLE001 —— 摘要是诊断，写不进去不能影响 run 的结论
+            pass
         try:
             resolved_store.save_run_metrics(resolved_run_id, metrics)
             if result_status == STATUS_COMPLETED and degradations:
@@ -4164,6 +5263,13 @@ def execute_travel_run(
     if prefetch is not None:
         adopted_calls = _adopt_prefetch_sources(resolved_store, resolved_run_id, prefetch)
 
+    # 复用账本在这里**只建一次**并作为句柄传进图（见 TravelState.ledger 的注释）。
+    # Discovery 的调用也顺手播种进去：正式流程再问同一个键时会被记成 duplicate_query
+    # 而不是又打一遍 Provider。
+    ledger = CallLedger(scope=resolved_run_id)
+    if adopted_calls:
+        ledger.seed(adopted_calls)
+
     state: TravelState = {
         "run_id": resolved_run_id,
         "query": query,
@@ -4179,6 +5285,7 @@ def execute_travel_run(
         "prefetch": prefetch,
         #: 从 Discovery 过户过来的调用（审计里要标明"复用"，不是本次真的调了）
         "adopted_calls": adopted_calls,
+        "ledger": ledger,
         "source": source,
         "source_session_id": source_session_id,
         "progress_hook": progress_hook,

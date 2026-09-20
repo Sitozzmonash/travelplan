@@ -399,6 +399,9 @@ function normalizeCostBreakdown(value: unknown): AdminCostBreakdown | null {
 function normalizeRunMetrics(value: unknown): AdminRunMetrics {
   const record = isRecord(value) ? value : {};
   return {
+    // 先铺开原始 metrics：后端新增的性能摘要（performance_summary / transport_ms …）
+    // 不能被归一化悄悄丢掉，否则 Run Detail 的「性能摘要」永远拿不到数据。
+    ...(record as AdminRunMetrics),
     duration_ms: toNumberOrNull(record.duration_ms),
     input_tokens: toNumberOrNull(record.input_tokens),
     output_tokens: toNumberOrNull(record.output_tokens),
@@ -413,6 +416,7 @@ function normalizeRunMetrics(value: unknown): AdminRunMetrics {
     cost_currency: toStringOrNull(record.cost_currency),
     cost_source: toStringOrNull(record.cost_source),
     cost_breakdown: normalizeCostBreakdown(record.cost_breakdown),
+    performance_summary: isRecord(record.performance_summary) ? record.performance_summary : null,
   };
 }
 

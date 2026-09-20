@@ -1,0 +1,58 @@
+# TravelPlan 生产架构的「后端常驻容器」蓝图（Render Blueprint）。
+#
+# 固定架构（PRD §12 / docs/09_部署说明.md）：
+#
+#     Browser → Vercel（Next.js 前端）→ Render（FastAPI 常驻容器）→ Neon PostgreSQL
+#
+# 为什么后端不能塞进 Vercel Function：一次真实规划要跑几分钟。
+# `POST /api/v1/plans {background:true}` 先建 run 并**立刻返回 202**，真正的执行留在
+# **同一个进程**的后台线程里继续跑，前端轮询 `/api/v1/plans/{run_id}/status` 直到
+# SUCCESS / DEGRADED / FAILED。Serverless 函数在响应返回后就被冻结，跑不了这种长任务。
+#
+# 数据落在 Neon（`DATABASE_URL`）；容器里的 `/data` 只是临时产物目录，Render 免费层
+# 没有持久盘也不影响正确性 —— 重启只会丢 outputs/ 产物，业务数据全在 Neon。
+#
+# 用法（两种都可以）：
+#   1. Render 控制台 → New → Blueprint → 选本仓库（会自动读这份 render.yaml）；
+#   2. 直接建 Web Service：Runtime=Docker、Dockerfile=./Dockerfile、Health Check=/api/v1/health。
+#      带 `sync: false` 的环境变量需要在面板里手填（它们都是 Secret，绝不进仓库）。
+services:
+  - type: web
+    name: travelplan-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # 与 Neon 项目 travelplan（us-east-2 / Ohio）同区，省掉跨区往返延迟。
+    region: ohio
+    plan: free
+    healthCheckPath: /api/v1/health
+    autoDeployTrigger: commit
+    envVars:
+      # ---- Secret：只在 Render 面板里配置，仓库里永远只有 key 名 ----
+      - key: DATABASE_URL # Neon 连接串（含用户名/密码）；配了它后端才会走 Postgres
+        sync: false
+      - key: TRAVELPLAN_ADMIN_TOKEN # 管理端 Bearer Token；不配则 /api/v1/admin/** 一律 503
+        sync: false
+      - key: TRAVELPLAN_CORS_ORIGINS # Vercel 前端域名，逗号分隔（如 https://travelplan.vercel.app）
+        sync: false
+      - key: MODEL_NAME
+        sync: false
+      - key: MODEL_BASE_URL
+        sync: false
+      - key: MODEL_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: AMAP_API_KEY
+        sync: false
+      - key: TIKHUB_API_TOKEN
+        sync: false
+      - key: TUNIU_API_KEY
+        sync: false
+      - key: JEV_API_KEY
+        sync: false
+      # ---- 非 Secret：与 Dockerfile 的 ENV 一致，写在这里让「没有持久盘」这件事可见 ----
+      - key: TRAVELPLAN_OUTPUT_DIR
+        value: /data/outputs
+      - key: TRAVELPLAN_DB_PATH
+        value: /data/travelplan.db

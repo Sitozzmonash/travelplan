@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from app import planner
+from app.config import current_config
 from app.llm import LLM, degraded_note
 from app.models import (
     Decision,
@@ -35,6 +36,13 @@ from app.models import (
     Place,
     TripIntent,
     coerce_str,
+)
+from app.observability import (
+    MARK_PREFETCH_REUSED,
+    MARK_PROVIDER_CALLED,
+    CallLedger,
+    parallel_map,
+    query_key,
 )
 from app.prompts import EXTRACT_PLACES_PROMPT, RESEARCH_QUERY_EXPANSION_PROMPT
 from app.providers import ProviderHub
@@ -68,6 +76,22 @@ DEFAULT_POI_KEYWORDS = ("景点", "博物馆", "公园", "步行街", "古镇")
 # ======================================================================
 # 返回结构
 # ======================================================================
+
+
+class SimpleResult:
+    """与 ``ProviderResult`` 同形的空结果（只用 ``status`` / ``items`` / ``provider``）。
+
+    并发取数时某条线炸了，下游仍然要能拿到"这一次没结果"这个**数据**，
+    而不是一个异常或一个编出来的候选。
+    """
+
+    __slots__ = ("status", "items", "provider", "error")
+
+    def __init__(self, *, provider: str, status: str = "UNAVAILABLE", error: str | None = None) -> None:
+        self.status = status
+        self.items: list[Any] = []
+        self.provider = provider
+        self.error = error
 
 
 @dataclass(slots=True)
@@ -120,7 +144,13 @@ class PlaceCandidates:
 
 
 def fetch_transport_candidates(hub: ProviderHub, intent: TripIntent, *, reason_out: dict[str, Any] | None = None) -> TransportCandidates:
-    """查去程/回程的大交通候选（不做比选，比选留给 `app/selection.py` 的策略层）。"""
+    """查去程/回程的大交通候选（不做比选，比选留给 `app/selection.py` 的策略层）。
+
+    四条查询（去程火车 / 去程航班 / 回程火车 / 回程航班）互不依赖，一起发出去（Part A）：
+    串行做这四件事实测吃掉 210s，而它们唯一的"依赖"是以前是顺序写的。
+    结果按**固定顺序**合并（去程火车、去程航班、回程火车、回程航班），
+    所以并发不会让候选顺序抖动。
+    """
 
     destination = _destination(intent)
     origin = coerce_str(intent.origin) or None
@@ -134,16 +164,38 @@ def fetch_transport_candidates(hub: ProviderHub, intent: TripIntent, *, reason_o
     back = _last_date(intent)
     travelers = max(1, intent.travelers)
     result.queried = True
+    cfg = current_config()
+    has_back = back is not None and back >= start
 
-    out_trains = hub.search_trains(origin, destination, start)
-    out_flights = hub.search_flights(origin, destination, start, travelers=travelers)
+    # 四个任务按固定顺序定义，`parallel_map` 保证结果同序 —— 去程火车、去程航班、
+    # 回程火车、回程航班。谁先返回不参与任何决策。
+    tasks: list[Any] = [
+        lambda: hub.search_trains(origin, destination, start),
+        lambda: hub.search_flights(origin, destination, start, travelers=travelers),
+    ]
+    if has_back:
+        tasks.append(lambda: hub.search_trains(destination, origin, back))
+        tasks.append(lambda: hub.search_flights(destination, origin, back, travelers=travelers))
+    outcomes = parallel_map(tasks, max_workers=cfg.provider_max_concurrency, thread_prefix="tp-disc-transport")
+
+    def _value(index: int, label: str, provider: str) -> Any:
+        """取第 index 个结果；失败时返回空候选 + 一条降级说明（绝不用估算值代替）。"""
+
+        outcome = outcomes[index]
+        if outcome.ok and outcome.value is not None:
+            return outcome.value
+        result.degradations.append(f"{label} 查询失败（{outcome.error or '未知错误'}），本次按无候选处理")
+        return SimpleResult(provider=provider)
+
+    out_trains = _value(0, "去程火车", "12306")
+    out_flights = _value(1, "去程航班", "tuniu")
     result.provider_status["去程火车"] = out_trains.status
     result.provider_status["去程航班"] = out_flights.status
     result.outbound = [*out_trains.items, *out_flights.items]
 
-    if back is not None and back >= start:
-        in_trains = hub.search_trains(destination, origin, back)
-        in_flights = hub.search_flights(destination, origin, back, travelers=travelers)
+    if has_back:
+        in_trains = _value(2, "回程火车", "12306")
+        in_flights = _value(3, "回程航班", "tuniu")
         result.provider_status["回程火车"] = in_trains.status
         result.provider_status["回程航班"] = in_flights.status
         result.inbound = [*in_trains.items, *in_flights.items]
@@ -214,12 +266,25 @@ def fetch_hotel_candidates(
 # ======================================================================
 
 
-def discover_social_evidence(hub: ProviderHub, llm: LLM, intent: TripIntent) -> SocialEvidence:
-    """搜攻略：小红书 → 抖音（小红书空时）→ 网页，全部失败也照常返回空集。"""
+def discover_social_evidence(
+    hub: ProviderHub,
+    llm: LLM,
+    intent: TripIntent,
+    *,
+    ledger: CallLedger | None = None,
+) -> SocialEvidence:
+    """搜攻略：小红书 → 抖音（小红书空时）→ 网页，全部失败也照常返回空集。
+
+    同一条线内部的多次检索（3 个小红书关键词、2 个网页关键词）互不依赖，受控并发；
+    但**合并顺序按检索词顺序**，`MAX_EVIDENCE` 的截断点因此与串行版本完全一致 ——
+    并发只影响墙钟，不影响结果。抖音回退依赖小红书的结果，仍然是串行的。
+    """
 
     result = SocialEvidence()
     destination = _destination(intent) or ""
     prefs = "、".join(intent.preferences[:4])
+    cfg = current_config()
+    books = ledger or CallLedger(scope="discovery")
 
     expansion = llm.invoke_json(
         RESEARCH_QUERY_EXPANSION_PROMPT,
@@ -233,11 +298,29 @@ def discover_social_evidence(hub: ProviderHub, llm: LLM, intent: TripIntent) -> 
     else:
         result.queries = _fallback_queries(intent)
         result.query_source = "规则兜底检索词"
-        result.degradations.append(degraded_note(expansion, "检索词退化为规则组合"))
+        result.degradations.append(degraded_note(expansion, "检索词退化为组合"))
 
     evidences: list[Evidence] = []
-    for keyword in result.queries[:SOCIAL_QUERY_LIMIT]:
-        social = hub.search_xiaohongshu(keyword)
+    social_keywords = list(result.queries[:SOCIAL_QUERY_LIMIT])
+    outcomes = parallel_map(
+        [
+            (
+                lambda kw=keyword: books.fetch(
+                    query_key("tikhub", "search_xiaohongshu", query=kw),
+                    lambda kw=kw: hub.search_xiaohongshu(kw),
+                    detail=f"小红书「{kw}」",
+                )[0]
+            )
+            for keyword in social_keywords
+        ],
+        max_workers=cfg.provider_max_concurrency,
+        thread_prefix="tp-disc-social",
+    )
+    for keyword, outcome in zip(social_keywords, outcomes):
+        if not outcome.ok or outcome.value is None:
+            result.notes.append(f"小红书「{keyword}」：调用失败（已按无结果处理）")
+            continue
+        social = outcome.value
         result.platforms["小红书"] = result.platforms.get("小红书", 0) + len(social.items)
         evidences.extend(social.items)
         if not social.items:
@@ -246,13 +329,35 @@ def discover_social_evidence(hub: ProviderHub, llm: LLM, intent: TripIntent) -> 
             break
 
     if not any(ev.provider == "xhs" for ev in evidences) and destination:
-        douyin = hub.search_douyin(f"{destination} 旅游")
+        douyin = books.fetch(
+            query_key("tikhub", "search_douyin", query=f"{destination} 旅游"),
+            lambda: hub.search_douyin(f"{destination} 旅游"),
+            detail="抖音回退",
+        )[0]
         result.platforms["抖音"] = result.platforms.get("抖音", 0) + len(douyin.items)
         evidences.extend(douyin.items)
         result.notes.append(f"小红书没有返回可用攻略，回退抖音查询：{douyin.status}")
 
-    for keyword in result.queries[:WEB_QUERY_LIMIT]:
-        web = hub.web_search(keyword, max_results=5)
+    web_keywords = list(result.queries[:WEB_QUERY_LIMIT])
+    web_outcomes = parallel_map(
+        [
+            (
+                lambda kw=keyword: books.fetch(
+                    query_key("tavily", "web_search", query=kw),
+                    lambda kw=kw: hub.web_search(kw, max_results=5),
+                    detail=f"网页搜索「{kw}」",
+                )[0]
+            )
+            for keyword in web_keywords
+        ],
+        max_workers=cfg.provider_max_concurrency,
+        thread_prefix="tp-disc-web",
+    )
+    for keyword, outcome in zip(web_keywords, web_outcomes):
+        if not outcome.ok or outcome.value is None:
+            result.notes.append(f"网页搜索「{keyword}」：调用失败（已按无结果处理）")
+            continue
+        web = outcome.value
         if web.items:
             result.platforms["网页"] = result.platforms.get("网页", 0) + len(web.items)
         else:
@@ -309,8 +414,9 @@ def extract_place_candidates(
     evidences: Sequence[Evidence],
     *,
     queries: Sequence[str] | None = None,
-    verify_limit: int = DISCOVERY_POI_VERIFY_LIMIT,
+    verify_limit: int | None = None,
     poi_limit: int | None = None,
+    ledger: CallLedger | None = None,
 ) -> PlaceCandidates:
     """从攻略提到的地方 + 关键词，去高德查成真实 POI 候选。
 
@@ -318,6 +424,7 @@ def extract_place_candidates(
     所以坐标、行政区、营业时间全部有出处；查不到就不进候选，绝不用模型编一个地点。
 
     Discovery 阶段只做到这里：不两两算路线、不逐个查门票 —— 那要等用户选完之后做。
+    ``ledger`` 让同一次 Discovery 内的重复关键词只查一次高德（Part C）。
     """
 
     result = PlaceCandidates()
@@ -350,34 +457,57 @@ def extract_place_candidates(
         result.notes.append("没有可用的攻略证据，地点候选只能来自关键词搜索")
 
     keywords = _keyword_candidates(intent, list(queries or ()))
+    cfg = current_config()
+    books = ledger or CallLedger(scope="discovery")
+    limit = cfg.poi_query_limit if poi_limit is None else max(1, poi_limit)
+
+    # 关键词表：攻略自带地名 / 模型抽出的地名 / 兜底关键词。先合并去重再截断 ——
+    # 同一家店出现在两条攻略里时不该查两遍高德（Part C 的"同一个键只查一次"），
+    # 也让 DISCOVERY_MAX_PLACES（原始候选上限）真的是"去重后的原始候选数"。
+    raw_names: list[str] = []
+    for name in [
+        *provider_mentions[:limit],
+        *[coerce_str(item.get("name")) for item in extracted[:limit]],
+    ]:
+        cleaned = coerce_str(name).strip()
+        if cleaned and cleaned not in raw_names:
+            raw_names.append(cleaned)
+    search_terms = [*raw_names[: cfg.discovery_max_places], *keywords]
+
+    # 关键词 POI 搜索互不依赖 → 受控并发；合并仍按关键词顺序（first-wins 的字段因此稳定）。
+    outcomes = parallel_map(
+        [
+            (
+                lambda term=term: books.fetch(
+                    query_key("amap", "search_poi", destination=destination, query=term),
+                    lambda term=term: hub.search_poi(
+                        term, destination, page_size=cfg.poi_page_size, type_hint="attraction"
+                    ),
+                    detail=f"高德 POI「{term}」",
+                )[0]
+            )
+            for term in search_terms
+        ],
+        max_workers=cfg.provider_max_concurrency,
+        thread_prefix="tp-disc-poi",
+    )
+
     poi_status = "OK"
     places: list[Place] = []
     seen_ids: set[str] = set()
     searched = 0
-
-    def add_poi(keyword: str) -> None:
-        nonlocal poi_status
-        name = coerce_str(keyword)
-        if not name:
-            return
-        poi = hub.search_poi(name, destination, page_size=POI_PAGE_SIZE, type_hint="attraction")
-        poi_status = poi.status if poi_status == "OK" else poi_status
+    for term, outcome in zip(search_terms, outcomes):
+        searched += 1
+        if not outcome.ok or outcome.value is None:
+            result.degradations.append(f"高德 POI 查询「{term}」失败：{outcome.error}")
+            continue
+        poi = outcome.value
+        poi_status = poi_status if poi_status != "OK" else poi.status
         for place in poi.items:
             if place.place_id in seen_ids:
                 continue
             seen_ids.add(place.place_id)
             places.append(place)
-
-    limit = POI_QUERY_LIMIT if poi_limit is None else max(1, poi_limit)
-    for name in provider_mentions[:limit]:
-        add_poi(name)
-        searched += 1
-    for item in extracted[:limit]:
-        add_poi(coerce_str(item.get("name")))
-        searched += 1
-    for keyword in keywords:
-        add_poi(keyword)
-        searched += 1
 
     result.keyword_hits = searched
     if not places and destination:
@@ -390,21 +520,51 @@ def extract_place_candidates(
     deduped, dedupe_decisions = planner.dedupe_places(places)
     result.decisions.extend(dedupe_decisions)
 
+    # 用户可见候选上限（用户旅程 §8：12~20 个，不要一次丢 50 个）。为什么在这里截：
+    # 用户是在这一步做 MUST/WANT/REJECT 的，清单太长等于让他做无意义的筛选；
+    # 截断顺序按现有顺序（攻略提到过的在前），不按分数——此时还没有分数。
+    visible_limit = max(1, cfg.user_visible_poi_limit)
+    if len(deduped) > visible_limit:
+        result.notes.append(
+            f"候选 {len(deduped)} 个超过用户可见上限 {visible_limit}，已按攻略提及顺序截断"
+        )
+        deduped = deduped[:visible_limit]
+
     # Discovery 只对前 N 个做 POI 详情核实（营业时间/地址），控制成本；
-    # 正式 run 的 ⑥ 步会对真正要排的点做完整路线的两两验证。
-    for place in deduped[:verify_limit]:
-        detail = hub.poi_detail(place.place_id)
-        if not detail.ok:
+    # 正式 run 的 ⑥ 步会对"真正可能排进行程"的点做深度验证（Part D）。
+    verify = max(0, int(verify_limit if verify_limit is not None else cfg.discovery_poi_verify_limit))
+    detail_targets = deduped[:verify]
+    detail_outcomes = parallel_map(
+        [
+            (
+                lambda place=place: books.fetch(
+                    query_key("amap", "get_poi_detail", query=place.place_id),
+                    lambda place=place: hub.poi_detail(place.place_id),
+                    detail=f"POI 详情 {place.name}",
+                )[0]
+            )
+            for place in detail_targets
+        ],
+        max_workers=cfg.poi_verify_max_concurrency,
+        thread_prefix="tp-disc-detail",
+    )
+    for place, outcome in zip(detail_targets, detail_outcomes):
+        if not outcome.ok or outcome.value is None or not outcome.value.ok:
             continue
+        detail = outcome.value
         _apply_poi_detail(place, detail.items[0] if detail.items else {})
     result.places = deduped
     return result
 
 
 def _keyword_candidates(intent: TripIntent, queries: list[str]) -> list[str]:
-    """关键词兜底：保证"必去景点"不会因为攻略没写就完全缺席（两者都只是候选）。"""
+    """关键词兜底：保证"必去景点"不会因为攻略没写就完全缺席（两者都只是候选）。
+
+    上限来自 config（``POI_QUERY_LIMIT``）：每个关键词都是一次真实的高德调用。
+    """
 
     destination = _destination(intent) or ""
+    cap = max(1, current_config().poi_query_limit)
     names = list(DEFAULT_POI_KEYWORDS)
     for preference in intent.preferences[:4]:
         word = PREFERENCE_POI_QUERY.get(preference, preference)
@@ -417,7 +577,7 @@ def _keyword_candidates(intent: TripIntent, queries: list[str]) -> list[str]:
             continue
         if cleaned and cleaned not in names:
             names.append(cleaned)
-    return names[:POI_QUERY_LIMIT]
+    return names[:cap]
 
 
 def _apply_poi_detail(place: Place, detail: dict[str, Any]) -> None:
@@ -478,6 +638,7 @@ def prefetch(
     hotel_pages: int = 1,
     workers: int = 4,
     on_partial: Any | None = None,
+    ledger: CallLedger | None = None,
 ) -> dict[str, Any]:
     """四条线并行取数，返回给 Planning Session 存草稿的原始结果。
 
@@ -486,10 +647,14 @@ def prefetch(
 
     单条线失败不影响其它线（`TransportCandidates` 等各自带 degradations），
     这也满足验收标准里"social / hotel / transport 失败仍可继续"。
+
+    ``ledger`` 是这一次 Discovery 的查询键账本（Part C）：四条线共用一个，
+    所以"交通查过的键""social 查过的关键词"彼此之间也不会重复请求。
     """
 
     from concurrent.futures import ThreadPoolExecutor
 
+    books = ledger or CallLedger(scope="discovery")
     destinations = {
         "transport": (fetch_transport_candidates, (hub, intent)),
         "hotels": (fetch_hotel_candidates, (hub, intent)),
@@ -502,6 +667,8 @@ def prefetch(
         try:
             if name == "hotels":
                 outcomes[name] = func(*args, pages=hotel_pages)
+            elif name == "social":
+                outcomes[name] = func(*args, ledger=books)
             else:
                 outcomes[name] = func(*args)
         except Exception as exc:  # noqa: BLE001 —— 一条线崩了不能带走整个 Discovery
@@ -615,7 +782,7 @@ def prefetch(
     if social.evidences:
         try:
             places = extract_place_candidates(
-                hub, llm, intent, social.evidences, queries=social.queries
+                hub, llm, intent, social.evidences, queries=social.queries, ledger=books
             )
         except Exception as exc:  # noqa: BLE001
             errors["places"] = f"{type(exc).__name__}: {exc}"
@@ -633,6 +800,9 @@ def prefetch(
         "places": places,
         "errors": errors,
         "stages": stages,
+        # 本次 Discovery 的缓存/复用/降级计数（Part C）：写进会话，正式 run 与
+        # 管理端因此能回答"Prefetch 阶段省了多少重复查询"。
+        "ledger": books.summary(),
     }
 
 
@@ -670,6 +840,9 @@ class PrefetchBundle:
     discovery_status: str = "READY"
     #: 分阶段 Discovery 状态（管理端与 Bad Case 都要用它回答"卡在哪一步"）
     discovery: dict[str, Any] = field(default_factory=dict)
+    #: Discovery 阶段的缓存/复用/降级计数（Part C）：正式 run 与 perf 摘要在同一个
+    #: 界面上回答"Prefetch 省了多少次重复查询"。
+    ledger: dict[str, int] = field(default_factory=dict)
     #: 开始规划时为等 Discovery 而实际等待的毫秒数（0 = 没有在跑，直接开始）
     grace_waited_ms: int = 0
 
@@ -690,6 +863,7 @@ class PrefetchBundle:
             "degradations": list(self.degradations),
             "discovery_status": self.discovery_status,
             "discovery": dict(self.discovery),
+            "ledger": dict(self.ledger),
             "grace_waited_ms": self.grace_waited_ms,
         }
 
@@ -710,6 +884,11 @@ class PrefetchBundle:
             degradations=[coerce_str(item) for item in (data.get("degradations") or []) if coerce_str(item)],
             discovery_status=coerce_str(data.get("discovery_status")) or "READY",
             discovery=dict(data.get("discovery") or {}),
+            ledger={
+                str(key): int(value)
+                for key, value in (data.get("ledger") or {}).items()
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+            },
             grace_waited_ms=int(data.get("grace_waited_ms") or 0),
         )
 

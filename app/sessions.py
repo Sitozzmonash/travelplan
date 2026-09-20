@@ -483,6 +483,9 @@ def _bundle_from(session_id: str, intent: TripIntent, result: Mapping[str, Any],
         places=list(getattr(places, "places", []) or []),
         provider_calls=list(hub.audit_entries()) if hub is not None else [],
         degradations=degradations,
+        # Discovery 的复用/降级计数（Part C）：正式 run 的 perf 摘要要用它回答
+        # "Prefetch 到底省了多少次重复查询"。
+        ledger=dict(result.get("ledger") or {}),
         discovery_status=DISCOVERY_READY,
     )
 

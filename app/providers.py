@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import threading
 import time
@@ -67,6 +68,7 @@ except Exception:  # noqa: BLE001 —— 没装 superharness 时仍允许 import
         TOOL_STARTED = "tool.started"
         TOOL_FINISHED = "tool.finished"
 
+from app.config import provider_timeouts
 from app.models import (
     Evidence,
     FlightOption,
@@ -88,6 +90,7 @@ __all__ = [
     "ProviderError",
     "ProviderHub",
     "ProviderResult",
+    "ToolTimeout",
     "lnglat",
     "packages_root",
 ]
@@ -143,6 +146,59 @@ class ProviderError(RuntimeError):
     注意：**单次查询失败不走异常**，走 status。异常只用于"这个 Provider 根本装不起来"，
     因为那属于环境问题，藏在一个 EMPTY 里会让排查变成猜谜。
     """
+
+
+class ToolTimeout(RuntimeError):
+    """一次 Tool 调用超过它自己的预算（Part E）。
+
+    为什么要有这个类型而不是直接用 TimeoutError：调用点要能一眼分清"超时"与"工具报错"，
+    并把前者记成 status=TIMEOUT 走既有的 fallback 链路（12306→途牛、TikHub→MediaCrawler），
+    而不是笼统地记成 UNAVAILABLE。
+    """
+
+
+def _invoke_bounded(tool: Any, args: dict[str, Any], *, timeout: float, label: str) -> Any:
+    """在**独立守护线程**里调用一个签名里没有 ``timeout`` 的 Tool，到点就放弃等待。
+
+    为什么必须有这一层：高德 / TikHub / 联网搜索三个 Plugin Tool 的入参里没有 timeout
+    （高德是固定 20s × 3 次重试、TikHub 20s、Tavily 走 SDK 自己的超时），一旦上游劣化
+    就会把整个 run 拖住。这里给它们补一个由 config 控制的统一上限。
+
+    为什么用裸线程而不是线程池：线程池的 worker 被一个卡住的调用占满之后，**排队**的调用
+    会把排队时间算进自己的 timeout，于是出现"明明没人查它却报超时"的假故障。一调用一线程
+    （daemon=True）不会互相拖累，也不会让解释器退出时卡住；真正在飞的调用会在自己返回后
+    被丢弃，它的结果**不会**被当成有效数据混进来。
+    """
+
+    outcome: dict[str, Any] = {}
+
+    def worker() -> None:
+        try:
+            outcome["value"] = tool.invoke(args)
+        except BaseException as exc:  # noqa: BLE001 —— 原样带回给调用方判定
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=worker, name=f"tp-tool-{label}", daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise ToolTimeout(f"{label} 超过 {timeout:g}s 未返回，本次调用按 TIMEOUT 处理")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
+
+
+def tool_accepts_timeout(tool: Any) -> bool:
+    """这个 Tool 的入参签名里是否声明了 ``timeout``。
+
+    用签名判断而不是维护一张硬编码的工具名清单：Plugin 以后给某个工具加上 timeout 参数时
+    这里会自动跟上，不需要两边同时改（硬编码清单一定会漂移）。
+    """
+
+    try:
+        return "timeout" in set(getattr(tool, "args", None) or {})
+    except Exception:  # noqa: BLE001 —— 取不到签名就当作"不支持"，走 _invoke_bounded
+        return False
 
 
 # ==================================================
@@ -222,6 +278,21 @@ def as_payload(raw: Any) -> dict:
     return {}
 
 
+#: 置为真值时**不注册任何 MCP Server**。
+#: 为什么需要它：MCP Server 是 `npx -y 12306-mcp` 拉起的子进程，**不需要任何密钥**，
+#: 所以测试里那套"摘掉第三方 Key 让 Provider 自然降级"的离线策略拦不住它 ——
+#: 一个没显式注入替身的用例会真的联网，而且 stdio 握手不返回时线程会一直阻塞，
+#: 整套 pytest 会卡死在某个用例上（实测卡在 ~24%，半小时不动）。
+#: 生产不设这个变量，12306 主源照常生效。
+DISABLE_MCP_ENV = "TRAVELPLAN_DISABLE_MCP"
+
+
+def mcp_enabled() -> bool:
+    """MCP Server 是否允许注册（测试通过环境变量整体关掉）。"""
+
+    return os.environ.get(DISABLE_MCP_ENV, "").strip().lower() not in {"1", "true", "yes", "on"}
+
+
 def default_mcp_servers() -> list[MCPServerSpec]:
     """本项目用到的 MCP Server 清单（目前只有 12306 火车票）。
 
@@ -230,6 +301,10 @@ def default_mcp_servers() -> list[MCPServerSpec]:
     **拿到过 spec** 的 server 建句柄，两边各写一份迟早会漏掉一边（曾经就漏在自建
     Hub 这边：12306 每次都报「未注册 MCP Server 'railway_12306'」，主源从未生效）。
     """
+
+    if not mcp_enabled():
+        return []
+
     from superharness.capabilities.mcp import railway_12306_server
 
     return [railway_12306_server()]
@@ -305,6 +380,10 @@ class ProviderCall:
     source_url: str | None = None
     duration_ms: int | None = None
     cached: bool = False
+    #: 这次调用是**因为主源不可用**才发出的（12306→途牛火车、TikHub→MediaCrawler）。
+    #: 它让管理端与 profiler 能直接回答"哪些调用走了 fallback"，而不是从两条相邻的
+    #: 调用记录里猜。审计账本、provider_calls 表与 Trace 都读这个字段。
+    fallback: bool = False
     notes: list[str] = field(default_factory=list)
     #: 内部使用：从哪个 Plugin / MCP Server 来的。不进 sources 表。
     origin: str = ""
@@ -598,12 +677,22 @@ class ProviderHub:
         use_cache: bool = True,
         request_timeout: float = 60.0,
         mcp_timeout: float = 180.0,
+        timeouts: Mapping[str, float] | None = None,
         emit: Any | None = None,
     ) -> None:
         self.run_id = run_id
         self.store = store
         self.use_cache = use_cache
+        #: 没有单独配置的 Provider / Tool 的兜底预算。**有单独配置的一律用单独配置** ——
+        #: Part E 的要求就是"不能一个值管所有 Provider"。
         self.request_timeout = request_timeout
+        #: provider → 它自己的 timeout 秒数（来自 app/config.py，带环境变量覆盖）。
+        #: 显式传 `timeouts` 是为了测试能构造一个"某个 Provider 必然超时"的 Hub。
+        self.timeouts: dict[str, float] = (
+            {str(key): float(value) for key, value in timeouts.items()}
+            if timeouts is not None
+            else provider_timeouts()
+        )
         #: 上报给 SuperHarness 原生 Observability 的钩子（START.md §9：不要重造）。
         #: 不传就只是没有 Tool 日志，规划照常跑。
         self._emit_hook = emit
@@ -655,6 +744,11 @@ class ProviderHub:
         self._counter += 1
         prefix = self.run_id or "run"
         return f"{prefix}-src-{self._counter:03d}"
+
+    def _timeout_for(self, provider: str) -> float:
+        """这个 Provider 本次的调用预算（秒）。Part E：每个 Provider 一份。"""
+
+        return float(self.timeouts.get(provider, self.request_timeout))
 
     def _cache_key(self, provider: str, tool: str, args: Mapping[str, Any]) -> str:
         try:
@@ -728,8 +822,16 @@ class ProviderHub:
         source_type: str,
         kind: str,
         source_url: str | None = None,
+        timeout: float | None = None,
     ) -> ProviderCall:
-        """调用 Plugin Tool 并归一成 ProviderCall（不做业务映射）。"""
+        """调用 Plugin Tool 并归一成 ProviderCall（不做业务映射）。
+
+        ``timeout`` 是**这个 Provider 自己的**预算（Part E）。Tool 签名里声明了 timeout
+        就传给 Tool（让子进程 / httpx 自己收敛）；没声明就在 Hub 层用 ``_invoke_bounded``
+        兜住 —— 两条路径产生的都只是"这一次调用超时"，不会丢掉已经拿到的别的结果。
+        """
+
+        budget = float(timeout if timeout is not None else self._timeout_for(provider))
         args = {key: value for key, value in args.items() if value is not None}
         key = self._cache_key(provider, tool_name, args)
 
@@ -768,20 +870,32 @@ class ProviderHub:
             )
             return self._record(call)
 
+        tool = found[1]
+        # 支持 timeout 的 Tool 走它自己的超时；同时把值写进 query，审计里能看到
+        # "这次用的是几秒的预算"，而不是事后猜。
+        supports_timeout = tool_accepts_timeout(tool)
+        if supports_timeout:
+            args = {**args, "timeout": budget}
+
         started = time.monotonic()
         raw: Any = None
         try:
-            raw = found[1].invoke(args)
+            if supports_timeout:
+                raw = tool.invoke(args)
+            else:
+                raw = _invoke_bounded(tool, args, timeout=budget, label=f"{provider}/{tool_name}")
         except Exception as exc:  # noqa: BLE001 —— Tool 炸了要变成 status，不是往上抛
+            message = _scrub_secrets(f"{type(exc).__name__}: {exc}")
+            status = "TIMEOUT" if isinstance(exc, ToolTimeout) else "UNAVAILABLE"
             call = ProviderCall(
                 source_id=self._next_source_id(),
                 provider=provider,
                 source_type=source_type,
                 tool=tool_name,
                 query=dict(args),
-                status="UNAVAILABLE",
+                status=status,
                 fetched_at=utcnow(),
-                error=_scrub_secrets(f"{type(exc).__name__}: {exc}"),
+                error=message,
                 duration_ms=int((time.monotonic() - started) * 1000),
                 notes=[traceback.format_exc(limit=3)],
                 origin=plugin,
@@ -870,7 +984,9 @@ class ProviderHub:
         provider: str,
         source_type: str,
         kind: str,
+        timeout: float | None = None,
     ) -> ProviderCall:
+        budget = float(timeout if timeout is not None else self._timeout_for(provider))
         args = {key: value for key, value in args.items() if value is not None}
         key = self._cache_key(provider, tool_name, args)
 
@@ -912,7 +1028,7 @@ class ProviderHub:
 
         started = time.monotonic()
         try:
-            raw = handle.call(tool_name, args, timeout=self.request_timeout)
+            raw = handle.call(tool_name, args, timeout=budget)
         except Exception as exc:  # noqa: BLE001
             message = _scrub_secrets(f"{type(exc).__name__}: {exc}")
             lowered = message.lower()
@@ -986,7 +1102,6 @@ class ProviderHub:
                 "departure_city": origin,
                 "arrival_city": destination,
                 "departure_date": day,
-                "timeout": self.request_timeout,
             },
             provider="tuniu",
             source_type="flight",
@@ -1070,11 +1185,17 @@ class ProviderHub:
                 "departure_city": origin,
                 "arrival_city": destination,
                 "departure_date": day,
-                "timeout": self.request_timeout,
             },
             provider="tuniu",
             source_type="train",
             kind="train",
+        )
+        # 标记"这是 fallback 调用"：审计与管理端要能直接回答"哪些调用是主源不可用之后的
+        # 备选"，而不是靠"两条记录挨在一起"去猜。**不**因为它是 fallback 就降低可信度 ——
+        # 它仍然是一手数据，只是来源不同。
+        fallback.fallback = True
+        fallback.notes.append(
+            f"fallback：12306 {primary.status}（{primary.error or primary.status}）后改用途牛火车"
         )
         calls.append(fallback)
 
@@ -1126,7 +1247,6 @@ class ProviderHub:
                 "check_in": start,
                 "check_out": end,
                 "page_num": page_num,
-                "timeout": self.request_timeout,
             },
             provider="tuniu",
             source_type="hotel",
@@ -1164,7 +1284,7 @@ class ProviderHub:
         call = self._plugin_call(
             plugin="tuniu_travel",
             tool_name="tuniu_search_scenic_tickets",
-            args={"scenic_name": scenic_name, "timeout": self.request_timeout},
+            args={"scenic_name": scenic_name},
             provider="tuniu",
             source_type="ticket",
             kind="ticket",
@@ -1350,11 +1470,13 @@ class ProviderHub:
         fallback = self._plugin_call(
             plugin="mediacrawler_social",
             tool_name=fallback_tool,
-            args={"keyword": keyword, "limit": 10, "timeout": 240.0},
+            args={"keyword": keyword, "limit": 10},
             provider="mediacrawler",
             source_type=source_type,
             kind="social",
         )
+        fallback.fallback = True
+        fallback.notes.append(f"fallback：TikHub {primary.status} 后改用 MediaCrawler")
         calls.append(fallback)
 
         if fallback.status == "OK" and fallback.items:
@@ -1443,8 +1565,23 @@ class ProviderHub:
             )
 
         started = time.monotonic()
+        timed_out = False
         try:
-            text = as_text(tool.invoke(args))
+            # web_search 的入参里没有 timeout（SDK 自己的超时不可控），所以走 Hub 层的
+            # 统一预算：超时按 TIMEOUT 记，让上层如实降级成"这次没搜到攻略"，
+            # 而不是把一次卡死的联网搜索算成 run 的耗时。
+            text = as_text(
+                _invoke_bounded(
+                    tool,
+                    args,
+                    timeout=self._timeout_for("tavily"),
+                    label="tavily/web_search",
+                )
+            )
+        except ToolTimeout as exc:
+            text = ""
+            error = _scrub_secrets(str(exc))
+            timed_out = True
         except Exception as exc:  # noqa: BLE001
             text = ""
             error = _scrub_secrets(f"{type(exc).__name__}: {exc}")
@@ -1453,7 +1590,7 @@ class ProviderHub:
 
         status, items = _interpret_web_search(text)
         if error is not None:
-            status = "UNAVAILABLE"
+            status = "TIMEOUT" if timed_out else "UNAVAILABLE"
 
         call = ProviderCall(
             source_id=self._next_source_id(),
@@ -1511,6 +1648,7 @@ class ProviderHub:
                 "duration_ms": call.duration_ms,
                 "item_count": len(call.items),
                 "cached": call.cached,
+                "fallback": call.fallback,
                 "error": call.error,
                 "source_url": call.source_url,
                 "notes": list(call.notes),

@@ -1,0 +1,290 @@
+{
+  "note": "优化前（BEFORE）真实 run 基线，来自 outputs/ 的 trace.jsonl + audit_report.json + metrics.json",
+  "captured_at": "2026-09-20",
+  "runs": [
+    {
+      "run_id": "tp-20260920-164133-9291f8",
+      "total_ms": 616028,
+      "total_s": 616.0,
+      "stages": {
+        "parse_intent": {
+          "duration_ms": 12023,
+          "status": "SUCCESS"
+        },
+        "search_intercity_transport": {
+          "duration_ms": 140064,
+          "status": "SUCCESS"
+        },
+        "search_hotels": {
+          "duration_ms": 3591,
+          "status": "SUCCESS"
+        },
+        "search_social_guides": {
+          "duration_ms": 25465,
+          "status": "SUCCESS"
+        },
+        "extract_and_normalize_places": {
+          "duration_ms": 171995,
+          "status": "SUCCESS"
+        },
+        "verify_poi_and_routes": {
+          "duration_ms": 77637,
+          "status": "WARNING"
+        },
+        "score_candidates": {
+          "duration_ms": 25922,
+          "status": "SUCCESS"
+        },
+        "build_initial_plan": {
+          "duration_ms": 1043,
+          "status": "SUCCESS"
+        },
+        "check_budget": {
+          "duration_ms": 20,
+          "status": "SUCCESS"
+        },
+        "check_feasibility": {
+          "duration_ms": 39,
+          "status": "SUCCESS"
+        },
+        "critic_and_revise": {
+          "duration_ms": 109959,
+          "status": "WARNING"
+        },
+        "finalize": {
+          "duration_ms": 47463,
+          "status": "SUCCESS"
+        }
+      },
+      "providers": {
+        "12306/railway_12306_get-tickets": {
+          "calls": 2,
+          "total_ms": 29687,
+          "max_ms": 15780
+        },
+        "tuniu/tuniu_search_flights": {
+          "calls": 2,
+          "total_ms": 67265,
+          "max_ms": 36922
+        },
+        "tuniu/tuniu_search_trains": {
+          "calls": 1,
+          "total_ms": 11000,
+          "max_ms": 11000
+        },
+        "tuniu/tuniu_search_hotels": {
+          "calls": 1,
+          "total_ms": 3561,
+          "max_ms": 3561
+        },
+        "tikhub/search_xiaohongshu": {
+          "calls": 3,
+          "total_ms": 2281,
+          "max_ms": 859
+        },
+        "mediacrawler/search_xhs_via_mediacrawler": {
+          "calls": 3,
+          "total_ms": 28,
+          "max_ms": 14
+        },
+        "tikhub/search_douyin": {
+          "calls": 1,
+          "total_ms": 641,
+          "max_ms": 641
+        },
+        "mediacrawler/search_douyin_via_mediacrawler": {
+          "calls": 1,
+          "total_ms": 0,
+          "max_ms": 0
+        },
+        "tavily/web_search": {
+          "calls": 2,
+          "total_ms": 4749,
+          "max_ms": 2641
+        },
+        "amap/search_poi": {
+          "calls": 16,
+          "total_ms": 38654,
+          "max_ms": 7421
+        },
+        "amap/get_poi_detail": {
+          "calls": 6,
+          "total_ms": 56948,
+          "max_ms": 43452
+        },
+        "amap/route": {
+          "calls": 7,
+          "total_ms": 20462,
+          "max_ms": 5108
+        },
+        "tuniu/tuniu_search_scenic_tickets": {
+          "calls": 3,
+          "total_ms": 25795,
+          "max_ms": 11483
+        }
+      },
+      "provider_status": {
+        "OK": 34,
+        "TIMEOUT": 2,
+        "INVALID_RESPONSE": 1,
+        "FREE_CREDIT_EXHAUSTED": 2,
+        "UNAVAILABLE": 4,
+        "RATE_LIMIT": 2,
+        "EMPTY": 3
+      },
+      "counts": {
+        "llm_calls": 8,
+        "jev_calls": 3,
+        "tool_calls": 48,
+        "provider_calls": 48,
+        "route_calls": 7,
+        "poi_calls": 16,
+        "poi_detail_calls": 6
+      },
+      "tokens": {
+        "input": 21330,
+        "output": 15638,
+        "total": 36968
+      }
+    },
+    {
+      "run_id": "tp-20260920-205658-ead2ba",
+      "total_ms": 518179,
+      "total_s": 518.2,
+      "stages": {
+        "parse_intent": {
+          "duration_ms": 27,
+          "status": "SUCCESS"
+        },
+        "search_intercity_transport": {
+          "duration_ms": 210179,
+          "status": "SUCCESS"
+        },
+        "search_hotels": {
+          "duration_ms": 5393,
+          "status": "SUCCESS"
+        },
+        "search_social_guides": {
+          "duration_ms": 23311,
+          "status": "SUCCESS"
+        },
+        "extract_and_normalize_places": {
+          "duration_ms": 132216,
+          "status": "SUCCESS"
+        },
+        "verify_poi_and_routes": {
+          "duration_ms": 58550,
+          "status": "WARNING"
+        },
+        "score_candidates": {
+          "duration_ms": 13847,
+          "status": "SUCCESS"
+        },
+        "build_initial_plan": {
+          "duration_ms": 1186,
+          "status": "SUCCESS"
+        },
+        "check_budget": {
+          "duration_ms": 49,
+          "status": "SUCCESS"
+        },
+        "check_feasibility": {
+          "duration_ms": 169,
+          "status": "SUCCESS"
+        },
+        "critic_and_revise": {
+          "duration_ms": 25960,
+          "status": "SUCCESS"
+        },
+        "finalize": {
+          "duration_ms": 46454,
+          "status": "SUCCESS"
+        }
+      },
+      "providers": {
+        "12306/railway_12306_get-tickets": {
+          "calls": 2,
+          "total_ms": 110187,
+          "max_ms": 59297
+        },
+        "tuniu/tuniu_search_flights": {
+          "calls": 2,
+          "total_ms": 35592,
+          "max_ms": 30452
+        },
+        "tuniu/tuniu_search_hotels": {
+          "calls": 1,
+          "total_ms": 5359,
+          "max_ms": 5359
+        },
+        "tikhub/search_xiaohongshu": {
+          "calls": 3,
+          "total_ms": 2545,
+          "max_ms": 952
+        },
+        "mediacrawler/search_xhs_via_mediacrawler": {
+          "calls": 3,
+          "total_ms": 46,
+          "max_ms": 31
+        },
+        "tikhub/search_douyin": {
+          "calls": 1,
+          "total_ms": 750,
+          "max_ms": 750
+        },
+        "mediacrawler/search_douyin_via_mediacrawler": {
+          "calls": 1,
+          "total_ms": 0,
+          "max_ms": 0
+        },
+        "tavily/web_search": {
+          "calls": 2,
+          "total_ms": 6139,
+          "max_ms": 3530
+        },
+        "amap/search_poi": {
+          "calls": 16,
+          "total_ms": 54542,
+          "max_ms": 5515
+        },
+        "amap/get_poi_detail": {
+          "calls": 6,
+          "total_ms": 21559,
+          "max_ms": 4718
+        },
+        "amap/route": {
+          "calls": 9,
+          "total_ms": 36761,
+          "max_ms": 7281
+        },
+        "tuniu/tuniu_search_scenic_tickets": {
+          "calls": 3,
+          "total_ms": 13295,
+          "max_ms": 6077
+        }
+      },
+      "provider_status": {
+        "OK": 36,
+        "TIMEOUT": 1,
+        "FREE_CREDIT_EXHAUSTED": 3,
+        "UNAVAILABLE": 4,
+        "RATE_LIMIT": 1,
+        "EMPTY": 4
+      },
+      "counts": {
+        "llm_calls": 7,
+        "jev_calls": 3,
+        "tool_calls": 49,
+        "provider_calls": 49,
+        "route_calls": 9,
+        "poi_calls": 16,
+        "poi_detail_calls": 6
+      },
+      "tokens": {
+        "input": 17538,
+        "output": 14330,
+        "total": 31868
+      }
+    }
+  ]
+}

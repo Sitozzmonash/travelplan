@@ -21,7 +21,7 @@
 | 新增 Benchmark | `benchmark/cases/*.jsonl` + `benchmark/README.md` | 加一行 JSON 即可；确定性用例不许联网；改了 cases 或 `FIXTURE_VERSION` 要重跑两份基线 |
 | 新增 BadCase 规则 | `app/badcase.py` | 加一条规则函数并接进 `detect_badcases()`；类别常量在模块顶部 |
 | 触发 Evolution | 管理端 `/admin/evolution` 或 `POST /api/v1/admin/evolution/runs` | 需要 `EVOLUTION_ENABLED=true`，否则 409 |
-| 部署 | [09_部署说明.md](09_部署说明.md) | Vercel 只能承载前端；API 需要常驻容器（原因与替代方案都在那篇） |
+| 部署 | [09_部署说明.md](09_部署说明.md) | 固定架构：Vercel 前端 + Render 常驻容器 + Neon PostgreSQL；含免费层实测与验收脚本 |
 
 ## 文档清单
 
@@ -35,7 +35,7 @@
 | [06_BadCase机制.md](06_BadCase机制.md) | 字段表、全部类别与触发条件（含用户旅程 8 类）、人工处理流程 |
 | [07_评测体系.md](07_评测体系.md) | Benchmark v0.1：套件、指标、基线、怎么加 case；与 Guided Journey 测试的关系 |
 | [08_进化机制.md](08_进化机制.md) | Evolution：聚类 → 候选改动 → 评测对比 → Experience，以及不做什么 |
-| [09_部署说明.md](09_部署说明.md) | Vercel 能力边界（附官方限制）、容器部署、环境变量、同域名方案 |
+| [09_部署说明.md](09_部署说明.md) | 固定架构（Vercel 前端 + Render 常驻容器 + Neon PostgreSQL）、Vercel 能力边界与官方限制、环境变量、免费层实测、验收脚本 |
 | [10_开发与修改指南.md](10_开发与修改指南.md) | 本地跑起来、测试约定、新增能力的步骤、提交前检查清单 |
 | [11_用户旅程与PlanningSession.md](11_用户旅程与PlanningSession.md) | Guided 六步向导 → 正式 run：会话状态机、Prefetch、结构化偏好、MUST/WANT/REJECT |
 | [12_Provider健康与观测.md](12_Provider健康与观测.md) | `provider_calls` 调用账本、Provider Health 统计口径与阈值、UNKNOWN 语义、脱敏 |

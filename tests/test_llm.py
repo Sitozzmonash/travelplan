@@ -160,12 +160,23 @@ def test_degraded_reason_is_human_readable_and_empty_on_success() -> None:
 
 
 def test_audit_entries_never_contain_prompts_or_secrets() -> None:
-    """审计条目只记 tag/model/status/耗时/字数，不含 prompt 全文与任何 Key。"""
+    """审计条目只记元数据（tag/model/status/耗时/字数/起止时刻），不含 prompt 全文与任何 Key。"""
     llm = LLM(model=_OkModel("x" * 200))
     llm.invoke("system-prompt-with-secret-skb-123", "user", tag="t")
 
     entry = llm.audit_entries()[0]
-    assert set(entry) == {"tag", "model", "status", "duration_ms", "error", "chars"}
+    # started_at / finished_at 是为了让 Trace 能画出真实的先后（缺了它们，所有模型调用
+    # 都会挤在 run 结尾），它们同样只放时刻、不放内容。
+    assert set(entry) == {
+        "tag",
+        "model",
+        "status",
+        "duration_ms",
+        "error",
+        "chars",
+        "started_at",
+        "finished_at",
+    }
     assert entry["chars"] == 200
     assert "skb-123" not in str(entry)
 

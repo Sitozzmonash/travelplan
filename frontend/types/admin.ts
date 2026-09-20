@@ -162,6 +162,12 @@ export interface AdminRunMetrics {
   /** `user_price` 表示按用户配置的每百万 token 单价算出；null 表示未配置。 */
   cost_source?: AdminCostSource | null;
   cost_breakdown?: AdminCostBreakdown | null;
+  /**
+   * 后端写入的性能摘要（Part M）。形状不固定：可能是
+   * `{ total_duration_ms, transport_ms, …, provider_calls, cache_hits, prefetch_reused, fallback_count }`，
+   * 也可能同名字段直接平铺在 `metrics.*` 上。展示层按「有就用、没有就按阶段推导」处理。
+   */
+  performance_summary?: AdminRecord | null;
 }
 
 export interface AdminStageProgress {
@@ -290,11 +296,32 @@ export interface AdminStageDetail {
   tokens?: AdminStageTokens | null;
 }
 
-/** 引导式会话里保存的结构化偏好。 */
+/**
+ * 引导式会话里保存的结构化偏好。
+ * 两种口径都要能接：旧接口返回 POI 名称数组，新接口按 MUST/WANT/REJECT 返回计数。
+ */
 export interface AdminPlaceSelections {
-  must: string[];
-  want: string[];
-  reject: string[];
+  must: string[] | number;
+  want: string[] | number;
+  reject: string[] | number;
+}
+
+/**
+ * Discovery → 正式 Run 的单条线交接结论（`user_journey.discovery` 的一项）。
+ * `handoff` 取 `reused` / `fallback_query` / `unavailable`（未登记取值原样展示）。
+ */
+export interface AdminJourneyHandoff {
+  /** 后端给的中文标签（交通 / 酒店 / 攻略 / 地点）。 */
+  label?: string | null;
+  handoff?: string | null;
+  prefetch_available?: boolean | null;
+  queried_in_run?: boolean | null;
+  resolved?: boolean | null;
+  /** 该线的原始 Discovery 状态（OK / EMPTY / DEGRADED…）。 */
+  status?: string | null;
+  result_count?: number | null;
+  duration_ms?: number | null;
+  degraded?: boolean | null;
 }
 
 /**
@@ -309,8 +336,19 @@ export interface AdminUserJourney {
   hotel_priority?: string | null;
   pace?: string | null;
   place_selections?: AdminPlaceSelections | null;
-  prefetch_reused?: boolean | null;
+  /** 旧口径是布尔（这次 run 有没有复用 prefetch），新口径是每条线的布尔。 */
+  prefetch_reused?: boolean | Record<string, boolean> | null;
+  prefetch_reused_any?: boolean | null;
+  /** Discovery 已经查到的线（transport / hotels / social / places）。 */
+  prefetch_available?: string[] | null;
+  prefetch_status?: string | null;
   discovery_status?: string | null;
+  /** 每条线的交接结论；键为 transport / hotels / social / places。 */
+  discovery?: Record<string, AdminJourneyHandoff> | null;
+  /** 分阶段原始 Discovery 数据（status / duration_ms / result_count…）。 */
+  prefetch_stages?: Record<string, AdminDiscoveryStage> | null;
+  /** 开始规划时为等待 Discovery 实际等待的毫秒数（0 = 无需等待）。 */
+  grace_waited_ms?: number | null;
 }
 
 export const BADCASE_ROOT_CAUSE_STATUSES = ["suspected", "verified", "rejected"] as const;

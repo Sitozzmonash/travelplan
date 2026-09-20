@@ -6,6 +6,7 @@ frontend/
 benchmark/
 docs/
 tests/
+scripts/
 data/
 outputs/
 _acceptance/

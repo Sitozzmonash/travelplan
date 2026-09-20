@@ -44,6 +44,29 @@ def offline_environment():
             os.environ[name] = value
 
 
+@pytest.fixture(autouse=True, scope="session")
+def no_mcp_subprocesses():
+    """测试期间不注册 MCP Server。
+
+    为什么摘密钥还不够：12306 走 `npx -y 12306-mcp` 拉起子进程，**不需要任何密钥**。
+    于是"未配置 → 降级"这条离线路径对它不适用：一个没显式注入假 Hub 的用例会真的
+    联网，而 stdio 握手一旦不返回，`future.result()` 会一直等下去 —— 整套 pytest
+    卡死在单个用例上（实测卡在 ~24% 超过半小时，且看不出是哪个用例）。
+    关掉之后 12306 报告"未注册"，走的正是 conftest 想要的确定性降级分支。
+    需要验证 MCP 装配本身的用例（如 test_agent_api）自己 delenv 打开。
+    """
+
+    from app.providers import DISABLE_MCP_ENV
+
+    saved = os.environ.get(DISABLE_MCP_ENV)
+    os.environ[DISABLE_MCP_ENV] = "1"
+    yield
+    if saved is None:
+        os.environ.pop(DISABLE_MCP_ENV, None)
+    else:
+        os.environ[DISABLE_MCP_ENV] = saved
+
+
 @pytest.fixture(autouse=True)
 def no_paid_jev_calls(monkeypatch):
     """即使某个用例自己设置了 JEV_API_KEY，也不能让它变成一次真实调用。

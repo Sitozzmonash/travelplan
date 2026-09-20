@@ -184,6 +184,12 @@ def health() -> dict[str, Any]:
     `store` 里同时报**后端类型**：SQLite 报本地库路径，Postgres 报脱敏后的
     `postgresql://***@host/db`（绝不回显用户名/密码）。连库失败时也要如实报
     "配置目标是哪个后端"，而不是假装一切正常。
+
+    顶层另有两个**契约字段**（PRD §14 字面要求，供部署/监控直接消费，不必再解析
+    `store` 嵌套结构）：`database_backend = sqlite|postgres`、
+    `database_connected = true|false`。`database_connected` 就是"这次真的把库连上
+    并建表成功"；配了 `DATABASE_URL` 却连不上时它为 `false` 且 `status=degraded`，
+    **绝不会**因为退回本地 SQLite 而变成 `true`。
     """
     store_ok = True
     store_error: str | None = None
@@ -218,6 +224,9 @@ def health() -> dict[str, Any]:
         "status": "ok" if store_ok else "degraded",
         "workflow": WORKFLOW_NAME,
         "project_id": PROJECT_ID,
+        # 部署契约字段（PRD §14）：后端类型固定二选一，连接状态来自"真的连上并建表"。
+        "database_backend": store_info.get("backend") or "unknown",
+        "database_connected": store_ok,
         "store": store_info,
         "providers_configured": configured,
         "notes": [
@@ -763,10 +772,12 @@ def admin_run_detail(run_id: str) -> dict[str, Any]:
         }
     return {
         "run": run,
+        # 用上面补过 cost_source / cost_breakdown 的 metrics_row。这里曾经同时写了
+        # 两个 "metrics" 键（后一个直接取原始行），字典字面量是后者胜，于是成本拆分
+        # 永远到不了前端 —— 表现成"填了单价也没有成本明细"。
         "metrics": metrics_row,
         "user_journey": _user_journey(store, run, store.get_plan(run_id)),
         "stages": _stage_details(store, run_id),
-        "metrics": store.get_run_metrics(run_id) or {},
         "progress": store.get_run_progress(run_id),
         "trace": spans,
         "decisions": store.get_decisions(run_id),
@@ -1480,6 +1491,10 @@ def _user_journey(store: TravelPlanStore, run: dict[str, Any], stored_plan: dict
     """这次 run 的"用户前置选择"：来源、策略、POI 计数、prefetch 是否复用。
 
     管理端默认折叠（用户旅程落地任务 §22：适度可见，不做复杂行为分析系统）。
+
+    分阶段交接结果（`discovery`：复用预取 / 本次补查 / 无可用结果、`prefetch_stages`、
+    `grace_waited_ms`）在 run 的审计里已经算好了，这里**并进来**：管理端要能直接回答
+    "这次 Guided run 哪部分是复用的、哪部分补查了"，而不是自己去 Trace 里猜。
     """
 
     session_id = run.get("source_session_id")
@@ -1488,7 +1503,7 @@ def _user_journey(store: TravelPlanStore, run: dict[str, Any], stored_plan: dict
     if isinstance(stored_plan, dict) and isinstance(stored_plan.get("plan"), dict):
         intent = stored_plan["plan"].get("intent") or {}
     selections = (session or {}).get("poi_selections") or {}
-    return {
+    base: dict[str, Any] = {
         "source": str(run.get("source") or "quick"),
         "source_session_id": session_id,
         "transport_mode": intent.get("transport_mode"),
@@ -1503,6 +1518,10 @@ def _user_journey(store: TravelPlanStore, run: dict[str, Any], stored_plan: dict
         "prefetch_reused": bool((session or {}).get("prefetch")) if session else None,
         "discovery_status": (session or {}).get("discovery_status"),
     }
+    rich = (_load_audit(str(run.get("run_id") or "")) or {}).get("user_journey")
+    if isinstance(rich, dict):
+        base.update({key: value for key, value in rich.items() if value is not None})
+    return base
 
 
 @api.get("/api/v1/admin/runs/{run_id}/stages", dependencies=[Depends(require_admin)])

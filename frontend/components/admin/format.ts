@@ -321,7 +321,7 @@ export function runSourceLabel(source: string | null | undefined): string {
 interface TraceAttributeSpec {
   label: string;
   unit?: string;
-  kind?: "count" | "percent" | "money" | "text";
+  kind?: "count" | "percent" | "money" | "text" | "duration";
 }
 
 /**
@@ -365,6 +365,22 @@ const TRACE_ATTRIBUTE_SPECS: Record<string, TraceAttributeSpec> = {
   数据源状态: { label: "数据源状态", kind: "text" },
   状态: { label: "状态", kind: "text" },
   决策: { label: "决策", kind: "text" },
+  // Discovery → 正式 Run 的交接 span（component=planner，name=discovery_handoff）。
+  // 四条线（transport / hotels / social / places）的值是交接结论，见 HANDOFF_VALUE_LABELS。
+  grace_waited_ms: { label: "Discovery 等待", kind: "duration" },
+};
+
+/**
+ * Discovery 交接结论 → 中文。
+ *
+ * 为什么按「值」而不是按「键」映射：同一个 `discovery_handoff` span 里，四条线用的是
+ * `transport` / `hotels` / `social` / `places` 做键，而 `transport` 这个键在 provider span 上
+ * 表示传输方式（http / mcp stdio）。按值翻译只命中这三个专用字符串，不会误伤。
+ */
+const HANDOFF_VALUE_LABELS: Record<string, string> = {
+  reused: "复用预取",
+  fallback_query: "本次补查",
+  unavailable: "无可用结果",
 };
 
 /** 未登记的键原样返回；登记过的换成友好标签。 */
@@ -384,7 +400,11 @@ function truncateText(text: string): string {
  */
 export function formatTraceAttributeValue(key: string, value: unknown): string {
   const spec = TRACE_ATTRIBUTE_SPECS[key];
-  if (!spec) return formatMetricValue(value);
+  if (!spec) {
+    // 未登记的键：先把 Discovery 交接结论翻成中文，其余走通用格式化。
+    if (typeof value === "string" && HANDOFF_VALUE_LABELS[value]) return HANDOFF_VALUE_LABELS[value];
+    return formatMetricValue(value);
+  }
   if (value === null || value === undefined) return "未返回";
 
   if (spec.kind === "count" || spec.kind === "money") {
@@ -397,6 +417,11 @@ export function formatTraceAttributeValue(key: string, value: unknown): string {
 
   if (spec.kind === "percent") {
     if (typeof value === "number" && Number.isFinite(value)) return formatRatio(value);
+    return truncateText(formatMetricValue(value));
+  }
+
+  if (spec.kind === "duration") {
+    if (typeof value === "number" && Number.isFinite(value)) return formatDurationMs(value);
     return truncateText(formatMetricValue(value));
   }
 

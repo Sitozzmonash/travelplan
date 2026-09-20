@@ -248,6 +248,7 @@ class _ConnectionPool:
         deadline = time.monotonic() + timeout
         while True:
             create = False
+            stale: list[Any] = []
             with self._cond:
                 if self._closed:
                     raise PostgresUnavailable("postgres/neon 连接池已关闭，无法再获取连接")
@@ -255,7 +256,11 @@ class _ConnectionPool:
                     conn = self._idle.pop()
                     if getattr(conn, "closed", False) or getattr(conn, "broken", False):
                         self._live -= 1
+                        stale.append(conn)  # 坏连接不能留着，也不能在持锁时关
                         continue
+                    for dead in stale:
+                        with contextlib.suppress(Exception):
+                            dead.close()
                     return conn
                 if self._live < self._max_size:
                     self._live += 1
@@ -267,11 +272,21 @@ class _ConnectionPool:
                             "等待 postgres/neon 连接超时（连接池已满且长时间未归还）"
                         )
                     self._cond.wait(remaining)
+            for dead in stale:
+                with contextlib.suppress(Exception):
+                    dead.close()
             if not create:
                 continue
             try:
                 return self._connect()
             except PostgresUnavailable:
+                # 建连失败必须把刚才预占的名额还回去。否则 DATABASE_URL 配了但连不上时，
+                # 每失败一次 `_live` 就多欠一条：第 N+1 次调用会以为"池子满了"，
+                # 于是从"2 秒清晰报错"退化成"干等 15 秒超时" —— 线上排查方向会被带偏，
+                # 而且 Neon 恢复后池子仍然被这些幽灵名额占着，永远连不上。
+                with self._cond:
+                    self._live -= 1
+                    self._cond.notify()
                 raise
             except Exception as exc:  # noqa: BLE001 —— 统一转成清晰异常，绝不回退 SQLite
                 with self._cond:

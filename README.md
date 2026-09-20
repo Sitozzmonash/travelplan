@@ -111,7 +111,11 @@ TIKHUB_API_TOKEN=...      # 小红书 / 抖音，只走免费额度
 TUNIU_API_KEY=...         # 机票 / 酒店 / 火车 / 门票
 JEV_API_KEY=...           # 三处软决策（未配置则自动降级，不影响主流程）
 TRAVELPLAN_ADMIN_TOKEN=...  # 管理端 Bearer Token（不配则 /api/v1/admin/** 一律 503）
+DATABASE_URL=...          # Neon PostgreSQL（生产必填）。不配则本地 SQLite；**配了却连不上会显式报错，绝不静默回退**
 ```
+
+生产部署的固定架构是 **Vercel（前端）+ Render（FastAPI 常驻容器）+ Neon PostgreSQL**，
+步骤、免费层特性与验收脚本见 [`docs/09_部署说明.md`](docs/09_部署说明.md)。
 
 可选覆盖：`RAILWAY_12306_COMMAND`、`TUNIU_COMMAND`、`MEDIACRAWLER_DIR`、`TRAVELPLAN_DB_PATH`、
 `TRAVELPLAN_OUTPUT_DIR`、`TRAVELPLAN_CORS_ORIGINS`、`TRAVELPLAN_LLM_TIMEOUT_SECONDS`、
@@ -253,7 +257,7 @@ P95 延迟 / fallback；**没有调用历史显示 UNKNOWN 而不是失败，也
 - TikHub 免费额度耗尽时小红书/抖音会降级，此时 Trust 的「多来源证据」分项会偏低，Critic 置信度相应下调。
 - 门到门时长里的机场/车站接驳，在未取得高德真实路线时按具名常量估算，并在 `selection_reason` 里注明。
 - 没有出发日期时查不到大交通：系统会如实告警并留下 Bad Case（`missing_disclosure`），**不猜日期**。
-- 后端不能部署到 Vercel Serverless：见 [`docs/09_部署说明.md`](docs/09_部署说明.md)（附 Vercel 官方限制数字与实测记录）。
+- 后端不能部署到 Vercel Serverless（长任务、Node/MCP、产物落盘都不成立）：固定架构是 Vercel 前端 + Render 常驻容器 + Neon PostgreSQL，见 [`docs/09_部署说明.md`](docs/09_部署说明.md)（附 Vercel 官方限制数字与真实部署实测记录）。
 
 ## 8. 测试与评测
 

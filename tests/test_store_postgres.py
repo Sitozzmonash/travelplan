@@ -253,15 +253,20 @@ class TestSchemaTranslation:
                 r"CREATE TABLE IF NOT EXISTS (\w+)", translate_postgres_schema(SCHEMA)
             )
         )
+        # 翻译只改类型，不能增删表；数量下限防止"翻译时漏表"。
         assert sqlite_tables == pg_tables
-        assert len(sqlite_tables) == 21  # 20+ 张表，防止翻译时漏表
+        assert len(sqlite_tables) >= 20  # 本仓 20+ 张表（PRD §17）
 
     def test_postgres_schema_splits_into_individual_statements(self):
         statements = split_sql_statements(translate_postgres_schema(SCHEMA))
+        expected_creates = re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", SCHEMA)
+        expected_indexes = re.findall(r"CREATE INDEX IF NOT EXISTS (\w+)", SCHEMA)
         creates = [s for s in statements if s.upper().startswith("CREATE TABLE")]
         indexes = [s for s in statements if s.upper().startswith("CREATE INDEX")]
-        assert len(creates) == 21
-        assert len(indexes) >= 10
+        assert len(creates) == len(expected_creates)
+        assert len(indexes) == len(expected_indexes)
+        # 每条拆出来的语句都必须是可执行的 DDL，且结构合法
+        assert len(statements) == len(creates) + len(indexes)
         for statement in statements:
             _assert_structurally_valid_postgres(statement)
 
@@ -395,8 +400,11 @@ class TestPostgresConnectionWrapper:
         with PostgresConnection(pool) as conn:
             conn.executescript(translate_postgres_schema(SCHEMA))
         statements = [sql for sql, _ in pool.conn.executed]
-        assert len(statements) == 35  # 21 张表 + 14 个索引
+        # 与"直接拆 SCHEMA"的结果条数一致（schema 增长时测试不会假失败）
+        expected = split_sql_statements(translate_postgres_schema(SCHEMA))
+        assert len(statements) == len(expected)
         for sql in statements:
+            assert sql.upper().startswith(("CREATE TABLE", "CREATE INDEX"))
             _assert_structurally_valid_postgres(sql)
 
     def test_raw_execute_does_not_double_escape(self):

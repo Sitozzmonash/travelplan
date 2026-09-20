@@ -65,10 +65,67 @@ class TravelPlanConfig:
     model_price_output_per_million: float | None = None
     model_price_cached_per_million: float | None = None
 
+    # ==================================================================
+    # 性能（Part A / D / E）：受控并发、取数上限、Provider 单独 timeout
+    # ==================================================================
+    # 为什么这些值必须在 config 而不是散落在节点里：它们决定"一次 run 打多少个 Provider
+    # 请求、并发几路、等多久放弃"。上线后要调的是这些数字，不是流程代码，放这里才能
+    # 通过环境变量 / 管理端在不重启服务的前提下改。
+
+    #: 互不依赖的 Provider 查询并发上限（交通 4 条线、POI 关键词搜索等）。
+    #: 它同时是"绝不无限并发打 Provider"这道闸门的唯一开关。
+    provider_max_concurrency: int = 4
+    #: POI 详情（营业时间/地址）并发上限
+    poi_verify_max_concurrency: int = 4
+    #: 路线查询并发上限（路线是 verify 阶段最贵的一项，14 段串行能吃掉一分钟）
+    route_max_concurrency: int = 4
+    #: 互不依赖的模型调用并发上限。刻意给得很小：并发模型调用换不来多少墙钟时间，
+    #: 却会让 token 峰值与限流风险一起上升。
+    llm_max_concurrency: int = 2
+
+    #: 一次节点内最多拿多少个高德关键词去搜 POI（每个关键词一次 search_poi）
+    poi_query_limit: int = 8
+    #: 单次 search_poi 要几页
+    poi_page_size: int = 10
+    #: 最多给几个地点补高德 POI 详情（营业时间/地址）
+    poi_detail_limit: int = 6
+    #: 最多查几段市内路线（**不做** POI × POI 全连接）
+    max_route_lookups: int = 14
+    #: 最多查几个景点的门票价格（只有入选候选才查）
+    ticket_lookup_limit: int = 3
+    #: 攻略里最多提取多少个原始地名送去高德核实（原始候选，不是用户可见候选）
+    discovery_max_places: int = 20
+    #: Discovery 阶段最多对多少个 POI 做详情核实
+    discovery_poi_verify_limit: int = 20
+    #: 用户可见的 POI 候选上限（用户旅程 §8：12~20 个，不要一次丢 50 个）
+    user_visible_poi_limit: int = 20
+    #: 进入 Planner 的深度候选上限（规格：8~15）。超过这个数的候选不参与深度验证
+    #: （不查 POI 详情、不参与路线计算），但仍然保留在候选集合里由 Trust/AdRisk 打分。
+    planner_poi_limit: int = 15
+
+    # --- 每个 Provider 的单独 timeout（Part E）---
+    # 依据是一次真实 run 的 Profiling：12306 单次 59.3s（MCP 冷启动另有 19.6s），
+    # 途牛各接口 5s 级但偶发劣化，高德 2.5~3.3s（插件内部 20s × 3 次重试），
+    # Tavily 3.5s，TikHub / MediaCrawler 是几十秒级。**不能**所有 Provider 用同一个值：
+    # 一个值要么把 12306 的正常慢查询误判成故障，要么让高德的病态重试拖住整个 run。
+    #: 途牛（机票/火车/酒店/门票）：偏大，允许它比高德慢一个量级
+    tuniu_timeout_seconds: float = 90.0
+    #: 12306 MCP：单次实测 59.3s，留足余量；超时后走途牛火车 fallback
+    railway_12306_timeout_seconds: float = 90.0
+    #: 高德：实测 2.5~3.3s，偏小 —— 超时就按"未核实"处理，绝不用估算值冒充
+    amap_timeout_seconds: float = 25.0
+    #: TikHub：几十秒级，超时后走 MediaCrawler fallback
+    tikhub_timeout_seconds: float = 45.0
+    #: MediaCrawler：拉子进程 + 可能卡在扫码登录，偏大（插件默认 180）
+    mediacrawler_timeout_seconds: float = 180.0
+    #: 联网搜索（Tavily）：实测 3.5s，偏小
+    web_search_timeout_seconds: float = 30.0
+
     # --- 引导式旅程（Planning Session / Discovery）---
     discovery_enabled: bool = True
     planning_session_ttl_minutes: int = 45
-    #: Discovery 阶段给用户的 POI 候选总数上限（用户旅程 §8：12~20 个，不要一次丢 50 个）
+    #: 用户可见 POI 候选上限的**历史别名**（管理端旧配置项 / 环境变量 DISCOVERY_PLACE_LIMIT）。
+    #: 实际生效的是 ``user_visible_poi_limit``；这里保留字段只为了让旧覆盖值仍能被读到。
     discovery_place_limit: int = 20
     #: 每个类别先展示多少个
     discovery_place_per_category: int = 5
@@ -111,6 +168,13 @@ class TravelPlanConfig:
             except ValueError:
                 return default
 
+        # 用户可见候选上限优先读 USER_VISIBLE_POI_LIMIT，读不到再退回历史别名
+        # DISCOVERY_PLACE_LIMIT —— 旧部署的覆盖值必须继续生效，否则一次升级就会
+        # 悄悄把"用户看到 20 个候选"变成"看到默认值"。
+        visible_places = integer("USER_VISIBLE_POI_LIMIT", None) or integer(
+            "DISCOVERY_PLACE_LIMIT", defaults.user_visible_poi_limit
+        )
+
         return cls(
             budget_enabled=flag("BUDGET_ENABLED", defaults.budget_enabled),
             max_run_tokens=integer("MAX_RUN_TOKENS", defaults.max_run_tokens),
@@ -140,13 +204,62 @@ class TravelPlanConfig:
             model_price_cached_per_million=decimal(
                 "MODEL_PRICE_CACHED_PER_MILLION", defaults.model_price_cached_per_million
             ),
+            # --- 性能（Part A/D/E）---
+            # 并发上限一律钳到 >=1：0 或负数会让节点"什么都不查"，
+            # 那是比慢更严重的问题（会静默产出没有验证过的行程）。
+            provider_max_concurrency=max(
+                1, integer("PROVIDER_MAX_CONCURRENCY", defaults.provider_max_concurrency) or 1
+            ),
+            poi_verify_max_concurrency=max(
+                1, integer("POI_VERIFY_MAX_CONCURRENCY", defaults.poi_verify_max_concurrency) or 1
+            ),
+            route_max_concurrency=max(
+                1, integer("ROUTE_MAX_CONCURRENCY", defaults.route_max_concurrency) or 1
+            ),
+            llm_max_concurrency=max(
+                1, integer("LLM_MAX_CONCURRENCY", defaults.llm_max_concurrency) or 1
+            ),
+            poi_query_limit=max(1, integer("POI_QUERY_LIMIT", defaults.poi_query_limit) or 1),
+            poi_page_size=max(1, integer("POI_PAGE_SIZE", defaults.poi_page_size) or 1),
+            poi_detail_limit=integer("POI_DETAIL_LIMIT", defaults.poi_detail_limit)
+            if integer("POI_DETAIL_LIMIT", defaults.poi_detail_limit) is not None
+            else defaults.poi_detail_limit,
+            max_route_lookups=max(1, integer("MAX_ROUTE_LOOKUPS", defaults.max_route_lookups) or 1),
+            ticket_lookup_limit=integer("TICKET_LOOKUP_LIMIT", defaults.ticket_lookup_limit)
+            if integer("TICKET_LOOKUP_LIMIT", defaults.ticket_lookup_limit) is not None
+            else defaults.ticket_lookup_limit,
+            discovery_max_places=max(1, integer("DISCOVERY_MAX_PLACES", defaults.discovery_max_places) or 1),
+            discovery_poi_verify_limit=integer(
+                "DISCOVERY_POI_VERIFY_LIMIT", defaults.discovery_poi_verify_limit
+            )
+            if integer("DISCOVERY_POI_VERIFY_LIMIT", defaults.discovery_poi_verify_limit) is not None
+            else defaults.discovery_poi_verify_limit,
+            user_visible_poi_limit=visible_places or defaults.user_visible_poi_limit,
+            planner_poi_limit=max(1, integer("PLANNER_POI_LIMIT", defaults.planner_poi_limit) or 1),
+            tuniu_timeout_seconds=decimal("TUNIU_TIMEOUT_SECONDS", defaults.tuniu_timeout_seconds)
+            or defaults.tuniu_timeout_seconds,
+            railway_12306_timeout_seconds=decimal(
+                "RAILWAY_12306_TIMEOUT_SECONDS", defaults.railway_12306_timeout_seconds
+            )
+            or defaults.railway_12306_timeout_seconds,
+            amap_timeout_seconds=decimal("AMAP_TIMEOUT_SECONDS", defaults.amap_timeout_seconds)
+            or defaults.amap_timeout_seconds,
+            tikhub_timeout_seconds=decimal("TIKHUB_TIMEOUT_SECONDS", defaults.tikhub_timeout_seconds)
+            or defaults.tikhub_timeout_seconds,
+            mediacrawler_timeout_seconds=decimal(
+                "MEDIACRAWLER_TIMEOUT_SECONDS", defaults.mediacrawler_timeout_seconds
+            )
+            or defaults.mediacrawler_timeout_seconds,
+            web_search_timeout_seconds=decimal(
+                "WEB_SEARCH_TIMEOUT_SECONDS", defaults.web_search_timeout_seconds
+            )
+            or defaults.web_search_timeout_seconds,
             discovery_enabled=flag("DISCOVERY_ENABLED", defaults.discovery_enabled),
             planning_session_ttl_minutes=integer(
                 "PLANNING_SESSION_TTL_MINUTES", defaults.planning_session_ttl_minutes
             )
             or defaults.planning_session_ttl_minutes,
-            discovery_place_limit=integer("DISCOVERY_PLACE_LIMIT", defaults.discovery_place_limit)
-            or defaults.discovery_place_limit,
+            discovery_place_limit=visible_places or defaults.discovery_place_limit,
             discovery_place_per_category=integer(
                 "DISCOVERY_PLACE_PER_CATEGORY", defaults.discovery_place_per_category
             )
@@ -215,6 +328,29 @@ EDITABLE_KEYS: dict[str, tuple[str, float | None, float | None]] = {
     "DISCOVERY_PLACE_PER_CATEGORY": ("int", 1, 20),
     "DISCOVERY_HOTEL_PAGES": ("int", 1, 10),
     "PLANNING_SESSION_TTL_MINUTES": ("int", 5, 1440),
+    # 性能：受控并发（Part A / L）。上限给到 16 是有意的护栏 ——
+    # 再往上就不是"调参"而是拿 Provider 的限流去赌一次 run 能不能跑完。
+    "PROVIDER_MAX_CONCURRENCY": ("int", 1, 16),
+    "POI_VERIFY_MAX_CONCURRENCY": ("int", 1, 16),
+    "ROUTE_MAX_CONCURRENCY": ("int", 1, 16),
+    "LLM_MAX_CONCURRENCY": ("int", 1, 8),
+    # 性能：取数上限（Part D）
+    "POI_QUERY_LIMIT": ("int", 1, 30),
+    "POI_PAGE_SIZE": ("int", 1, 50),
+    "POI_DETAIL_LIMIT": ("int", 0, 60),
+    "MAX_ROUTE_LOOKUPS": ("int", 0, 60),
+    "TICKET_LOOKUP_LIMIT": ("int", 0, 30),
+    "DISCOVERY_MAX_PLACES": ("int", 1, 80),
+    "DISCOVERY_POI_VERIFY_LIMIT": ("int", 0, 60),
+    "USER_VISIBLE_POI_LIMIT": ("int", 4, 60),
+    "PLANNER_POI_LIMIT": ("int", 1, 60),
+    # 性能：Provider 单独 timeout（秒，Part E）
+    "TUNIU_TIMEOUT_SECONDS": ("float", 5.0, 300.0),
+    "RAILWAY_12306_TIMEOUT_SECONDS": ("float", 5.0, 300.0),
+    "AMAP_TIMEOUT_SECONDS": ("float", 2.0, 120.0),
+    "TIKHUB_TIMEOUT_SECONDS": ("float", 5.0, 300.0),
+    "MEDIACRAWLER_TIMEOUT_SECONDS": ("float", 5.0, 600.0),
+    "WEB_SEARCH_TIMEOUT_SECONDS": ("float", 2.0, 120.0),
     # 功能开关
     "BADCASE_ENABLED": ("bool", None, None),
     "EVOLUTION_ENABLED": ("bool", None, None),
@@ -295,6 +431,65 @@ def current_config() -> TravelPlanConfig:
     """每次读取当前环境，避免长驻 API 进程把非敏感开关永久缓存。"""
 
     return TravelPlanConfig.from_env()
+
+
+# ======================================================================
+# 性能配置的读取入口（Part A / D / E / M）
+# ======================================================================
+# Provider / 节点只从这里取"并发几路、查几条、等多久"：env 名与字段名只在一处出现，
+# 不会出现"providers.py 抄了一遍 env 名、workflow.py 又抄了一遍"的漂移。
+
+#: Provider 名 → 它自己的 timeout 配置字段（Part E 要求每个 provider 单独一份）。
+PROVIDER_TIMEOUT_FIELDS: dict[str, str] = {
+    "tuniu": "tuniu_timeout_seconds",
+    "12306": "railway_12306_timeout_seconds",
+    "amap": "amap_timeout_seconds",
+    "tikhub": "tikhub_timeout_seconds",
+    "mediacrawler": "mediacrawler_timeout_seconds",
+    "tavily": "web_search_timeout_seconds",
+}
+
+
+def provider_timeouts(config: TravelPlanConfig | None = None) -> dict[str, float]:
+    """provider → 本次生效的超时秒数。故意**不**提供"一个全局值"的回退出口。"""
+
+    resolved = config or current_config()
+    return {
+        provider: float(getattr(resolved, field))
+        for provider, field in PROVIDER_TIMEOUT_FIELDS.items()
+    }
+
+
+#: 性能摘要要快照的配置项（Part M）：管理端与 profiler 要能回答
+#: "这一次 run 是在什么并发上限 / 取数上限 / 超时下跑的"。
+PERFORMANCE_CONFIG_KEYS: tuple[str, ...] = (
+    "provider_max_concurrency",
+    "poi_verify_max_concurrency",
+    "route_max_concurrency",
+    "llm_max_concurrency",
+    "poi_query_limit",
+    "poi_page_size",
+    "poi_detail_limit",
+    "max_route_lookups",
+    "ticket_lookup_limit",
+    "discovery_max_places",
+    "discovery_poi_verify_limit",
+    "user_visible_poi_limit",
+    "planner_poi_limit",
+    "tuniu_timeout_seconds",
+    "railway_12306_timeout_seconds",
+    "amap_timeout_seconds",
+    "tikhub_timeout_seconds",
+    "mediacrawler_timeout_seconds",
+    "web_search_timeout_seconds",
+)
+
+
+def performance_config_snapshot(config: TravelPlanConfig | None = None) -> dict[str, Any]:
+    """性能相关配置的只读快照（不含任何 Secret，只有并发/上限/timeout）。"""
+
+    resolved = config or current_config()
+    return {key: getattr(resolved, key) for key in PERFORMANCE_CONFIG_KEYS}
 
 
 @dataclass(frozen=True, slots=True)
