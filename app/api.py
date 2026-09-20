@@ -588,11 +588,20 @@ def admin_runs(
 
 
 @api.get("/api/v1/admin/planning-sessions", dependencies=[Depends(require_admin)])
-def admin_planning_sessions(limit: int = 50, offset: int = 0, q: str | None = None) -> dict[str, Any]:
+def admin_planning_sessions(
+    limit: int = 50,
+    offset: int = 0,
+    q: str | None = None,
+    status: str | None = None,
+    destination: str | None = None,
+    has_run: bool | None = None,
+) -> dict[str, Any]:
     """Guided Session 列表：从"用户前置选择"追溯到最终 Run 的入口。"""
 
     store = get_store()
-    items, total = store.list_planning_sessions(limit=limit, offset=offset, q=q)
+    items, total = store.list_planning_sessions(
+        limit=limit, offset=offset, q=q, status=status, destination=destination, has_run=has_run
+    )
     return {
         "items": [_admin_session_row(item) for item in items],
         "limit": limit,
@@ -608,13 +617,62 @@ def admin_planning_session_detail(session_id: str) -> dict[str, Any]:
     if session is None:
         raise HTTPException(status_code=404, detail=f"没有 session_id={session_id} 的会话")
     view = sessions.session_view(session)
-    view["discovery"] = {
-        "transport_candidates": len(session.get("transport_candidates") or []),
-        "hotel_candidates": len(session.get("hotel_candidates") or []),
-        "place_candidates": len(session.get("place_candidates") or []),
-        "provider_calls": len((session.get("prefetch") or {}).get("provider_calls") or []),
+    # 详情按文档信封返回：session / preferences / discovery / prefetch_summary / events / run_link。
+    # 分成几块而不是一个大对象：前端每一块独立折叠与独立降级，缺一块不影响其余部分渲染。
+    basic = session.get("basic_intent") or {}
+    prefetch = session.get("prefetch") or {}
+    discovery = dict(session.get("discovery") or {})
+    run_id = session.get("run_id")
+    run = store.get_run(run_id) if run_id else None
+    progress = store.get_run_progress(run_id) if run_id else None
+    selections = dict(session.get("poi_selections") or {})
+    places = {str(card.get("place_id")): str(card.get("name")) for card in session.get("place_candidates") or []}
+    return {
+        "session": {
+            **view,
+            "discovery": None,  # 下面单独给，避免同一份数据出现两种形状
+        },
+        "basic_info": {
+            **basic,
+            "created_at": session.get("created_at"),
+            "updated_at": session.get("updated_at"),
+            "expires_at": session.get("expires_at"),
+        },
+        "preferences": view.get("preferences"),
+        "preference_labels": view.get("preference_labels"),
+        "discovery": {
+            "overall": session.get("discovery_status"),
+            "stages": discovery,
+            "degradations": session.get("degradations") or [],
+        },
+        "prefetch_summary": {
+            "transport_candidates": len(prefetch.get("outbound") or []) + len(prefetch.get("inbound") or []),
+            "hotel_candidates": len(prefetch.get("hotels") or []),
+            "evidence_count": len(prefetch.get("evidences") or []),
+            "place_candidates": len(prefetch.get("places") or []),
+            "provider_calls": len(prefetch.get("provider_calls") or []),
+        },
+        "poi_selections": {
+            "counts": {
+                "must": sum(1 for v in selections.values() if str(v).upper() == "MUST"),
+                "want": sum(1 for v in selections.values() if str(v).upper() == "WANT"),
+                "reject": sum(1 for v in selections.values() if str(v).upper() == "REJECT"),
+                "neutral": len(session.get("place_candidates") or []) - len(selections),
+            },
+            "items": [
+                {"place_id": key, "name": places.get(str(key), str(key)), "state": str(value).upper()}
+                for key, value in selections.items()
+            ],
+        },
+        "events": session.get("events") or [],
+        "run_link": {
+            "has_run": bool(run_id),
+            "run_id": run_id,
+            "run_status": (progress or {}).get("status") if progress else (run or {}).get("status"),
+            "started_at": (progress or {}).get("started_at") if progress else None,
+            "finished_at": (progress or {}).get("finished_at") if progress else None,
+        },
     }
-    return view
 
 
 def _admin_session_row(session: dict[str, Any]) -> dict[str, Any]:
@@ -666,8 +724,26 @@ def admin_run_detail(run_id: str) -> dict[str, Any]:
         "started_at": progress.get("started_at"),
         "finished_at": progress.get("finished_at"),
     }
+    metrics_row = store.get_run_metrics(run_id) or {}
+    # cost_source / 单价快照不在 run_metrics 表里（表结构固定）。这里按"成本非空即由用户单价算出"
+    # 拼出来，让前端能区分"后端没给定价"与"按你填的单价估算"。
+    config = current_config()
+    if metrics_row.get("cost") is not None:
+        metrics_row = {
+            **metrics_row,
+            "cost_source": "user_price",
+            "cost_breakdown": {
+                "input_tokens": metrics_row.get("input_tokens"),
+                "output_tokens": metrics_row.get("output_tokens"),
+                "cached_tokens": metrics_row.get("cached_tokens"),
+                "input_price_per_million": config.model_price_input_per_million,
+                "output_price_per_million": config.model_price_output_per_million,
+                "cached_price_per_million": config.model_price_cached_per_million,
+            },
+        }
     return {
         "run": run,
+        "metrics": metrics_row,
         "user_journey": _user_journey(store, run, store.get_plan(run_id)),
         "stages": _stage_details(store, run_id),
         "metrics": store.get_run_metrics(run_id) or {},
@@ -1005,31 +1081,161 @@ def admin_jev_health() -> dict[str, Any]:
     return health
 
 
-@api.get("/api/v1/admin/providers", dependencies=[Depends(require_admin)])
-def admin_providers() -> dict[str, Any]:
-    configured = {
-        "railway_12306": bool(os.environ.get("RAILWAY_12306_COMMAND", "npx")),
+#: Provider → 中文名（展示用）。未列出的 Provider 原样显示 —— 页面必须能自动扩展。
+PROVIDER_LABELS: dict[str, str] = {
+    "12306": "铁路 12306",
+    "tuniu": "途牛",
+    "amap": "高德地图",
+    "tikhub": "小红书 / 抖音（TikHub）",
+    "mediacrawler": "本地抓取（MediaCrawler）",
+    "tavily": "网页搜索",
+    "jev": "Jev 决策",
+    "unknown": "未知来源",
+}
+
+#: 状态判定阈值：只看**最近这批调用**，样本太小时不硬下结论。
+PROVIDER_SAMPLE_FOR_STATUS = 5
+PROVIDER_DEGRADED_FAILURE_RATE = 0.2
+PROVIDER_UNAVAILABLE_FAILURE_RATE = 0.6
+
+
+def _provider_status(stats: dict[str, Any]) -> str:
+    """健康状态。没有调用历史时必须是 UNKNOWN，**不能**显示成失败。
+
+    这条例外很重要：刚部署、或某个 Provider 这周没被用到，都不是故障。
+    把"没有数据"画成红色会让运维去查一个根本没坏的东西。
+    """
+
+    calls = int(stats.get("calls") or 0)
+    last_status = stats.get("last_status")
+    if calls == 0:
+        return "UNKNOWN"
+    if last_status in {"AUTH_ERROR", "UNAVAILABLE"} and calls >= PROVIDER_SAMPLE_FOR_STATUS:
+        rate = int(stats.get("failures") or 0) / calls
+        return "UNAVAILABLE" if rate >= PROVIDER_UNAVAILABLE_FAILURE_RATE else "DEGRADED"
+    if calls < PROVIDER_SAMPLE_FOR_STATUS:
+        # 样本太少：只说"最近一次是什么状态"，不下健康结论。
+        return "UNKNOWN" if last_status == "OK" else "DEGRADED"
+    rate = int(stats.get("failures") or 0) / calls
+    if rate >= PROVIDER_UNAVAILABLE_FAILURE_RATE:
+        return "UNAVAILABLE"
+    if rate >= PROVIDER_DEGRADED_FAILURE_RATE:
+        return "DEGRADED"
+    return "HEALTHY"
+
+
+def _provider_configured() -> dict[str, bool]:
+    return {
+        "12306": bool(os.environ.get("RAILWAY_12306_COMMAND", "npx")),
         "tuniu": bool(os.environ.get("TUNIU_API_KEY")),
         "amap": bool(os.environ.get("AMAP_API_KEY")),
         "tikhub": bool(os.environ.get("TIKHUB_API_TOKEN")),
         "mediacrawler": bool(os.environ.get("MEDIACRAWLER_DIR")),
+        "tavily": bool(os.environ.get("TAVILY_API_KEY")),
         "jev": bool(os.environ.get("JEV_API_KEY") or os.environ.get("TYPESAFE_API_KEY")),
     }
+
+
+@api.get("/api/v1/admin/providers", dependencies=[Depends(require_admin)])
+def admin_providers(limit_per_provider: int = 200) -> dict[str, Any]:
+    """Provider Health：用**真实调用账本**聚合，不做假探活。
+
+    口径：每个 Provider 取最近 `limit_per_provider` 次调用（固定样本量，才能让不同
+    Provider 的成功率可比 —— 它们的调用量差几十倍）。没有任何调用历史 → UNKNOWN。
+    """
+
     store = get_store()
-    stats: dict[str, dict[str, int]] = {}
-    for run in store.list_runs(limit=50):
-        for span in store.get_trace_spans(run["run_id"]):
-            if span.get("component") != "tool":
-                continue
-            provider = str(_span_attributes(span).get("provider") or "unknown")
-            bucket = stats.setdefault(provider, {"calls": 0, "failures": 0})
-            bucket["calls"] += 1
-            if str(_span_attributes(span).get("status")) != "OK":
-                bucket["failures"] += 1
+    configured = _provider_configured()
+    configured_keys = list(configured)
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for stats in store.provider_call_stats(limit_per_provider=limit_per_provider):
+        provider = str(stats["provider"])
+        seen.add(provider)
+        rows.append(
+            {
+                **stats,
+                "label": PROVIDER_LABELS.get(provider, provider),
+                "configured": configured.get(provider),
+                "status": _provider_status(stats),
+                "success_rate": round(int(stats["successes"]) / int(stats["calls"]), 4)
+                if stats["calls"]
+                else None,
+                "failure_rate": round(int(stats["failures"]) / int(stats["calls"]), 4)
+                if stats["calls"]
+                else None,
+            }
+        )
+    # 配置了但最近没被调用过的 Provider 也要出现（状态 UNKNOWN），
+    # 否则运维会以为"这个数据源不存在"，而不是"这段时间没用到"。
+    for provider in configured_keys:
+        if provider in seen:
+            continue
+        rows.append(
+            {
+                "provider": provider,
+                "label": PROVIDER_LABELS.get(provider, provider),
+                "configured": configured[provider],
+                "status": "UNKNOWN",
+                "calls": 0,
+                "successes": 0,
+                "failures": 0,
+                "timeouts": 0,
+                "auth_errors": 0,
+                "rate_limited": 0,
+                "empty": 0,
+                "fallback_count": 0,
+                "last_call_at": None,
+                "last_success_at": None,
+                "last_failure_at": None,
+                "avg_latency_ms": None,
+                "p95_latency_ms": None,
+                "tools": [],
+                "sources": [],
+                "last_error": None,
+                "last_status": None,
+                "success_rate": None,
+                "failure_rate": None,
+            }
+        )
+    rows.sort(key=lambda row: (row["status"] == "HEALTHY", row["provider"]))
+    failing = [row["provider"] for row in rows if row["status"] in {"DEGRADED", "UNAVAILABLE"}]
     return {
-        "configured": configured,
+        "items": rows,
+        "summary": {
+            "providers": len(rows),
+            "healthy": sum(1 for row in rows if row["status"] == "HEALTHY"),
+            "degraded": sum(1 for row in rows if row["status"] == "DEGRADED"),
+            "unavailable": sum(1 for row in rows if row["status"] == "UNAVAILABLE"),
+            "unknown": sum(1 for row in rows if row["status"] == "UNKNOWN"),
+            "needs_attention": failing,
+        },
+        "note": (
+            "统计口径：每个 Provider 最近 "
+            f"{limit_per_provider} 次真实调用（含 Discovery 阶段）。"
+            "没有调用历史显示 UNKNOWN，不代表故障；本页不主动打第三方接口（不做假探活），"
+            "也不会回显任何密钥。"
+        ),
+    }
+
+
+@api.get("/api/v1/admin/providers/{provider}", dependencies=[Depends(require_admin)])
+def admin_provider_detail(provider: str, limit: int = 20) -> dict[str, Any]:
+    """某个 Provider 的最近调用明细（含来源：Discovery / 正式 Run / Benchmark）。"""
+
+    store = get_store()
+    calls = store.list_provider_calls(provider=provider, limit=limit)
+    stats = next(
+        (row for row in store.provider_call_stats() if row["provider"] == provider), None
+    )
+    return {
+        "provider": provider,
+        "label": PROVIDER_LABELS.get(provider, provider),
+        "configured": _provider_configured().get(provider),
+        "status": _provider_status(stats) if stats else "UNKNOWN",
         "stats": stats,
-        "note": "configured 是环境变量状态；stats 是最近 50 个 run 的真实调用统计。",
+        "calls": calls,
+        "note": "调用明细不含任何密钥；query 只保留解释'查了什么'的键值。",
     }
 
 

@@ -216,9 +216,10 @@ class TestJevArtifacts:
         metrics = json.loads((target / "metrics.json").read_text(encoding="utf-8"))
         # metrics.json 与库里的 run_metrics 必须是同一份数字，否则"产物"和"管理端"会各说各话。
         stored = store.get_run_metrics(RUN_ID)
-        assert {key: metrics[key] for key in metrics} == {
-            key: stored[key] for key in metrics
-        }
+        # metrics.json 比 run_metrics 表多两个"展示用"字段（cost_source / cost_breakdown，
+        # 表结构固定放不进去）。可比的是表里那批字段。
+        shared = [key for key in stored if key not in ("run_id", "updated_at")]
+        assert {key: metrics[key] for key in shared} == {key: stored[key] for key in shared}
         assert metrics["jev_calls"] == len(result.audit["jev_calls"])
 
         trace_lines = [

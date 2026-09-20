@@ -53,6 +53,31 @@ _STATUS_EXPR = (
 )
 
 
+def _percentile(values: list[int], ratio: float) -> int | None:
+    """最近邻百分位。样本很少时不做插值 —— 4 次调用算出来的 P95 插值是在编数字。"""
+
+    if not values:
+        return None
+    index = min(len(values) - 1, max(0, int(round(ratio * (len(values) - 1)))))
+    return int(values[index])
+
+
+#: 调用参数里绝不允许落库的键（大小写无关）。在**存储边界**做，而不是只靠调用方——
+#: 只要有一个调用点忘了脱敏，密钥就会进库并通过管理端接口回显出去。
+_SENSITIVE_QUERY_KEYS = ("api_key", "apikey", "key", "token", "access_token", "authorization", "secret", "password")
+
+
+def _scrub_query(query: Any) -> dict[str, Any]:
+    """丢掉凭据类参数，其余原样保留（Provider Health 要看到"查了什么"）。"""
+
+    if not isinstance(query, dict):
+        return {}
+    return {
+        str(key): ("***" if any(mark in str(key).lower() for mark in _SENSITIVE_QUERY_KEYS) else value)
+        for key, value in query.items()
+    }
+
+
 def _json(value: Any) -> str:
     """统一 JSON 序列化：ensure_ascii=False 让中文在库里可读，排查问题不用再转码。"""
     return json.dumps(value, ensure_ascii=False, default=str)
@@ -341,12 +366,36 @@ CREATE TABLE IF NOT EXISTS planning_sessions (
     evidence_summary_json TEXT,
     degradations_json   TEXT,
     events_json         TEXT,
+    discovery_json      TEXT,
     prefetch_json       TEXT,
     error               TEXT,
     run_id              TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_planning_sessions_updated ON planning_sessions(updated_at);
+
+-- Provider 调用账本（观测用）。
+-- 与 sources 的分工：sources 是"这次 run 用了什么证据"；provider_calls 是"谁在什么时候
+-- 调了哪个数据源、成不成、多快" —— 后者要能记录还没有 run 的 Discovery 调用。
+CREATE TABLE IF NOT EXISTS provider_calls (
+    call_id         TEXT PRIMARY KEY,
+    provider        TEXT NOT NULL,
+    tool            TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    source_type     TEXT NOT NULL,
+    source_id       TEXT,
+    run_id          TEXT,
+    session_id      TEXT,
+    fetched_at      TEXT NOT NULL,
+    duration_ms     INTEGER,
+    returned        INTEGER,
+    error           TEXT,
+    fallback        INTEGER NOT NULL DEFAULT 0,
+    query_json      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_calls_provider ON provider_calls(provider, fetched_at);
+CREATE INDEX IF NOT EXISTS idx_provider_calls_source ON provider_calls(source_type, fetched_at);
 
 -- 管理端可运行时修改的非 Secret 配置（覆盖环境变量，落库以便重启后仍在）。
 CREATE TABLE IF NOT EXISTS runtime_config (
@@ -448,6 +497,8 @@ class TravelPlanStore:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(planning_sessions)")}
         if columns and "prefetch_json" not in columns:
             conn.execute("ALTER TABLE planning_sessions ADD COLUMN prefetch_json TEXT")
+        if columns and "discovery_json" not in columns:
+            conn.execute("ALTER TABLE planning_sessions ADD COLUMN discovery_json TEXT")
 
     # ------------------------------------------------------------------
     # run
@@ -1358,8 +1409,8 @@ class TravelPlanStore:
                 " (session_id, status, discovery_status, created_at, updated_at, expires_at,"
                 "  basic_intent_json, preferences_json, poi_selections_json, transport_json,"
                 "  hotels_json, places_json, evidence_summary_json, degradations_json,"
-                "  events_json, prefetch_json, error, run_id)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "  events_json, discovery_json, prefetch_json, error, run_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     session_id,
                     session.get("status") or "COLLECTING",
@@ -1376,6 +1427,7 @@ class TravelPlanStore:
                     _json(session.get("evidence_summary") or {}),
                     _json(session.get("degradations") or []),
                     _json(session.get("events") or []),
+                    _json(session.get("discovery") or {}),
                     _json(session.get("prefetch") or {}),
                     session.get("error"),
                     session.get("run_id"),
@@ -1401,6 +1453,7 @@ class TravelPlanStore:
             "evidence_summary": _loads(row["evidence_summary_json"], {}),
             "degradations": _loads(row["degradations_json"], []),
             "events": _loads(row["events_json"], []),
+            "discovery": _loads(row["discovery_json"], {}),
             "prefetch": _loads(row["prefetch_json"], {}),
             "error": row["error"],
             "run_id": row["run_id"],
@@ -1414,13 +1467,30 @@ class TravelPlanStore:
         return self._session_row(row) if row is not None else None
 
     def list_planning_sessions(
-        self, *, limit: int = 50, offset: int = 0, q: str | None = None
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        q: str | None = None,
+        status: str | None = None,
+        destination: str | None = None,
+        has_run: bool | None = None,
     ) -> tuple[list[dict], int]:
         clauses: list[str] = []
         params: list[Any] = []
         if q:
             clauses.append("(session_id LIKE ? OR COALESCE(run_id,'') LIKE ?)")
             params.extend([f"%{q}%", f"%{q}%"])
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        if destination:
+            clauses.append("basic_intent_json LIKE ?")
+            params.append(f"%{destination}%")
+        if has_run is True:
+            clauses.append("run_id IS NOT NULL")
+        elif has_run is False:
+            clauses.append("run_id IS NULL")
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._connect() as conn:
             total = conn.execute(
@@ -1452,6 +1522,150 @@ class TravelPlanStore:
                 (stamp, stamp),
             )
             return int(cursor.rowcount or 0)
+
+    # ------------------------------------------------------------------
+    # Provider 调用账本（Provider Health 的数据源）
+    # ------------------------------------------------------------------
+
+    def save_provider_call(self, call: dict[str, Any]) -> str:
+        """记一次 Provider 调用。`call_id` 由调用方给（要能幂等重放）。"""
+
+        call_id = str(call.get("call_id") or "")
+        if not call_id:
+            call_id = f"{call.get('provider')}-{call.get('tool')}-{call.get('fetched_at')}-{utcnow().timestamp()}"
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO provider_calls"
+                " (call_id, provider, tool, status, source_type, source_id, run_id, session_id,"
+                "  fetched_at, duration_ms, returned, error, fallback, query_json)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    call_id,
+                    str(call.get("provider") or "unknown"),
+                    str(call.get("tool") or "unknown"),
+                    str(call.get("status") or "UNKNOWN"),
+                    str(call.get("source_type") or "run"),
+                    call.get("source_id"),
+                    call.get("run_id"),
+                    call.get("session_id"),
+                    str(call.get("fetched_at") or utcnow().isoformat()),
+                    call.get("duration_ms"),
+                    call.get("returned"),
+                    call.get("error"),
+                    1 if call.get("fallback") else 0,
+                    _json(_scrub_query(call.get("query"))),
+                ),
+            )
+        return call_id
+
+    def save_provider_calls(self, calls: Iterable[dict[str, Any]]) -> int:
+        count = 0
+        for call in calls:
+            self.save_provider_call(call)
+            count += 1
+        return count
+
+    def list_provider_calls(
+        self,
+        *,
+        provider: str | None = None,
+        source_type: str | None = None,
+        limit: int = 200,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if provider:
+            clauses.append("provider=?")
+            params.append(provider)
+        if source_type:
+            clauses.append("source_type=?")
+            params.append(source_type)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM provider_calls"
+                + where
+                + " ORDER BY fetched_at DESC, call_id LIMIT ?",
+                [*params, max(1, min(limit, 1000))],
+            ).fetchall()
+        return [
+            {
+                **{key: row[key] for key in row.keys() if key != "query_json"},
+                "query": _loads(row["query_json"], {}),
+                "fallback": bool(row["fallback"]),
+            }
+            for row in rows
+        ]
+
+    def provider_names(self) -> list[str]:
+        """出现过的 Provider（页面必须能自动扩展，不能写死一份清单）。"""
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT provider FROM provider_calls ORDER BY provider"
+            ).fetchall()
+        return [str(row["provider"]) for row in rows]
+
+    def provider_call_stats(self, *, limit_per_provider: int = 200) -> list[dict[str, Any]]:
+        """按 Provider 聚合真实调用数据。
+
+        `limit_per_provider` 是"看最近多少次调用"，不是时间窗：样本量固定，
+        才能让成功率与 P95 在不同 Provider 之间可比（调用量差异极大）。
+        """
+
+        stats: list[dict[str, Any]] = []
+        for provider in self.provider_names():
+            calls = self.list_provider_calls(provider=provider, limit=limit_per_provider)
+            successes = [call for call in calls if call["status"] == "OK"]
+            failures = [call for call in calls if call["status"] != "OK"]
+            latencies = sorted(
+                int(call["duration_ms"])
+                for call in calls
+                if isinstance(call.get("duration_ms"), int)
+            )
+            stats.append(
+                {
+                    "provider": provider,
+                    "calls": len(calls),
+                    "successes": len(successes),
+                    "failures": len(failures),
+                    "timeouts": sum(1 for call in calls if call["status"] == "TIMEOUT"),
+                    "auth_errors": sum(1 for call in calls if call["status"] == "AUTH_ERROR"),
+                    "rate_limited": sum(1 for call in calls if call["status"] == "RATE_LIMIT"),
+                    "empty": sum(1 for call in calls if call["status"] == "EMPTY"),
+                    "fallback_count": sum(1 for call in calls if call["fallback"]),
+                    "last_call_at": calls[0]["fetched_at"] if calls else None,
+                    "last_success_at": successes[0]["fetched_at"] if successes else None,
+                    "last_failure_at": failures[0]["fetched_at"] if failures else None,
+                    "avg_latency_ms": round(sum(latencies) / len(latencies)) if latencies else None,
+                    "p95_latency_ms": _percentile(latencies, 0.95),
+                    "tools": sorted({str(call["tool"]) for call in calls}),
+                    "sources": sorted({str(call["source_type"]) for call in calls}),
+                    "last_error": failures[0]["error"] if failures and failures[0].get("error") else None,
+                    "last_status": calls[0]["status"] if calls else None,
+                }
+            )
+        return stats
+
+    def count_planning_sessions(
+        self, *, status: str | None = None, has_run: bool | None = None
+    ) -> int:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        if has_run is True:
+            clauses.append("run_id IS NOT NULL")
+        elif has_run is False:
+            clauses.append("run_id IS NULL")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            return int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM planning_sessions" + where, params
+                ).fetchone()["n"]
+            )
 
     # ------------------------------------------------------------------
     # runtime config（管理端可编辑的非 Secret 配置）

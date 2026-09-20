@@ -2975,6 +2975,7 @@ def _detect_and_save_badcases(
         ctx = BadCaseContext(
             run_id=state["run_id"],
             plan=plan,
+            journey=_user_journey_summary(state, plan),
             provider_calls=_provider_call_rows(state.get("hub")),
             jev_calls=list(state.get("jev_calls") or []),
             degradations=list(dict.fromkeys(degradations)),
@@ -3090,6 +3091,49 @@ LLM_STAGE_MAP: dict[str, str] = {
     "critic": "critic_and_revise",
     "final_answer": "finalize",
 }
+
+
+def _record_provider_calls(state: TravelState) -> int:
+    """把本次 run 的 Provider 调用写进观测账本 `provider_calls`。
+
+    与 `sources` 的分工：sources 是"这次 run 用了什么证据"（业务，带外键）；这张表是
+    "谁在什么时候调了哪个数据源、成不成、多快"（观测）。Provider Health 只读后者，
+    这样它既能统计正式 Run，也能统计还没有 run 的 Discovery。
+    """
+
+    store = state.get("store")
+    if store is None:
+        return 0
+    run_source = str(state.get("source") or "quick")
+    source_type = "benchmark" if run_source == "benchmark" else "run"
+    rows: list[dict[str, Any]] = []
+    for index, entry in enumerate(_provider_call_rows(state.get("hub"))):
+        rows.append(
+            {
+                "call_id": f"{state['run_id']}:{index}:{entry.get('source_id')}",
+                "provider": entry.get("provider"),
+                "tool": entry.get("tool"),
+                "status": entry.get("status"),
+                "source_type": source_type,
+                "source_id": entry.get("source_id"),
+                "run_id": state.get("run_id"),
+                "session_id": state.get("source_session_id"),
+                "fetched_at": entry.get("fetched_at"),
+                "duration_ms": entry.get("duration_ms"),
+                "returned": entry.get("returned"),
+                "error": (entry.get("note") or "")[:400] or None,
+                "fallback": False,
+                "query": {
+                    key: value
+                    for key, value in (entry.get("query") or {}).items()
+                    if str(key).lower() not in {"api_key", "token", "authorization", "secret"}
+                },
+            }
+        )
+    try:
+        return store.save_provider_calls(rows)
+    except Exception:  # noqa: BLE001 —— 观测写不进去不该让规划失败
+        return 0
 
 
 def _llm_stage_for(tag: str) -> str | None:
@@ -3242,6 +3286,7 @@ def node_finalize(state: TravelState) -> dict:
     # 把 Provider / 模型调用转录成 span（component=provider|mcp|tool|llm）。放在这里是因为
     # 两者的调用账本此时才完整；Bad Case 的 trace_refs 也在这之后才落库，指向的 span 一定存在。
     _emit_run_spans(state, llm=llm)
+    _record_provider_calls(state)
     _record_subspan(
         state,
         component=SpanKind.STORE,
@@ -3363,10 +3408,71 @@ def _build_audit(
         "tradeoff": state.get("tradeoff") or {},
         "quality_gate": state.get("gate") or {},
         "quality": (state.get("quality").to_dict() if state.get("quality") is not None else {}),
+        "user_journey": _user_journey_summary(state, plan),
         "timeline": timeline,
         "artifacts": artifacts,
         "degradations": list(dict.fromkeys(degradations)),
         "evidence_summary": _evidence_summary(state, plan),
+    }
+
+
+def _user_journey_summary(state: TravelState, plan: TripPlan) -> dict[str, Any]:
+    """这次 run 的"用户前置选择"上下文（管理端 Run Detail 与 Bad Case 共用）。
+
+    `prefetch_reused` 是**用证据推出来的**，不是标记位：如果这次 run 复用了 Discovery，
+    它就不应该再自己打一遍交通/酒店/攻略。两边都发生 = 没复用（这正是要暴露的问题）。
+    """
+
+    intent = plan.intent
+    selections = dict(intent.place_selections or {})
+    bundle = state.get("prefetch")
+    planned_ids = [item.place_id for day in plan.days for item in day.items if item.place_id]
+
+    bundle_had: set[str] = set()
+    if bundle is not None:
+        if bundle.outbound or bundle.inbound:
+            bundle_had.add("transport")
+        if bundle.hotels:
+            bundle_had.add("hotels")
+        if bundle.evidences:
+            bundle_had.add("social")
+        if bundle.places:
+            bundle_had.add("places")
+    ran_itself = {
+        str(entry.get("tool"))
+        for entry in _provider_call_rows(state.get("hub"))
+    }
+    # 这些工具一旦出现在本次 run 的账本里，就说明它自己又查了一遍。
+    self_queried = {
+        "transport": bool({"search_trains", "search_flights"} & ran_itself),
+        "hotels": "search_hotels" in ran_itself,
+        "social": bool({"search_xiaohongshu", "search_douyin", "web_search"} & ran_itself),
+        "places": "search_poi" in ran_itself,
+    }
+    reused = {
+        key: (key in bundle_had and not self_queried[key]) for key in ("transport", "hotels", "social", "places")
+    }
+    return {
+        "source": state.get("source") or "quick",
+        "source_session_id": state.get("source_session_id"),
+        "transport_mode": intent.transport_mode,
+        "transport_priority": intent.transport_priority,
+        "hotel_priority": intent.hotel_priority,
+        "pace": intent.pace,
+        "place_selections": {
+            "must": sum(1 for value in selections.values() if str(value).upper() == "MUST"),
+            "want": sum(1 for value in selections.values() if str(value).upper() == "WANT"),
+            "reject": sum(1 for value in selections.values() if str(value).upper() == "REJECT"),
+        },
+        "prefetch_available": sorted(bundle_had),
+        "prefetch_reused": reused,
+        "prefetch_reused_any": any(reused.values()),
+        "prefetch_status": (bundle.discovery_status if bundle is not None else None),
+        "discovery": (bundle.discovery if bundle is not None else {}),
+        "rejected_in_plan": selection.rejected_place_intruders(planned_ids, selections),
+        "must_missing": selection.must_place_shortfall(
+            planned_ids, selections, list(state.get("places") or [])
+        ),
     }
 
 
@@ -3642,6 +3748,20 @@ def execute_travel_run(
         provider_calls = resolved_hub.audit_entries()
         jev_records = [call for call in (final.get("jev_calls") or []) if call.get("attempted")]
         badcases = list(final.get("badcases") or [])
+        config = current_config()
+        price_in = config.model_price_input_per_million
+        price_out = config.model_price_output_per_million
+        price_cached = config.model_price_cached_per_million
+        cost: float | None = None
+        if has_usage and price_in is not None and price_out is not None:
+            # 单价是**用户填的估计值**，不是 Provider 回执 —— 产物里标 cost_source=user_price。
+            cached_price = price_cached if price_cached is not None else price_in
+            cost = round(
+                input_tokens / 1_000_000 * price_in
+                + output_tokens / 1_000_000 * price_out
+                + cached_tokens / 1_000_000 * cached_price,
+                6,
+            )
         metrics: dict[str, Any] = {
             "duration_ms": round((time.perf_counter() - started) * 1000),
             "input_tokens": input_tokens if has_usage else None,
@@ -3654,8 +3774,17 @@ def execute_travel_run(
             "tool_calls": len(provider_calls),
             "provider_failures": sum(1 for call in provider_calls if call.get("status") != "OK"),
             "badcase_count": len(badcases),
-            # 没有 Provider 可核实的 pricing 回执时，cost 必须为 null。
-            "cost": None,
+            # 没配单价、或拿不到 token 时 cost 必须为 null（不猜）。
+            "cost": cost,
+            "cost_source": "user_price" if cost is not None else None,
+            "cost_breakdown": {
+                "input_tokens": input_tokens if has_usage else None,
+                "output_tokens": output_tokens if has_usage else None,
+                "cached_tokens": cached_tokens if has_usage else None,
+                "input_price_per_million": price_in,
+                "output_price_per_million": price_out,
+                "cached_price_per_million": price_cached,
+            },
         }
         try:
             resolved_store.save_run_metrics(resolved_run_id, metrics)

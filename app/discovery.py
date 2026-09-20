@@ -493,13 +493,27 @@ def prefetch(
         except Exception as exc:  # noqa: BLE001 —— 一条线崩了不能带走整个 Discovery
             errors[name] = f"{type(exc).__name__}: {exc}"
 
+    import time as _time
+
+    # 每条线单独计时：管理端要回答"Discovery 卡在哪一步"，只有总耗时是答不出来的。
+    timings: dict[str, dict[str, Any]] = {
+        name: {"started_at": _iso(), "finished_at": None, "duration_ms": None}
+        for name in destinations
+    }
+    started_at = {name: _time.perf_counter() for name in destinations}
+
     with ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="tp-discovery") as pool:
         futures = [pool.submit(run, name, func, args) for name, (func, args) in destinations.items()]
         for future in futures:
             future.result()
+    for name in destinations:
+        timings[name]["duration_ms"] = round((_time.perf_counter() - started_at[name]) * 1000)
+        timings[name]["finished_at"] = _iso()
 
     social: SocialEvidence = outcomes.get("social") or SocialEvidence()
     places = PlaceCandidates()
+    timings["places"] = {"started_at": _iso(), "finished_at": None, "duration_ms": None}
+    places_started = _time.perf_counter()
     if social.evidences:
         try:
             places = extract_place_candidates(
@@ -507,13 +521,55 @@ def prefetch(
             )
         except Exception as exc:  # noqa: BLE001
             errors["places"] = f"{type(exc).__name__}: {exc}"
+    timings["places"]["duration_ms"] = round((_time.perf_counter() - places_started) * 1000)
+    timings["places"]["finished_at"] = _iso()
+
+    transport: TransportCandidates | None = outcomes.get("transport")
+    hotels: HotelCandidates | None = outcomes.get("hotels")
+    stages = {
+        "transport": {
+            **timings["transport"],
+            "status": "FAILED" if "transport" in errors else ("EMPTY" if not (transport and transport.all_options) else "OK"),
+            "result_count": len(transport.all_options) if transport else 0,
+            "degraded": bool(transport and transport.degradations),
+            "error": errors.get("transport"),
+        },
+        "hotels": {
+            **timings["hotels"],
+            "status": "FAILED" if "hotels" in errors else ("EMPTY" if not (hotels and hotels.items) else "OK"),
+            "result_count": len(hotels.items) if hotels else 0,
+            "degraded": bool(hotels and hotels.degradations),
+            "error": errors.get("hotels"),
+        },
+        "social": {
+            **timings["social"],
+            "status": "FAILED" if "social" in errors else ("EMPTY" if not social.evidences else "OK"),
+            "result_count": len(social.evidences),
+            "degraded": bool(social.degradations),
+            "error": errors.get("social"),
+        },
+        "places": {
+            **timings["places"],
+            "status": "FAILED" if "places" in errors else ("EMPTY" if not places.places else "OK"),
+            "result_count": len(places.places),
+            "degraded": bool(places.degradations),
+            "error": errors.get("places"),
+        },
+    }
     return {
-        "transport": outcomes.get("transport"),
-        "hotels": outcomes.get("hotels"),
+        "transport": transport,
+        "hotels": hotels,
         "social": social,
         "places": places,
         "errors": errors,
+        "stages": stages,
     }
+
+
+def _iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ======================================================================
@@ -542,6 +598,8 @@ class PrefetchBundle:
     provider_calls: list[dict[str, Any]] = field(default_factory=list)
     degradations: list[str] = field(default_factory=list)
     discovery_status: str = "READY"
+    #: 分阶段 Discovery 状态（管理端与 Bad Case 都要用它回答"卡在哪一步"）
+    discovery: dict[str, Any] = field(default_factory=dict)
 
     @property
     def reused(self) -> bool:
@@ -559,6 +617,7 @@ class PrefetchBundle:
             "provider_calls": list(self.provider_calls),
             "degradations": list(self.degradations),
             "discovery_status": self.discovery_status,
+            "discovery": dict(self.discovery),
         }
 
     @classmethod
@@ -577,6 +636,7 @@ class PrefetchBundle:
             provider_calls=list(data.get("provider_calls") or []),
             degradations=[coerce_str(item) for item in (data.get("degradations") or []) if coerce_str(item)],
             discovery_status=coerce_str(data.get("discovery_status")) or "READY",
+            discovery=dict(data.get("discovery") or {}),
         )
 
 

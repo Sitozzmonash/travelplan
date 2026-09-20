@@ -227,8 +227,16 @@ class TestConfigAndJevHealth:
 
     def test_providers_reports_config_and_real_stats(self, client):
         body = client.get("/api/v1/admin/providers", headers=AUTH).json()
-        assert set(body) == {"configured", "stats", "note"}
-        assert body["stats"], "至少要有一次真实工具调用统计"
+        assert set(body) == {"items", "summary", "note"}
+        assert body["items"], "至少要有一次真实工具调用统计"
+        # 没有调用历史的 Provider 必须是 UNKNOWN，不能显示成故障
+        assert all(
+            row["status"] in {"HEALTHY", "DEGRADED", "UNAVAILABLE", "UNKNOWN"}
+            for row in body["items"]
+        )
+        assert "needs_attention" in body["summary"]
+        # 不能回显任何密钥
+        assert "sk-" not in client.get("/api/v1/admin/providers", headers=AUTH).text
 
 
 class TestEvolutionApi:

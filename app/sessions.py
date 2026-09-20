@@ -248,7 +248,13 @@ def cancel_session(store: TravelPlanStore, session_id: str) -> dict[str, Any] | 
 # ======================================================================
 
 
-def run_discovery(store: TravelPlanStore, session_id: str) -> None:
+def run_discovery(
+    store: TravelPlanStore,
+    session_id: str,
+    *,
+    hub_factory: Callable[[str], Any] | None = None,
+    llm_factory: Callable[[], Any] | None = None,
+) -> None:
     """后台 Prefetch：四条线并行取数，结果写回会话。
 
     单条线失败只记降级（`discovery_status=PARTIAL`），绝不让用户卡在加载页 ——
@@ -267,13 +273,25 @@ def run_discovery(store: TravelPlanStore, session_id: str) -> None:
         from app.llm import LLM
         from app.providers import ProviderHub, default_mcp_servers
 
-        # store=None：Discovery 的调用**不落库**。它属于会话（可能从没变成正式 run），
+        # store=None：Discovery 的调用不写 sources。它属于会话（可能从没变成正式 run），
         # 而且 `sources.run_id` 有指向 runs 的外键 —— 写进去要么撞外键、要么污染运行列表。
-        # 调用账本留在内存里，正式 run 复用时再"过户"到自己的 sources 表（保来源链）。
-        hub = ProviderHub(run_id=session_id, store=None, mcp_servers=default_mcp_servers())
-        llm = LLM.from_env()
+        # 调用账本留在内存里，随后写进 provider_calls（观测表，无外键）供 Provider Health 用。
+        if hub_factory is not None:
+            hub = hub_factory(session_id)
+        else:
+            hub = ProviderHub(run_id=session_id, store=None, mcp_servers=default_mcp_servers())
+        llm = llm_factory() if llm_factory is not None else LLM.from_env()
         config = current_config()
-        started = _now().isoformat()
+        events = list(session.get("events") or [])
+        for stage, name in (
+            ("transport", "transport_prefetch"),
+            ("hotels", "hotel_prefetch"),
+            ("social", "social_discovery"),
+        ):
+            events.append(_event(f"{name}_started", stage))
+        session["events"] = events
+        started = _now()
+
         result = discovery.prefetch(
             hub,
             llm,
@@ -282,6 +300,11 @@ def run_discovery(store: TravelPlanStore, session_id: str) -> None:
             workers=max(1, config.discovery_workers),
         )
         bundle = _bundle_from(session_id, intent, result, hub)
+        stages = result.get("stages") or {}
+        # 调用账本落库：Discovery 的调用发生在会话里，没有 run_id。
+        # Provider Health 要能区分"Discovery 阶段大量超时"与"正式 Run 正常"，
+        # 所以这些调用必须单独留痕（sources 表有 runs 外键，这里进不去）。
+        _record_provider_calls(store, bundle.provider_calls, session_id=session_id)
         session.update(
             {
                 "status": SESSION_READY,
@@ -292,23 +315,50 @@ def run_discovery(store: TravelPlanStore, session_id: str) -> None:
                     "sources_used": len({call.get("source_id") for call in bundle.provider_calls}),
                     "places_verified": sum(1 for place in bundle.places if place.amap_verified),
                     "total_candidates": len(bundle.places),
+                    "transport_candidates": len(bundle.outbound) + len(bundle.inbound),
+                    "hotel_candidates": len(bundle.hotels),
+                    "evidence_count": len(bundle.evidences),
                 },
+                "discovery": stages,
                 "prefetch": bundle.dump(),
                 "degradations": bundle.degradations,
-                "events": [
-                    *(session.get("events") or []),
-                    _event("discovery_finished", f"交通 {len(bundle.outbound) + len(bundle.inbound)} 个候选，"
-                                                 f"酒店 {len(bundle.hotels)} 个，地点 {len(bundle.places)} 个"),
-                ],
             }
         )
+        finished_events = list(session.get("events") or [])
+        for stage, name in (
+            ("transport", "transport_prefetch"),
+            ("hotels", "hotel_prefetch"),
+            ("social", "social_discovery"),
+            ("places", "place_extraction"),
+        ):
+            info = stages.get(stage) or {}
+            finished_events.append(
+                _event(
+                    f"{name}_finished",
+                    f"status={info.get('status') or 'UNKNOWN'}，"
+                    f"结果 {info.get('result_count') or 0} 条，"
+                    f"耗时 {info.get('duration_ms') or '?'}ms"
+                    + (f"，error={info['error']}" if info.get("error") else ""),
+                )
+            )
+        finished_events.append(
+            _event(
+                "discovery_finished",
+                f"交通 {len(bundle.outbound) + len(bundle.inbound)} 个候选，"
+                f"酒店 {len(bundle.hotels)} 个，地点 {len(bundle.places)} 个，"
+                f"总耗时 {round((_now() - started).total_seconds() * 1000)}ms",
+            )
+        )
+        session["events"] = finished_events
         if bundle.degradations or result.get("errors"):
             session["discovery_status"] = DISCOVERY_PARTIAL
             if result.get("errors"):
-                session["degradations"] = [*session["degradations"], *[f"{k}: {v}" for k, v in result["errors"].items()]]
+                session["degradations"] = [
+                    *session["degradations"],
+                    *[f"{k}: {v}" for k, v in result["errors"].items()],
+                ]
         else:
             session["discovery_status"] = DISCOVERY_READY
-        del started
     except Exception as exc:  # noqa: BLE001 —— Discovery 崩了也要让用户能继续
         degradations.append(f"Discovery 失败：{type(exc).__name__}: {exc}")
         session["status"] = SESSION_READY
@@ -325,6 +375,41 @@ def run_discovery(store: TravelPlanStore, session_id: str) -> None:
     store.save_planning_session(session)
 
 
+def _record_provider_calls(store: TravelPlanStore, calls: Sequence[Mapping[str, Any]], *, session_id: str) -> int:
+    """把 Discovery 的调用账本写进 provider_calls（观测用，不放进 sources）。
+
+    不写 Secret、不写完整 raw 响应：只留"谁、什么时候、调了什么、成不成、多快、返回几条"。
+    """
+
+    rows = [
+        {
+            "call_id": f"{session_id}:{index}:{call.get('source_id')}",
+            "provider": call.get("provider"),
+            "tool": call.get("tool"),
+            "status": call.get("status"),
+            "source_type": "discovery",
+            "source_id": call.get("source_id"),
+            "session_id": session_id,
+            "fetched_at": call.get("fetched_at"),
+            "duration_ms": call.get("duration_ms"),
+            "returned": call.get("item_count"),
+            "error": (call.get("error") or "")[:400] or None,
+            "fallback": False,
+            # query 只留能解释"查了什么"的键值，且不含任何凭据。
+            "query": {
+                key: value
+                for key, value in (call.get("arguments") or {}).items()
+                if key.lower() not in {"api_key", "token", "authorization", "secret"}
+            },
+        }
+        for index, call in enumerate(calls)
+    ]
+    try:
+        return store.save_provider_calls(rows)
+    except Exception:  # noqa: BLE001 —— 观测写不进去不该让 Discovery 失败
+        return 0
+
+
 def _bundle_from(session_id: str, intent: TripIntent, result: Mapping[str, Any], hub: Any) -> discovery.PrefetchBundle:
     transport = result.get("transport")
     hotels = result.get("hotels")
@@ -334,6 +419,7 @@ def _bundle_from(session_id: str, intent: TripIntent, result: Mapping[str, Any],
     for part in (transport, hotels, social, places):
         degradations.extend(getattr(part, "degradations", []) or [])
     return discovery.PrefetchBundle(
+        discovery=dict(result.get("stages") or {}),
         session_id=session_id,
         basic_intent={
             "origin": intent.origin,
@@ -532,7 +618,11 @@ def start_run(
     session["status"] = SESSION_STARTING
     session["run_id"] = run_id
     session["updated_at"] = _now().isoformat()
-    session["events"] = [*(session.get("events") or []), _event("run_started", run_id)]
+    session["events"] = [
+        *(session.get("events") or []),
+        _event("session_confirmed", f"用户确认并开始规划（{query}）"),
+        _event("run_started", run_id),
+    ]
     store.save_planning_session(session)
 
     submit(_start_job, store, run_id, query, intent, bundle, output_dir, session_id)

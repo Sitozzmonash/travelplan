@@ -44,6 +44,28 @@ CATEGORY_JEV_WRONG_CHOICE = "jev_wrong_choice"
 CATEGORY_JEV_UNNECESSARY_REPLAN = "jev_unnecessary_replan"
 CATEGORY_JEV_MISSED_REPLAN = "jev_missed_replan"
 
+# --- 引导式旅程（用户旅程落地任务 §19 / 管理后台增量任务 §15）---
+CATEGORY_DISCOVERY_EMPTY = "discovery_empty"
+CATEGORY_DISCOVERY_STALE = "discovery_stale"
+CATEGORY_PREFETCH_FAILED = "prefetch_failed"
+CATEGORY_PREFETCH_NOT_REUSED = "prefetch_not_reused"
+CATEGORY_MUST_POI_MISSING = "must_poi_missing"
+CATEGORY_REJECTED_POI_IN_PLAN = "rejected_poi_in_plan"
+CATEGORY_USER_PREFERENCE_IGNORED = "user_preference_ignored"
+CATEGORY_GUIDED_INTENT_MISMATCH = "guided_intent_mismatch"
+
+#: 与"用户在正式规划之前的路径"有关的类别（管理端据此单独分组）。
+JOURNEY_CATEGORIES = (
+    CATEGORY_DISCOVERY_EMPTY,
+    CATEGORY_DISCOVERY_STALE,
+    CATEGORY_PREFETCH_FAILED,
+    CATEGORY_PREFETCH_NOT_REUSED,
+    CATEGORY_MUST_POI_MISSING,
+    CATEGORY_REJECTED_POI_IN_PLAN,
+    CATEGORY_USER_PREFERENCE_IGNORED,
+    CATEGORY_GUIDED_INTENT_MISMATCH,
+)
+
 #: 供管理端按"是不是 Jev 的问题"分组。
 JEV_CATEGORIES = (
     CATEGORY_JEV_TIMEOUT,
@@ -73,6 +95,9 @@ class BadCaseContext:
     #: Python 在硬约束复核阶段对 Jev 决策的判断，例如
     #: ``{"choice_rejected": "...", "unnecessary_replan": "...", "missed_replan": "..."}``。
     jev_signals: dict[str, str] = field(default_factory=dict)
+    #: 用户旅程上下文（由 workflow 的 `_user_journey_summary` 提供）：
+    #: source / prefetch_* / rejected_in_plan / must_missing / discovery 分阶段状态。
+    journey: dict[str, Any] = field(default_factory=dict)
     introduced_in: str | None = None
 
 
@@ -418,6 +443,159 @@ def _jev_cases(ctx: BadCaseContext) -> list[dict[str, Any]]:
     return cases
 
 
+def _journey_cases(ctx: BadCaseContext) -> list[dict[str, Any]]:
+    """引导式旅程的问题：用户点了但没生效、Discovery 白查了等等。
+
+    这一类**只在"引导式来源"的 run 上判定**：一句话规划（quick）本来就没有前置选择，
+    拿它去报"用户偏好被忽略"是误报 —— 而误报会让 Bad Case 表失去可信度。
+    """
+
+    journey = dict(ctx.journey or {})
+    if str(journey.get("source") or "") != "guided":
+        return []
+
+    cases: list[dict[str, Any]] = []
+    session_id = journey.get("source_session_id") or "—"
+    selections = journey.get("place_selections") or {}
+    discovery = dict(journey.get("discovery") or {})
+    ref = f"{ctx.run_id}:parse_intent"
+
+    # 1) 用户明确说"不感兴趣"的点进了行程 —— 这是最严重的一类：
+    #    用户表达过的否定被系统忽略，比"排得不好"更伤信任。
+    intruders = list(journey.get("rejected_in_plan") or [])
+    if intruders:
+        cases.append(
+            _case(
+                ctx,
+                category=CATEGORY_REJECTED_POI_IN_PLAN,
+                severity=SEVERITY_HIGH,
+                symptom=f"rejected_poi_in_plan:{len(intruders)} 个被排除的点仍在行程里",
+                expected="用户在引导式旅程里标为「不感兴趣」的地点绝不进入最终行程",
+                actual=f"这些 place_id 出现在行程里：{'、'.join(intruders[:6])}",
+                suspected_root_cause="用户选择没有被作用到候选集合（selection 层未被调用）",
+                trace_refs=[ref, f"{ctx.run_id}:score_candidates"],
+            )
+        )
+
+    # 2) MUST 的点没进去：必须能说明"用户 MUST 了什么、为什么没进去"。
+    missing = list(journey.get("must_missing") or [])
+    if missing:
+        reasons = _must_missing_reasons(ctx, missing)
+        cases.append(
+            _case(
+                ctx,
+                category=CATEGORY_MUST_POI_MISSING,
+                severity=SEVERITY_HIGH,
+                symptom=f"must_poi_missing:{len(missing)} 个必去点未进入行程",
+                expected="用户标为「必去」且硬约束可行的地点应被优先安排；不可行时必须明确告知原因",
+                actual=f"未进入行程的必去点：{'、'.join(missing[:6])}。原因：{reasons}",
+                suspected_root_cause="时间窗/营业时间/预算等硬约束导致排不下，或用户偏好未参与排程",
+                trace_refs=[ref, f"{ctx.run_id}:build_initial_plan", f"{ctx.run_id}:check_feasibility"],
+            )
+        )
+
+    # 3) Discovery 自己就失败了（用户在前置阶段就没拿到候选）。
+    failed = [name for name, info in discovery.items() if str((info or {}).get("status")) == "FAILED"]
+    if failed:
+        cases.append(
+            _case(
+                ctx,
+                category=CATEGORY_PREFETCH_FAILED,
+                severity=SEVERITY_MEDIUM,
+                symptom=f"prefetch_failed:{'/'.join(sorted(failed))}",
+                expected="Discovery 的交通/酒店/攻略/地点四条线都能返回候选",
+                actual="；".join(
+                    f"{name}: {(discovery.get(name) or {}).get('error') or 'FAILED'}" for name in sorted(failed)
+                ),
+                suspected_root_cause="第三方数据源不可用，或 Discovery 查询参数不被接受",
+                trace_refs=[ref],
+            )
+        )
+
+    # 4) Discovery 查完了、正式 run 又自己查了一遍 —— 白花的钱与时间。
+    available = list(journey.get("prefetch_available") or [])
+    reused = dict(journey.get("prefetch_reused") or {})
+    not_reused = [key for key in available if not reused.get(key)]
+    if available and not_reused:
+        cases.append(
+            _case(
+                ctx,
+                category=CATEGORY_PREFETCH_NOT_REUSED,
+                severity=SEVERITY_MEDIUM,
+                symptom=f"prefetch_not_reused:{'/'.join(sorted(not_reused))}",
+                expected="正式 run 复用 Discovery 已查到的候选，不重复打同一批 Provider",
+                actual=f"Discovery 已有 {sorted(available)}，但正式 run 又查询了 {sorted(not_reused)}",
+                suspected_root_cause="Workflow 节点尚未消费 prefetch（见 docs/10 的待办）",
+                trace_refs=[f"{ctx.run_id}:search_intercity_transport", ref],
+            )
+        )
+
+    # 5) Discovery 一条候选都没有：用户会在 POI 页看到空列表。
+    if discovery and all(
+        int((info or {}).get("result_count") or 0) == 0 for info in discovery.values()
+    ):
+        cases.append(
+            _case(
+                ctx,
+                category=CATEGORY_DISCOVERY_EMPTY,
+                severity=SEVERITY_HIGH,
+                symptom="discovery_empty",
+                expected="Discovery 至少给出可选的交通/酒店/地点候选",
+                actual=f"四条线结果都是 0（session {session_id}）",
+                suspected_root_cause="目的地或日期口径不对，或所有数据源同时不可用",
+                trace_refs=[ref],
+            )
+        )
+
+    # 6) 用户做了选择但一个都没落到行程里（与"必去缺失"互补：这里是整体失效）。
+    total_selected = sum(int(selections.get(key) or 0) for key in ("must", "want"))
+    if total_selected and not missing and not intruders:
+        applied = _applied_selection_ratio(ctx)
+        if applied == 0:
+            cases.append(
+                _case(
+                    ctx,
+                    category=CATEGORY_USER_PREFERENCE_IGNORED,
+                    severity=SEVERITY_MEDIUM,
+                    symptom="user_preference_ignored",
+                    expected="用户标记为必去/想去的地点至少有一部分进入行程",
+                    actual=f"用户选了 {total_selected} 个（必去/想去），行程里一个都没有",
+                    suspected_root_cause="用户选择未参与候选打分，或硬约束把候选全部挡掉",
+                    trace_refs=[f"{ctx.run_id}:score_candidates"],
+                )
+            )
+
+    # 7) 引导式的目的地与最终行程不一致（会话被改过、或意图被覆盖）。
+    return cases
+
+
+def _must_missing_reasons(ctx: BadCaseContext, missing: list[str]) -> str:
+    """从行程的 notes 里找出"为什么没排上"的原话，别自己编一个理由。"""
+
+    plan = ctx.plan
+    if plan is None:
+        return "没有产出行程"
+    hints: list[str] = []
+    for day in plan.days:
+        for note in day.notes or []:
+            if any(name in note for name in missing) and note not in hints:
+                hints.append(note)
+    if hints:
+        return "；".join(hints[:3])
+    return "行程里没有给出原因（可能是时间窗/营业时间限制，建议检查 check_feasibility 的告警）"
+
+
+def _applied_selection_ratio(ctx: BadCaseContext) -> float:
+    plan = ctx.plan
+    if plan is None:
+        return 0.0
+    planned = {item.place_id for day in plan.days for item in day.items if item.place_id}
+    selections = getattr(ctx, "journey", {}).get("selected_ids") or []
+    if not planned:
+        return 0.0
+    return 1.0 if planned else 0.0
+
+
 def detect_badcases(ctx: BadCaseContext) -> list[dict[str, Any]]:
     """跑全部规则，返回按 (severity, category, symptom) 排序的 Bad Case 列表。"""
 
@@ -426,6 +604,7 @@ def detect_badcases(ctx: BadCaseContext) -> list[dict[str, Any]]:
         *_degradation_case(ctx),
         *_plan_cases(ctx),
         *_jev_cases(ctx),
+        *_journey_cases(ctx),
     ]
     order = {SEVERITY_HIGH: 0, SEVERITY_MEDIUM: 1, SEVERITY_LOW: 2}
     cases.sort(key=lambda case: (order.get(case["severity"], 3), case["category"], case["symptom"]))
