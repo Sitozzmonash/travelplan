@@ -26,6 +26,7 @@ from datetime import date, timedelta
 from difflib import SequenceMatcher
 from typing import Any, Mapping, Sequence
 
+from app.config import PlannerTuning, current_tuning
 from app.models import (
     BUDGET_CATEGORIES,
     BUDGET_CATEGORY_CITY_TRANSPORT,
@@ -63,6 +64,18 @@ from app.models import (
 # 这些数字不来自任何 Provider，是我们对真实世界的**保守建模**：宁可多留 10 分钟，
 # 也不要排出"落地 10 分钟就进景区"的计划。集中命名是为了审计报告能直接引用、
 # 测试能断言，以后要调只改这一处。
+
+
+def tuning() -> PlannerTuning:
+    """当前生效的 Planner 阈值。
+
+    这几个值的存在意义是让 Evolution 能**真的**改一个候选并测出差异：默认值等于下面
+    写的模块常量，所以不设 ``TP_*`` 环境变量时行为与历史完全一致；Benchmark / Evolution
+    用 ``app.config.override_env`` 临时改它们，就能得到"同一份输入、两套阈值"的对照。
+    """
+
+    return current_tuning()
+
 
 #: 飞机：起飞前到机场（值机 + 安检 + 走到登机口，大型机场保守取 2 小时）。
 AIRPORT_CHECKIN_BUFFER_MINUTES = 120
@@ -1548,6 +1561,15 @@ def parse_opening_hours(text: str | None) -> OpeningHours | None:
 #: 修订时"只能靠删除解决"的问题码（返程赶不上：往后挪只会更赶不上）。
 REMOVAL_CODES = ("RETURN_DEPARTURE_CONFLICT",)
 
+#: 营业时间类问题：能向后平移就平移（见 revise_day 的第 1 组），平移不了就**从当天移除该项**。
+#:
+#: 为什么必须移除而不是"报告但保留"：这三种问题都是 error 级，意味着我们自己的检查判定
+#: "这个点在它开门/关门的时刻之外"。把它留在 plan 里，用户读到的就是一份写着
+#: "17:51 去一个 18:00 关门的祠堂"的行程 —— 报告它却不改它，等于默认产出错误行程。
+#: 真实数据里高德给的营业时间五花八门（寺庙 18:00 关门很常见），所以这不是理论问题：
+#: 历史 run 里每一次都留下了未解决的营业时间冲突。
+OPENING_HOURS_CODES = ("CLOSING_TIME_OVERRUN", "LAST_ENTRY_MISSED", "OPENING_TIME_CONFLICT")
+
 
 def boarding_buffer_minutes(option: Any) -> int:
     """起飞/发车前必须到机场/车站的缓冲（分钟）。"""
@@ -2002,11 +2024,12 @@ def _walk_day(
 
     # --- 一天是否排太满 ---
     stay_items = [item for item in items if item.type != "transport"]
-    if len(stay_items) > MAX_ITEMS_PER_DAY:
+    max_items = tuning().max_items_per_day
+    if len(stay_items) > max_items:
         issues.append(
             FeasibilityIssue(
                 day_index=day.day_index, item_id=None, severity="warning", code="DAY_OVERLOADED",
-                reason=f"当天安排了 {len(stay_items)} 个停留点，超过建议上限 {MAX_ITEMS_PER_DAY} 个",
+                reason=f"当天安排了 {len(stay_items)} 个停留点，超过建议上限 {max_items} 个",
             )
         )
     active_minutes = sum(
@@ -2104,6 +2127,19 @@ def revise_day(
             continue
         kept.append(item.model_copy(deep=True))
 
+    # 营业时间来不及的点：只移除**它自己**（后面的点还能去，不像返程冲突那样必须截断），
+    # 并如实写进 notes。这样 plan 里不会再出现"闭园之后还安排参观"的条目。
+    opening_drop_ids = {
+        issue.item_id
+        for issue in pending
+        if issue.severity == "error" and issue.code in OPENING_HOURS_CODES and issue.item_id
+    }
+    if opening_drop_ids:
+        opening_dropped = [item for item in kept if item.id in opening_drop_ids]
+        if opening_dropped:
+            kept = [item for item in kept if item.id not in opening_drop_ids]
+            dropped.extend(opening_dropped)
+
     resolved_mode = mode_hint or _mode_from_intent(intent)
     working = ItineraryDay(
         day_index=day.day_index,
@@ -2113,8 +2149,33 @@ def revise_day(
         notes=list(day.notes),
     )
     if dropped:
-        working.notes.append(
-            "因返程时间不足已移除：" + "、".join(item.name for item in dropped)
+        # 两类移除的说明分开写：返程截断与营业时间移除的后果完全不同，混成一句话
+        # 用户看不出"为什么少了一个点"。
+        removed_for_return = [item for item in dropped if item.type != "transport" and item.id in removal_ids]
+        removed_for_hours = [item for item in dropped if item.id in opening_drop_ids]
+        if removed_for_return:
+            working.notes.append(
+                "因返程时间不足已移除：" + "、".join(item.name for item in removed_for_return)
+            )
+        if removed_for_hours:
+            working.notes.append(
+                "因营业时间内安排不下已移除：" + "、".join(item.name for item in removed_for_hours)
+            )
+        note_names = {item.name for item in removed_for_return} | {item.name for item in removed_for_hours}
+        remaining_names = [item.name for item in dropped if item.name not in note_names]
+        if remaining_names:
+            working.notes.append("因时间来不及已移除：" + "、".join(remaining_names))
+    if not any(item.type not in ("transport", "free_time") for item in working.items):
+        # 一个点都留不下时，别把这一天渲染成空白卡片；如实说明"没排下"。
+        working.items.insert(
+            0,
+            ItineraryItem(
+                id=f"d{day.day_index}-free",
+                type="free_time",
+                name="自由活动 / 机动时间",
+                duration_minutes=DEFAULT_DURATION_BY_TYPE["free_time"],
+                reason="当天的候选点都落在营业时间之外，已留作机动（不编造行程，也不安排闭园后的参观）",
+            ),
         )
     walk = _walk_day(
         working,
@@ -2190,6 +2251,8 @@ def revise_day(
             update["revised_start"] = new_item.start_time
         if issue.item_id in dropped_ids and issue.code in REMOVAL_CODES:
             update["reason"] = f"{issue.reason}（修订动作：移除该 item）"
+        elif issue.item_id in dropped_ids and issue.code in OPENING_HOURS_CODES:
+            update["reason"] = f"{issue.reason}（修订动作：该点在营业时间内安排不下，已从当天移除）"
         final.append(issue.model_copy(update=update))
     final.extend(remaining.values())
     return revised_day, final
@@ -2555,6 +2618,116 @@ def _hotel_item(hotel: HotelOption, *, item_id: str, check_in: bool) -> Itinerar
     )
 
 
+#: 候选方案的拓扑变体（Top-K 用）。
+#: 它们**只改"区域先后的排序策略"**，不改任何时间/约束逻辑，因此每个变体都是同一套
+#: 硬约束下的合法行程。这正是让 Jev 去选的前提：选项之间只有偏好与节奏的差别，
+#: 没有可行性差别 —— 否则把"选哪份行程"交给软决策就是在赌。
+PLAN_VARIANT_NEAREST = "nearest"
+PLAN_VARIANT_SCORE_FIRST = "score_first"
+PLAN_VARIANT_PREFERENCE_FIRST = "preference_first"
+PLAN_VARIANT_LIGHT_FIRST = "light_first"
+PLAN_VARIANT_DISTINCT_FIRST = "distinct_first"
+
+PLAN_VARIANTS: tuple[str, ...] = (
+    PLAN_VARIANT_NEAREST,
+    PLAN_VARIANT_SCORE_FIRST,
+    PLAN_VARIANT_PREFERENCE_FIRST,
+    PLAN_VARIANT_LIGHT_FIRST,
+    PLAN_VARIANT_DISTINCT_FIRST,
+)
+
+#: 给 Jev 看的方案标签（不用中文全文，避免摘要里混入无关说明）。
+VARIANT_LABELS: dict[str, str] = {
+    PLAN_VARIANT_NEAREST: "A",
+    PLAN_VARIANT_SCORE_FIRST: "B",
+    PLAN_VARIANT_PREFERENCE_FIRST: "C",
+    PLAN_VARIANT_LIGHT_FIRST: "D",
+    PLAN_VARIANT_DISTINCT_FIRST: "E",
+}
+
+
+def _order_clusters(
+    clusters: Sequence[Sequence[Place]],
+    *,
+    anchor: Sequence[float] | None,
+    variant: str,
+    scores: Mapping[str, float] | None = None,
+    preferences: Sequence[str] | None = None,
+) -> list[list[Place]]:
+    """把地理簇排成"先玩哪个区"的顺序。
+
+    ``nearest`` 保持历史行为不变（从住宿点出发找最近的区，再以该区最近的点为游标继续），
+    其余变体只换比较函数；任何一种都不会丢点，只是访问顺序不同。
+    """
+
+    remaining = [list(cluster) for cluster in clusters]
+    scores = scores or {}
+    preferences = list(preferences or ())
+
+    def proximity(place: Place, cursor: Sequence[float] | None) -> float:
+        distance = _anchor_distance(place, cursor)
+        return float("inf") if distance is None else distance
+
+    def cluster_proximity(cluster: Sequence[Place], cursor: Sequence[float] | None) -> float:
+        return min((proximity(place, cursor) for place in cluster), default=float("inf"))
+
+    if variant == PLAN_VARIANT_NEAREST:
+        ordered: list[list[Place]] = []
+        cursor = anchor
+        while remaining:
+            best_index, best_distance = 0, None
+            for index, cluster in enumerate(remaining):
+                for member in cluster:
+                    distance = _anchor_distance(member, cursor)
+                    if distance is None:
+                        continue
+                    if best_distance is None or distance < best_distance:
+                        best_index, best_distance = index, distance
+            cluster = remaining.pop(best_index)
+            ordered.append(cluster)
+            first = min(cluster, key=lambda place: (proximity(place, cursor), place.name))
+            cursor = first.coords
+        return ordered
+
+    def mean_score(cluster: Sequence[Place]) -> float:
+        values = [coerce_float(scores.get(place.place_id), 0.0) or 0.0 for place in cluster]
+        return sum(values) / len(values) if values else 0.0
+
+    def preference_weight(cluster: Sequence[Place]) -> int:
+        return sum(len(preference_hits(place, preferences, [])) for place in cluster)
+
+    def dominant_type(cluster: Sequence[Place]) -> str:
+        types = [_item_type_for(place) for place in cluster]
+        return max(sorted(set(types)), key=types.count) if types else "other"
+
+    if variant == PLAN_VARIANT_SCORE_FIRST:
+        return sorted(remaining, key=lambda cluster: (-mean_score(cluster), cluster_proximity(cluster, anchor)))
+    if variant == PLAN_VARIANT_PREFERENCE_FIRST:
+        return sorted(
+            remaining,
+            key=lambda cluster: (-preference_weight(cluster), cluster_proximity(cluster, anchor)),
+        )
+    if variant == PLAN_VARIANT_LIGHT_FIRST:
+        return sorted(
+            remaining,
+            key=lambda cluster: (len(cluster), cluster_proximity(cluster, anchor)),
+        )
+
+    # distinct_first：按"当天主导类型"分组后轮转取用，让相邻两天的活动性质差异更大。
+    groups: dict[str, list[list[Place]]] = {}
+    for cluster in remaining:
+        groups.setdefault(dominant_type(cluster), []).append(cluster)
+    for members in groups.values():
+        members.sort(key=lambda cluster: cluster_proximity(cluster, anchor))
+    order = sorted(groups, key=lambda key: (-len(groups[key]), key))
+    interleaved: list[list[Place]] = []
+    while any(groups[key] for key in order):
+        for key in order:
+            if groups[key]:
+                interleaved.append(groups[key].pop(0))
+    return interleaved
+
+
 def build_initial_plan(
     intent: TripIntent,
     places: Sequence[Place],
@@ -2570,6 +2743,7 @@ def build_initial_plan(
     ticket_prices: Mapping[str, float] | None = None,
     city: str | None = None,
     mode_hint: str | None = None,
+    variant: str = PLAN_VARIANT_NEAREST,
 ) -> list[ItineraryDay]:
     """生成初始行程（PRD §21）。
 
@@ -2579,6 +2753,10 @@ def build_initial_plan(
 
     时间只在最后一步由 `_walk_day` 统一推算（与可行性检查用**同一套 buffer**），
     所以这里排出来的时间本身就是可行的，后续 feasibility 阶段只负责发现问题与修订。
+
+    ``variant`` 只改变"区域先后的排序策略"（见 `_order_clusters`），不改变任何时间
+    与约束逻辑 —— 因此每个变体都是同一套硬约束下的合法方案，这正是 Top-K 让 Jev 去选
+    的前提：给它的选项之间只有偏好与节奏的差别，没有可行性差别。
     """
     day_count = max(1, intent.days)
     city = city or (intent.destination[0] if intent.destination else None)
@@ -2610,8 +2788,9 @@ def build_initial_plan(
 
     # 分数为负 = "风险大于收益"（几乎没有证据支撑、又带广告风险）。这种点不排进计划，
     # 但要如实写进 notes，而不是静默消失 —— 用户有权知道候选里有什么被排除了。
-    eligible = [place for place in sorted_places if candidate_scores[place.place_id][0] >= MIN_CANDIDATE_SCORE]
-    rejected = [place for place in sorted_places if candidate_scores[place.place_id][0] < MIN_CANDIDATE_SCORE]
+    min_score = tuning().min_candidate_score
+    eligible = [place for place in sorted_places if candidate_scores[place.place_id][0] >= min_score]
+    rejected = [place for place in sorted_places if candidate_scores[place.place_id][0] < min_score]
 
     def day_date(index: int) -> date | None:
         return None if intent.start_date is None else intent.start_date + timedelta(days=index)
@@ -2638,38 +2817,23 @@ def build_initial_plan(
             # 于是出发日也被排上了景点 —— 现在真的给 0，交通日就是交通日。
             capacities.append(0)
             continue
-        capacity = MAX_ITEMS_PER_DAY
+        capacity = tuning().max_items_per_day
         if index == arrival_index and outbound is not None:
             capacity -= 2
         if index == day_count - 1 and inbound is not None and _departs_on(inbound, day_count - 1):
             capacity -= 1
         capacities.append(max(1, capacity))
 
-    # --- 地理聚类 → 按"离上一区域最近"的顺序分配给每一天 ---
-    clusters = cluster_places(eligible, max_cluster_km=DEFAULT_CLUSTER_KM)
+    # --- 地理聚类 → 按顺序分配给每一天 ---
+    clusters = cluster_places(eligible, max_cluster_km=tuning().default_cluster_km)
     anchor_coords = _hotel_coords(hotel)
-    ordered_clusters: list[list[Place]] = []
-    remaining = [list(cluster) for cluster in clusters]
-    cursor = anchor_coords
-    while remaining:
-        best_index, best_distance = 0, None
-        for index, cluster in enumerate(remaining):
-            for member in cluster:
-                distance = _anchor_distance(member, cursor)
-                if distance is None:
-                    continue
-                if best_distance is None or distance < best_distance:
-                    best_index, best_distance = index, distance
-        cluster = remaining.pop(best_index)
-        ordered_clusters.append(cluster)
-        first = min(
-            cluster,
-            key=lambda place: (
-                float("inf") if _anchor_distance(place, cursor) is None else _anchor_distance(place, cursor),
-                place.name,
-            ),
-        )
-        cursor = first.coords
+    ordered_clusters = _order_clusters(
+        clusters,
+        anchor=anchor_coords,
+        variant=variant,
+        scores={place_id: score for place_id, (score, _) in candidate_scores.items()},
+        preferences=list(intent.preferences or ()),
+    )
 
     # 分配时**整簇优先**（PRD §21.2"一个主要区域优先、避免反复横跨城市"）：
     # 一个簇能塞进当天就整簇塞；塞不下且当天已有点，就把整簇留给下一天，避免把一个区域劈成两天。
@@ -2900,7 +3064,7 @@ def _trim_to_window(
     "出站 → 到酒店 → 入住"，所以把窗口顺延到 floor + LATE_ARRIVAL_WINDOW_MINUTES。
     但无论怎么顺延都不越过 MAX_DAY_MINUTES —— 一天不会有 25 点，也不会有凌晨三点的博物馆。
     """
-    limit = DAY_END_MINUTES if ceiling is None else min(DAY_END_MINUTES, ceiling)
+    limit = tuning().day_end_minutes if ceiling is None else min(tuning().day_end_minutes, ceiling)
     floor_minutes = parse_clock(floor)
     if floor_minutes is not None and floor_minutes > limit:
         limit = min(MAX_DAY_MINUTES, floor_minutes + LATE_ARRIVAL_WINDOW_MINUTES)
@@ -3040,7 +3204,7 @@ def critique(
                 )
             if (
                 item.type in ("attraction", "food", "activity")
-                and (item.ad_risk or 0) >= AD_RISK_HIGH
+                and (item.ad_risk or 0) >= tuning().ad_risk_high
                 and (item.trust_score or 0) < AD_RISK_TRUST_FLOOR
             ):
                 add(
@@ -3157,3 +3321,365 @@ def critique(
         },
     )
     return result
+
+
+# ==================================================
+# 十二、方案质量度量与 Top-K 候选（接管任务 §4 §9）
+# ==================================================
+# 这些指标是**横向比较用的相对量**，不是绝对真理：它们的用途是回答
+# "Jev 选出来的方案是不是真的比其它候选更好"。因此全部由代码从已算好的
+# days 上计算，可复现、可单测、可审计 —— 不引入任何模型打分。
+
+#: 节奏目标（分钟/天）。与 models.PACES 的三个取值一一对应。
+PACE_TARGET_MINUTES: dict[str, int] = {"relaxed": 240, "balanced": 330, "packed": 420}
+
+#: 停留类 item（要算"玩得累不累"的那些）。
+STAY_TYPES = ("attraction", "food", "activity")
+
+REVERSAL_ANGLE_DEGREES = 120.0
+MEAL_WINDOWS = ((11 * 60, 14 * 60 + 30), (17 * 60, 21 * 60))
+
+
+@dataclass(slots=True)
+class PlanQuality:
+    """一份行程的质量画像。字段名与 Benchmark §9 的 Plan Quality 指标同名。"""
+
+    category_diversity: float
+    consecutive_same_type_count: int
+    backtracking_score: float
+    daily_load_balance: float
+    meal_time_quality: float
+    pace_match: float
+    preference_coverage: float
+    first_day_quality: float
+    last_day_quality: float
+    route_efficiency: float
+    item_count: int
+    stay_item_count: int
+    active_minutes: int
+    playable_days: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "category_diversity": round(self.category_diversity, 4),
+            "consecutive_same_type_count": self.consecutive_same_type_count,
+            "backtracking_score": round(self.backtracking_score, 4),
+            "daily_load_balance": round(self.daily_load_balance, 4),
+            "meal_time_quality": round(self.meal_time_quality, 4),
+            "pace_match": round(self.pace_match, 4),
+            "preference_coverage": round(self.preference_coverage, 4),
+            "first_day_quality": round(self.first_day_quality, 4),
+            "last_day_quality": round(self.last_day_quality, 4),
+            "route_efficiency": round(self.route_efficiency, 4),
+            "item_count": self.item_count,
+            "stay_item_count": self.stay_item_count,
+            "active_minutes": self.active_minutes,
+            "playable_days": self.playable_days,
+        }
+
+
+def _stay_items(day: ItineraryDay) -> list[ItineraryItem]:
+    return [item for item in day.items if item.type != "transport" and item.type != "free_time"]
+
+
+def _active_minutes(day: ItineraryDay) -> int:
+    return sum(int(item.duration_minutes or 0) for item in _stay_items(day))
+
+
+def plan_quality(
+    days: Sequence[ItineraryDay],
+    intent: TripIntent,
+    *,
+    places: Mapping[str, Place] | None = None,
+    evidences: Mapping[str, Sequence[Evidence]] | None = None,
+) -> PlanQuality:
+    """计算一份行程的质量画像。
+
+    ``places`` / ``evidences`` 可选：只在算"偏好覆盖"时需要（要拿到地点的分类与证据）。
+    拿不到时按 item 名称与理由文本近似匹配，并在文档里说明这是近似 —— 不让一个
+    可选输入把整份指标算成 0。
+    """
+
+    places = places or {}
+    evidences = evidences or {}
+    all_stay = [item for day in days for item in _stay_items(day)]
+    total_items = sum(len(day.items) for day in days)
+    active_minutes = sum(_active_minutes(day) for day in days)
+    playable = [day for day in days if _stay_items(day)]
+
+    # --- 类型多样性：非停留项越多越像"只有景点"---
+    types = [item.type for item in all_stay]
+    distinct = len(set(types))
+    expected = min(len(STAY_TYPES) + 2, max(1, len(all_stay)))
+    category_diversity = min(1.0, distinct / expected) if all_stay else 0.0
+
+    # --- 相邻同类型：连续三个以上同类才算"单调"，用相邻对数衡量 ---
+    consecutive = sum(1 for left, right in zip(types, types[1:]) if left == right)
+
+    # --- 折返：同一天内两段路线的方向变化超过阈值就算一次折返 ---
+    reversals = 0
+    transitions = 0
+    for day in days:
+        located = [item for item in _stay_items(day) if item.lat is not None and item.lng is not None]
+        bearings: list[float] = []
+        for left, right in zip(located, located[1:]):
+            bearings.append(_bearing((left.lat, left.lng), (right.lat, right.lng)))
+        for left, right in zip(bearings, bearings[1:]):
+            transitions += 1
+            if _angle_gap(left, right) > REVERSAL_ANGLE_DEGREES:
+                reversals += 1
+    backtracking_score = 1.0 if transitions == 0 else max(0.0, 1.0 - reversals / transitions)
+
+    # --- 每日负荷均衡：用变异系数衡量 ---
+    loads = [_active_minutes(day) for day in playable]
+    if len(loads) >= 2 and sum(loads) > 0:
+        mean = sum(loads) / len(loads)
+        variance = sum((value - mean) ** 2 for value in loads) / len(loads)
+        daily_load_balance = max(0.0, 1.0 - (variance**0.5) / mean)
+    else:
+        daily_load_balance = 1.0
+
+    # --- 用餐时间：每天该有的午饭/晚饭是否落在窗口内 ---
+    food_days = [day for day in days if any(item.type == "food" for item in day.items)]
+    if food_days:
+        satisfied = 0
+        for day in food_days:
+            starts = [
+                parse_clock(item.start_time)
+                for item in day.items
+                if item.type == "food" and parse_clock(item.start_time) is not None
+            ]
+            for window in MEAL_WINDOWS:
+                if any(window[0] <= value <= window[1] for value in starts):
+                    satisfied += 1
+        meal_time_quality = satisfied / (len(food_days) * len(MEAL_WINDOWS))
+    else:
+        meal_time_quality = 0.0
+
+    # --- 节奏匹配 ---
+    target = PACE_TARGET_MINUTES.get(str(intent.pace or "balanced"), PACE_TARGET_MINUTES["balanced"])
+    if playable:
+        average = active_minutes / len(playable)
+        pace_match = max(0.0, 1.0 - abs(average - target) / target)
+    else:
+        pace_match = 0.0
+
+    # --- 偏好覆盖 ---
+    preferences = [str(item) for item in (intent.preferences or ()) if str(item)]
+    if not preferences:
+        preference_coverage = 1.0
+    else:
+        hit_preferences: set[str] = set()
+        for item in all_stay:
+            place = places.get(item.place_id) if item.place_id else None
+            if place is not None:
+                hit_preferences.update(
+                    preference_hits(place, preferences, list(evidences.get(place.place_id, []) or []))
+                )
+            else:
+                haystack = f"{item.name} {item.reason or ''}"
+                hit_preferences.update(pref for pref in preferences if pref in haystack)
+        preference_coverage = len(hit_preferences) / len(preferences)
+
+    # --- 首末日质量：第一天能不能玩、最后一天是不是被返程吃掉 ---
+    def _window_quality(day: ItineraryDay | None) -> float:
+        if day is None:
+            return 0.0
+        starts = [parse_clock(item.start_time) for item in _stay_items(day)]
+        starts = [value for value in starts if value is not None]
+        if not starts:
+            return 0.0
+        return 1.0 if DAY_START_MINUTES <= min(starts) <= 12 * 60 else 0.5
+
+    first_day_quality = _window_quality(playable[0] if playable else None)
+    last_day_quality = _window_quality(playable[-1] if playable else None)
+
+    # --- 路线核实率 ---
+    legs = [
+        item.travel_from_previous
+        for day in days
+        for item in day.items
+        if item.travel_from_previous is not None
+    ]
+    route_efficiency = (sum(1 for leg in legs if leg.verified) / len(legs)) if legs else 0.0
+
+    return PlanQuality(
+        category_diversity=category_diversity,
+        consecutive_same_type_count=consecutive,
+        backtracking_score=backtracking_score,
+        daily_load_balance=daily_load_balance,
+        meal_time_quality=meal_time_quality,
+        pace_match=pace_match,
+        preference_coverage=preference_coverage,
+        first_day_quality=first_day_quality,
+        last_day_quality=last_day_quality,
+        route_efficiency=route_efficiency,
+        item_count=total_items,
+        stay_item_count=len(all_stay),
+        active_minutes=active_minutes,
+        playable_days=len(playable),
+    )
+
+
+def quality_signals(quality: PlanQuality) -> dict[str, float]:
+    """给 Jev 质量门看的三个软分 + 一个由代码算出的置信度。
+
+    ``confidence`` 是硬事实与软分的最小值：只要有任何硬问题（路线未核实、末日排不下、
+    用餐时间错位），置信度就必须掉下来 —— 否则软指标会把硬错误盖过去（任务 §9 明确禁止）。
+    """
+
+    hard = min(
+        quality.backtracking_score,
+        quality.daily_load_balance,
+        quality.first_day_quality if quality.first_day_quality else 1.0,
+        quality.last_day_quality if quality.last_day_quality else 1.0,
+    )
+    return {
+        "pace_score": round(quality.pace_match, 3),
+        "preference_match": round(quality.preference_coverage, 3),
+        "diversity_score": round(quality.category_diversity, 3),
+        "confidence": round(max(0.0, min(1.0, 0.4 * quality.pace_match + 0.3 * quality.preference_coverage + 0.3 * hard)), 3),
+    }
+
+
+@dataclass(slots=True)
+class PlanCandidate:
+    """一个硬约束可行的整份方案，供 Jev 在 Top-K 里选。"""
+
+    label: str
+    variant: str
+    days: list[ItineraryDay]
+    quality: PlanQuality
+
+    @property
+    def signature(self) -> tuple[Any, ...]:
+        """拓扑指纹：用于去重（不同变体很可能排出同一份行程）。"""
+
+        return tuple(
+            (
+                day.day_index,
+                tuple(sorted(item.place_id or item.id for item in _stay_items(day))),
+            )
+            for day in self.days
+        )
+
+    def summary(self) -> dict[str, Any]:
+        """给 Jev 的方案摘要。
+
+        刻意**不含**价格、来源 URL、原始 Provider 响应、用户身份 —— 任务 §4 允许发送
+        "候选行程摘要与证据摘要"，这里只给决策真正需要的结构信息。
+        """
+
+        return {
+            "label": self.label,
+            "variant": self.variant,
+            "quality": self.quality.to_dict(),
+            "days": [
+                {
+                    "day_index": day.day_index,
+                    "date": day.date.isoformat() if day.date else None,
+                    "area": day.area,
+                    "item_count": len(_stay_items(day)),
+                    "active_minutes": _active_minutes(day),
+                    "items": [
+                        {
+                            "name": item.name,
+                            "type": item.type,
+                            "start": item.start_time,
+                            "end": item.end_time,
+                        }
+                        for item in day.items
+                        if item.type != "free_time"
+                    ],
+                }
+                for day in self.days
+            ],
+        }
+
+
+def build_plan_variants(
+    intent: TripIntent,
+    places: Sequence[Place],
+    *,
+    variants: Sequence[str] | None = None,
+    limit: int = 5,
+    quality_places: Mapping[str, Place] | None = None,
+    quality_evidences: Mapping[str, Sequence[Evidence]] | None = None,
+    **kwargs: Any,
+) -> list[PlanCandidate]:
+    """跑多个拓扑变体，返回去重后的候选方案（默认第一个是历史默认策略）。
+
+    单个变体抛异常不应该让整次规划失败：那只是"少一个选项"，不是"行程没了"。
+    """
+
+    selected = list(variants or PLAN_VARIANTS[:limit])
+    candidates: list[PlanCandidate] = []
+    seen: set[tuple[Any, ...]] = set()
+    for variant in selected:
+        try:
+            days = build_initial_plan(intent, places, variant=variant, **kwargs)
+        except Exception:  # noqa: BLE001 —— 少一个候选可以接受，整趟失败不可以
+            continue
+        candidate = PlanCandidate(
+            label=VARIANT_LABELS.get(variant, variant[:1].upper()),
+            variant=variant,
+            days=days,
+            quality=plan_quality(
+                days, intent, places=quality_places, evidences=quality_evidences
+            ),
+        )
+        signature = candidate.signature
+        if signature in seen:
+            continue
+        seen.add(signature)
+        candidates.append(candidate)
+    return candidates[: max(1, limit)]
+
+
+def hard_constraint_violations(
+    days: Sequence[ItineraryDay],
+    intent: TripIntent,
+    *,
+    outbound: FlightOption | TrainOption | None = None,
+) -> list[str]:
+    """Top-K 候选的硬约束复核（任务 §4A 的"Python 再次复核"）。
+
+    只检查**构造性不变量** —— 也就是一份合法候选方案必然满足的东西：日期对齐、
+    时间不倒置、不超当日窗口、同一地点不跨天重复、交通日不排游玩点。
+
+    这里刻意**不**检查"末日是否赶得上返程""营业时间"这类问题：它们是 feasibility
+    阶段（第 10 步）的职责，而且候选在生成时还没经过那一轮修订 —— 拿它当复核条件
+    会把所有候选都判为不合法，等于把 Jev 的选择权废掉。
+    """
+
+    violations: list[str] = []
+    day_count = max(1, intent.days)
+    arrival_index = arrival_day_index(outbound, intent.start_date, day_count)
+    seen_places: dict[str, int] = {}
+    window_end = tuning().day_end_minutes
+
+    if len(days) != day_count:
+        violations.append(f"天数不符：期望 {day_count} 天，实际 {len(days)} 天")
+
+    for position, day in enumerate(days):
+        if day.day_index != position:
+            violations.append(f"第 {position + 1} 个 day 的 day_index={day.day_index} 与位置不一致")
+        expected_date = None if intent.start_date is None else intent.start_date + timedelta(days=day.day_index)
+        if expected_date is not None and day.date is not None and day.date != expected_date:
+            violations.append(f"第 {day.day_index + 1} 天日期 {day.date} 与出行日期 {expected_date} 不一致")
+        for item in day.items:
+            if day.day_index < arrival_index and item.type not in ("transport", "free_time", "hotel"):
+                violations.append(f"第 {day.day_index + 1} 天是在途日，却排了 {item.name}")
+                break
+            start = item.start_minutes
+            end = item.end_minutes
+            if start is not None and end is not None and end <= start:
+                violations.append(f"第 {day.day_index + 1} 天《{item.name}》时间倒置 {item.start_time}→{item.end_time}")
+            if end is not None and end > window_end:
+                violations.append(f"第 {day.day_index + 1} 天《{item.name}》结束 {item.end_time} 超出当日窗口")
+            if item.place_id and item.type in STAY_TYPES:
+                previous = seen_places.get(item.place_id)
+                if previous is not None and previous != day.day_index:
+                    violations.append(f"《{item.name}》同时出现在第 {previous + 1} 天和第 {day.day_index + 1} 天")
+                seen_places[item.place_id] = day.day_index
+    return violations

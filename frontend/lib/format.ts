@@ -102,3 +102,19 @@ export function formatPriceType(type: PriceType | string | undefined): string {
 export function formatPercent(value: number): string {
   return `${Math.round(value * 100)}%`;
 }
+
+/**
+ * Provider 查询参数压成一行。
+ *
+ * 后端把 `sources.query_json` 原样给出来（结构保真），所以这里拿到的是对象而不是字符串；
+ * 直接把它当一个 React 子节点渲染会抛 "Objects are not valid as a React child" 并让整页
+ * 进入错误边界 —— 用户端与管理端都必须经过这个函数。
+ */
+export function formatProviderQuery(query: Record<string, unknown> | null | undefined): string {
+  if (!query) return "—";
+  const entries = Object.entries(query);
+  if (entries.length === 0) return "—";
+  return entries
+    .map(([key, value]) => `${key}=${Array.isArray(value) ? value.join(" / ") : String(value)}`)
+    .join("，");
+}

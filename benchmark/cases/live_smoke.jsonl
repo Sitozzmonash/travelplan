@@ -1,0 +1,5 @@
+{"case_id": "live-bj-cd-5d", "suite": "live_smoke", "title": "真实链路：北京→成都 5 天", "query": "10月1日从北京去成都玩5天，两个人，预算6000，喜欢美食和拍照", "live": true, "fixtures": {}, "expect": {}}
+{"case_id": "live-sh-hz-3d", "suite": "live_smoke", "title": "真实链路：上海→杭州 3 天", "query": "10月2日从上海去杭州玩3天，一个人，喜欢慢节奏和咖啡", "live": true, "fixtures": {}, "expect": {}}
+{"case_id": "live-gz-cq-4d", "suite": "live_smoke", "title": "真实链路：广州→重庆 4 天", "query": "10月1日从广州去重庆玩4天，三个人，预算8000，喜欢火锅和夜景", "live": true, "fixtures": {}, "expect": {}}
+{"case_id": "live-cd-lz-4d", "suite": "live_smoke", "title": "真实链路：成都→兰州 4 天", "query": "10月1日从成都去兰州玩4天，两个人，预算5000，喜欢牛肉面", "live": true, "fixtures": {}, "expect": {}}
+{"case_id": "live-sz-xa-5d", "suite": "live_smoke", "title": "真实链路：深圳→西安 5 天", "query": "9月30日从深圳去西安玩5天，两个人，喜欢历史文化和面食", "live": true, "fixtures": {}, "expect": {}}

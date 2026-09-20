@@ -1,0 +1,12 @@
+{"case_id": "basic-bj-cd-5d", "suite": "basic", "title": "北京→成都 5 天（美食+拍照，有预算）", "query": "10月1日从北京去成都玩5天，两个人，预算6000，喜欢美食和拍照", "fixtures": {}, "expect": {"hard_constraints_ok": true, "min_items": 4}}
+{"case_id": "basic-sh-hz-3d", "suite": "basic", "title": "上海→杭州 3 天（慢节奏）", "query": "10月2日从上海去杭州玩3天，一个人，喜欢慢节奏和咖啡", "fixtures": {}, "expect": {"hard_constraints_ok": true, "min_items": 3}}
+{"case_id": "basic-gz-cq-4d", "suite": "basic", "title": "广州→重庆 4 天（火锅+夜景，三人）", "query": "10月1日从广州去重庆玩4天，三个人，预算8000，喜欢火锅和夜景", "fixtures": {}, "expect": {"hard_constraints_ok": true, "min_items": 3}}
+{"case_id": "basic-cc-cd-6d", "suite": "basic", "title": "长春→成都 6 天（自然风光）", "query": "10月1日从长春去成都玩6天，两个人，预算9000，喜欢自然风光", "fixtures": {}, "expect": {"hard_constraints_ok": true, "min_items": 4}}
+{"case_id": "basic-sz-xa-5d", "suite": "basic", "title": "深圳→西安 5 天（历史+面食）", "query": "9月30日从深圳去西安玩5天，两个人，喜欢历史文化和面食", "fixtures": {}, "expect": {"hard_constraints_ok": true, "min_items": 4}}
+{"case_id": "basic-hz-sz-3d", "suite": "basic", "title": "杭州→苏州 3 天（带父母，节奏慢）", "query": "10月3日从杭州去苏州玩3天，三个人，节奏慢一点，带父母", "fixtures": {}, "expect": {"hard_constraints_ok": true, "min_items": 3}}
+{"case_id": "basic-cd-lz-4d", "suite": "basic", "title": "成都→兰州 4 天（牛肉面+黄河）", "query": "10月1日从成都去兰州玩4天，两个人，预算5000，喜欢牛肉面和黄河", "fixtures": {}, "expect": {"hard_constraints_ok": true, "min_items": 3}}
+{"case_id": "basic-wh-cs-3d", "suite": "basic", "title": "武汉→长沙 3 天（小吃）", "query": "10月4日从武汉去长沙玩3天，两个人，喜欢小吃和夜市", "fixtures": {}, "expect": {"hard_constraints_ok": true, "min_items": 3}}
+{"case_id": "basic-nj-qd-5d", "suite": "basic", "title": "南京→青岛 5 天（海边，有预算）", "query": "10月1日从南京去青岛玩5天，两个人，预算7000，喜欢海边和海鲜", "fixtures": {}, "expect": {"hard_constraints_ok": true, "min_items": 4}}
+{"case_id": "basic-tj-bj-2d", "suite": "basic", "title": "天津→北京 2 天（博物馆）", "query": "10月5日从天津去北京玩2天，一个人，喜欢博物馆和胡同", "fixtures": {}, "expect": {"hard_constraints_ok": true, "min_items": 2}}
+{"case_id": "basic-xm-fz-3d", "suite": "basic", "title": "厦门→福州 3 天（低预算单人）", "query": "10月2日从厦门去福州玩3天，一个人，预算3000，喜欢老街", "fixtures": {}, "expect": {"hard_constraints_ok": true, "min_items": 3}}
+{"case_id": "basic-km-lj-5d", "suite": "basic", "title": "昆明→丽江 5 天（古城+雪山）", "query": "10月1日从昆明去丽江玩5天，两个人，预算8000，喜欢古城和雪山", "fixtures": {}, "expect": {"hard_constraints_ok": true, "min_items": 4}}

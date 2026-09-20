@@ -31,12 +31,13 @@ export function SummaryCards({
     (plan.transport?.inbound_selected ? 1 : 0);
 
   const hotel = plan.hotel?.selected ?? null;
+  const budget = plan.budget ?? null;
   const summary = plan.evidence_summary;
   const sourcesUsed = summary?.sources_used ?? plan.sources.length;
   const placesVerified =
     summary?.places_verified ??
     new Set(plan.days.flatMap((day) => day.items.map((item) => item.place_id)).filter(Boolean)).size;
-  const filtered = summary?.low_trust_filtered ?? plan.decisions.filter((d) => d.status === "REJECT").length;
+  const filtered = summary?.low_trust_filtered ?? plan.decisions?.filter((d) => d.status === "REJECT").length ?? 0;
 
   return (
     <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4" data-testid="summary-cards">
@@ -96,21 +97,29 @@ export function SummaryCards({
       </SummaryCard>
 
       <SummaryCard icon={Wallet} title="预算" onClick={onOpenBudget} actionLabel="查看预算明细">
-        <p className="tabular text-sm font-medium text-foreground">
-          预计总计 {formatCNY(plan.budget.projected_total)}
-        </p>
-        <p className="tabular mt-1 text-xs text-muted-foreground">
-          预算 {formatCNY(plan.budget.budget_total)} · 剩余 {formatCNY(plan.budget.remaining)}
-        </p>
-        <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
-          <span className="tabular">实时价格 {formatCNY(plan.budget.known_real_cost)}</span>
-          <span className="tabular">估算费用 {formatCNY(plan.budget.estimated_cost)}</span>
-        </div>
-        {plan.budget.status === "over_budget" ? (
-          <p className="tabular mt-1.5 text-xs text-danger-subtle-foreground">
-            预计超出 {formatCNY(Math.abs(plan.budget.remaining ?? 0))}
+        {budget ? (
+          <>
+            <p className="tabular text-sm font-medium text-foreground">
+              预计总计 {formatCNY(budget.projected_total)}
+            </p>
+            <p className="tabular mt-1 text-xs text-muted-foreground">
+              预算 {formatCNY(budget.budget_total)} · 剩余 {formatCNY(budget.remaining)}
+            </p>
+            <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+              <span className="tabular">实时价格 {formatCNY(budget.known_real_cost)}</span>
+              <span className="tabular">估算费用 {formatCNY(budget.estimated_cost)}</span>
+            </div>
+            {budget.status === "over_budget" ? (
+              <p className="tabular mt-1.5 text-xs text-danger-subtle-foreground">
+                预计超出 {formatCNY(Math.abs(budget.remaining ?? 0))}
+              </p>
+            ) : null}
+          </>
+        ) : (
+          <p className="text-xs leading-5 text-muted-foreground">
+            这次规划没有返回预算汇总，因此这里没有总额与余量。交通、住宿与门票的候选仍然可以查看。
           </p>
-        ) : null}
+        )}
       </SummaryCard>
 
       <SummaryCard icon={ShieldCheck} title="可信度" onClick={onOpenTrust} actionLabel="查看来源与依据">

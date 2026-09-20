@@ -11,7 +11,7 @@ TravelPlan 有**两条 Runtime 路径**：
 - **固定 12 步规划流程**（主路径，CLI 与 FastAPI 默认）：`run_travel()` → `HybridRunner.invoke(route=WORKFLOW)` → `TravelWorkflowRunnable` → `execute_travel_run()` → 一张 LangGraph `StateGraph`。决定「做什么」的是代码，LLM 只做自然语言 → 结构化输入、以及最后把结果讲成人话。
 - **SuperHarness Agent Loop**（`route="agent"`）：处理自由追问，才真正走 Router / Plugin / MCP / Memory 全链路。
 
-两条路径**不是同一套 Runtime 内部实现**：固定流程复用 SuperHarness 的装配（Router 打分、Checkpointer、Observability 上报口），但其编排由 TravelPlan 自己的 LangGraph 完成；Agent Loop 才是 SuperHarness 的原生 Agent 运行时。见 §4、§7-B。
+两条路径**不是同一套 Runtime 内部实现**：固定流程复用 SuperHarness 的装配（HybridRunner 挂载框架、`default_mcp_servers` 清单、Observability 上报口），但其编排由 TravelPlan 自己的 LangGraph 完成，且**不经过 Router 打分、不接 SuperHarness Checkpointer**（见 §3.3）；Agent Loop 才是 SuperHarness 的原生 Agent 运行时。见 §4、§7-B。
 
 ## 2. 目录职责
 
@@ -29,7 +29,7 @@ TravelPlan 有**两条 Runtime 路径**：
 - **职责**：装配层，只把 SuperHarness 装起来，不写业务算法。
 - **入口与关键符号**：
   - `TravelWorkflowRunnable`（`app/agent.py:116`）：把固定流程包成 HybridRunner 能调的 runnable，只做输入形状适配（messages → query）与结果透传。
-  - `travel_workflow_spec()`（`app/agent.py:159`）：`WorkflowSpec(name, description, runnable)`，`description` 供 Workflow Router 用 BM25 打分。
+  - `travel_workflow_spec()`（`app/agent.py:159`）：`WorkflowSpec(name, description, runnable)`。`description` **只在 `route=None` 走自动路由时**才被 Workflow Router 用 BM25 打分；默认 `route=Route.WORKFLOW` 显式指定，不会走到这一步（见 §3.3）。
   - `create_travel_app()`（`app/agent.py:206`）：调 `create_harness_app(workflows=[spec], system_prompt=…, mcp_servers=default_mcp_servers(), model=…, checkpointer=…)`。
   - `_Emitter`（`app/agent.py:172`）：把 `HybridRunner.emit` 延后回填给先构造好的 runnable。
   - `run_travel()`（`app/agent.py:251`）：CLI 与 FastAPI 共用的唯一业务入口。
@@ -115,7 +115,7 @@ TravelPlan 有**两条 Runtime 路径**：
 CLI (main.py) 或 FastAPI (app/api.py)
 ↓  run_travel(query, route=Route.WORKFLOW)
 HybridRunner.invoke(payload, route=…, context=HarnessContext)        # superharness
-↓  WorkflowRouter 命中 travelplan_workflow
+↓  _select() 见 route 非空 → _explicit_route(route) 直取，跳过 Router/BM25
 TravelWorkflowRunnable.invoke / ainvoke (app/agent.py:133,147)
 ↓  extract_query + asyncio.to_thread
 execute_travel_run(query, …)          (app/workflow.py:2626)
@@ -146,7 +146,9 @@ ObservabilityMiddleware：before_agent 建 trace_id，wrap_model_call / wrap_too
 
 ### 3.3 两条路径不是完全相同的 Runtime
 
-- 固定流程：编排是 TravelPlan 自己的 `build_travel_graph()`（LangGraph `StateGraph`），但**挂在 HybridRunner 下**，复用了它的 Router 评分、Checkpointer（thread_id）、以及 `emit` 上报口。
+- 固定流程：编排是 TravelPlan 自己的 `build_travel_graph()`（LangGraph `StateGraph`）。**它是"裸 `graph.compile()`"**（`app/workflow.py:2550` 末尾），**没有传 `checkpointer=`**，也没有把 `thread_id` 用作 checkpoint 键 —— 所以它**不接 SuperHarness 的 Checkpointer**。它挂在 HybridRunner 下，复用的只有**路由挂载框架**（`HybridRunner._select` 里显式 route → `_explicit_route`）与 **`emit` 上报口**。
+- 默认不做 Router 打分：`run_travel()` 的缺省是 `route=Route.WORKFLOW`（`app/agent.py:257`），`HybridRunner._select(state, route)` 见 `route` 非空直接走 `_explicit_route()`，只有 `route=None` 才会调 `router.select(...)` 做 BM25 打分（`super_harness/superharness/workflows/workflows.py:108-131`）。
+- Checkpointer 挂在别处：`create_travel_app(checkpointer=…)`（`app/agent.py:230`）传入的 Checkpointer 落在 Agent Loop（`create_harness_app` 的 agent 侧）上；固定流程图里 `execute_travel_run` 的 `thread_id` 参数目前**没有参与任何 checkpoint**（`app/workflow.py:2630`，仅作为入口参数透传，最终 `travel_graph().invoke(state)` 无 config）。这是**之后要决策的点**：是否让 SuperHarness 的 Workflow Runtime 统一支持 Checkpointer + Trace（见 §7-B）。
 - Agent Loop：编排是 SuperHarness 的 LangGraph Agent，TravelPlan 只提供 `TRAVEL_AGENT_SYSTEM_PROMPT` 与 MCP 清单。
 - 直接后果：固定流程**没有 trace_id**（`ObservabilityMiddleware.before_agent` 只在 Agent 生命周期里建 trace_id），所以原生 `TraceCollector` 不给它生成 span 树 —— 见 §7-B。
 
@@ -154,7 +156,7 @@ ObservabilityMiddleware：before_agent 建 trace_id，wrap_model_call / wrap_too
 
 | 能力 | 当前实现位置 | 理想归属 | 当前是否合理 | 说明 |
 |---|---|---|---|---|
-| Capability Router | SuperHarness（HybridRunner 内） | SuperHarness | 合理 | 固定流程也借它做 route 打分 |
+| Capability Router | SuperHarness（HybridRunner 内） | SuperHarness | 合理 | 固定流程默认**不**借它打分：显式 `route` 走 `_explicit_route` 直取；仅 `route=None` 自动路由时才打分 |
 | Plugin Loader | SuperHarness `PluginLoader` | SuperHarness | 合理 | TravelPlan 只包了 `PluginToolSet` 建索引 |
 | MCP Loader | SuperHarness `MCPLoader` | SuperHarness | 合理 | TravelPlan 只包了懒连接句柄 `MCPServerHandle` |
 | LLM Model Factory | SuperHarness `create_model` | SuperHarness | 合理 | TravelPlan 的 `LLM` 只是外层 wrapper |
@@ -255,6 +257,7 @@ ObservabilityMiddleware：before_agent 建 trace_id，wrap_model_call / wrap_too
 - 机制：`ObservabilityMiddleware.before_agent`（`super_harness/superharness/middleware.py:56`）里 `trace_id = uuid4().hex[:12]`，写到 agent state 的 `_obs_trace_id`；随后 `wrap_model_call` / `wrap_tool_call` 打点都带这个 trace_id。`TraceCollector.__call__`（`super_harness/superharness/observability/trace.py:29`）遇到 `event.trace_id` 为空直接跳过。
 - 固定流程走 `TravelWorkflowRunnable → execute_travel_run → LangGraph`，**没有经过 Agent 生命周期**，因此没有 `before_agent` 建的 trace_id。Provider/LLM 事件虽然通过 `_Emitter → HybridRunner.emit → EventBus` 到达 Console（所以 `[TOOL]`/`[LLM]` 能看到），但 `TraceCollector` 因缺 trace_id 不建 span 树。
 - 现有替代物是 TravelPlan 自己的 `audit_report.json`（timeline / stages / provider_calls / llm_calls），是**业务审计**而不是原生 Trace。
+- 与 Checkpointer 的关联：固定流程同时也不接 SuperHarness Checkpointer（裸 `graph.compile()`，见 §3.3）。两者同源——都是「SuperHarness 的 Workflow Runtime 面没有覆盖到固定流程」。**待决策**：是否让 SuperHarness 的 Workflow Runtime 统一给「显式 route 的固定 Workflow」也提供 Checkpointer + Trace，而不是让每个业务各补一套。
 
 ### C. ProviderHub 直接调用 Loader，不经过 Agent Capability Router
 

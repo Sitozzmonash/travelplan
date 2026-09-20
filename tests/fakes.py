@@ -15,6 +15,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from app.config import TravelPlanConfig
 from app.llm import STATUS_OK, STATUS_UNAVAILABLE, LLMResult
 from app.models import (
     Evidence,
@@ -31,6 +32,16 @@ QUERY = "10月1日从北京去成都玩5天，两个人，预算6000，喜欢美
 
 #: 真实 Provider 的 status 用大写词表；测试里断言状态时复用同一套字面量。
 STATUS_UNAVAILABLE_PROVIDER = "UNAVAILABLE"
+
+
+def _fake_offset(name: str) -> int:
+    """把地点名稳定地映射到 0..7。
+
+    为什么要"稳定"：同一份假数据必须每次跑出同一份行程，否则单测与 Benchmark 都不可复现。
+    为什么要"按名字"：真实流程逐个名字查 POI，用下标会让所有点叠在一起（见 search_poi 注释）。
+    """
+
+    return sum(ord(char) for char in name) % 8
 
 
 def _call(provider: str, tool: str, query: dict) -> ProviderCall:
@@ -60,32 +71,44 @@ class FakeHub:
         *,
         failing: set[str] | None = None,
         empty: set[str] | None = None,
+        poi_spread: float = 0.01,
     ) -> None:
         self.calls: list[str] = []
         self.store = store
         self.run_id = run_id
         self.failing = set(failing or ())
         self.empty = set(empty or ())
+        #: POI 之间的经纬度间距（度）。默认 0.01° ≈ 1.1km，所有点会落进同一个地理簇 ——
+        #: 那样 Top-K 只会排出一种拓扑，Jev 的"选方案"就无从触发。想测多候选时给
+        #: 一个更大的值（0.25° ≈ 28km），模拟"城市里相距很远的几个区"。
+        self.poi_spread = poi_spread
         #: audit_report.json 的 provider_calls 来源。真实 Hub 从自己的调用账本生成，
         #: 假 Hub 也按同样的形状记，否则 audit 断言测的就是假件的常量。
         self._audit: list[dict[str, Any]] = []
 
     # --- 内部工具 ---
 
-    def _mk(self, tool: str, **kwargs: Any) -> ProviderResult:
+    def _mk(self, tool: str, *, inject_key: str | None = None, **kwargs: Any) -> ProviderResult:
         """构造 ProviderResult 并落 sources 表，模拟真实 Hub 的副作用。
 
         失败时也要**保留调用记录**：真实 Hub 会把失败的调用以 `status != OK` 落进
         `sources` 与 audit —— "查了但没查到"和"根本没查"是两件事，审计必须分得清。
+
+        `inject_key` 用于"公开方法名 ≠ 具体工具名"的场景（社交检索有小红书/抖音两个工具，
+        但注入是按搜索方法给的）：不传就按工具名匹配，传了就用它匹配 `failing` / `empty`。
+        没有这个参数时，`failing={"search_xiaohongshu"}` 会静默失效 —— 用例会"通过"
+        但根本没有注入，Benchmark 也就测不出东西来（真实踩过）。
         """
+
+        key = inject_key or tool
         calls = list(kwargs.get("calls") or [])
         provider = kwargs.get("provider", "")
 
-        if tool in self.failing:
+        if key in self.failing:
             for call in calls:
                 call.status = STATUS_UNAVAILABLE_PROVIDER
             result = ProviderResult(status=STATUS_UNAVAILABLE_PROVIDER, provider=provider, calls=calls)
-        elif tool in self.empty:
+        elif key in self.empty:
             result = ProviderResult(status="EMPTY", provider=provider, calls=calls)
         else:
             result = ProviderResult(**kwargs)
@@ -218,6 +241,10 @@ class FakeHub:
                     raw={},
                     hotel_id="h1",
                     name=f"{city}春熙路智选假日",
+                    # 酒店坐标必须给：Planner 的"先去哪个区"是按离住宿的远近排的，
+                    # 没有坐标时所有排序变体退化成同一个顺序，Top-K 就永远只有一份方案。
+                    lat=30.6570,
+                    lng=104.0660,
                     price_per_night=420.0,
                     rating=4.6,
                     business_area="春熙路",
@@ -232,6 +259,8 @@ class FakeHub:
                     raw={},
                     hotel_id="h2",
                     name=f"{city}郊区快捷",
+                    lat=30.5740,
+                    lng=103.9250,
                     price_per_night=180.0,
                     rating=3.9,
                     business_area="双流",
@@ -251,11 +280,22 @@ class FakeHub:
         "美食：担担面、龙抄手、串串香、老火锅。住宿建议住春熙路附近，地铁方便。"
     )
 
-    def _evidence(self, provider: str, tool: str, keyword: str, *, source_type: str, mentions: list[str], index: int = 1):
+    def _evidence(
+        self,
+        provider: str,
+        tool: str,
+        keyword: str,
+        *,
+        source_type: str,
+        mentions: list[str],
+        index: int = 1,
+        inject_key: str,
+    ):
         self.calls.append(tool)
         call = _call(provider, tool, {"keyword": keyword})
         return self._mk(
             tool,
+            inject_key=inject_key,
             status="OK",
             provider=provider,
             calls=[call],
@@ -282,12 +322,13 @@ class FakeHub:
         return self._evidence(
             "tikhub", "xiaohongshu", keyword, source_type="xiaohongshu",
             mentions=["宽窄巷子", "武侯祠", "锦里", "人民公园"], index=1,
+            inject_key="search_xiaohongshu",
         )
 
     def search_douyin(self, keyword, **kwargs):
         return self._evidence(
             "tikhub", "douyin", keyword, source_type="douyin",
-            mentions=[], index=2,
+            mentions=[], index=2, inject_key="search_douyin",
         )
 
     def web_search(self, query, **kwargs):
@@ -319,20 +360,23 @@ class FakeHub:
                     "poi_id": f"poi-{name}",
                     "name": name,
                     "type": type_hint or "风景名胜",
-                    "latitude": 30.6 + index * 0.01,
-                    "longitude": 104.05 + index * 0.01,
-                    "address": f"{region}示例地址{index}号",
+                    # 坐标必须由**名字**决定，不能用本次调用的下标：真实流程是逐名字各查一次，
+                    # 下标永远是 0，那样所有点会叠在同一个坐标上 —— 地理聚类只剩一个簇，
+                    # Top-K 也就永远只有一份拓扑（曾经真的发生过）。
+                    "latitude": 30.6 + _fake_offset(name) * self.poi_spread,
+                    "longitude": 104.05 + _fake_offset(name) * self.poi_spread,
+                    "address": f"{region}示例地址{name}",
                     "city": region,
-                    "district": "青羊区",
+                    "district": f"示例区{_fake_offset(name)}",
                     "business_area": "宽窄巷子",
-                    "opening_hours": "08:30-18:00",
+                    "opening_hours": "08:30-21:30",
                 },
                 city=region,
                 aliases=[name],
                 type_hint=type_hint,
                 expected_duration_minutes=90,
             )
-            for index, name in enumerate(names[:4])
+            for name in names[:6]
         ]
         return self._mk("search_poi", status="OK" if items else "EMPTY", provider="amap", calls=[call], items=items)
 
@@ -344,7 +388,7 @@ class FakeHub:
             status="OK",
             provider="amap",
             calls=[call],
-            items=[{"poi_id": poi_id, "opening_hours": "08:30-18:00", "address": "示例地址", "business_area": "宽窄巷子"}],
+            items=[{"poi_id": poi_id, "opening_hours": "08:30-21:30", "address": "示例地址", "business_area": "宽窄巷子"}],
         )
 
     def route(self, origin, destination, mode="transit", **kwargs):
@@ -426,6 +470,11 @@ class FakeLLM:
         {"name": "宽窄巷子", "category": "attraction", "tone": "positive"},
         {"name": "武侯祠", "category": "attraction", "tone": "positive"},
         {"name": "锦里", "category": "attraction", "tone": "neutral"},
+        # 多出来的三个点是有意的：POI 太少时 Top-K 的拓扑变体会**收敛成同一份行程**
+        # （时间窗容量决定了排法，区域顺序无关），于是"多候选"这条路径根本没被跑到。
+        {"name": "大熊猫基地", "category": "attraction", "tone": "positive"},
+        {"name": "杜甫草堂", "category": "attraction", "tone": "positive"},
+        {"name": "春熙路", "category": "activity", "tone": "neutral"},
     ]
 
     def __init__(self, *, unavailable: bool = False, intent_payload: dict | None = None) -> None:
@@ -492,3 +541,75 @@ def make_store(db_path) -> TravelPlanStore:
     store = TravelPlanStore(db_path=db_path)
     store.init_schema()
     return store
+
+
+class FakeJev:
+    """离线 Jev 替身（PRD §34.3）。
+
+    真实 Jev 是一次 1.5s 预算的 HTTP 调用，单测与 Benchmark 都不能依赖它。这里替换的
+    只是"网络那一层"：返回真实的 `JevResult`，所以产品代码对它的处理路径与线上一致 ——
+    包括 fallback、circuit breaker 计数与 trace 记录。
+
+    ``script`` 决定每个 tag 返回什么：
+      * ``choice``   —— 返回哪个选项（必须是 criteria 里的键）；
+      * ``status``   —— 非 OK 时模拟超时 / 429 / 结构不合法；
+      * 未列出的 tag —— 自动选第一个 criteria 键，让"没写脚本"的调用不会失败。
+    """
+
+    def __init__(
+        self,
+        script: dict[str, dict[str, Any]] | None = None,
+        *,
+        default_confidence: float = 0.9,
+        available: bool = True,
+    ) -> None:
+        self.script = dict(script or {})
+        self.default_confidence = default_confidence
+        self.available = available
+        self.calls: list[Any] = []
+        self.config = TravelPlanConfig.from_env()
+        #: 真实 JevClient 也有这两个属性，产品代码不会因为换了实现而需要分支。
+        self._circuit_open = False
+
+    def choose(self, *, tag: str, state: dict[str, Any], instructions: str, criteria: dict[str, str]):
+        from app.decision.jev import JevResult
+
+        self.calls.append({"tag": tag, "state": state, "instructions": instructions, "criteria": criteria})
+        if not self.available:
+            result = JevResult(tag=tag, status="TIMEOUT", duration_ms=1500, error="fake timeout", attempted=True)
+            return self._record(result)
+        spec = self.script.get(tag, {})
+        if spec.get("status"):
+            result = JevResult(
+                tag=tag,
+                status=str(spec["status"]),
+                duration_ms=12,
+                error=str(spec.get("error") or "脚本指定的失败"),
+                quota=spec.get("quota"),
+                attempted=True,
+            )
+            return self._record(result)
+        choice = str(spec.get("choice") or next(iter(criteria), ""))
+        if choice not in criteria:
+            result = JevResult(
+                tag=tag,
+                status="INVALID_RESPONSE",
+                duration_ms=9,
+                error=f"脚本给出的 {choice!r} 不在选项中",
+                attempted=True,
+            )
+            return self._record(result)
+        result = JevResult(
+            tag=tag,
+            status="OK",
+            choice=choice,
+            confidence=float(spec.get("confidence", self.default_confidence)),
+            duration_ms=int(spec.get("duration_ms", 11)),
+            model="fake-jev",
+            quota=spec.get("quota"),
+            attempted=True,
+        )
+        return self._record(result)
+
+    def _record(self, result: Any) -> Any:
+        return result

@@ -15,6 +15,8 @@ interface PlaceDetailDrawerProps {
   onOpenChange: (open: boolean) => void;
   item: ItineraryItem | null;
   day: ItineraryDay | null;
+  /** 当天在工作台里的显示名（Day N），由调用方给出，避免从 day_index 反推序号。 */
+  dayLabel?: string;
   sources: SourceRef[];
   evidence: Evidence[];
   onOpenEvidence?: () => void;
@@ -35,6 +37,7 @@ export function PlaceDetailDrawer({
   onOpenChange,
   item,
   day,
+  dayLabel,
   sources,
   evidence,
   onOpenEvidence,
@@ -49,7 +52,9 @@ export function PlaceDetailDrawer({
       title={item ? item.name : "安排详情"}
       description={
         item
-          ? `Day ${(day?.day_index ?? 0) + 1}${day?.date ? ` · ${formatDate(day.date)}` : ""} · ${ITEM_TYPE_LABELS[item.type]}`
+          ? [dayLabel, day?.date ? formatDate(day.date) : null, ITEM_TYPE_LABELS[item.type]]
+              .filter((part): part is string => Boolean(part))
+              .join(" · ")
           : undefined
       }
       footer={

@@ -1,0 +1,4 @@
+{"case_id": "pf-trains-fail", "suite": "provider_failure", "title": "注入：12306 失败 → 途牛火车兜底", "query": "10月1日从北京去成都玩5天，两个人", "fixtures": {"failing": ["search_trains"]}, "expect": {"expect_badcase_categories": ["provider_failure"]}}
+{"case_id": "pf-flights-fail", "suite": "provider_failure", "title": "注入：途牛机票失败", "query": "10月1日从北京去成都玩5天，两个人", "fixtures": {"failing": ["search_flights"]}, "expect": {"expect_badcase_categories": ["provider_failure"]}}
+{"case_id": "pf-hotels-empty", "suite": "provider_failure", "title": "注入：住宿返回空（不是失败，是没数据）", "query": "10月1日从北京去成都玩5天，两个人", "fixtures": {"empty": ["search_hotels"]}, "expect": {"expect_badcase_categories": ["missing_disclosure"]}}
+{"case_id": "pf-social-fail", "suite": "provider_failure", "title": "注入：社交攻略 Provider 全失败", "query": "10月1日从北京去成都玩5天，两个人，喜欢美食", "fixtures": {"failing": ["search_xiaohongshu", "search_douyin"], "empty": ["web_search"]}, "expect": {"expect_badcase_categories": ["provider_failure"]}}

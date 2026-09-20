@@ -1,0 +1,6 @@
+{"case_id": "hard-same-day-return", "suite": "hard", "title": "当天往返（0 晚住宿）", "query": "10月1日从北京去天津，当天往返", "fixtures": {}, "expect": {"hard_constraints_ok": true}}
+{"case_id": "hard-cross-midnight-train", "suite": "hard", "title": "跨天到达的卧铺（在途日不排游玩点）", "query": "10月1日从广州坐卧铺去成都玩5天，两个人", "fixtures": {}, "expect": {"hard_constraints_ok": true}}
+{"case_id": "hard-depart-on-last-day", "suite": "hard", "title": "最后一天当天返程（末日必须留出赶车时间）", "query": "9月28日从北京去成都玩5天，10月2日当天回北京，两个人", "fixtures": {}, "expect": {"hard_constraints_ok": true}}
+{"case_id": "hard-no-budget", "suite": "hard", "title": "不给预算（只统计不比较）", "query": "10月1日从北京去成都玩5天，两个人，喜欢美食", "fixtures": {}, "expect": {"hard_constraints_ok": true, "min_items": 3}}
+{"case_id": "hard-one-day", "suite": "hard", "title": "只玩 1 天", "query": "10月1日从北京去成都玩1天，一个人", "fixtures": {}, "expect": {"hard_constraints_ok": true}}
+{"case_id": "hard-no-start-date", "suite": "hard", "title": "没给出发日期（不猜日期；交通无法查询必须如实披露）", "query": "从北京去成都玩5天，两个人，喜欢美食和拍照", "fixtures": {}, "expect": {"min_items": 3, "expect_badcase_categories": ["missing_disclosure"]}}

@@ -140,6 +140,7 @@ class TravelWorkflowRunnable:
             store=self.store,
             model=self.model,
             emit=self.emit,
+            run_id=self._run_id(input),
         )
         self._remember(result)
         return result
@@ -151,6 +152,12 @@ class TravelWorkflowRunnable:
     def _thread_id(self, config: Any) -> str | None:
         configurable = (config or {}).get("configurable") or {}
         return configurable.get("thread_id")
+
+    def _run_id(self, input: Any) -> str | None:
+        """API 后台任务预先分配 run_id；普通 CLI/Agent 路径仍由 Workflow 自己生成。"""
+        if isinstance(input, dict) and isinstance(input.get("run_id"), str):
+            return input["run_id"] or None
+        return None
 
     def _remember(self, result: RunResult) -> None:
         self._results[result.run_id] = result
@@ -258,6 +265,7 @@ def run_travel(
     model: Any | None = None,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
     debug: bool = False,
+    run_id: str | None = None,
     app: Any | None = None,
 ) -> RunResult:
     """CLI 与 FastAPI 共用的唯一业务入口。
@@ -267,7 +275,9 @@ def run_travel(
                                     这条路的 output 形状不同，调用方需要自己处理。
     """
     runner = app if app is not None else _shared_app(output_dir, model)
-    payload = {"messages": [{"role": "user", "content": query}]}
+    payload: dict[str, Any] = {"messages": [{"role": "user", "content": query}]}
+    if run_id:
+        payload["run_id"] = run_id
     config = {"configurable": {"thread_id": thread_id}} if thread_id else None
 
     result = runner.invoke(

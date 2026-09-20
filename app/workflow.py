@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import operator
 import re
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -35,6 +36,17 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from app import planner
+from app.badcase import BadCaseContext, detect_badcases, summarize as summarize_badcases
+from app.config import current_config
+from app.decision.jev import JevClient
+from app.decision.planner_decision import (
+    DECISION_PLAN_CHOICE,
+    DECISION_QUALITY_GATE,
+    DECISION_TRADEOFF,
+    choose_plan,
+    quality_gate,
+    resolve_tradeoff,
+)
 from app.llm import LLM, degraded_note
 from app.models import (
     BudgetSummary,
@@ -66,8 +78,10 @@ from app.prompts import (
     INTENT_PARSE_PROMPT,
     RESEARCH_QUERY_EXPANSION_PROMPT,
 )
+from app.observability import SpanKind, now_iso, span_id
 from app.providers import ProviderHub, default_mcp_servers, lnglat
 from app.store import TravelPlanStore
+from app.version import travelplan_commit
 
 # ==================================================
 # 常量
@@ -211,11 +225,16 @@ class TravelState(TypedDict, total=False):
     user_id: str
     debug: bool
     output_dir: str
+    # 固定流程的可观测钩子：只上报真实节点边界，不参与任何旅行决策。
+    progress_hook: Any
 
     # --- 运行时句柄（不序列化，见模块 docstring） ---
     store: TravelPlanStore
     hub: ProviderHub
     llm: LLM
+    jev: JevClient
+    #: 子 span 记录口（component 由调用方给）。观测失败不影响规划。
+    record_span: Any
 
     # --- 解析结果 ---
     intent: TripIntent
@@ -247,6 +266,17 @@ class TravelState(TypedDict, total=False):
     warnings: list[FeasibilityIssue]
     critic: dict
 
+    # --- Top-K 与 Jev 软决策（接管任务 §4） ---
+    plan_candidates: list
+    plan_choice: dict
+    quality: Any
+    tradeoff: dict
+    gate: dict
+    #: 每次 Jev 调用的可审计记录（管理端 Run Detail 直接渲染）。
+    jev_calls: Annotated[list[dict], operator.add]
+    #: 本次 run 检测到的 Bad Case（finalize 阶段产生）。
+    badcases: list[dict]
+
     # --- 产物 ---
     plan: TripPlan
     plan_md: str
@@ -273,6 +303,80 @@ def new_run_id() -> str:
 
 def _stamp(stage: str, text: str) -> dict[str, Any]:
     return {"at": utcnow().isoformat(), "stage": stage, "text": text}
+
+
+#: 让 Jev 比较的候选方案数上限。
+#: 给多了摘要变长、判断质量下降（还会挤占它 1.5s 的超时预算），给少了没有比较价值。
+MAX_PLAN_CANDIDATES = 5
+
+
+def _record_subspan(
+    state: TravelState,
+    *,
+    component: SpanKind | str,
+    name: str,
+    status: str,
+    started_at: str,
+    attributes: dict[str, Any] | None = None,
+    parent_span_id: str | None = None,
+    error: str | None = None,
+) -> None:
+    """写一条业务级子 span（component 分类见 observability.SpanKind）。
+
+    观测永远不能反过来弄坏规划：拿不到 recorder、或写库失败，都只是少一条诊断记录。
+    """
+
+    recorder = state.get("record_span")
+    if recorder is None:
+        return
+    try:
+        recorder(
+            component=str(component),
+            name=name,
+            status=status,
+            started_at=started_at,
+            finished_at=now_iso(),
+            attributes=attributes or {},
+            parent_span_id=parent_span_id,
+            error=error,
+        )
+    except Exception:
+        return
+
+
+def _span_recorder(state: TravelState) -> Any | None:
+    """把 recorder 适配成 app.decision 需要的协议（它只调用，不关心实现）。"""
+
+    recorder = state.get("record_span")
+    if recorder is None:
+        return None
+
+    def record(
+        *,
+        component: str,
+        name: str,
+        status: str,
+        started_at: str,
+        finished_at: str,
+        attributes: dict[str, Any],
+        parent_span_id: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        try:
+            recorder(
+                component=component,
+                name=name,
+                status=status,
+                started_at=started_at,
+                finished_at=finished_at,
+                attributes=attributes,
+                parent_span_id=parent_span_id,
+                error=error,
+            )
+        except Exception:
+            return
+
+    return record
 
 
 def _stage(stage_id: str, title: str, summary: str, steps: list[str], **stats: Any) -> dict:
@@ -1756,30 +1860,102 @@ def node_score_candidates(state: TravelState) -> dict:
 
 
 def node_build_plan(state: TravelState) -> dict:
+    """生成初始行程：先由 Python 排出 Top-K 候选，再让 Jev 选整体更好的那份。
+
+    分工（任务 §3）：
+      Python  → 排程、时间推算、硬约束（决定"有哪些合法方案"）
+      Jev     → 只在若干**同样合法**的方案之间选（决定"哪份体验更好"）
+
+    Jev 选中的方案必须再过一次硬约束复核；不通过就退回默认方案。任何 Jev 失败都只是
+    fallback，行程照常产出。
+    """
     intent = state["intent"]
     places = list(state.get("places", []))
     evidences = list(state.get("evidences", []))
     linked = _link_evidence(evidences, places)
     transport_plan = state.get("transport_plan")
     hotel_plan = state.get("hotel_plan")
+    run_id = state["run_id"]
+    outbound = state.get("outbound")
 
-    days = planner.build_initial_plan(
+    build_kwargs: dict[str, Any] = {
+        "trust_scores": state.get("trust_scores") or {},
+        "ad_risks": state.get("ad_risks") or {},
+        "trust_details": state.get("trust_details") or {},
+        "evidences": linked,
+        "routes": state.get("routes") or {},
+        "hotel": hotel_plan.selected if hotel_plan else None,
+        "outbound": outbound,
+        "inbound": state.get("inbound"),
+        "ticket_prices": state.get("ticket_prices") or {},
+        "city": _destination(intent),
+        "mode_hint": None,
+    }
+    parent = f"{run_id}:build_initial_plan"
+
+    candidates_started = now_iso()
+    candidates = planner.build_plan_variants(
         intent,
         places,
-        trust_scores=state.get("trust_scores") or {},
-        ad_risks=state.get("ad_risks") or {},
-        trust_details=state.get("trust_details") or {},
-        evidences=linked,
-        routes=state.get("routes") or {},
-        hotel=hotel_plan.selected if hotel_plan else None,
-        outbound=state.get("outbound"),
-        inbound=state.get("inbound"),
-        ticket_prices=state.get("ticket_prices") or {},
-        city=_destination(intent),
-        mode_hint=None,
+        limit=MAX_PLAN_CANDIDATES,
+        quality_places={place.place_id: place for place in places},
+        quality_evidences=linked,
+        **build_kwargs,
     )
+    if not candidates:
+        # 所有变体都失败时，退回"只跑默认策略"：与引入 Top-K 之前的行为完全一致，
+        # 异常照旧抛出（而不是被变体循环吞掉），这样失败仍然能定位到真正的排程错误。
+        fallback_days = planner.build_initial_plan(intent, places, **build_kwargs)
+        candidates = [
+            planner.PlanCandidate(
+                label=planner.VARIANT_LABELS[planner.PLAN_VARIANT_NEAREST],
+                variant=planner.PLAN_VARIANT_NEAREST,
+                days=fallback_days,
+                quality=planner.plan_quality(
+                    fallback_days,
+                    intent,
+                    places={place.place_id: place for place in places},
+                    evidences=linked,
+                ),
+            )
+        ]
+    _record_subspan(
+        state,
+        component=SpanKind.PLANNER,
+        name="build_candidates",
+        status="SUCCESS" if candidates else "FAILED",
+        started_at=candidates_started,
+        attributes={"candidate_count": len(candidates), "variants": [c.variant for c in candidates]},
+        parent_span_id=parent,
+    )
+
+    jev = state.get("jev")
+    choice = choose_plan(
+        candidates,
+        intent,
+        jev=jev,
+        recorder=_span_recorder(state),
+        parent_span_id=parent,
+        hard_violations=lambda candidate: planner.hard_constraint_violations(
+            candidate.days, intent, outbound=outbound
+        ),
+    )
+    chosen = choice.candidate
+
+    recheck_started = now_iso()
+    violations = planner.hard_constraint_violations(chosen.days, intent, outbound=outbound)
+    _record_subspan(
+        state,
+        component=SpanKind.PLANNER,
+        name="hard_constraint_recheck",
+        status="SUCCESS" if not violations else "WARNING",
+        started_at=recheck_started,
+        attributes={"label": chosen.label, "violations": violations[:5], "count": len(violations)},
+        parent_span_id=parent,
+    )
+
     days = _annotate_items(
-        days,
+        chosen.days,
         places=places,
         linked=linked,
         trust_details=state.get("trust_details") or {},
@@ -1788,6 +1964,14 @@ def node_build_plan(state: TravelState) -> dict:
 
     item_count = sum(len(day.items) for day in days)
     steps = [f"共 {len(days)} 天、{item_count} 个安排"]
+    if len(candidates) > 1:
+        steps.append(
+            f"Top-{len(candidates)} 候选："
+            + "、".join(f"{c.label}({c.variant})" for c in candidates)
+        )
+    steps.append(f"方案选择：{choice.reason}")
+    if choice.rejected:
+        steps.append(f"硬约束复核否决了 Jev 的选择：{choice.rejected}")
     for day in days:
         first = day.items[0].start_time if day.items else "—"
         last = day.items[-1].end_time if day.items else "—"
@@ -1797,13 +1981,43 @@ def node_build_plan(state: TravelState) -> dict:
         )
         steps.extend(f"　{note}" for note in (day.notes or [])[:2])
 
-    summary = f"排出 {len(days)} 天 {item_count} 项安排"
+    summary = f"排出 {len(days)} 天 {item_count} 项安排（候选 {len(candidates)} 份，选用 {chosen.label}）"
+    decision = _decision(
+        run_id,
+        DecisionStatus.SELECT if not choice.fallback else DecisionStatus.PASS,
+        "jev" if choice.jev_record is not None else "planner",
+        ["JEV_PLAN_CHOICE"] + (["JEV_FALLBACK"] if choice.fallback else []),
+        choice.reason,
+        {
+            "selected": chosen.label,
+            "variant": chosen.variant,
+            "candidates": [candidate.label for candidate in candidates],
+            "fallback": choice.fallback,
+            "quality": chosen.quality.to_dict(),
+        },
+    )
     return {
         "days": days,
+        "plan_candidates": candidates,
+        "plan_choice": choice.to_dict(),
+        "quality": chosen.quality,
+        "decisions": [decision],
+        "jev_calls": [choice.jev_record] if choice.jev_record and choice.jev_record.get("attempted") else [],
         "timeline": [
             _stamp("build_initial_plan", summary + f"（{'、'.join(day.area or '未定' for day in days)}）")
         ],
-        "stages": [_stage("build_initial_plan", "生成初始行程", summary, steps, 天数=len(days), 安排数=item_count)],
+        "stages": [
+            _stage(
+                "build_initial_plan",
+                "生成初始行程",
+                summary,
+                steps,
+                天数=len(days),
+                安排数=item_count,
+                候选数=len(candidates),
+                选用=chosen.label,
+            )
+        ],
     }
 
 
@@ -1885,6 +2099,20 @@ def node_check_budget(state: TravelState) -> dict:
         steps.extend(f"优化建议：{item}" for item in budget.optimization_suggestions)
 
     summary = f"预计 ¥{budget.projected_total:,.0f}（真实 ¥{budget.known_real_cost:,.0f} + 估算 ¥{budget.estimated_cost:,.0f}），状态 {budget.status}"
+    _record_subspan(
+        state,
+        component=SpanKind.BUDGET,
+        name="check_budget",
+        status="SUCCESS",
+        started_at=now_iso(),
+        attributes={
+            "projected_total": budget.projected_total,
+            "known_real_cost": budget.known_real_cost,
+            "estimated_cost": budget.estimated_cost,
+            "status": budget.status,
+        },
+        parent_span_id=f"{state['run_id']}:check_budget",
+    )
     return {
         "budget": budget,
         "timeline": [_stamp("check_budget", summary)],
@@ -1907,72 +2135,75 @@ def node_check_budget(state: TravelState) -> dict:
 # ==================================================
 
 
-def node_check_feasibility(state: TravelState) -> dict:
-    intent = state["intent"]
-    days = list(state.get("days") or [])
-    places = {place.place_id: place for place in state.get("places", [])}
+def _feasibility_inputs(state: TravelState) -> tuple[int, int | None, int | None]:
+    """三个与 days 无关的硬边界：抵达日、首日可起排时刻、末日截止时刻。"""
 
+    intent = state["intent"]
     outbound = state.get("outbound")
     inbound = state.get("inbound")
-    arrival_index = planner.arrival_day_index(
-        outbound, intent.start_date, max(1, intent.days)
-    )
+    arrival_index = planner.arrival_day_index(outbound, intent.start_date, max(1, intent.days))
     first_day_start = planner.arrival_day_start_minutes(
         outbound, transfer_minutes=state.get("outbound_transfer_minutes")
     )
     last_day_deadline = planner.departure_deadline_minutes(
         inbound, transfer_minutes=state.get("inbound_transfer_minutes")
     )
+    return arrival_index, first_day_start, last_day_deadline
 
-    revised, issues = planner.apply_feasibility_pass(
+
+def _apply_feasibility_pass(state: TravelState, days: list[ItineraryDay]) -> tuple[list[ItineraryDay], list[FeasibilityIssue]]:
+    """对一份具体的 days 跑时间/窗口修订。
+
+    抽出来是为了让 critic 阶段"换了候选方案就重跑一遍"能和第 10 步走**完全同一条**
+    路径 —— 否则换方案后 warnings 与实际 days 会对不上。
+    """
+
+    arrival_index, first_day_start, last_day_deadline = _feasibility_inputs(state)
+    return planner.apply_feasibility_pass(
         days,
         state.get("routes") or {},
-        intent,
-        places=places,
+        state["intent"],
+        places={place.place_id: place for place in state.get("places", [])},
         first_day_start=first_day_start,
         first_day_index=arrival_index,
         last_day_deadline=last_day_deadline,
     )
 
+
+def _contextual_feasibility_issues(state: TravelState) -> list[FeasibilityIssue]:
+    """与 days 无关的可行性告警（天数被交通吃掉 / 发车日不符 / 回程跨度 / 无住宿）。"""
+
+    intent = state["intent"]
+    outbound = state.get("outbound")
+    inbound = state.get("inbound")
+    arrival_index, _, _ = _feasibility_inputs(state)
+    hotel_plan = state.get("hotel_plan")
+    return [
+        *_transit_span_issues(intent, outbound, arrival_index),
+        *_off_date_issues(intent, outbound, inbound),
+        *_inbound_span_issues(intent, inbound),
+        *_hotel_issues(intent, hotel_plan.selected if hotel_plan else None),
+    ]
+
+
+def node_check_feasibility(state: TravelState) -> dict:
+    intent = state["intent"]
+    days = list(state.get("days") or [])
+    outbound = state.get("outbound")
+    inbound = state.get("inbound")
+    arrival_index, first_day_start, last_day_deadline = _feasibility_inputs(state)
+
+    revised, issues = _apply_feasibility_pass(state, days)
+
     resolved = sum(1 for issue in issues if issue.resolved)
     errors = sum(1 for issue in issues if issue.severity == "error" and not issue.resolved)
 
-    # 去程吃掉整天数时如实告警：这类行程"看起来 6 天"，实际可游玩的天数少得多。
-    # 不调天数、不悄悄把日期改掉 —— 只把事实说出来，让用户自己决定要不要换交通方式。
-    span_issues = _transit_span_issues(intent, outbound, arrival_index)
-    issues = [*issues, *span_issues]
-    resolved += sum(1 for issue in span_issues if issue.resolved)
-    errors += sum(
-        1 for issue in span_issues if issue.severity == "error" and not issue.resolved
-    )
-
-    # 去程实际发车日不在约定出发日时如实告警（12306 会返回早一天的车次，见
-    # planner.departure_day_offset）。改日期是编造，改行程去迁就它也一样，所以只报出来。
-    date_issues = _off_date_issues(intent, outbound, inbound)
-    issues = [*issues, *date_issues]
-    resolved += sum(1 for issue in date_issues if issue.resolved)
-    errors += sum(
-        1 for issue in date_issues if issue.severity == "error" and not issue.resolved
-    )
-
-    # 回程"没有方案"或"要坐两天"时如实告警：一份排到 10-06 的行程，如果回程 10-08
-    # 才到家，那两天必须有交代；一个回程都没选到更要说，别让行程看起来是闭环的。
-    inbound_issues = _inbound_span_issues(intent, inbound)
-    issues = [*issues, *inbound_issues]
-    resolved += sum(1 for issue in inbound_issues if issue.resolved)
-    errors += sum(
-        1 for issue in inbound_issues if issue.severity == "error" and not issue.resolved
-    )
-
-    # 住宿一个候选都没有时如实告警：几晚空缺不能只写在 audit 的降级记录里，
-    # 否则预算显示"住宿 ¥0 / 预算内"，用户看不出这趟行程没地方睡。
-    hotel_plan = state.get("hotel_plan")
-    hotel_issues = _hotel_issues(intent, hotel_plan.selected if hotel_plan else None)
-    issues = [*issues, *hotel_issues]
-    resolved += sum(1 for issue in hotel_issues if issue.resolved)
-    errors += sum(
-        1 for issue in hotel_issues if issue.severity == "error" and not issue.resolved
-    )
+    # 与 days 无关的告警（天数被交通吃掉 / 发车日不符 / 回程跨度 / 一个住宿都没有）：
+    # 这些事实必须说出来，但不修改行程 —— 改日期是编造，改行程去迁就它也一样。
+    contextual = _contextual_feasibility_issues(state)
+    issues = [*issues, *contextual]
+    resolved += sum(1 for issue in contextual if issue.resolved)
+    errors += sum(1 for issue in contextual if issue.severity == "error" and not issue.resolved)
 
     # 抵达链的原始值（落地/到站 + 出站 + 接驳 + 入住）与**起排时刻**是两个数：
     # 红眼航班 02:20 就能到酒店，但那天从 08:30 才排行程（人要睡觉）。
@@ -2006,6 +2237,21 @@ def node_check_feasibility(state: TravelState) -> dict:
         )
 
     summary = f"发现 {len(issues)} 个时间/营业时间问题，自动修订 {resolved} 个，遗留 {errors} 个"
+    _record_subspan(
+        state,
+        component=SpanKind.FEASIBILITY,
+        name="check_feasibility",
+        status="SUCCESS" if errors == 0 else "WARNING",
+        started_at=now_iso(),
+        attributes={
+            "issues": len(issues),
+            "auto_revised": resolved,
+            "unresolved_errors": errors,
+            "arrival_index": arrival_index,
+            "last_day_deadline_minutes": last_day_deadline,
+        },
+        parent_span_id=f"{state['run_id']}:check_feasibility",
+    )
     return {
         "days": revised,
         "warnings": issues,
@@ -2083,6 +2329,237 @@ def _plan_digest(plan: TripPlan) -> dict[str, Any]:
     }
 
 
+def _hard_issue_texts(plan: TripPlan) -> list[str]:
+    """Jev 质量门必须看到的硬问题清单（由代码判定，不是模型判断）。
+
+    它同时是 Bad Case 规则 ``jev_missed_replan`` 的判据：Jev 在**知道**这些问题的
+    前提下仍然说 KEEP，才说明是它的判断出了问题。
+    """
+
+    issues = [
+        f"{issue.code}@day{issue.day_index}: {issue.reason}"
+        for issue in plan.warnings
+        if issue.severity == "error" and not issue.resolved
+    ]
+    if plan.transport is None or plan.transport.selected is None:
+        issues.append("缺少去程交通披露")
+    if plan.hotel is None or plan.hotel.selected is None:
+        issues.append("缺少住宿披露")
+    return issues
+
+
+@dataclass(slots=True)
+class _JevReview:
+    """critic 阶段两次 Jev 软决策的汇总（供 node_critic_revise 消费）。"""
+
+    tradeoff: dict[str, Any]
+    gate: dict[str, Any]
+    jev_calls: list[dict[str, Any]]
+    decisions: list[Decision]
+    steps: list[str]
+    degradations: list[str]
+    #: 质量门要求 REPLAN 且确实换成了另一份候选时才非空。
+    swapped: planner.PlanCandidate | None = None
+    days: list[ItineraryDay] | None = None
+    warnings: list[FeasibilityIssue] | None = None
+
+
+def _replan_choice(
+    candidates: list[planner.PlanCandidate],
+    current: planner.PlanCandidate | None,
+) -> planner.PlanCandidate | None:
+    """确定性重排：换一份**拓扑不同**的候选（按偏好匹配→节奏匹配择优）。
+
+    这就是 REPLAN 在 v0.1 的真实含义 —— 用同一套 Planner 的另一套区域排序策略重排一版，
+    而不是调模型凭空再生成一份（那会引入无法复现的行程）。没有别的候选时返回 None。
+    """
+
+    others = [candidate for candidate in candidates if current is None or candidate.label != current.label]
+    if not others:
+        return None
+    return max(
+        others,
+        key=lambda candidate: (
+            candidate.quality.preference_coverage,
+            candidate.quality.pace_match,
+            -candidate.quality.consecutive_same_type_count,
+        ),
+    )
+
+
+def _jev_review(
+    state: TravelState,
+    plan: TripPlan,
+    *,
+    llm_decisions: list[Decision],
+) -> _JevReview:
+    """Jev 的两个软决策节点：关键 Trade-off（§4B）与 Quality Gate（§4C）。
+
+    两者都只产出"选哪个 / 要不要重排"，并把结构化结果交给 Python 执行。
+    执行前一律先过 ``hard_constraint_violations``：软决策不得越过硬约束。
+    """
+
+    run_id = state["run_id"]
+    jev = state.get("jev")
+    intent = state["intent"]
+    outbound = state.get("outbound")
+    candidates = list(state.get("plan_candidates") or [])
+    selected_label = (state.get("plan_choice") or {}).get("selected")
+    current = next((candidate for candidate in candidates if candidate.label == selected_label), None)
+    parent = f"{run_id}:critic_and_revise"
+    recorder = _span_recorder(state)
+    jev_calls: list[dict[str, Any]] = []
+    decisions: list[Decision] = []
+    steps: list[str] = []
+    degradations: list[str] = []
+
+    # --- B. 关键 Trade-off ---
+    alternatives = [
+        candidate for candidate in candidates if current is None or candidate.label != current.label
+    ][:3]
+    tradeoff = resolve_tradeoff(
+        current=current or _candidate_of(plan, state),
+        alternatives=alternatives,
+        intent=intent,
+        jev=jev,
+        recorder=recorder,
+        parent_span_id=parent,
+    )
+    if tradeoff.jev_record is not None and tradeoff.jev_record.get("attempted"):
+        jev_calls.append(tradeoff.jev_record)
+    decisions.append(
+        _decision(
+            plan.run_id,
+            DecisionStatus.KEEP if tradeoff.choice.startswith("KEEP") else DecisionStatus.REVISION,
+            "jev" if tradeoff.jev_record is not None else "planner",
+            ["JEV_TRADEOFF", tradeoff.choice] + (["JEV_FALLBACK"] if tradeoff.fallback else []),
+            tradeoff.reason,
+            {"choice": tradeoff.choice, "applied": tradeoff.applied_label},
+        )
+    )
+    steps.append(f"关键取舍：{tradeoff.reason}")
+
+    # --- C. Planner Quality Gate ---
+    hard_issues = _hard_issue_texts(plan)
+    quality = state.get("quality") or planner.plan_quality(plan.days, intent)
+    gate = quality_gate(
+        quality=quality,
+        hard_issues=hard_issues,
+        intent=intent,
+        jev=jev,
+        recorder=recorder,
+        parent_span_id=parent,
+    )
+    if gate.jev_record is not None and gate.jev_record.get("attempted"):
+        jev_calls.append(gate.jev_record)
+    steps.append(
+        f"质量门：{gate.reason}（软分 {gate.signals}，硬问题 {gate.hard_issue_count} 项）"
+    )
+    decisions.append(
+        _decision(
+            plan.run_id,
+            DecisionStatus.PASS if gate.decision == "KEEP" else DecisionStatus.REVISION,
+            "jev" if gate.jev_record is not None else "planner",
+            ["JEV_QUALITY_GATE", gate.decision] + (["JEV_FALLBACK"] if gate.fallback else []),
+            gate.reason,
+            {"signals": gate.signals, "hard_issues": hard_issues[:5]},
+        )
+    )
+
+    review = _JevReview(
+        tradeoff=tradeoff.to_dict(),
+        gate=gate.to_dict(),
+        jev_calls=jev_calls,
+        decisions=decisions,
+        steps=steps,
+        degradations=degradations,
+    )
+
+    # --- 执行 REPLAN：换一份候选并重跑可行性修订 ---
+    wants_replan = tradeoff.choice == "REPLAN" or gate.decision == "REPLAN"
+    if not wants_replan:
+        return review
+    replacement = _replan_choice(candidates, current)
+    if replacement is None:
+        note = "质量门要求重排，但没有第二份候选方案可用；已如实记录，不凭空生成新行程"
+        steps.append(note)
+        degradations.append(note)
+        review.steps = steps
+        review.degradations = degradations
+        return review
+    violations = planner.hard_constraint_violations(replacement.days, intent, outbound=outbound)
+    if violations:
+        note = f"重排候选 {replacement.label} 未通过硬约束复核，保持原方案：{violations[0]}"
+        steps.append(note)
+        degradations.append(note)
+        review.steps = steps
+        review.degradations = degradations
+        return review
+
+    revised_days, issues = _apply_feasibility_pass(state, replacement.days)
+    contextual = _contextual_feasibility_issues(state)
+    new_warnings = [*issues, *contextual]
+    new_hard = [
+        f"{issue.code}@day{issue.day_index}: {issue.reason}"
+        for issue in new_warnings
+        if issue.severity == "error" and not issue.resolved
+    ]
+    # 重排后硬问题反而变多就没有换的必要 —— 那只是把问题换了个样子。
+    if len(new_hard) > len(hard_issues):
+        note = (
+            f"重排候选 {replacement.label} 的硬问题从 {len(hard_issues)} 增加到 {len(new_hard)}，"
+            "已放弃重排并保留原方案"
+        )
+        steps.append(note)
+        degradations.append(note)
+        review.steps = steps
+        review.degradations = degradations
+        return review
+
+    steps.append(
+        f"已按质量门重排：{current.label if current else '原方案'} → {replacement.label}"
+        f"（硬问题 {len(hard_issues)} → {len(new_hard)}）"
+    )
+    decisions.append(
+        _decision(
+            plan.run_id,
+            DecisionStatus.REVISION,
+            "planner",
+            ["JEV_REPLAN_APPLIED", f"TO_{replacement.label}"],
+            f"质量门要求重排，已换用候选 {replacement.label} 并重跑可行性修订",
+            {
+                "from": current.label if current else None,
+                "to": replacement.label,
+                "hard_issues_before": len(hard_issues),
+                "hard_issues_after": len(new_hard),
+            },
+        )
+    )
+    review.swapped = replacement
+    review.days = revised_days
+    review.warnings = new_warnings
+    review.steps = steps
+    review.degradations = degradations
+    # 换方案后 LLM Critic 的意见已经对不上新行程，如实说明而不是继续沿用。
+    if llm_decisions:
+        review.degradations.append("重排后模型 Critic 的意见对应的是被替换的方案，仅供参考")
+    return review
+
+
+def _candidate_of(plan: TripPlan, state: TravelState) -> planner.PlanCandidate:
+    """当 state 里没有候选（老调用路径）时，用当前 days 现造一个占位候选。
+
+    它只用于给 Jev 描述"当前是什么"，因此质量按当前 days 现算，不编造。
+    """
+
+    return planner.PlanCandidate(
+        label=str((state.get("plan_choice") or {}).get("selected") or "A"),
+        variant=str((state.get("plan_choice") or {}).get("variant") or planner.PLAN_VARIANT_NEAREST),
+        days=list(plan.days),
+        quality=state.get("quality") or planner.plan_quality(plan.days, state["intent"]),
+    )
+
+
 def node_critic_revise(state: TravelState) -> dict:
     llm = state["llm"]
     evidences = list(state.get("evidences", []))
@@ -2131,7 +2608,11 @@ def node_critic_revise(state: TravelState) -> dict:
     else:
         critic_degradations = [degraded_note(critic_result, "本次只有规则 Critic 参与")]
 
-    decisions = [*rule_decisions, *llm_decisions]
+    # --- Jev：关键 Trade-off + 质量门（接管任务 §4B §4C） ---
+    review = _jev_review(state, plan, llm_decisions=llm_decisions)
+    critic_degradations = [*critic_degradations, *review.degradations]
+
+    decisions = [*rule_decisions, *llm_decisions, *review.decisions]
     confidence_decision = next(
         (item for item in rule_decisions if "PLAN_CONFIDENCE" in item.reason_codes), None
     )
@@ -2142,6 +2623,7 @@ def node_critic_revise(state: TravelState) -> dict:
         f"模型 Critic：{critic['status']}"
         + (f"，verdict={critic['verdict'] or '未给出'}" if critic_result.ok else "（未参与，已如实记录）"),
         f"规则置信度：{confidence:.0%}（高德状态 {state.get('amap_status', 'OK')}）",
+        *review.steps,
     ]
     if critic["confidence"] is not None:
         steps.append(f"模型自评置信度：{critic['confidence']}/100")
@@ -2152,10 +2634,31 @@ def node_critic_revise(state: TravelState) -> dict:
         )
 
     summary = f"规则 {len(rule_decisions)} 条 + 模型 {len(llm_decisions)} 条决策；计划置信度 {confidence:.0%}"
-    return {
+    if review.swapped is not None:
+        summary += f"；已按质量门重排为候选 {review.swapped.label}"
+    _record_subspan(
+        state,
+        component=SpanKind.CRITIC,
+        name="rule_critic",
+        status="SUCCESS",
+        started_at=now_iso(),
+        attributes={
+            "rule_decisions": len(rule_decisions),
+            "llm_decisions": len(llm_decisions),
+            "confidence": confidence,
+            "llm_critic_status": critic["status"],
+            "hard_issues": _hard_issue_texts(plan)[:5],
+        },
+        parent_span_id=f"{state['run_id']}:critic_and_revise",
+    )
+
+    result: dict[str, Any] = {
         "critic": critic,
-        "decisions": [*rule_decisions, *llm_decisions],
+        "decisions": decisions,
         "degradations": critic_degradations,
+        "tradeoff": review.tradeoff,
+        "gate": review.gate,
+        "jev_calls": review.jev_calls,
         "timeline": [_stamp("critic_and_revise", summary)],
         "stages": [
             _stage(
@@ -2166,9 +2669,16 @@ def node_critic_revise(state: TravelState) -> dict:
                 规则决策=len(rule_decisions),
                 模型决策=len(llm_decisions),
                 置信度=f"{confidence:.0%}",
+                Jev决策=len(review.jev_calls),
             )
         ],
     }
+    # 重排后必须把新的 days / warnings 写回 state，否则 finalize 会拿旧行程去算预算。
+    if review.days is not None:
+        result["days"] = review.days
+        result["warnings"] = review.warnings or []
+        result["quality"] = planner.plan_quality(review.days, state["intent"])
+    return result
 
 
 # ==================================================
@@ -2366,6 +2876,262 @@ def _write_artifacts(
     return written
 
 
+def _provider_call_rows(hub: Any) -> list[dict[str, Any]]:
+    """Provider 调用账本 → audit / Bad Case 共用的行结构。"""
+
+    rows: list[dict[str, Any]] = []
+    for entry in hub.audit_entries() if hub is not None else []:
+        rows.append(
+            {
+                "provider": entry["provider"],
+                "tool": entry["tool"],
+                "query": entry.get("arguments") or {},
+                "status": entry["status"],
+                "returned": entry.get("item_count"),
+                "duration_ms": entry.get("duration_ms"),
+                "fetched_at": entry.get("fetched_at"),
+                "source_id": entry.get("source_id"),
+                "note": "；".join(entry.get("notes") or []) or entry.get("error") or None,
+            }
+        )
+    return rows
+
+
+def _jev_signals(state: TravelState) -> dict[str, str]:
+    """Python 对 Jev 决策的复核结论（Bad Case 规则 jev_wrong_choice 等的判据）。"""
+
+    signals: dict[str, str] = {}
+    choice = state.get("plan_choice") or {}
+    if choice.get("rejected"):
+        signals["choice_rejected"] = str(choice["rejected"])
+    gate = state.get("gate") or {}
+    if gate.get("unnecessary_replan"):
+        signals["unnecessary_replan"] = str(gate.get("reason") or "")
+    if gate.get("missed_replan"):
+        signals["missed_replan"] = str(gate.get("reason") or "")
+    return signals
+
+
+def _detect_and_save_badcases(
+    state: TravelState, *, plan: TripPlan, degradations: list[str]
+) -> list[dict[str, Any]]:
+    """按规则检测本次 run 的 Bad Case 并落库。
+
+    检测失败（或写库失败）绝不能让一次成功的规划变成失败 run —— Bad Case 是"事后复盘"
+    的能力，不是行程的一部分。
+    """
+
+    try:
+        if not current_config().badcase_enabled:
+            return []
+        ctx = BadCaseContext(
+            run_id=state["run_id"],
+            plan=plan,
+            provider_calls=_provider_call_rows(state.get("hub")),
+            jev_calls=list(state.get("jev_calls") or []),
+            degradations=list(dict.fromkeys(degradations)),
+            metrics={},
+            jev_signals=_jev_signals(state),
+            # 让每条 Bad Case 记住"是哪一版代码造成的"，否则回归集无法判断是否还成立。
+            introduced_in=travelplan_commit(),
+        )
+        cases = detect_badcases(ctx)
+        state["store"].save_badcases(cases)
+        return cases
+    except Exception:
+        return []
+
+
+def _write_run_artifacts(
+    *,
+    run_id: str,
+    store: TravelPlanStore,
+    output_dir: Path,
+    metrics: dict[str, Any],
+    badcases: list[dict[str, Any]],
+) -> dict[str, str]:
+    """写 run 级产物：trace.jsonl / metrics.json / badcases.json。
+
+    这三件必须等**整张图跑完**再写：finalize 节点执行时，它自己的 span 与
+    run_metrics 都还没落库，此刻写出来的 trace 会缺最后一步、metrics 会缺总量。
+
+    Trace 用 JSONL（一行一个 span，便于 grep/流式处理）；数据库负责查询与聚合。
+    """
+
+    target = output_dir / run_id
+    target.mkdir(parents=True, exist_ok=True)
+    written: dict[str, str] = {}
+
+    spans = store.get_trace_spans(run_id)
+    trace_path = target / "trace.jsonl"
+    trace_path.write_text(
+        "".join(json.dumps(span, ensure_ascii=False, default=str) + "\n" for span in spans),
+        encoding="utf-8",
+    )
+    written["trace.jsonl"] = str(trace_path)
+
+    metrics_path = target / "metrics.json"
+    metrics_path.write_text(
+        json.dumps(metrics, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+    )
+    written["metrics.json"] = str(metrics_path)
+
+    badcases_path = target / "badcases.json"
+    badcases_path.write_text(
+        json.dumps(
+            {"run_id": run_id, "summary": summarize_badcases(badcases), "items": badcases},
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        ),
+        encoding="utf-8",
+    )
+    written["badcases.json"] = str(badcases_path)
+
+    # audit_report.json 是"这份 run 有哪些产物"的索引，新增的三件要补进去，
+    # 否则前端/人会以为产物还是三件。
+    audit_path = target / "audit_report.json"
+    if audit_path.is_file():
+        try:
+            audit = json.loads(audit_path.read_text(encoding="utf-8"))
+            entries = audit.setdefault("artifacts", [])
+            known = {item.get("filename") for item in entries if isinstance(item, dict)}
+            for filename, label, fmt in (
+                ("trace.jsonl", "运行 Trace", "jsonl"),
+                ("metrics.json", "运行指标", "json"),
+                ("badcases.json", "Bad Case", "json"),
+            ):
+                if filename not in known:
+                    entries.append(
+                        {"label": label, "filename": filename, "format": fmt, "available": True}
+                    )
+            audit_path.write_text(
+                json.dumps(audit, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+            )
+        except (OSError, ValueError):
+            pass
+    return written
+
+
+#: Provider 调用 → 它属于哪个 workflow 节点。
+#: 审计账本里没有阶段信息（真实 Hub 是通用调用器，不知道自己在哪个业务步骤），
+#: 所以按"这个工具只会在哪个节点被调用"做静态映射；映射不到就**不挂父 span**，
+#: 宁可树少一层，也不编一个假的归属。
+PROVIDER_STAGE_MAP: dict[str, str] = {
+    "search_trains": "search_intercity_transport",
+    "search_flights": "search_intercity_transport",
+    "search_hotels": "search_hotels",
+    "search_xiaohongshu": "search_social_guides",
+    "search_douyin": "search_social_guides",
+    "web_search": "search_social_guides",
+    "search_poi": "verify_poi_and_routes",
+    "poi_detail": "verify_poi_and_routes",
+    "geocode": "verify_poi_and_routes",
+    "route": "verify_poi_and_routes",
+    "search_scenic_tickets": "score_candidates",
+}
+
+#: 通过 MCP Server 提供的 Provider。12306 走 `npx 12306-mcp`，不是一个 HTTP 接口。
+MCP_BACKED_PROVIDERS: dict[str, str] = {"12306": "railway_12306"}
+
+#: LLM 调用的 tag → 所属节点。tag 带序号时按前缀匹配。
+LLM_STAGE_MAP: dict[str, str] = {
+    "parse_intent": "parse_intent",
+    "query_expansion": "search_social_guides",
+    "extract_places": "extract_and_normalize_places",
+    "critic": "critic_and_revise",
+    "final_answer": "finalize",
+}
+
+
+def _llm_stage_for(tag: str) -> str | None:
+    if tag in LLM_STAGE_MAP:
+        return LLM_STAGE_MAP[tag]
+    for prefix, stage in LLM_STAGE_MAP.items():
+        if tag.startswith(prefix):
+            return stage
+    return None
+
+
+def _emit_run_spans(state: TravelState, *, llm: Any) -> None:
+    """把 Provider 与模型调用补成 Trace span（任务 §5 的 provider / tool / mcp / llm）。
+
+    为什么放在 finalize 之后统一补：ProviderHub 与 LLM 的调用账本是**它们自己的**事实，
+    已经在运行过程中被完整记下。在这里逐条转录成 span，不需要给每个调用点包一层回调，
+    也不会因为某个调用点忘了埋点就丢数据。
+
+    层级：workflow 节点 → provider（或 mcp）→ tool。tool span 的 id 与 Bad Case 的
+    ``trace_refs`` 一致（``{run}:provider:{provider}:{tool}``），所以从 Bad Case 能直接
+    跳到那条 span。
+    """
+
+    run_id = state["run_id"]
+
+    def parent_for(stage: str | None) -> str | None:
+        return f"{run_id}:{stage}" if stage else None
+
+    emitted_groups: set[str] = set()
+    for entry in _provider_call_rows(state.get("hub")):
+        provider = str(entry.get("provider") or "unknown")
+        tool = str(entry.get("tool") or "unknown")
+        stage = PROVIDER_STAGE_MAP.get(tool)
+        server = MCP_BACKED_PROVIDERS.get(provider)
+        group_component = SpanKind.MCP if server else SpanKind.PROVIDER
+        group_name = server or provider
+        group_id = span_id(run_id, group_component, group_name)
+        if group_id not in emitted_groups:
+            emitted_groups.add(group_id)
+            _record_subspan(
+                state,
+                component=group_component,
+                name=group_name,
+                status="SUCCESS",
+                started_at=str(entry.get("fetched_at") or now_iso()),
+                attributes={"provider": provider, "transport": "mcp stdio" if server else "http"},
+                parent_span_id=parent_for(stage),
+            )
+        _record_subspan(
+            state,
+            component=SpanKind.TOOL,
+            name=tool,
+            # 单个 tool 的成败就是它自己的状态；成组状态由管理端按子 span 聚合。
+            status="SUCCESS" if entry.get("status") == "OK" else "WARNING",
+            started_at=str(entry.get("fetched_at") or now_iso()),
+            attributes={
+                "provider": provider,
+                "tool": tool,
+                "status": entry.get("status"),
+                "returned": entry.get("returned"),
+                "duration_ms": entry.get("duration_ms"),
+                "query": entry.get("query"),
+                "source_id": entry.get("source_id"),
+                "note": entry.get("note"),
+            },
+            parent_span_id=group_id,
+            error=None if entry.get("status") == "OK" else str(entry.get("note") or entry.get("status")),
+        )
+
+    for index, entry in enumerate(llm.audit_entries() if llm is not None else []):
+        tag = str(entry.get("tag") or "unnamed")
+        _record_subspan(
+            state,
+            component=SpanKind.LLM,
+            name=tag,
+            status="SUCCESS" if entry.get("status") == "OK" else "WARNING",
+            started_at=now_iso(),
+            attributes={
+                "tag": tag,
+                "model": entry.get("model"),
+                "status": entry.get("status"),
+                "duration_ms": entry.get("duration_ms"),
+                "chars": entry.get("chars"),
+                "error": entry.get("error"),
+            },
+            parent_span_id=parent_for(_llm_stage_for(tag)),
+            error=entry.get("error"),
+        )
+
+
 def node_finalize(state: TravelState) -> dict:
     store = state["store"]
     llm = state["llm"]
@@ -2425,6 +3191,28 @@ def node_finalize(state: TravelState) -> dict:
     store.save_plan(plan, plan_md)
     store.finish_run(run_id, STATUS_COMPLETED)
 
+    # 把 Provider / 模型调用转录成 span（component=provider|mcp|tool|llm）。放在这里是因为
+    # 两者的调用账本此时才完整；Bad Case 的 trace_refs 也在这之后才落库，指向的 span 一定存在。
+    _emit_run_spans(state, llm=llm)
+    _record_subspan(
+        state,
+        component=SpanKind.STORE,
+        name="persist",
+        status="SUCCESS",
+        started_at=now_iso(),
+        attributes={
+            "decisions": len(decisions),
+            "days": len(plan.days),
+            "plan_items": sum(len(day.items) for day in plan.days),
+        },
+        parent_span_id=f"{run_id}:finalize",
+    )
+
+    # Bad Case 检测放在**所有事实都已定型之后**：plan / degradations / Jev 记录 / Provider
+    # 账本此时才是最终值，规则判断不会因为流程后面又改动而失效。
+    badcases = _detect_and_save_badcases(state, plan=plan, degradations=degradations)
+    badcase_counts = summarize_badcases(badcases)
+
     audit = _build_audit(state, plan=plan, decisions=decisions, degradations=degradations, prose_note=prose_note)
     outputs = _write_artifacts(
         plan=plan, plan_md=plan_md, audit=audit, output_dir=Path(state["output_dir"])
@@ -2434,20 +3222,31 @@ def node_finalize(state: TravelState) -> dict:
         f"决策链 {len(decisions)} 条已落库（plan / decisions / sources / evidence / places）",
         f"成文方式：{prose_note}",
         f"产物：{', '.join(outputs)}",
+        f"Bad Case：{badcase_counts['total']} 条（高 {badcase_counts['high']} / 中 {badcase_counts['medium']} / 低 {badcase_counts['low']}）",
     ]
     if budget_note:
         steps.append(budget_note)
 
-    summary = f"产出 plan.json / plan.md / audit_report.json（{len(decisions)} 条决策）"
+    summary = f"产出 plan.json / plan.md / audit_report.json（{len(decisions)} 条决策、{badcase_counts['total']} 条 Bad Case）"
     return {
         "plan": plan,
         "plan_md": plan_md,
         "outputs": outputs,
         "status": STATUS_COMPLETED,
         "audit": audit,
+        "badcases": badcases,
         "degradations": new_degradations,
         "timeline": [_stamp("finalize", summary)],
-        "stages": [_stage("finalize", "成文与归档", summary, steps, 决策数=len(decisions))],
+        "stages": [
+            _stage(
+                "finalize",
+                "成文与归档",
+                summary,
+                steps,
+                决策数=len(decisions),
+                BadCase数=badcase_counts["total"],
+            )
+        ],
     }
 
 
@@ -2471,21 +3270,8 @@ def _build_audit(
     """
     hub = state.get("hub")
     llm = state.get("llm")
-    provider_calls: list[dict[str, Any]] = []
-    for entry in hub.audit_entries() if hub is not None else []:
-        provider_calls.append(
-            {
-                "provider": entry["provider"],
-                "tool": entry["tool"],
-                "query": entry.get("arguments") or {},
-                "status": entry["status"],
-                "returned": entry.get("item_count"),
-                "duration_ms": entry.get("duration_ms"),
-                "fetched_at": entry.get("fetched_at"),
-                "source_id": entry.get("source_id"),
-                "note": "；".join(entry.get("notes") or []) or entry.get("error") or None,
-            }
-        )
+    provider_calls = _provider_call_rows(hub)
+    jev_calls = list(state.get("jev_calls") or [])
 
     sources = plan.sources
     stages = list(state.get("stages") or [])
@@ -2522,6 +3308,13 @@ def _build_audit(
         "decisions": [decision.model_dump(mode="json") for decision in decisions],
         "provider_calls": provider_calls,
         "llm_calls": llm.audit_entries() if llm is not None else [],
+        # Jev 调用明细进 audit：管理端 Run Detail 的 "Jev Calls" 直接读它，
+        # 每条都带 decision_type / confidence / latency / fallback reason / quota。
+        "jev_calls": jev_calls,
+        "plan_choice": state.get("plan_choice") or {},
+        "tradeoff": state.get("tradeoff") or {},
+        "quality_gate": state.get("gate") or {},
+        "quality": (state.get("quality").to_dict() if state.get("quality") is not None else {}),
         "timeline": timeline,
         "artifacts": artifacts,
         "degradations": list(dict.fromkeys(degradations)),
@@ -2547,6 +3340,59 @@ def _evidence_summary(state: TravelState, plan: TripPlan) -> dict[str, int]:
 # ==================================================
 
 
+def _instrument_node(stage_id: str, node: Any) -> Any:
+    """为固定节点补业务级进度与 span，而不引入第二个 Workflow Runtime。
+
+    SuperHarness 仍负责跨 Agent 的 EventBus/Trace；这层只写 UI 轮询需要的事实。
+    即使观测写库失败，也绝不能让旅行规划本身失败。
+    """
+
+    def wrapped(state: TravelState) -> dict:
+        hook = state.get("progress_hook")
+        started_at = utcnow().isoformat()
+        started = time.perf_counter()
+        if hook is not None:
+            hook(stage_id, "RUNNING", f"正在执行 {stage_id}", {}, started_at, None)
+        try:
+            result = node(state)
+        except Exception as exc:
+            if hook is not None:
+                hook(
+                    stage_id,
+                    "FAILED",
+                    f"{stage_id} 执行失败",
+                    {"duration_ms": round((time.perf_counter() - started) * 1000)},
+                    started_at,
+                    utcnow().isoformat(),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            raise
+
+        stage = next(
+            (entry for entry in (result.get("stages") or []) if entry.get("id") == stage_id),
+            {},
+        )
+        facts = {
+            str(item.get("label")): item.get("value")
+            for item in (stage.get("stats") or [])
+            if isinstance(item, dict) and item.get("label")
+        }
+        facts["duration_ms"] = round((time.perf_counter() - started) * 1000)
+        has_warning = bool(result.get("degradations"))
+        if hook is not None:
+            hook(
+                stage_id,
+                "WARNING" if has_warning else "SUCCESS",
+                str(stage.get("summary") or f"{stage_id} 已完成"),
+                facts,
+                started_at,
+                utcnow().isoformat(),
+            )
+        return result
+
+    return wrapped
+
+
 def build_travel_graph() -> CompiledStateGraph:
     """编译 12 步固定流程（PRD §25）。
 
@@ -2554,18 +3400,18 @@ def build_travel_graph() -> CompiledStateGraph:
     这一步不走 Agent，也不猜一个城市继续跑。
     """
     graph = StateGraph(TravelState)
-    graph.add_node("parse_intent", node_parse_intent)
-    graph.add_node("search_intercity_transport", node_search_transport)
-    graph.add_node("search_hotels", node_search_hotels)
-    graph.add_node("search_social_guides", node_search_social)
-    graph.add_node("extract_and_normalize_places", node_extract_places)
-    graph.add_node("verify_poi_and_routes", node_verify_poi_and_routes)
-    graph.add_node("score_candidates", node_score_candidates)
-    graph.add_node("build_initial_plan", node_build_plan)
-    graph.add_node("check_budget", node_check_budget)
-    graph.add_node("check_feasibility", node_check_feasibility)
-    graph.add_node("critic_and_revise", node_critic_revise)
-    graph.add_node("finalize", node_finalize)
+    graph.add_node("parse_intent", _instrument_node("parse_intent", node_parse_intent))
+    graph.add_node("search_intercity_transport", _instrument_node("search_intercity_transport", node_search_transport))
+    graph.add_node("search_hotels", _instrument_node("search_hotels", node_search_hotels))
+    graph.add_node("search_social_guides", _instrument_node("search_social_guides", node_search_social))
+    graph.add_node("extract_and_normalize_places", _instrument_node("extract_and_normalize_places", node_extract_places))
+    graph.add_node("verify_poi_and_routes", _instrument_node("verify_poi_and_routes", node_verify_poi_and_routes))
+    graph.add_node("score_candidates", _instrument_node("score_candidates", node_score_candidates))
+    graph.add_node("build_initial_plan", _instrument_node("build_initial_plan", node_build_plan))
+    graph.add_node("check_budget", _instrument_node("check_budget", node_check_budget))
+    graph.add_node("check_feasibility", _instrument_node("check_feasibility", node_check_feasibility))
+    graph.add_node("critic_and_revise", _instrument_node("critic_and_revise", node_critic_revise))
+    graph.add_node("finalize", _instrument_node("finalize", node_finalize))
 
     graph.set_entry_point("parse_intent")
     graph.add_conditional_edges(
@@ -2634,13 +3480,14 @@ def execute_travel_run(
     model: Any | None = None,
     hub: ProviderHub | None = None,
     llm: LLM | None = None,
+    jev: JevClient | None = None,
     run_id: str | None = None,
     emit: Any | None = None,
 ) -> RunResult:
-    """跑完一次完整规划：12 步固定流程 + 落库 + 写 `outputs/<run_id>/` 三件产物。
+    """跑完一次完整规划：12 步固定流程 + 落库 + 写 `outputs/<run_id>/` 产物。
 
-    `store` / `model` / `hub` / `llm` 允许注入，是为了让单测能在不联网、不写真实库的
-    前提下跑整条流程；生产路径不传这几个参数。
+    `store` / `model` / `hub` / `llm` / `jev` 允许注入，是为了让单测与 Benchmark 能在
+    不联网、不写真实库的前提下跑整条流程；生产路径不传这几个参数。
 
     `emit` 是 SuperHarness 原生 Observability 的上报口（START.md §9：不要重造），
     只影响日志，不参与任何业务判断。
@@ -2648,6 +3495,141 @@ def execute_travel_run(
     resolved_run_id = run_id or new_run_id()
     resolved_store = store or TravelPlanStore()
     resolved_store.create_run(resolved_run_id, user_id=user_id, original_query=query)
+    started = time.perf_counter()
+
+    def progress_hook(
+        stage_id: str,
+        status: str,
+        message: str,
+        facts: dict[str, Any],
+        started_at: str | None,
+        finished_at: str | None,
+        *,
+        error: str | None = None,
+    ) -> None:
+        """把已经发生的节点变化写进轮询状态；观测失败不影响规划。"""
+        try:
+            resolved_store.update_stage(
+                resolved_run_id,
+                stage_id,
+                status,
+                message=message,
+                facts=facts,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+            resolved_store.save_trace_span(
+                resolved_run_id,
+                f"{resolved_run_id}:{stage_id}",
+                component="workflow",
+                name=stage_id,
+                status=status,
+                started_at=started_at or utcnow().isoformat(),
+                finished_at=finished_at,
+                attributes=facts,
+                error=error,
+            )
+        except Exception:
+            # 可观测性是诊断能力，不能反过来把一趟原本可用的旅行规划打成失败。
+            return
+
+    def record_span(
+        *,
+        component: str,
+        name: str,
+        status: str,
+        started_at: str,
+        finished_at: str,
+        attributes: dict[str, Any],
+        parent_span_id: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        """业务级子 span（planner / jev / llm / provider / budget / feasibility / critic / store）。
+
+        span_id 由 (component, name) 决定，因此 Bad Case 能引用一个**稳定可查**的 id，
+        而不是一段描述性文字。
+        """
+
+        try:
+            resolved_store.save_trace_span(
+                resolved_run_id,
+                span_id(resolved_run_id, component, name),
+                component=str(component),
+                name=name,
+                status=status,
+                started_at=started_at,
+                finished_at=finished_at,
+                parent_span_id=parent_span_id,
+                attributes=attributes,
+                error=error,
+            )
+        except Exception:
+            return
+
+    def persist_metrics(
+        *, result_status: str, degradations: list[str], final: dict[str, Any]
+    ) -> dict[str, Any]:
+        """汇总现有 LLM / Provider / Jev 留痕；取不到的 cost/token 保持空而非伪造为 0。
+
+        返回写进库的那份 metrics，供 run 级产物（metrics.json）复用同一份数字。
+        """
+
+        usages = [call.usage or {} for call in getattr(resolved_llm, "calls", [])]
+        # "拿到了 usage 对象"不等于"里面有数字"：假件/部分 Provider 会返回空 usage。
+        # 全是空的时候必须写 None（不知道），不能写 0 —— 0 会被读成"模型没消耗 token"。
+        has_usage = any(bool(usage) for usage in usages)
+        input_tokens = sum(int(usage.get("input_tokens") or 0) for usage in usages)
+        output_tokens = sum(int(usage.get("output_tokens") or 0) for usage in usages)
+        cached_tokens = sum(int(usage.get("cached_tokens") or 0) for usage in usages)
+        provider_calls = resolved_hub.audit_entries()
+        jev_records = [call for call in (final.get("jev_calls") or []) if call.get("attempted")]
+        badcases = list(final.get("badcases") or [])
+        metrics: dict[str, Any] = {
+            "duration_ms": round((time.perf_counter() - started) * 1000),
+            "input_tokens": input_tokens if has_usage else None,
+            "output_tokens": output_tokens if has_usage else None,
+            "cached_tokens": cached_tokens if has_usage else None,
+            "total_tokens": (input_tokens + output_tokens) if has_usage else None,
+            "llm_calls": len(getattr(resolved_llm, "calls", [])),
+            # 只统计**真实发出**的 Jev 调用：SKIPPED / 未配置 不是调用，记 0 才不会高估用量。
+            "jev_calls": len(jev_records),
+            "tool_calls": len(provider_calls),
+            "provider_failures": sum(1 for call in provider_calls if call.get("status") != "OK"),
+            "badcase_count": len(badcases),
+            # 没有 Provider 可核实的 pricing 回执时，cost 必须为 null。
+            "cost": None,
+        }
+        try:
+            resolved_store.save_run_metrics(resolved_run_id, metrics)
+            if result_status == STATUS_COMPLETED and degradations:
+                # 保留 runs.status="completed" 兼容旧 API，只提升管理端状态为 DEGRADED。
+                resolved_store.set_progress_status(
+                    resolved_run_id, "DEGRADED", "规划完成，但部分能力已降级"
+                )
+        except Exception:
+            pass
+        return metrics
+
+    def write_artifacts(final: dict[str, Any], metrics: dict[str, Any]) -> dict[str, str]:
+        """run 级产物落盘。
+
+        只有**产出了 plan 的 run** 才建 `outputs/<run_id>/` 目录：这个目录的语义是
+        "这次跑出了一份行程"。要求澄清或失败的 run 不会伪造一个产物目录 —— 它们的
+        trace/metrics 仍在数据库里，管理端照常可查。
+        """
+
+        if not final.get("plan"):
+            return {}
+        try:
+            return _write_run_artifacts(
+                run_id=resolved_run_id,
+                store=resolved_store,
+                output_dir=Path(output_dir),
+                metrics=metrics,
+                badcases=list(final.get("badcases") or []),
+            )
+        except Exception:
+            return {}
 
     owns_hub = hub is None
     resolved_hub = hub or ProviderHub(
@@ -2657,6 +3639,9 @@ def execute_travel_run(
         emit=emit,
     )
     resolved_llm = llm or LLM.from_env(model, emit=emit)
+    # Jev 客户端总是构造：它自己会在"未配置 / 开关关闭"时返回 SKIPPED，
+    # 所以调用方不需要知道 Jev 是否可用，也永远不会因为它不可用而拿不到行程。
+    resolved_jev = jev or JevClient()
 
     state: TravelState = {
         "run_id": resolved_run_id,
@@ -2667,20 +3652,27 @@ def execute_travel_run(
         "store": resolved_store,
         "hub": resolved_hub,
         "llm": resolved_llm,
+        "jev": resolved_jev,
+        "record_span": record_span,
+        "progress_hook": progress_hook,
         "decisions": [],
         "timeline": [],
         "stages": [],
         "degradations": [],
+        "jev_calls": [],
     }
 
     try:
         final = travel_graph().invoke(state)
     except Exception as exc:  # noqa: BLE001 —— 兜底：任何未预期异常都要如实记录并落一个 failed run
-        resolved_store.finish_run(resolved_run_id, STATUS_FAILED)
+        resolved_store.finish_run(resolved_run_id, STATUS_FAILED, error=f"{type(exc).__name__}: {exc}")
+        metrics = persist_metrics(result_status=STATUS_FAILED, degradations=[], final={})
+        outputs = write_artifacts({}, metrics)
         return RunResult(
             run_id=resolved_run_id,
             status=STATUS_FAILED,
             error=f"{type(exc).__name__}: {exc}",
+            outputs=outputs,
         )
     finally:
         if owns_hub:
@@ -2689,33 +3681,44 @@ def execute_travel_run(
     status = final.get("status") or STATUS_FAILED
     if status == STATUS_NEEDS_CLARIFICATION:
         resolved_store.finish_run(resolved_run_id, STATUS_NEEDS_CLARIFICATION)
+        degradations = list(final.get("degradations") or [])
+        metrics = persist_metrics(result_status=status, degradations=degradations, final=final)
+        outputs = write_artifacts(final, metrics)
         return RunResult(
             run_id=resolved_run_id,
             status=STATUS_NEEDS_CLARIFICATION,
             error=final.get("clarify"),
-            degradations=list(final.get("degradations") or []),
+            outputs={**dict(final.get("outputs") or {}), **outputs},
+            degradations=degradations,
         )
 
     plan = final.get("plan")
     if status != STATUS_COMPLETED:
         # 图走到这里说明它既没 finalize 也没要求澄清：如实落一个 failed run，
         # 而不是把中间态原样回给调用方 —— 否则 runs 行会永远停在 running。
-        resolved_store.finish_run(resolved_run_id, STATUS_FAILED)
+        resolved_store.finish_run(resolved_run_id, STATUS_FAILED, error=f"流程没有正常收尾（图返回 status={status}）")
+        degradations = list(final.get("degradations") or [])
+        metrics = persist_metrics(result_status=STATUS_FAILED, degradations=degradations, final=final)
+        outputs = write_artifacts(final, metrics)
         return RunResult(
             run_id=resolved_run_id,
             status=STATUS_FAILED,
             error=f"流程没有正常收尾（图返回 status={status}）",
-            degradations=list(final.get("degradations") or []),
+            outputs={**dict(final.get("outputs") or {}), **outputs},
+            degradations=degradations,
         )
 
+    degradations = list(final.get("degradations") or [])
+    metrics = persist_metrics(result_status=status, degradations=degradations, final=final)
+    outputs = write_artifacts(final, metrics)
     return RunResult(
         run_id=resolved_run_id,
         status=status,
         plan=plan,
         plan_md=final.get("plan_md") or "",
         audit=final.get("audit") or {},
-        outputs=dict(final.get("outputs") or {}),
-        degradations=list(final.get("degradations") or []),
+        outputs={**dict(final.get("outputs") or {}), **outputs},
+        degradations=degradations,
     )
 
 

@@ -81,6 +81,11 @@ export function PlanningProgress({ steps, className }: PlanningProgressProps) {
                   >
                     {step.label}
                   </p>
+                  {step.unknown ? (
+                    <p className="mt-0.5 text-[11px] leading-5 text-warning-subtle-foreground">
+                      后端本次新增的阶段，前端清单尚未收录
+                    </p>
+                  ) : null}
                   {step.facts?.length ? (
                     <ul className="mt-1 flex flex-wrap gap-x-3 gap-y-1">
                       {step.facts.map((fact) => (
@@ -89,6 +94,8 @@ export function PlanningProgress({ steps, className }: PlanningProgressProps) {
                         </li>
                       ))}
                     </ul>
+                  ) : step.description ? (
+                    <p className="mt-1 text-xs leading-5 text-muted-foreground">{step.description}</p>
                   ) : null}
                 </div>
                 <StatusLabel status={step.status} />

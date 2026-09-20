@@ -35,7 +35,9 @@ interface PlanWorkspaceProps {
  * 不计算 Trust / Ad Risk / 可行性 / 预算，也不生成任何行程内容。
  */
 export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
-  const [activeDay, setActiveDay] = useState(0);
+  // 存的是后端的 day_index 值，不是数组下标：后端不保证 day_index 从 0 开始，
+  // 按下标取会读到错误的一天，而 warning 的 day_index 也需要按值对齐。
+  const [activeDayIndex, setActiveDayIndex] = useState<number>(() => plan.days[0]?.day_index ?? 0);
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
   const [lockedItemIds, setLockedItemIds] = useState<string[]>([]);
 
@@ -53,10 +55,16 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
   const [revising, setRevising] = useState(false);
   const [reviseMessage, setReviseMessage] = useState<string | null>(null);
 
-  const day = plan.days[activeDay] ?? null;
+  // intent / budget / warnings 在降级路径下可能缺失：这里按空值兜底，避免整页崩溃。
+  // 用 useMemo 固定引用，否则 `?? []` 每次渲染都会生成新数组，连带下游 memo 失效。
+  const days = useMemo(() => plan.days ?? [], [plan.days]);
+  const warnings = useMemo(() => plan.warnings ?? [], [plan.warnings]);
+  const sources = useMemo(() => plan.sources ?? [], [plan.sources]);
+  const day = days.find((entry) => entry.day_index === activeDayIndex) ?? days[0] ?? null;
+  const activeDayPosition = day ? Math.max(days.findIndex((entry) => entry.day_index === day.day_index), 0) : 0;
   const fetchedAt = useMemo(
-    () => plan.sources.find((source) => source.fetched_at)?.fetched_at ?? plan.generated_at,
-    [plan.sources, plan.generated_at],
+    () => sources.find((source) => source.fetched_at)?.fetched_at ?? plan.generated_at,
+    [sources, plan.generated_at],
   );
 
   const mapPoints: MapPoint[] = useMemo(
@@ -94,8 +102,8 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
 
   const sourcesOfItem = useCallback(
     (item: ItineraryItem | null) =>
-      item ? plan.sources.filter((source) => item.source_ids.includes(source.source_id)) : [],
-    [plan.sources],
+      item ? sources.filter((source) => item.source_ids.includes(source.source_id)) : [],
+    [sources],
   );
 
   function openEvidence(item: ItineraryItem) {
@@ -119,7 +127,7 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
 
   function requestRevise(item: ItineraryItem, action: ReviseTarget["action"]) {
     setReviseMessage(null);
-    setReviseTarget({ action, itemId: item.id, dayIndex: day?.day_index ?? activeDay });
+    setReviseTarget({ action, itemId: item.id, dayIndex: day?.day_index ?? activeDayIndex });
   }
 
   const confirmRevise = useCallback(
@@ -144,7 +152,7 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
     [plan.run_id],
   );
 
-  const dayLabel = day ? `Day ${activeDay + 1}` : "";
+  const dayLabel = day ? `Day ${activeDayPosition + 1}` : "";
 
   return (
     <div className="space-y-5 pb-24 lg:pb-6">
@@ -173,7 +181,7 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
             icon={ListChecks}
             description="按时间顺序排列，段间交通与停留时长都来自后端计算结果。"
           >
-            <DayTabs days={plan.days} activeDay={activeDay} onChange={setActiveDay} />
+            <DayTabs days={days} activeDayIndex={day?.day_index ?? activeDayIndex} onChange={setActiveDayIndex} />
             <div className="mt-4">
               <ItineraryTimeline
                 day={day}
@@ -196,10 +204,12 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
 
           <div id="feasibility">
             <FeasibilityAlert
-              warnings={plan.warnings}
-              days={plan.days}
+              warnings={warnings}
+              days={days}
               onJumpToItem={(dayIndex, itemId) => {
-                setActiveDay(dayIndex);
+                // dayIndex 是 warning.day_index（后端值），必须按值选中，
+                // 不能当成数组下标，否则 day_index 不从 0 开始时跳到别的一天。
+                setActiveDayIndex(dayIndex);
                 setSelectedItemId(itemId);
                 scrollTo("itinerary");
               }}
@@ -228,7 +238,7 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
         <div className="space-y-5">
           <SelectedHotelCard
             hotel={plan.hotel}
-            sources={plan.sources}
+            sources={sources}
             onOpenCompare={() => setHotelOpen(true)}
             onOpenSource={openSources}
           />
@@ -250,11 +260,11 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
             <TransportSummary plan={plan} />
           </SectionCard>
 
-          {plan.warnings.filter((warning) => !warning.resolved).length ? (
+          {warnings.filter((warning) => !warning.resolved).length ? (
             <div className="flex items-start gap-2 rounded-xl border border-warning/25 bg-warning-subtle/70 px-3.5 py-3 text-xs leading-5">
               <CircleAlert className="mt-0.5 size-3.5 shrink-0 text-warning-subtle-foreground" aria-hidden />
               <span className="text-warning-subtle-foreground">
-                本次有 {plan.warnings.filter((warning) => !warning.resolved).length} 项未解决的问题，
+                本次有 {warnings.filter((warning) => !warning.resolved).length} 项未解决的问题，
                 已在「时间与可行性检查」中逐条说明，并给出原计划与调整建议。
               </span>
             </div>
@@ -262,14 +272,21 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
         </div>
       </div>
 
-      <BudgetCard budget={plan.budget} scopeLabel="2 人合计" />
+      {plan.budget ? (
+        <BudgetCard budget={plan.budget} scopeLabel="2 人合计" />
+      ) : (
+        <PartialNotice
+          title="这次没有返回预算汇总"
+          description="交通、住宿与门票的候选仍然可见，但无法给出总额与预算余量。可以重新规划一次以获取完整预算。"
+        />
+      )}
 
       <TransportCompare
         open={transportOpen}
         onOpenChange={setTransportOpen}
         transport={plan.transport}
-        travelers={plan.intent.travelers}
-        sources={plan.sources}
+        travelers={plan.intent?.travelers ?? 0}
+        sources={sources}
         onOpenSource={openSources}
       />
 
@@ -277,7 +294,7 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
         open={hotelOpen}
         onOpenChange={setHotelOpen}
         hotel={plan.hotel}
-        sources={plan.sources}
+        sources={sources}
         onOpenSource={openSources}
         onRequestChange={(hotel) => {
           setHotelOpen(false);
@@ -298,6 +315,7 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
         onOpenChange={setPlaceOpen}
         item={placeItem}
         day={day}
+        dayLabel={dayLabel}
         sources={sourcesOfItem(placeItem)}
         evidence={placeItem ? getEvidence(plan, placeItem.evidence_ids) : []}
         onOpenEvidence={() => {
@@ -312,7 +330,7 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
       <SourcesDrawer
         open={sourcesOpen}
         onOpenChange={setSourcesOpen}
-        sources={plan.sources}
+        sources={sources}
         generatedAt={plan.generated_at}
         highlightSourceId={highlightSourceId}
       />

@@ -1,0 +1,24 @@
+# 构建上下文瘦身：镜像里只该有"跑服务需要的东西"。
+# 注意 super_harness/ 不能排除 —— requirements.txt 里有 `-e ./super_harness[mcp]`。
+.git
+.gitignore
+frontend/
+benchmark/
+docs/
+tests/
+data/
+outputs/
+_acceptance/
+*.md
+!README.md
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.*
+*.log
+_tmp_request.json
+Dockerfile
+.dockerignore

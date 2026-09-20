@@ -377,6 +377,60 @@ def test_get_plan_returns_stored_plan_and_markdown(client: Any) -> None:
     assert body["plan_md"].strip()
 
 
+def test_run_status_exposes_real_workflow_stage_progress(client: Any) -> None:
+    """轮询状态来自节点包装器的真实开始/结束事件，不是前端计时器模拟。"""
+    response = client.get("/api/v1/plans/api-fixture-run/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] in {"SUCCESS", "DEGRADED"}
+    stages = {stage["stage_id"]: stage for stage in body["stages"]}
+    assert set(stages) >= {"parse_intent", "search_intercity_transport", "finalize"}
+    assert stages["parse_intent"]["status"] in {"SUCCESS", "WARNING"}
+    assert stages["finalize"]["finished_at"]
+
+
+def test_background_create_returns_run_id_without_faking_completion(
+    client: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """后台模式应返回 RUNNING，真实完成由 status endpoint 后续观察。"""
+    from app import api as api_module
+
+    submitted: dict[str, Any] = {}
+
+    class StubExecutor:
+        def submit(self, fn: Any, *args: Any) -> None:
+            submitted["fn"] = fn
+            submitted["args"] = args
+
+    monkeypatch.setattr(api_module, "_RUN_EXECUTOR", StubExecutor())
+    monkeypatch.setattr(api_module, "new_run_id", lambda: "background-run")
+
+    response = client.post("/api/v1/plans", json={"message": QUERY, "background": True})
+    assert response.status_code == 202
+    assert response.json()["run_id"] == "background-run"
+    assert response.json()["status"] == "RUNNING"
+    assert submitted["args"] == ("background-run", QUERY)
+
+    progress = client.get("/api/v1/plans/background-run/status")
+    assert progress.status_code == 200
+    assert progress.json()["status"] == "RUNNING"
+
+
+def test_admin_api_requires_token_and_does_not_expose_secrets(
+    client: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TRAVELPLAN_ADMIN_TOKEN", "admin-test-token")
+    monkeypatch.setenv("JEV_API_KEY", "never-return-this")
+
+    assert client.get("/api/v1/admin/overview").status_code == 401
+    response = client.get(
+        "/api/v1/admin/config", headers={"Authorization": "Bearer admin-test-token"}
+    )
+    assert response.status_code == 200
+    assert response.json()["secret_configured"]["jev"] is True
+    assert "never-return-this" not in response.text
+
+
 def test_get_plan_404_for_unknown_run(client: Any) -> None:
     assert client.get("/api/v1/plans/tp-does-not-exist").status_code == 404
 

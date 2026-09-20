@@ -5,6 +5,7 @@ import { ArrowRight, ChevronDown, SlidersHorizontal, Sparkles } from "lucide-rea
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { CityCombobox } from "@/components/city-combobox";
 import { cn } from "@/lib/utils";
 
 const EXAMPLES = [
@@ -150,13 +151,19 @@ export function TripSearch({ onSubmit, submitting = false }: TripSearchProps) {
           <div className="mt-3 grid gap-4 border-t border-border/70 pt-4">
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
               <Field label="出发地">
-                <Input value={origin} onChange={(event) => setOrigin(event.target.value)} placeholder="北京" />
+                <CityCombobox
+                  value={origin}
+                  onChange={setOrigin}
+                  placeholder="北京"
+                  ariaLabel="出发地"
+                />
               </Field>
               <Field label="目的地">
-                <Input
+                <CityCombobox
                   value={destination}
-                  onChange={(event) => setDestination(event.target.value)}
+                  onChange={setDestination}
                   placeholder="成都"
+                  ariaLabel="目的地"
                 />
               </Field>
               <Field label="出发日期">

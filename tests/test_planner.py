@@ -1665,8 +1665,15 @@ class TestReviseDay:
         assert resolve_issue.resolved is True
         assert "移除该 item" in resolve_issue.reason
 
-    def test_unsolvable_issues_stay_unresolved(self):
-        """LAST_ENTRY_MISSED 是硬约束：不假装修好了，交给 Critic 判断。"""
+    def test_opening_hours_conflict_removes_the_item_and_records_it(self):
+        """营业时间来不及的点必须**从行程里移除**，而不是"报个错但留着"。
+
+        早先的实现把 LAST_ENTRY_MISSED / CLOSING_TIME_OVERRUN 保持未解决，理由是
+        "不假装修好了"。但用户拿到的 plan 里因此会出现"17:51 去一个 18:00 关门的祠堂"
+        这种条目 —— 我们自己的检查判它是 error，行程里却照样写着。真实数据里寺庙
+        18:00 关门很常见，历史 run 每一次都留下了这类未解决冲突，所以改成
+        "排不下就不排"，并如实说明为什么少了一个点。
+        """
         places = {"P1": make_place("P1", "只能早进", opening_hours="10:00-18:00 最晚进入13:00")}
         day = make_day([make_item("a", type="attraction", place_id="P1", name="只能早进",
                                   start_time="14:00", duration_minutes=60)])
@@ -1674,8 +1681,17 @@ class TestReviseDay:
 
         revised, final = revise_day(day, issues, places=places)
 
-        assert "LAST_ENTRY_MISSED" in codes(check_feasibility(revised, places=places))
-        assert next(i for i in final if i.code == "LAST_ENTRY_MISSED").resolved is False
+        # 1) 行程里不再有那个安排不下的点；
+        assert revised.item_by_id("a") is None
+        # 2) 重新检查不会再有这个冲突（这才是"修好了"的证明）；
+        assert "LAST_ENTRY_MISSED" not in codes(check_feasibility(revised, places=places))
+        # 3) 决策链里如实记下修订动作与原因，而不是静默消失。
+        issue = next(i for i in final if i.code == "LAST_ENTRY_MISSED")
+        assert issue.resolved is True
+        assert "已从当天移除" in issue.reason
+        assert any("因营业时间内安排不下已移除" in note for note in revised.notes)
+        # 4) 一天的点全被移除时给一条机动时间，而不是渲染成空白卡片。
+        assert any(item.type == "free_time" for item in revised.items)
 
     def test_revision_records_original_and_revised_start(self):
         day = make_day([make_item("a", type="attraction", place_id="P1", name="A",

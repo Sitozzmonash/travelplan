@@ -8,14 +8,17 @@ import { formatDateShort, formatWeekday } from "@/lib/format";
 
 interface DayTabsProps {
   days: ItineraryDay[];
-  activeDay: number;
-  onChange: (index: number) => void;
+  /** 当前选中天的 day_index 值（后端字段），不是数组下标。 */
+  activeDayIndex: number;
+  onChange: (dayIndex: number) => void;
 }
 
 /** Day 导航（FRONTEND_DESIGN §10）：Tab + 横向滚动，移动端同样横向滚动。 */
-export function DayTabs({ days, activeDay, onChange }: DayTabsProps) {
+export function DayTabs({ days, activeDayIndex, onChange }: DayTabsProps) {
   const scrollerRef = useRef<HTMLDivElement>(null);
-  const current = days[activeDay];
+  const matched = days.findIndex((entry) => entry.day_index === activeDayIndex);
+  const currentPosition = matched >= 0 ? matched : 0;
+  const current = days[currentPosition];
 
   function scrollBy(delta: number) {
     scrollerRef.current?.scrollBy({ left: delta, behavior: "smooth" });
@@ -29,12 +32,12 @@ export function DayTabs({ days, activeDay, onChange }: DayTabsProps) {
           className="flex gap-1.5 overflow-x-auto scroll-smooth pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
         >
           {days.map((day, index) => {
-            const active = index === activeDay;
+            const active = day.day_index === activeDayIndex;
             return (
               <button
                 key={day.day_index}
                 type="button"
-                onClick={() => onChange(index)}
+                onClick={() => onChange(day.day_index)}
                 aria-current={active}
                 className={cn(
                   "flex shrink-0 flex-col items-start rounded-lg border px-3 py-2 text-left transition-colors",
@@ -77,7 +80,7 @@ export function DayTabs({ days, activeDay, onChange }: DayTabsProps) {
 
       {current?.area ? (
         <p className="mt-2 truncate text-xs text-muted-foreground">
-          Day {activeDay + 1} · {current.area}
+          Day {currentPosition + 1} · {current.area}
         </p>
       ) : null}
     </div>

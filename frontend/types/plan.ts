@@ -250,15 +250,19 @@ export interface Decision {
 export interface TripPlan {
   run_id: string;
   query: string;
-  intent: TripIntent;
+  /**
+   * 以下四项在降级路径下可能整体缺失（后端尚未产出或产出失败），
+   * 因此它们是可选的：使用方必须按空值处理，而不是假定一定存在。
+   */
+  intent?: TripIntent;
   transport: TransportPlan | null;
   hotel: HotelPlan | null;
   days: ItineraryDay[];
-  budget: BudgetSummary;
-  warnings: Warning[];
+  budget?: BudgetSummary;
+  warnings?: Warning[];
   sources: SourceRef[];
   generated_at: string;
-  decisions: Decision[];
+  decisions?: Decision[];
   /**
    * 证据明细（Evidence Store）。后端可随 plan.json 一起返回，
    * 前端只读取用于 Evidence Drawer，不做任何可信度计算。

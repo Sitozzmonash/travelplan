@@ -3,49 +3,70 @@
 import { useRouter } from "next/navigation";
 import { useCallback, useState } from "react";
 import { CircleAlert, Database, Lock, ShieldCheck, Sparkles } from "lucide-react";
-import type { PlanningStepState } from "@/types/api";
-import { API_BASE_URL, API_MODE, createPlan, createPlanningSteps, describeApiError } from "@/lib/api";
+import type { CreatePlanResult, PlanningStepState } from "@/types/api";
+import {
+  API_BASE_URL,
+  API_MODE,
+  type ApiErrorKind,
+  apiErrorKind,
+  createPlan,
+  createPlanningSteps,
+  describeApiError,
+  mergeProgressEvent,
+} from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { PlanningProgress } from "@/components/planning-progress";
 import { SectionCard } from "@/components/section-card";
-import { ErrorState } from "@/components/state-views";
+import { ErrorState, PartialNotice, RunStatusBadge, UnauthorizedState } from "@/components/state-views";
 import { TripSearch } from "@/components/trip-search";
 
-type Phase = "idle" | "planning" | "error";
+type Phase = "idle" | "planning" | "result" | "error";
 
 export default function HomePage() {
   const router = useRouter();
   const [phase, setPhase] = useState<Phase>("idle");
   const [steps, setSteps] = useState<PlanningStepState[]>(() => createPlanningSteps());
   const [query, setQuery] = useState("");
+  /**
+   * 已经跑完但没有直接进入工作台的 run：DEGRADED 需要先把降级原因说清楚，
+   * FAILED / CANCELLED 需要按各自的状态渲染，不能一律说成「服务出错」。
+   */
+  const [result, setResult] = useState<CreatePlanResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [errorKind, setErrorKind] = useState<ApiErrorKind | null>(null);
 
   const runPlanning = useCallback(
     async (message: string) => {
       setQuery(message);
       setSteps(createPlanningSteps());
+      setResult(null);
       setError(null);
+      setErrorKind(null);
       setPhase("planning");
       try {
-        const result = await createPlan(message, {
+        const created = await createPlan(message, {
           onProgress: (event) => {
-            setSteps((current) =>
-              current.map((step) =>
-                step.id === event.step_id
-                  ? { ...step, status: event.status, facts: event.facts ?? step.facts }
-                  : step,
-              ),
-            );
+            setSteps((current) => mergeProgressEvent(current, event));
           },
         });
-        router.push(`/plan/${encodeURIComponent(result.run_id)}`);
+        if (created.status === "SUCCESS" && created.plan) {
+          router.push(`/plan/${encodeURIComponent(created.run_id)}`);
+          return;
+        }
+        setResult(created);
+        setPhase("result");
       } catch (cause) {
         setError(describeApiError(cause));
+        setErrorKind(apiErrorKind(cause));
         setPhase("error");
       }
     },
     [router],
   );
+
+  function openPlan(runId: string) {
+    router.push(`/plan/${encodeURIComponent(runId)}`);
+  }
 
   return (
     <div className="relative">
@@ -79,6 +100,7 @@ export default function HomePage() {
               title="正在规划"
               icon={Sparkles}
               description={query ? `需求：${query}` : undefined}
+              action={<RunStatusBadge status="RUNNING" />}
               className="shadow-sm"
             >
               <PlanningProgress steps={steps} />
@@ -93,15 +115,80 @@ export default function HomePage() {
             </SectionCard>
           ) : null}
 
+          {phase === "result" && result ? (
+            <SectionCard
+              title={result.status === "DEGRADED" ? "行程已生成，但本次有降级" : "这次没有生成行程"}
+              icon={Sparkles}
+              description={query ? `需求：${query}` : undefined}
+              action={<RunStatusBadge status={result.status} />}
+              className="shadow-sm"
+            >
+              {result.status === "DEGRADED" ? (
+                <>
+                  <PartialNotice
+                    title="规划完成，但有阶段返回了降级数据"
+                    description={result.message ?? "部分 Provider 本次只返回了缓存或部分数据，行程仍然可用。"}
+                    detail="降级会影响个别价格或通勤时间的准确性，出行前请再次确认。"
+                  />
+                  {result.degradations?.length ? (
+                    <ul className="mt-3 grid gap-1.5">
+                      {result.degradations.map((item) => (
+                        <li key={item} className="flex gap-2 text-xs leading-5 text-muted-foreground">
+                          <span className="text-border">·</span>
+                          <span className="min-w-0">{item}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                </>
+              ) : (
+                <ErrorState
+                  title={result.status === "CANCELLED" ? "这次规划被取消" : "规划在生成过程中失败"}
+                  description={
+                    result.message ??
+                    (result.status === "CANCELLED"
+                      ? "后端取消了这次规划任务，通常是服务重启或任务被手动终止。可以重新规划一次。"
+                      : "规划服务在生成过程中出错，本次没有产出可用行程。可以重新规划一次。")
+                  }
+                  detail={`run_id：${result.run_id}`}
+                  onRetry={() => runPlanning(query)}
+                  retryLabel="重新规划"
+                />
+              )}
+
+              <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-border/70 pt-3">
+                <PlanningProgress steps={steps} className="w-full border-0 bg-transparent shadow-none" />
+                <div className="flex flex-wrap items-center gap-2">
+                  {result.plan ? (
+                    <Button size="sm" onClick={() => openPlan(result.run_id)}>
+                      打开行程
+                    </Button>
+                  ) : null}
+                  <Button variant="ghost" size="sm" onClick={() => setPhase("idle")}>
+                    返回修改需求
+                  </Button>
+                </div>
+              </div>
+            </SectionCard>
+          ) : null}
+
           {phase === "error" ? (
             <div className="space-y-3">
-              <ErrorState
-                title="这次没有生成行程"
-                description={error ?? "规划服务没有返回结果，本次没有产出可用行程。"}
-                detail={`规划服务地址：${API_BASE_URL}`}
-                onRetry={() => runPlanning(query)}
-                retryLabel="重新规划"
-              />
+              {errorKind === "unauthorized" ? (
+                <UnauthorizedState
+                  title="没有权限访问规划服务"
+                  description={error ?? "规划服务拒绝了这次请求。"}
+                  detail={`规划服务地址：${API_BASE_URL}`}
+                />
+              ) : (
+                <ErrorState
+                  title="这次没有生成行程"
+                  description={error ?? "规划服务没有返回结果，本次没有产出可用行程。"}
+                  detail={`规划服务地址：${API_BASE_URL}`}
+                  onRetry={() => runPlanning(query)}
+                  retryLabel="重新规划"
+                />
+              )}
               <Button variant="ghost" size="sm" onClick={() => setPhase("idle")}>
                 返回修改需求
               </Button>

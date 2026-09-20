@@ -12,20 +12,38 @@
  * 这里不保存、不引用任何 Provider Secret（AMAP / TikHub / 途牛等一律由后端持有）。
  */
 
-import type { AuditReport, CreatePlanResult, PlanProgressEvent, PlanningStepState, ReviseRequest, ReviseResult } from "@/types/api";
+import type {
+  AuditReport,
+  CreatePlanResult,
+  PlanProgressEvent,
+  PlanningStepState,
+  ReviseRequest,
+  ReviseResult,
+  RunProgress,
+  RunStageProgress,
+  RunStatus,
+  StepStatus,
+} from "@/types/api";
 import type { Evidence, TripPlan } from "@/types/plan";
-import { MOCK_STEP_DELAY_MS, MOCK_STEP_RESULTS, initialStepStates } from "./mock/progress";
+import { MOCK_STEP_DELAY_MS, MOCK_STEP_RESULTS, initialStepStates, stageLabel } from "./mock/progress";
 import { mockAudit } from "./mock/audit";
 import { mockPlan } from "./mock/plan";
 
 export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 
 /** true = 使用内置演示数据；false = 全部请求发往 FastAPI。 */
-export const USE_MOCK_API = (process.env.NEXT_PUBLIC_USE_MOCK_API ?? "true") !== "false";
+export const USE_MOCK_API = (process.env.NEXT_PUBLIC_USE_MOCK_API ?? "false") !== "false";
 
 export const API_MODE: "mock" | "live" = USE_MOCK_API ? "mock" : "live";
 
-export type ApiErrorKind = "network" | "not_found" | "endpoint_missing" | "server" | "invalid" | "timeout";
+export type ApiErrorKind =
+  | "network"
+  | "not_found"
+  | "endpoint_missing"
+  | "unauthorized"
+  | "server"
+  | "invalid"
+  | "timeout";
 
 export class ApiError extends Error {
   readonly kind: ApiErrorKind;
@@ -93,6 +111,15 @@ async function request<T>(path: string, options: RequestOptions<T>): Promise<T> 
         notFound ? `${method} ${path} 返回 404：${notFound.note}` : `${method} ${path} 返回 404`,
       );
     }
+    // 401 / 403 是权限问题，不是服务端故障：必须单独分类，否则会对用户说成「服务出错」。
+    if (response.status === 401 || response.status === 403) {
+      const text = await response.text().catch(() => "");
+      throw new ApiError(
+        "没有访问规划服务的权限",
+        "unauthorized",
+        `${method} ${path} 返回 ${response.status} ${text.slice(0, 200)}`,
+      );
+    }
     if (!response.ok) {
       const text = await response.text().catch(() => "");
       throw new ApiError("规划服务返回异常", "server", `${method} ${path} 返回 ${response.status} ${text.slice(0, 200)}`);
@@ -130,18 +157,23 @@ function isCreatePlanResult(value: unknown): value is CreatePlanResult {
   return value.plan === null || isRecord(value.plan);
 }
 
+function isRunProgress(value: unknown): value is RunProgress {
+  if (!isRecord(value) || typeof value.run_id !== "string" || typeof value.status !== "string") return false;
+  return Array.isArray(value.stages);
+}
+
+/**
+ * 只校验「这份结果能不能渲染」：run_id / query / days 缺一不可。
+ * intent、budget、warnings、decisions 等属于可选产出：降级路径下后端可能整块省略，
+ * 若把它们也算作 invalid，用户会连已有的行程都看不到。缺失值由使用方按空值处理。
+ */
 function isTripPlan(value: unknown): value is TripPlan {
   return (
     isRecord(value) &&
     typeof value.run_id === "string" &&
+    value.run_id.length > 0 &&
     typeof value.query === "string" &&
-    isRecord(value.intent) &&
-    Array.isArray(value.days) &&
-    isRecord(value.budget) &&
-    Array.isArray(value.warnings) &&
-    Array.isArray(value.sources) &&
-    Array.isArray(value.decisions) &&
-    typeof value.generated_at === "string"
+    Array.isArray(value.days)
   );
 }
 
@@ -176,6 +208,8 @@ export function describeApiError(error: unknown): string {
         return "这个行程编号没有对应的规划结果。它可能已经过期，或者链接不完整。请返回首页重新生成一次。";
       case "endpoint_missing":
         return `找不到创建规划的接口。请确认后端地址（${API_BASE_URL}）是否正确，或后端是否已部署最新版本。`;
+      case "unauthorized":
+        return "规划服务拒绝了这次请求（401 / 403）。请确认当前环境使用的是有权限的访问地址或凭据，然后重试。";
       case "network":
         return `暂时无法连接规划服务（${API_BASE_URL}）。请确认后端已启动，或稍后重试。`;
       case "timeout":
@@ -190,24 +224,144 @@ export function describeApiError(error: unknown): string {
   return "发生了未预期的错误，本次无法展示行程。";
 }
 
+/** 供页面选择状态视图用：401/403 应渲染 Unauthorized，而不是通用的服务错误。 */
+export function apiErrorKind(error: unknown): ApiErrorKind | null {
+  return error instanceof ApiError ? error.kind : null;
+}
+
 export interface CreatePlanOptions {
   /** 规划过程回调。接 FastAPI 后由真实进度驱动，当前 mock 版为合理模拟。 */
   onProgress?: (event: PlanProgressEvent) => void;
+  /**
+   * 轮询期间的继续条件。页面卸载后返回 false 即可停止轮询，
+   * 避免用户在离开「仍在生成中」页面后仍在后台反复请求 /status。
+   */
+  shouldContinue?: () => boolean;
 }
 
 /**
  * 规划步骤清单（FRONTEND_DESIGN §6）。
- * mock 与真实后端共用同一份步骤定义，进度事件按 step_id 更新状态。
+ * mock 与真实后端共用同一份步骤定义，进度事件按 stage_id 更新状态。
  */
 export function createPlanningSteps(): PlanningStepState[] {
   return initialStepStates();
+}
+
+/**
+ * 把一个进度事件合并进步骤清单。
+ * 后端新增前端还不认识的 stage 时追加一行，而不是把事件丢掉：
+ * 丢掉的后果是这一行永远停在「等待」，用户以为规划卡住了。
+ */
+export function mergeProgressEvent(
+  steps: PlanningStepState[],
+  event: PlanProgressEvent,
+): PlanningStepState[] {
+  const index = steps.findIndex((step) => step.id === event.step_id);
+  if (index === -1) {
+    return [
+      ...steps,
+      {
+        id: event.step_id,
+        label: event.label ?? stageLabel(event.step_id),
+        description: event.description,
+        status: event.status,
+        facts: event.facts,
+        unknown: true,
+      },
+    ];
+  }
+  const next = steps.slice();
+  const current = next[index];
+  next[index] = { ...current, status: event.status, facts: event.facts ?? current.facts };
+  return next;
+}
+
+function toStepStatus(status: RunStageProgress["status"]): StepStatus {
+  const statuses: Record<RunStageProgress["status"], StepStatus> = {
+    WAITING: "waiting",
+    RUNNING: "running",
+    SUCCESS: "success",
+    WARNING: "warning",
+    FAILED: "error",
+  };
+  return statuses[status];
+}
+
+function progressFacts(stage: RunStageProgress): string[] {
+  const facts = Object.entries(stage.facts ?? {}).map(([label, value]) => `${label}：${String(value)}`);
+  return stage.message ? [stage.message, ...facts] : facts;
+}
+
+function emitProgress(progress: RunProgress, onProgress?: CreatePlanOptions["onProgress"]): void {
+  for (const stage of progress.stages) {
+    onProgress?.({
+      step_id: stage.stage_id,
+      status: toStepStatus(stage.status),
+      facts: progressFacts(stage),
+      label: stageLabel(stage.stage_id),
+    });
+  }
+}
+
+/** DEGRADED 时要能说清「哪一步降级了」，只给一个状态码对用户没有意义。 */
+function collectDegradations(progress: RunProgress): string[] {
+  return progress.stages
+    .filter((stage) => stage.status === "WARNING" || stage.status === "FAILED")
+    .map((stage) => {
+      const detail = stage.message || progressFacts(stage).join("；");
+      return detail ? `${stageLabel(stage.stage_id)}：${detail}` : stageLabel(stage.stage_id);
+    });
+}
+
+const DONE_STATUSES: RunStatus[] = ["SUCCESS", "DEGRADED"];
+const STOPPED_STATUSES: RunStatus[] = ["FAILED", "CANCELLED"];
+
+/**
+ * 轮询 run 状态直到终态（createPlan 与「仍在生成中」页面共用同一份逻辑）。
+ *
+ * FAILED / CANCELLED 返回结果而不是抛异常：调用方要按状态分别渲染，
+ * 统一抛成 ApiError 只会让用户看到一句笼统的「服务出错」，看不出是失败还是被取消。
+ */
+export async function waitForRun(runId: string, options: CreatePlanOptions = {}): Promise<CreatePlanResult> {
+  const started = Date.now();
+  while (Date.now() - started < PLAN_TIMEOUT_MS) {
+    if (options.shouldContinue && !options.shouldContinue()) {
+      throw new ApiError("已停止查询规划状态", "timeout", `run_id=${runId} 的轮询被调用方终止`);
+    }
+    const progress: RunProgress = await getPlanStatus(runId);
+    emitProgress(progress, options.onProgress);
+    if (DONE_STATUSES.includes(progress.status)) {
+      return {
+        run_id: runId,
+        status: progress.status,
+        plan: await getPlan(runId),
+        message: progress.message,
+        degradations: progress.status === "DEGRADED" ? collectDegradations(progress) : undefined,
+      };
+    }
+    if (STOPPED_STATUSES.includes(progress.status)) {
+      return {
+        run_id: runId,
+        status: progress.status,
+        plan: null,
+        message: progress.error ?? progress.message,
+        degradations: collectDegradations(progress),
+      };
+    }
+    await delay(900);
+  }
+  throw new ApiError(
+    "规划请求超时",
+    "timeout",
+    `run_id=${runId} 超过 ${PLAN_TIMEOUT_MS / 1000} 秒仍未结束`,
+  );
 }
 
 export async function createPlan(message: string, options: CreatePlanOptions = {}): Promise<CreatePlanResult> {
   if (!USE_MOCK_API) {
     const payload = await request<CreatePlanResult>("/api/v1/plans", {
       method: "POST",
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ message, background: true }),
       validate: isCreatePlanResult,
       timeoutMs: PLAN_TIMEOUT_MS,
       notFound: {
@@ -216,22 +370,33 @@ export async function createPlan(message: string, options: CreatePlanOptions = {
         note: "创建接口不存在，通常是 API Base URL 配置错误或后端部署过期。",
       },
     });
-    if (!payload.plan) {
-      const plan = await getPlan(payload.run_id);
-      return { ...payload, plan };
-    }
-    return payload;
+    return waitForRun(payload.run_id, options);
   }
 
   for (const [stepId, result] of Object.entries(MOCK_STEP_RESULTS)) {
-    options.onProgress?.({ step_id: stepId, status: "running" });
+    options.onProgress?.({ step_id: stepId, status: "running", label: stageLabel(stepId) });
     await delay(MOCK_STEP_DELAY_MS[stepId] ?? 600);
-    options.onProgress?.({ step_id: stepId, status: result.status, facts: result.facts });
+    options.onProgress?.({
+      step_id: stepId,
+      status: result.status,
+      facts: result.facts,
+      label: stageLabel(stepId),
+    });
   }
 
   const plan = clone(mockPlan);
   plan.query = message;
-  return { run_id: plan.run_id, status: "completed", plan };
+  return { run_id: plan.run_id, status: "SUCCESS", plan };
+}
+
+export async function getPlanStatus(id: string): Promise<RunProgress> {
+  if (USE_MOCK_API) {
+    throw new ApiError("演示模式没有运行状态接口", "invalid");
+  }
+  return request<RunProgress>(`/api/v1/plans/${encodeURIComponent(id)}/status`, {
+    method: "GET",
+    validate: isRunProgress,
+  });
 }
 
 function isKnownMockRun(id: string): boolean {

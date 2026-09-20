@@ -57,29 +57,81 @@ OUTBOUND_OFF_DATE（发车日与约定日不符却不明说）
 
 这些对应 `docs/ACCEPTANCE.md` §36.7 已定位并修复/未修复的条目，**每条都能在 `tests/` 找到或补一个硬断言**。
 
+### 2.5 Case 数据格式（`benchmark/cases/*.json`）
+
+每个 case 一个 JSON 文件，约好字段后下一步 Agent 就能直接生成、执行器直接读，不再重新设计：
+
+```json
+{
+  "case_id": "hard-003-cross-midnight",
+  "query": "10月1日从北京去成都玩5天…",
+  "tags": ["hard", "cross_midnight", "red_eye"],
+  "fixtures": {
+    "date": "2026-10-01",
+    "providers": {
+      "railway_12306": "mock|live|fail",
+      "tuniu": "mock|live|fail",
+      "tikhub": "mock|live|free_credit_0",
+      "mediacrawler": "unavailable",
+      "amap": "mock|live|route_unavailable",
+      "llm": "mock|live|timeout"
+    }
+  },
+  "expected_constraints": {
+    "has_outbound": true,
+    "has_inbound": true,
+    "has_hotel": true,
+    "first_day_is_transit_day": true,
+    "no_activity_before_arrival": true,
+    "hard_time_conflict_free": true,
+    "opening_hours_respected": true,
+    "budget_math_consistent": true,
+    "max_consecutive_same_type": 2
+  },
+  "judge_rules": {
+    "hard": "rule", 
+    "plan_quality": "rule+llm",
+    "ux": "llm"
+  }
+}
+```
+
+字段说明：
+
+- `fixtures.providers` 决定该 case 走 Deterministic/Mock 还是 Live（见 §7），以及要不要注入 Provider Failure（`fail` / `timeout` / `free_credit_0` / `route_unavailable`）——对应 §2.C 的 6 种故障。
+- `expected_constraints` 是**可机器判定的期望**：执行器把 run 产物逐条对照生成负向指标；判定不了真假的期望不要放进来（那是软指标）。
+- `judge_rules` 声明每条约束由谁判：`rule`（代码）/ `rule+llm`（规则为主、LLM 补软项）/ `llm`（仅软指标）。
+- `tags` 用于筛选子集（如只跑 `hard` 或只跑 `regression`）。
+
 ## 3. 指标
 
-### 3.1 Hard Constraint（代码评分，任何 >0 即 FAIL）
+### 3.1 Hard Constraint（代码评分，统一负向指标：任何 >0 即 FAIL）
+
+> 全部用**负向指标**（越高越差），这样才能统一「>0 → FAIL」的判据。
+> 不能混入「越高越好」的正向率，否则 `date_consistency_rate=0.98` 这类值没法套同一个门槛。
 
 ```text
-date_consistency_rate          日期一致性
-hard_time_conflict_rate        硬时间冲突（同日内区间重叠）
-opening_hours_violation_rate   营业时间冲突
-missing_transport_disclosure_rate   去程/回程缺失却不明说
-missing_hotel_disclosure_rate       住宿缺失却不明说
-budget_math_error_rate         预算数学错误
-hallucinated_price_rate        编造价格（查不到 source 或对不上 fetched_at 的值）
-hallucinated_route_rate        编造路线（没高德数据却给了具体耗时）
-source_coverage_rate           实时价格必须有 source
+date_mismatch_rate               日期不符率（发车/抵达日与约定日不符却不明说）
+hard_time_conflict_rate          硬时间冲突（同日内区间重叠）
+opening_hours_violation_rate     营业时间冲突
+missing_transport_disclosure_rate    去程/回程缺失却不明说
+missing_hotel_disclosure_rate        住宿缺失却不明说
+budget_math_error_rate           预算数学错误
+hallucinated_price_rate          编造价格（查不到 source 或对不上 fetched_at 的值）
+hallucinated_route_rate          编造路线（没高德数据却给了具体耗时）
+missing_source_rate              实时价格缺 source（或缺 fetched_at）的比例
 ```
 
 硬门槛（示例，阈值随第一版评测定稿）：
 
 ```text
-hallucinated_price > 0  → FAIL
-hard_time_conflict > 0  → FAIL
-critical date error > 0 → FAIL
+hallucinated_price_rate  > 0 → FAIL
+hard_time_conflict_rate  > 0 → FAIL
+date_mismatch_rate       > 0 → FAIL（critical 级日期错误是它的特例）
 ```
+
+> 若后续想保留正向口径做展示，可另算镜像指标（如 `date_consistency_rate = 1 - date_mismatch_rate`），
+> 但**参与门槛判定的必须是负向指标**。
 
 ### 3.2 Plan Quality（规则 + LLM Judge）
 

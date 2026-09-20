@@ -106,7 +106,7 @@ export const mockAudit: AuditReport = {
       ],
     },
   ],
-  decisions: mockPlan.decisions,
+  decisions: mockPlan.decisions ?? [],
   provider_calls: [
     {
       provider: "途牛",

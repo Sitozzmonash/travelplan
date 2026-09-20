@@ -1616,9 +1616,3 @@ export const mockPlan: TripPlan = {
     low_trust_filtered: 4,
   },
 };
-
-export { evidence as mockEvidence };
-
-export function findEvidence(ids: string[]): Evidence[] {
-  return evidence.filter((entry) => ids.includes(entry.id));
-}

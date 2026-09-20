@@ -1415,7 +1415,7 @@ class TestTravelGraph:
         assert travel_graph() is travel_graph()
         assert isinstance(build_travel_graph(), type(travel_graph()))
 
-    def test_only_the_four_accumulating_channels_use_operator_add(self):
+    def test_only_the_audit_channels_use_operator_add(self):
         # workflow 用了 `from __future__ import annotations`，注解是字符串，
         # 必须先 get_type_hints 解析成真正的 Annotated 才能看 reducer；
         # 还要带 include_extras=True，否则 Annotated 的元数据会被剥掉。
@@ -1427,8 +1427,10 @@ class TestTravelGraph:
             if get_origin(hint) is Annotated and operator.add in hint.__metadata__
         }
 
-        # 累加语义只允许这四条审计通道有：多一条就意味着某个业务字段会被叠加。
-        assert accumulating == {"decisions", "timeline", "stages", "degradations"}
+        # 累加语义只允许这几条审计通道有：多一条就意味着某个业务字段会被叠加。
+        # jev_calls 与其余四条同类 —— 它也只做追加（build_initial_plan 与
+        # critic_and_revise 都写它），不参与任何旅行决策。
+        assert accumulating == {"decisions", "timeline", "stages", "degradations", "jev_calls"}
         for key in accumulating:
             assert get_origin(get_args(hints[key])[0]) is list, key
 

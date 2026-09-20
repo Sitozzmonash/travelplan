@@ -71,7 +71,8 @@ function WarningItem({
   days: ItineraryDay[];
   onJumpToItem?: (dayIndex: number, itemId: string) => void;
 }) {
-  const day = days.find((entry) => entry.day_index === warning.day_index);
+  const dayPosition = days.findIndex((entry) => entry.day_index === warning.day_index);
+  const day = dayPosition >= 0 ? days[dayPosition] : undefined;
   const item = warning.item_id ? day?.items.find((entry) => entry.id === warning.item_id) : undefined;
   const resolved = warning.resolved;
 
@@ -93,7 +94,7 @@ function WarningItem({
           {CODE_TITLES[warning.code] ?? (resolved ? "已自动修正 1 项问题" : "需要注意的问题")}
         </p>
         <span className="text-[11px] text-muted-foreground">
-          Day {warning.day_index + 1}
+          {dayPosition >= 0 ? `Day ${dayPosition + 1}` : `day_index ${warning.day_index}`}
           {item ? ` · ${item.name}` : ""}
         </span>
         {onJumpToItem && item ? (
