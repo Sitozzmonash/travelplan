@@ -117,9 +117,23 @@
 LLM 从 7 次降到 2 次，主要来自两处：Guided 模式不再对同一批证据重复抽地点
 （省掉 4 次 `extract_places`），以及 `query_expansion` 随攻略线一起被复用。
 
-### 2.3 3 天行程
+### 2.3 3 天行程（北京→西安 10/1 起 3 天 2 人 ¥4500）
 
-见 §2.4（跑完后补）。BEFORE 参照为 `tp-20260920-214836-5c61d9` = **1075.2s**。
+| 指标 | BEFORE | AFTER | 变化 |
+| --- | --- | --- | --- |
+| run_id | `tp-20260920-214836-5c61d9` | `tp-20260920-224653-f4e091` | — |
+| Discovery | 621.1s（交通 246.9s + 地点 372.4s，全串行） | **164.2s**（交通 46.3s / 酒店 9.9s / 攻略 21.8s / 地点 116.1s，四条线并行） | **−73.6%** |
+| **点开始规划后** | —（旧服务无复用，整段 1075.2s 都在等） | **262.0s** | — |
+| 总耗时 | **1075.2s** | 426.2s | **−60.4%** |
+| 终态 | completed | **SUCCESS** | — |
+| LLM 调用 | 7 | **2** | −71% |
+| 工具调用 | 48 | 20 | −58% |
+| Token | — | 13805 | — |
+| Discovery 交接 | 无（`prefetch_reused` 全 false） | transport/hotels/social/places **全部 `reused`** | — |
+
+> 这次 262s 明显高于 5 天的 78.4s，原因在 §5：`score_candidates` 里有一次
+> 途牛门票查询打满超时预算（185.3s）。不是复用没生效 —— 四条线同样是全部 `reused`。
+
 
 ### 2.4 Discovery 阶段本身（用户在前端选偏好时后台跑的那段）
 
@@ -168,16 +182,43 @@ LLM 从 7 次降到 2 次，主要来自两处：Guided 模式不再对同一批
 8. **本地起服务会写到线上库**：`.env` 一旦配了生产 `DATABASE_URL`，
    直接 `uvicorn` 就会连 Neon 建表写 run，且 `/health` 要 30s。
    新增 `scripts/serve_local.py` 强制 SQLite（清变量的顺序也在注释里写明了原因）。
+9. **生产上 run 永久卡在 RUNNING（本轮最严重）**：部署验证那次 quick run
+   （上海→杭州 2 天）在 `extract_and_normalize_places` 卡了一个多小时没结束，
+   前端会一直转圈。进程内复现 + 线程栈定位到根因：
+   **途牛插件工具在签名里声明了 `timeout`，内部 `subprocess.run` 却没把它传下去**
+   —— CLI 进程挂住时调用它的线程无限等待。此前 `_plugin_call` 的逻辑是
+   "Tool 说自己支持 timeout 就直接 `tool.invoke()`"，等于把上限交给了工具自己。
+   现在**所有** Plugin Tool 一律走 `_invoke_bounded` 的外层守护线程，到点一定放手；
+   声明了 timeout 的工具仍然拿到预算去做内部取消。
+   修复后用同一句 query 复跑：`ok: True`（改前卡死）。
 
 ## 5. 仍然存在的瓶颈
 
-- **`verify_poi_and_routes` 25.1s 已是最大单项**：15 次 `search_poi` 合计 121.3s、
-  26 次 `get_poi_detail` 合计 92.5s，已经是并发执行（所以合计远大于 25.1s 的墙钟），
-  继续压需要减少**候选数量**而不是提高并发。
-- **`critic_and_revise` 22.6s + `finalize` 19.7s 是不可压缩的模型时延**：
+- **`verify_poi_and_routes` 25.1s（5 天）/ `score_candidates` 185.4s（3 天）**：
+  3 天那次被**门票查询**拖住 —— `tuniu_search_scenic_tickets` 有 1 次 **TIMEOUT 185.3s**
+  （打满了途牛的预算），`12306_get-tickets` 一次 INVALID_RESPONSE（25.0s）。
+  这些调用已经是并发执行（3 次门票调用合计 191s、「合计 > 墙钟」正是并发在起作用），
+  所以继续压只能靠**减少要查门票的候选数**，而不是提高并发。
+- **`critic_and_revise` 21~23s + `finalize` 19.7~27.5s 是不可压缩的模型时延**：
   单次 LLM 调用本身就要 10~45s，只能靠"值不值得调"来省，不能靠并发。
 - **LLM 长尾没有硬上限**：单次调用最长见过 108.8s。目前 Provider 有独立 timeout，
   LLM 只有统一超时，还没有"这次调用不值得等"的预算（Part F 的下一步）。
-- **3 天行程的 AFTER 与 Discovery 干净值**：见 §2.3 / §2.4 的说明。
-- **两份 Bad Case 规则仍只有常量**：`discovery_stale`、`guided_intent_mismatch`
-  有类别定义但还没有触发器（不影响正确性，属于观测缺口）。
+- **`discovery_stale` / `guided_intent_mismatch`** 两份 Bad Case 规则仍只有常量定义、
+  没有触发器（不影响正确性，属于观测缺口）。
+- **3 天行程的 Discovery（164.2s）比 5 天的干净值（97.9s）慢**：北京→西安这条线
+  交通候选多（80 条 vs 44 条），地点抽取也到了 116.1s，仍在 100~170s 量级。
+
+## 6. 优化过程中修掉的埋点/观测问题（第二批）
+
+上面 §2/§3 的数字是修正过的，修正本身也是这轮工作的一部分：
+
+1. **子 span 时间戳**（§1.3）：provider/tool/llm 子 span 拿落盘时刻当起止，导致
+   "每个 Provider 都跑了 280~400s"。
+2. **同名 tool 覆盖**：16 次 `search_poi` 在 Trace 里只剩 1 条，调用数统计全错。
+3. **缺 duration 的调用被拉长成整段 run**：缓存命中、Provider 不可用、工具缺失这些
+   路径不记 `duration_ms`，而 span 窗口此前会退回"当前时刻"，于是**一条 UNAVAILABLE
+   记录被显示成 396.3s**，把真正超时那条（185.3s TIMEOUT）埋掉了。
+   现在没有 duration 的调用按零长度处理（它们本来就没发生外部调用）。
+4. **profiler 把成组 span 当单次调用累加**：provider/mcp 组 span 的窗口是组内
+   调用的并集，和 tool 一起求和会出现"合计 293s 而整个 run 只有 78s"的矛盾数字。
+

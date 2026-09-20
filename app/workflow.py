@@ -1596,56 +1596,62 @@ def node_search_transport(state: TravelState) -> dict:
 
     # 引导式把 Discovery 已经查到的候选带进来了。复用时**不重复打 12306/途牛**，
     # 但仍然按用户最终选的排序策略重新比选（偏好可能是在 Prefetch 之后才定的）。
+    #
+    # 复用必须**按方向**判定，不能"只要有一个方向有数据就整体复用"：Discovery 很可能
+    # 只跑完了去程（回程那条线还在 RUNNING，或用户本来就没定返程日期）。上一版用
+    # `bundle.outbound or bundle.inbound` 一刀切，结果是"去程有数据 → 回程也当成复用"，
+    # 回程候选被静默置空 —— 用户看到的是"回程没票"，真相是"回程没查"。
+    # 少查一个方向是 bug，不是优化，所以这里逐方向判断、缺哪个查哪个。
     bundle = state.get("prefetch")
-    reuse_transport = bool(bundle is not None and (bundle.outbound or bundle.inbound))
     has_back = back is not None and back >= start
+    reuse_out = bool(bundle is not None and bundle.outbound)
+    reuse_in = bool(bundle is not None and has_back and bundle.inbound)
+    # 12306 是火车主源，但单次实测 55s 级；开启对冲后，主源还在跑时就并发发一次途牛火车
+    # 当备胎，避免"主源慢 → 傻等 90s → 再串行等途牛"把整段交通拖到 3 分钟。
+    hedge = bool(cfg.transport_hedge_enabled)
 
-    # 四条互不依赖的查询（去程火车 / 去程航班 / 回程火车 / 回程航班）一起发出去。
-    # 串行做这四件事实测吃掉 210s（Part H 的 Before）；它们之间没有任何依赖关系，
-    # 唯一的理由就是"以前是顺序写的"。
-    if reuse_transport:
-        out_trains = _reuse_result(bundle.outbound, TrainOption, "12306")
-        out_flights = _reuse_result(bundle.outbound, FlightOption, "tuniu")
-        in_trains = _reuse_result(bundle.inbound, TrainOption, "12306")
-        in_flights = _reuse_result(bundle.inbound, FlightOption, "tuniu")
-        # 状态照抄复用结果的真实状态（REUSED / EMPTY），**不**统一写成 "REUSED" ——
-        # "Discovery 查过但没查到"与"Discovery 查到了"必须分得清。
-        provider_status["去程火车"] = out_trains.status
-        provider_status["去程航班"] = out_flights.status
+    # 降级文案按**任务定义顺序**收集：谁先超时不影响用户看到的那条说明。
+    notes: dict[str, str] = {}
+
+    def _leg(label: str, provider: str, tool: str, func: Callable[[], Any], budget: float) -> Callable[[], Any]:
+        """一个"带兜底预算 + 记降级"的取数任务（供并发执行）。"""
+
+        def run() -> Any:
+            value, note = _bounded_provider_call(
+                state, provider=provider, tool=tool, func=func, timeout=budget
+            )
+            if note:
+                notes[label] = note
+            return value
+
+        return run
+
+    # 只发**没有复用**的那几路；互不依赖，一起发出去。
+    # 串行做这四件事实测吃掉 210s（Part H 的 Before），而它们之间没有任何依赖关系。
+    queries: list[tuple[str, Callable[[], Any]]] = []
+    fetched: dict[str, Any] = {}
+
+    if reuse_out:
+        fetched["去程火车"] = _reuse_result(bundle.outbound, TrainOption, "12306")
+        fetched["去程航班"] = _reuse_result(bundle.outbound, FlightOption, "tuniu")
         # 把复用的结果按查询键登记进账本：这样"同一个查询在本次 run 里再问一次"
         # 会命中 cache_hit，而不是又打一遍 12306/途牛（Part C 要消灭的正是这件事）。
-        for direction, date_value, options in (
-            ("outbound", start, bundle.outbound),
-            ("inbound", back, bundle.inbound),
-        ):
-            if date_value is None:
-                continue
-            _remember_reused_trains(state, ledger, origin, destination, date_value, options, direction)
-            _remember_reused_flights(state, ledger, origin, destination, date_value, options, direction, travelers)
+        _remember_reused_trains(state, ledger, origin, destination, start, bundle.outbound, "去程")
+        _remember_reused_flights(
+            state, ledger, origin, destination, start, bundle.outbound, "去程", travelers
+        )
     else:
-        notes: dict[str, str] = {}
-
-        def _leg(label: str, provider: str, tool: str, func: Callable[[], Any], budget: float) -> Callable[[], Any]:
-            """一个"带兜底预算 + 记降级"的取数任务（供并发执行）。"""
-
-            def run() -> Any:
-                value, note = _bounded_provider_call(
-                    state, provider=provider, tool=tool, func=func, timeout=budget
-                )
-                if note:
-                    notes[label] = note
-                return value
-
-            return run
-
-        queries: list[tuple[str, Callable[[], Any]]] = [
+        queries.append(
             (
                 "去程火车",
                 _leg(
                     "去程火车", "12306", "search_trains",
-                    lambda: hub.search_trains(origin, destination, start), transport_budget,
+                    lambda: hub.search_trains(origin, destination, start, hedge=hedge),
+                    transport_budget,
                 ),
-            ),
+            )
+        )
+        queries.append(
             (
                 "去程航班",
                 _leg(
@@ -1653,15 +1659,25 @@ def node_search_transport(state: TravelState) -> dict:
                     lambda: hub.search_flights(origin, destination, start, travelers=travelers),
                     _provider_timeout("tuniu"),
                 ),
-            ),
-        ]
-        if has_back:
+            )
+        )
+
+    if has_back:
+        if reuse_in:
+            fetched["回程火车"] = _reuse_result(bundle.inbound, TrainOption, "12306")
+            fetched["回程航班"] = _reuse_result(bundle.inbound, FlightOption, "tuniu")
+            _remember_reused_trains(state, ledger, destination, origin, back, bundle.inbound, "回程")
+            _remember_reused_flights(
+                state, ledger, destination, origin, back, bundle.inbound, "回程", travelers
+            )
+        else:
             queries.append(
                 (
                     "回程火车",
                     _leg(
                         "回程火车", "12306", "search_trains",
-                        lambda: hub.search_trains(destination, origin, back), transport_budget,
+                        lambda: hub.search_trains(destination, origin, back, hedge=hedge),
+                        transport_budget,
                     ),
                 )
             )
@@ -1675,17 +1691,25 @@ def node_search_transport(state: TravelState) -> dict:
                     ),
                 )
             )
-        fetched = _run_parallel(queries, limit=cfg.provider_max_concurrency, thread_prefix="tp-transport")
-        out_trains = fetched["去程火车"]
-        out_flights = fetched["去程航班"]
-        in_trains = fetched.get("回程火车")
-        in_flights = fetched.get("回程航班")
-        provider_status["去程火车"] = out_trains.status
-        provider_status["去程航班"] = out_flights.status
-        # 降级文案按**任务定义顺序**收集：谁先超时不影响用户看到的那条说明。
-        degradations.extend(
-            notes[label] for label in ("去程火车", "去程航班", "回程火车", "回程航班") if label in notes
+
+    if queries:
+        fetched.update(
+            _run_parallel(
+                queries, limit=cfg.provider_max_concurrency, thread_prefix="tp-transport"
+            )
         )
+    degradations.extend(
+        notes[label] for label in ("去程火车", "去程航班", "回程火车", "回程航班") if label in notes
+    )
+
+    out_trains = fetched["去程火车"]
+    out_flights = fetched["去程航班"]
+    in_trains = fetched.get("回程火车")
+    in_flights = fetched.get("回程航班")
+    # 状态照抄结果的真实状态（REUSED / EMPTY / TIMEOUT / ...），**不**统一写成 "REUSED" ——
+    # "Discovery 查过但没查到"与"Discovery 查到了"必须分得清。
+    provider_status["去程火车"] = out_trains.status
+    provider_status["去程航班"] = out_flights.status
 
     outbound, out_alts, out_reason, out_scores = _select_transport(
         [*out_trains.items, *out_flights.items], direction="outbound", intent=intent
@@ -1694,7 +1718,7 @@ def node_search_transport(state: TravelState) -> dict:
     inbound = in_alts = None
     in_reason = ""
     if has_back:
-        if reuse_transport:
+        if reuse_in:
             in_reason = "复用 Discovery 已查到的回程候选（未重复查询）"
         elif back == start:
             in_reason = "当天往返，回程与去程同一天查询"
@@ -2218,13 +2242,42 @@ def node_extract_places(state: TravelState) -> dict:
             if not evidence.place_mentions and len(evidence.text) >= 40
         ][:EXTRACT_EVIDENCE_LIMIT]
     )
-    for evidence in llm_targets:
-        result = llm.invoke_json(
-            EXTRACT_PLACES_PROMPT,
-            f"标题：{evidence.title}\n来源：{evidence.provider}/{evidence.source_type}\n"
-            f"证据 id：{evidence.id}\n正文：\n{evidence.text[:EVIDENCE_TEXT_CHARS]}",
-            tag=f"extract_places:{evidence.id}",
-        )
+    # 多篇攻略是**互相独立**的 batch，串行等它们是一笔白花的墙钟：
+    # 实测 4 条证据串行 63.6s（最快 10.7s、最慢 19.6s），并发后墙钟≈最慢的那条。
+    # 上限走 config 的 LLM_MAX_CONCURRENCY（独立模型调用可以并行，但必须限并发）。
+    cfg = current_config()
+
+    def _extract_one(evidence: Any) -> Any:
+        """抽一条证据的地点；异常不往外抛，交给调用方按 degraded 处理。"""
+
+        try:
+            return evidence, llm.invoke_json(
+                EXTRACT_PLACES_PROMPT,
+                f"标题：{evidence.title}\n来源：{evidence.provider}/{evidence.source_type}\n"
+                f"证据 id：{evidence.id}\n正文：\n{evidence.text[:EVIDENCE_TEXT_CHARS]}",
+                tag=f"extract_places:{evidence.id}",
+            )
+        except Exception as exc:  # noqa: BLE001 —— 单条失败不能带走整批
+            return evidence, exc
+
+    if llm_targets:
+        outcomes = _run_parallel(
+            [(f"e{index}", (lambda item=item: _extract_one(item))) for index, item in enumerate(llm_targets)],
+            limit=cfg.llm_max_concurrency,
+            thread_prefix="tp-extract",
+        ).values()
+    else:
+        outcomes = []
+
+    # 按**定义顺序**消费结果，所以并发不会改变抽取出来的地点顺序。
+    for outcome in outcomes:
+        if isinstance(outcome, tuple) and len(outcome) == 2:
+            evidence, result = outcome
+        else:  # pragma: no cover —— 形状不对时跳过，不让它变成一次假成功
+            continue
+        if isinstance(result, Exception):
+            degradations.append(f"证据 {evidence.id} 的地点抽取被跳过：{type(result).__name__}: {result}")
+            continue
         if result.ok and isinstance(result.value, dict):
             for item in result.value.get("places", []) or []:
                 if isinstance(item, dict) and coerce_str(item.get("name")):
@@ -2300,7 +2353,6 @@ def node_extract_places(state: TravelState) -> dict:
         }
 
     # --- 2) 高德 POI 搜索（受控并发，Part A）---
-    cfg = current_config()
     keywords = _keyword_candidates(intent, state.get("queries") or _fallback_queries(intent))
     places: list[Place] = []
     seen_ids: set[str] = set()
@@ -2432,7 +2484,29 @@ def _deep_verify_places(
         )
         return float(trust)
 
-    neutral = [place for place in places if place.place_id not in selected_ids]
+    # REJECT 的点**直接出局**，不进 neutral 候选池。
+    # 上一版把它们放进池子再靠"超出 limit"挡下来，于是"Trust 分高的 REJECT 点"照样
+    # 进了深度验证 —— 用户明确说了不要还去查高德/查门票，既是实打实的浪费，
+    # 也和"硬排除"这个承诺不一致。
+    rejected = [
+        place for place in places if selection.selection_of(place, selections) == selection.REJECT
+    ]
+    for place in rejected:
+        skipped.append(
+            {
+                "place_id": place.place_id,
+                "name": place.name,
+                "reason": "USER_REJECT",
+                "reason_text": "用户明确表示不感兴趣，已硬排除，不再做深度验证",
+            }
+        )
+    rejected_ids = {place.place_id for place in rejected}
+
+    neutral = [
+        place
+        for place in places
+        if place.place_id not in selected_ids and place.place_id not in rejected_ids
+    ]
     # 排序键带 place_id 兜底：同名同分也不能靠字典顺序碰运气，否则并发下
     # "哪 15 个点被深度验证"会随输入噪声变化（同分不同名时曾真的抖过）。
     neutral.sort(key=lambda place: (-_trust_of(place), place.name, place.place_id))
@@ -2446,14 +2520,8 @@ def _deep_verify_places(
             {
                 "place_id": place.place_id,
                 "name": place.name,
-                "reason": (
-                    "USER_REJECT" if selection.selection_of(place, selections) == selection.REJECT else "PLANNER_LIMIT"
-                ),
-                "reason_text": (
-                    "用户明确表示不感兴趣，已硬排除，不再做深度验证"
-                    if selection.selection_of(place, selections) == selection.REJECT
-                    else f"Trust {_trust_of(place):.0f} 未进前 {int(limit)}，按 Planner 上限跳过深度验证"
-                ),
+                "reason": "PLANNER_LIMIT",
+                "reason_text": f"Trust {_trust_of(place):.0f} 未进前 {int(limit)}，按 Planner 上限跳过深度验证",
             }
         )
     return selected, skipped
@@ -3349,6 +3417,75 @@ def node_check_feasibility(state: TravelState) -> dict:
 # ==================================================
 
 
+#: 送给模型（Critic / 成文）的 plan digest 上限（字符）。超了**按结构**瘦身，不从中间切断。
+DIGEST_CHAR_BUDGET = 24_000
+#: 瘦身第 1 级：单条安排的理由保留多少字符。reason 是 digest 里最长的文本，先压它收益最大。
+DIGEST_REASON_CHARS = 80
+#: 瘦身第 2 级：每天最多保留几条安排。
+DIGEST_ITEMS_PER_DAY = 4
+#: 瘦身第 3 级：最多保留几天。
+DIGEST_DAYS = 6
+
+
+def _apply_narrowing(digest: dict[str, Any], level: int) -> dict[str, Any]:
+    """对 digest 做第 ``level`` 级结构瘦身（就地修改并返回）。"""
+
+    if level <= 0:
+        return digest
+    # 第 1 级：压短最长的文本字段。
+    for day in digest.get("days") or []:
+        for item in day.get("items") or []:
+            reason = item.get("reason")
+            if isinstance(reason, str) and len(reason) > DIGEST_REASON_CHARS:
+                item["reason"] = reason[:DIGEST_REASON_CHARS] + "…"
+    transport = digest.get("transport") or {}
+    if isinstance(transport.get("selection_reason"), str) and len(transport["selection_reason"]) > 300:
+        transport["selection_reason"] = transport["selection_reason"][:300] + "…"
+    if level < 2:
+        return digest
+    # 第 2 级：每天的条目数封顶，但**如实记录**砍掉了多少，模型才知道自己没看到全部。
+    for day in digest.get("days") or []:
+        items = day.get("items") or []
+        if len(items) > DIGEST_ITEMS_PER_DAY:
+            day["items_dropped"] = len(items) - DIGEST_ITEMS_PER_DAY
+            day["items"] = items[:DIGEST_ITEMS_PER_DAY]
+    if level < 3:
+        return digest
+    # 第 3 级：天数封顶 + 预算明细只留汇总。
+    days = digest.get("days") or []
+    if len(days) > DIGEST_DAYS:
+        digest["days_dropped"] = len(days) - DIGEST_DAYS
+        digest["days"] = days[:DIGEST_DAYS]
+    budget = digest.get("budget")
+    if isinstance(budget, dict):
+        budget.pop("breakdown", None)
+        budget.pop("breakdown_price_type", None)
+    return digest
+
+
+def _digest_json(plan: TripPlan, *, char_budget: int = DIGEST_CHAR_BUDGET) -> str:
+    """plan digest → **一定合法**的 JSON 文本，尽量不超过 ``char_budget``。
+
+    为什么要专门做这件事：上一版是 ``json.dumps(...)[:24000]``，那是**按字符切断 JSON**。
+    一旦超出，模型收到的是缺括号、缺引号的残片，解析必然失败 —— 省下的不是时间，而是
+    整次调用的产出（而且失败得很隐蔽：看起来像"模型不听话"）。
+    所以这里在**结构**上逐级做减法，每一级都仍然是一份合法 JSON，并把"裁剪过、砍了多少"
+    如实写进 payload，让模型知道自己看到的不是全部而不是以为行程就这么多。
+    """
+
+    digest = _plan_digest(plan)
+    text = json.dumps(digest, ensure_ascii=False, default=str)
+    for level in range(4):
+        if len(text) <= char_budget:
+            return text
+        # `_plan_digest` 每次都新造字典，所以可以安全地就地瘦身（不需要 deepcopy）。
+        if level < 3:
+            _apply_narrowing(digest, level + 1)
+            text = json.dumps(digest, ensure_ascii=False, default=str)
+    # 已瘦到最小形态仍超预算：照原样送出（合法 JSON 比"恰好卡在预算内"重要）。
+    return text
+
+
 def _plan_digest(plan: TripPlan) -> dict[str, Any]:
     """给 Critic 用的紧凑摘要。只给它已算好的事实，让它只做判断（PRD §25）。"""
     return {
@@ -3674,11 +3811,14 @@ def node_critic_revise(state: TravelState) -> dict:
     # 可以吃掉 26~110s（纯模型抖动），串行等于把这几十秒白白加在墙钟上。
     # 唯一有依赖的一处（"重排后 critic 意见已对不上新行程"）在两者都收完之后再补一句，
     # 因此结论与串行版本完全一致，只是不再互相等。
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="tp-critic") as pool:
+    with ThreadPoolExecutor(
+        max_workers=max(1, int(current_config().llm_max_concurrency)),
+        thread_name_prefix="tp-critic",
+    ) as pool:
         critic_future = pool.submit(
             llm.invoke_json,
             CRITIC_PROMPT,
-            json.dumps(_plan_digest(plan), ensure_ascii=False, default=str)[:24000],
+            _digest_json(plan),
             tag="critic",
         )
         # llm_decisions 先传空：它是 critic 的输出，此刻还没算出来；收完之后再补那句提示。
@@ -4454,10 +4594,18 @@ def _emit_run_spans(state: TravelState, *, llm: Any) -> None:
         return f"{run_id}:{stage}" if stage else None
 
     def span_window(entry: Mapping[str, Any]) -> tuple[str, str]:
-        """账本条目 → (started_at, finished_at)。缺 duration 时才退回当前时刻。"""
+        """账本条目 → (started_at, finished_at)。
+
+        没有 `duration_ms` 的条目按**零长度**处理，不要退回"当前时刻"。
+        为什么：缓存命中、Provider 不可用、工具缺失这些路径根本没发生外部调用，
+        它们不记 duration。若按"从现在算起"，这些 span 会被拉成"从调用时刻一直占到最后"
+        —— 实测把一条 UNAVAILABLE 记录显示成 396s，看起来像一次超长调用，
+        而真正超时的那条（185s TIMEOUT）反而被埋在里面。
+        """
 
         started = str(entry.get("fetched_at") or now_iso())
-        return started, finish_iso(started, entry.get("duration_ms"))
+        duration = entry.get("duration_ms")
+        return started, finish_iso(started, duration if isinstance(duration, (int, float)) else 0)
 
     entries = [*_provider_call_rows(state.get("hub")), *list(state.get("adopted_calls") or [])]
     # 先算每个 Provider / MCP 分组的真实时间窗：分组 span 的时间必须是它**所有**子调用的
@@ -4599,7 +4747,7 @@ def node_finalize(state: TravelState) -> dict:
 
     prose_result = llm.invoke(
         FINAL_ANSWER_PROMPT,
-        json.dumps(_plan_digest(plan), ensure_ascii=False, default=str)[:24000],
+        _digest_json(plan),
         tag="final_answer",
     )
     prose_ok = prose_result.ok and bool(prose_result.text.strip())

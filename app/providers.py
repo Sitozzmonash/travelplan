@@ -68,7 +68,7 @@ except Exception:  # noqa: BLE001 —— 没装 superharness 时仍允许 import
         TOOL_STARTED = "tool.started"
         TOOL_FINISHED = "tool.finished"
 
-from app.config import provider_timeouts
+from app.config import current_config, provider_timeouts, tool_timeout
 from app.models import (
     Evidence,
     FlightOption,
@@ -158,11 +158,14 @@ class ToolTimeout(RuntimeError):
 
 
 def _invoke_bounded(tool: Any, args: dict[str, Any], *, timeout: float, label: str) -> Any:
-    """在**独立守护线程**里调用一个签名里没有 ``timeout`` 的 Tool，到点就放弃等待。
+    """在**独立守护线程**里调用一个 Tool，到点就放弃等待。
 
-    为什么必须有这一层：高德 / TikHub / 联网搜索三个 Plugin Tool 的入参里没有 timeout
-    （高德是固定 20s × 3 次重试、TikHub 20s、Tavily 走 SDK 自己的超时），一旦上游劣化
-    就会把整个 run 拖住。这里给它们补一个由 config 控制的统一上限。
+    为什么必须有这一层：Plugin Tool 的超时行为不一致 —— 高德 / TikHub / 联网搜索的入参里
+    根本没有 timeout（高德是固定 20s × 3 次重试、TikHub 20s、Tavily 走 SDK 自己的超时）；
+    途牛那批**声明**了 timeout，内部 `subprocess.run` 却没把它传下去。上游一劣化或 CLI 挂住，
+    整条 run 就永久停在那里（生产上实测卡了一个多小时，run 一直是 RUNNING）。
+    所以这里对**所有** Plugin Tool 统一补一个由 config 控制的上限：
+    "声明了 timeout" 只用来决定要不要把预算传进参数，不再决定要不要设外层守护。
 
     为什么用裸线程而不是线程池：线程池的 worker 被一个卡住的调用占满之后，**排队**的调用
     会把排队时间算进自己的 timeout，于是出现"明明没人查它却报超时"的假故障。一调用一线程
@@ -385,6 +388,11 @@ class ProviderCall:
     #: 调用记录里猜。审计账本、provider_calls 表与 Trace 都读这个字段。
     fallback: bool = False
     notes: list[str] = field(default_factory=list)
+    #: 交通对冲（hedge）里"备胎跑完了但主源已给出结论、所以结果没被采用"。
+    #: 与 fallback 分开：fallback 说明"这是主源失败后的备选"，discarded 说明
+    #: "这条调用连备选都没当上"。管理端/profiler 要能区分"白打的那一次"与
+    #: "真正被采用的备选"，否则对冲的代价就看不见了。
+    discarded: bool = False
     #: 内部使用：从哪个 Plugin / MCP Server 来的。不进 sources 表。
     origin: str = ""
 
@@ -714,6 +722,19 @@ class ProviderHub:
         self.calls: list[ProviderCall] = []
         self._counter = 0
 
+        # 一把锁保护 Hub 自己的共享状态：source_id 计数器、缓存字典、调用列表、
+        # MCP 句柄表。**这不是理论风险**：workflow 的 4 条大交通查询、N 条 POI 查询
+        # 和路线查询共用同一个 Hub 并发调用；再加一次性提交 12306+途牛的交通对冲，
+        # 同一时刻可能有十几个线程在 Hub 里跑。裸的 `self._counter += 1` 是
+        # 读-改-写，并发下会发出重复 source_id（同一条记录被两条 provenance 指向）。
+        # 约束：锁只做内存操作，**绝不**在持锁时做网络 / 子进程调用（见 _mcp_handle）。
+        self._lock = threading.Lock()
+        #: 每个 MCP Server 一份"建句柄"锁。为什么不能只用上面那一把：`handle.tools()`
+        #: 会真的拉起 MCP 子进程（npx 冷启动可达十几秒），必须放在锁外做，否则一个
+        #: Server 的冷启动会把整个 Hub 卡住。用 per-server 锁既保证"同一个 Server
+        #: 只会有一个句柄/一个子进程"，又不会让不同 Server 的建连互相排队。
+        self._mcp_locks: dict[str, threading.Lock] = {}
+
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
@@ -871,8 +892,7 @@ class ProviderHub:
             return self._record(call)
 
         tool = found[1]
-        # 支持 timeout 的 Tool 走它自己的超时；同时把值写进 query，审计里能看到
-        # "这次用的是几秒的预算"，而不是事后猜。
+        # 把预算写进 query：审计里能看到"这次用的是几秒的预算"，而不是事后猜。
         supports_timeout = tool_accepts_timeout(tool)
         if supports_timeout:
             args = {**args, "timeout": budget}
@@ -880,10 +900,13 @@ class ProviderHub:
         started = time.monotonic()
         raw: Any = None
         try:
-            if supports_timeout:
-                raw = tool.invoke(args)
-            else:
-                raw = _invoke_bounded(tool, args, timeout=budget, label=f"{provider}/{tool_name}")
+            # 无论 Tool 自称是否支持 timeout，**一律**走 _invoke_bounded 的外层守护。
+            # 为什么不能相信"声明了 timeout"：声明不等于遵守。实测途牛火车工具签名里
+            # 有 timeout，内部 `subprocess.run` 却没把它传下去 —— CLI 进程挂住时，
+            # 调用它的 workflow 线程会无限等待，run 永远停在 RUNNING（生产上真的卡了
+            # 一个多小时，前端一直转圈）。外层守护保证"到点一定放手"，
+            # 声明了 timeout 的 Tool 仍然拿到它自己的预算去做内部取消。
+            raw = _invoke_bounded(tool, args, timeout=budget, label=f"{provider}/{tool_name}")
         except Exception as exc:  # noqa: BLE001 —— Tool 炸了要变成 status，不是往上抛
             message = _scrub_secrets(f"{type(exc).__name__}: {exc}")
             status = "TIMEOUT" if isinstance(exc, ToolTimeout) else "UNAVAILABLE"
