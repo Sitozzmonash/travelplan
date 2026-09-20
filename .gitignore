@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.env
+.env.local
+data/*.db
+data/vendors/
+outputs/
+node_modules/
+.next/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
+*.log
+# 例外：四个验收 case 的原始运行日志是 docs/ACCEPTANCE.md §36.4 的证据，要能追溯
+!_acceptance/*.log

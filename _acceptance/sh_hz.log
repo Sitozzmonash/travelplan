@@ -1,0 +1,713 @@
+
+[WORKFLOW]
+selected   travelplan_workflow
+
+[WORKFLOW]
+name       travelplan_workflow
+
+[LLM]
+model      kimi-k3
+context    -
+decision   OK
+output     {"origin_city": "上海", "destination_city": "杭州", "s ... 
+[truncated 234 chars]
+time       5969.0ms
+tokens     in=648 | out=543
+cache      hit=0
+12306 MCP Server running on stdio @Joooook
+12306 MCP Server running on stdio @Joooook
+
+[TOOL]
+name       12306/railway_12306_get-tickets
+input      {"date": "2026-10-02", "fromStation": "上海", "toSta ... [truncated 
+119 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 14:36:13.697423+ ... [truncated 5
+chars]
+time       26469.0ms
+status     OK
+
+[TOOL]
+name       tuniu/tuniu_search_flights
+input      {"departure_city": "上海", "arrival_city": "杭州", "de ... 
+[truncated 45 chars]
+output     UNAVAILABLE · 0 条 · fetched_at=2026-09-18 14:36:40 ... [truncated 
+64 chars]
+time       27031.0ms
+status     UNAVAILABLE
+Error making 12306 request: AxiosError: read ECONNRESET
+    at AxiosError.from (file:///C:/Users/Sito/AppData/Local/npm-cache/_npx/ed2d86c30172f167/node_modules/axios/lib/core/AxiosError.js:108:24)
+    at RedirectableRequest.handleRequestError (file:///C:/Users/Sito/AppData/Local/npm-cache/_npx/ed2d86c30172f167/node_modules/axios/lib/adapters/http.js:1340:27)
+    at RedirectableRequest.emit (node:events:508:28)
+    at emitErrorNT (node:internal/streams/destroy:170:8)
+    at emitErrorCloseNT (node:internal/streams/destroy:129:3)
+    at process.processTicksAndRejections (node:internal/process/task_queues:90:21)
+    at Axios.request (file:///C:/Users/Sito/AppData/Local/npm-cache/_npx/ed2d86c30172f167/node_modules/axios/lib/core/Axios.js:48:43)
+    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at async make12306Request (file:///C:/Users/Sito/AppData/Local/npm-cache/_npx/ed2d86c30172f167/node_modules/12306-mcp/build/index.js:634:26)
+    at async getTicketQueryPath (file:///C:/Users/Sito/AppData/Local/npm-cache/_npx/ed2d86c30172f167/node_modules/12306-mcp/build/index.js:1207:18)
+    at async file:///C:/Users/Sito/AppData/Local/npm-cache/_npx/ed2d86c30172f167/node_modules/12306-mcp/build/index.js:19:28 {
+  isAxiosError: true,
+  code: 'ECONNRESET',
+  config: [Object: null prototype] {
+    transitional: {
+      silentJSONParsing: true,
+      forcedJSONParsing: true,
+      clarifyTimeoutError: false,
+      legacyInterceptorReqResOrdering: true,
+      advertiseZstdAcceptEncoding: false,
+      validateStatusUndefinedResolves: true
+    },
+    adapter: [ 'xhr', 'http', 'fetch' ],
+    transformRequest: [ [Function: transformRequest] ],
+    transformResponse: [ [Function: transformResponse] ],
+    timeout: 0,
+    xsrfCookieName: 'XSRF-TOKEN',
+    xsrfHeaderName: 'X-XSRF-TOKEN',
+    maxContentLength: -1,
+    maxBodyLength: -1,
+    env: { FormData: [Function], Blob: [class Blob] },
+    validateStatus: [Function: validateStatus],
+    headers: Object [AxiosHeaders] {
+      Accept: 'application/json, text/plain, */*',
+      'Content-Type': undefined,
+      'User-Agent': 'axios/1.20.0',
+      'Accept-Encoding': 'gzip, compress, deflate, br'
+    },
+    method: 'get',
+    url: 'https://kyfw.12306.cn/otn/leftTicket/init?',
+    allowAbsoluteUrls: true,
+    data: undefined
+  },
+  request: <ref *1> Writable {
+    _events: {
+      close: undefined,
+      error: [Function: handleRequestError],
+      prefinish: undefined,
+      finish: undefined,
+      drain: undefined,
+      response: [Function: handleResponse],
+      socket: [Array],
+      abort: undefined
+    },
+    _writableState: WritableState {
+      highWaterMark: 16384,
+      length: 0,
+      corked: 0,
+      onwrite: [Function: bound onwrite],
+      writelen: 0,
+      bufferedIndex: 0,
+      pendingcb: 0,
+      Symbol(kState): 17581054,
+      Symbol(kBufferedValue): null,
+      Symbol(kErroredValue): [Error]
+    },
+    _maxListeners: undefined,
+    _options: {
+      maxRedirects: 21,
+      maxBodyLength: Infinity,
+      protocol: 'https:',
+      path: '/otn/leftTicket/init',
+      method: 'GET',
+      headers: [Object: null prototype],
+      agents: [Object],
+      auth: undefined,
+      family: undefined,
+      beforeRedirect: [Function: dispatchBeforeRedirect],
+      beforeRedirects: [Object: null prototype],
+      http2Options: undefined,
+      createConnection: undefined,
+      hostname: 'kyfw.12306.cn',
+      port: '',
+      agent: undefined,
+      sensitiveHeaders: [],
+      insecureHTTPParser: false,
+      nativeProtocols: [Object],
+      pathname: '/otn/leftTicket/init'
+    },
+    _ended: true,
+    _ending: true,
+    _redirectCount: 0,
+    _redirects: [],
+    _requestBodyLength: 0,
+    _requestBodyBuffers: [],
+    _eventsCount: 3,
+    _onNativeResponse: [Function (anonymous)],
+    _headerFilter: /^(?:Authorization|Proxy-Authorization|Cookie)$/i,
+    _currentRequest: ClientRequest {
+      _events: [Object: null prototype],
+      _eventsCount: 2,
+      _maxListeners: undefined,
+      outputData: [],
+      outputSize: 0,
+      writable: true,
+      destroyed: true,
+      _last: true,
+      chunkedEncoding: false,
+      shouldKeepAlive: true,
+      maxRequestsOnConnectionReached: false,
+      _defaultKeepAlive: true,
+      useChunkedEncodingByDefault: false,
+      sendDate: false,
+      _removedConnection: false,
+      _removedContLen: false,
+      _removedTE: false,
+      strictContentLength: false,
+      _contentLength: 0,
+      _hasBody: true,
+      _trailer: '',
+      finished: true,
+      _headerSent: true,
+      _closed: false,
+      _header: 'GET /otn/leftTicket/init HTTP/1.1\r\n' +
+        'Accept: application/json, text/plain, */*\r\n' +
+        'User-Agent: axios/1.20.0\r\n' +
+        'Accept-Encoding: gzip, compress, deflate, br\r\n' +
+        'Host: kyfw.12306.cn\r\n' +
+        'Connection: keep-alive\r\n' +
+        '\r\n',
+      _keepAliveTimeout: 0,
+      _onPendingData: [Function: nop],
+      agent: [Agent],
+      socketPath: undefined,
+      method: 'GET',
+      maxHeaderSize: undefined,
+      insecureHTTPParser: false,
+      joinDuplicateHeaders: undefined,
+      path: '/otn/leftTicket/init',
+      _ended: false,
+      res: null,
+      aborted: false,
+      timeoutCb: [Function: emitRequestTimeout],
+      upgradeOrConnect: false,
+      parser: null,
+      maxHeadersCount: null,
+      reusedSocket: true,
+      host: 'kyfw.12306.cn',
+      protocol: 'https:',
+      _redirectable: [Circular *1],
+      Symbol(shapeMode): false,
+      Symbol(kCapture): false,
+      Symbol(kBytesWritten): 0,
+      Symbol(kNeedDrain): false,
+      Symbol(corked): 0,
+      Symbol(kChunkedBuffer): [],
+      Symbol(kChunkedLength): 0,
+      Symbol(kSocket): [TLSSocket],
+      Symbol(kOutHeaders): [Object: null prototype],
+      Symbol(errored): null,
+      Symbol(kHighWaterMark): 16384,
+      Symbol(kRejectNonStandardBodyWrites): false,
+      Symbol(kUniqueHeaders): null,
+      Symbol(kError): [Error]
+    },
+    _currentUrl: 'https://kyfw.12306.cn/otn/leftTicket/init',
+    _timeout: null,
+    Symbol(shapeMode): true,
+    Symbol(kCapture): false
+  },
+  [cause]: Error: read ECONNRESET
+      at TLSWrap.onStreamRead (node:internal/stream_base_commons:216:20) {
+    errno: -4077,
+    code: 'ECONNRESET',
+    syscall: 'read'
+  }
+}
+file:///C:/Users/Sito/AppData/Local/npm-cache/_npx/ed2d86c30172f167/node_modules/12306-mcp/build/index.js:1209
+        throw new Error('Error: get 12306 web page failed.');
+              ^
+
+Error: Error: get 12306 web page failed.
+    at getTicketQueryPath (file:///C:/Users/Sito/AppData/Local/npm-cache/_npx/ed2d86c30172f167/node_modules/12306-mcp/build/index.js:1209:15)
+    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at async file:///C:/Users/Sito/AppData/Local/npm-cache/_npx/ed2d86c30172f167/node_modules/12306-mcp/build/index.js:19:28
+
+Node.js v24.7.0
+
+[TOOL]
+name       12306/railway_12306_get-tickets
+input      {"date": "2026-10-04", "fromStation": "杭州", "toSta ... [truncated 
+119 chars]
+output     UNAVAILABLE · 0 条 · fetched_at=2026-09-18 14:37:16 ... [truncated 
+81 chars]
+time       35969.0ms
+status     UNAVAILABLE
+
+[TOOL]
+name       tuniu/tuniu_search_trains
+input      {"departure_city": "杭州", "arrival_city": "上海", "de ... 
+[truncated 45 chars]
+output     TIMEOUT · 0 条 · fetched_at=2026-09-18 14:40:41.838 ... [truncated 
+48 chars]
+time       205062.0ms
+status     TIMEOUT
+
+[TOOL]
+name       tuniu/tuniu_search_flights
+input      {"departure_city": "杭州", "arrival_city": "上海", "de ... 
+[truncated 45 chars]
+output     UNAVAILABLE · 0 条 · fetched_at=2026-09-18 14:40:58 ... [truncated 
+64 chars]
+time       16172.0ms
+status     UNAVAILABLE
+
+[TOOL]
+name       tuniu/tuniu_search_hotels
+input      {"city": "杭州", "check_in": "2026-10-02", "check_ou ... [truncated 
+49 chars]
+output     OK · 8 条 · fetched_at=2026-09-18 14:41:01.863641+0 ... [truncated 4
+chars]
+time       3562.0ms
+status     OK
+
+[LLM]
+model      kimi-k3
+context    -
+decision   OK
+output     [
+  "杭州3天2晚旅游攻略自然拍照",
+  "十一国庆杭州旅游避坑排雷",
+  "杭州小众自然风 ... [truncated 189 chars]
+time       19844.0ms
+tokens     in=476 | out=1,218
+cache      hit=0
+
+[TOOL]
+name       tikhub/search_xiaohongshu
+input      {"keyword": "杭州3天2晚旅游攻略自然拍照", "page": 1}
+output     FREE_CREDIT_EXHAUSTED · 0 条 · fetched_at=2026-09-1 ... [truncated 
+146 chars]
+time       1265.0ms
+status     FREE_CREDIT_EXHAUSTED
+
+[TOOL]
+name       mediacrawler/search_xhs_via_mediacrawler
+input      {"keyword": "杭州3天2晚旅游攻略自然拍照", "limit": 10, "timeou ... 
+[truncated 10 chars]
+output     UNAVAILABLE · 0 条 · fetched_at=2026-09-18 14:41:23 ... [truncated 
+190 chars]
+time       16.0ms
+status     UNAVAILABLE
+
+[TOOL]
+name       tikhub/search_xiaohongshu
+input      {"keyword": "十一国庆杭州旅游避坑排雷", "page": 1}
+output     RATE_LIMIT · 0 条 · fetched_at=2026-09-18 14:41:23. ... [truncated 
+40 chars]
+time       858.0ms
+status     RATE_LIMIT
+
+[TOOL]
+name       mediacrawler/search_xhs_via_mediacrawler
+input      {"keyword": "十一国庆杭州旅游避坑排雷", "limit": 10, "timeout" ... 
+[truncated 8 chars]
+output     UNAVAILABLE · 0 条 · fetched_at=2026-09-18 14:41:24 ... [truncated 
+190 chars]
+time       16.0ms
+status     UNAVAILABLE
+
+[TOOL]
+name       tikhub/search_xiaohongshu
+input      {"keyword": "杭州小众自然风光拍照机位推荐", "page": 1}
+output     FREE_CREDIT_EXHAUSTED · 0 条 · fetched_at=2026-09-1 ... [truncated 
+146 chars]
+time       1062.0ms
+status     FREE_CREDIT_EXHAUSTED
+
+[TOOL]
+name       mediacrawler/search_xhs_via_mediacrawler
+input      {"keyword": "杭州小众自然风光拍照机位推荐", "limit": 10, "timeou ...
+[truncated 10 chars]
+output     UNAVAILABLE · 0 条 · fetched_at=2026-09-18 14:41:25 ... [truncated 
+190 chars]
+time       31.0ms
+status     UNAVAILABLE
+
+[TOOL]
+name       tikhub/search_douyin
+input      {"keyword": "杭州 旅游", "page": 1}
+output     RATE_LIMIT · 0 条 · fetched_at=2026-09-18 14:41:26. ... [truncated 
+40 chars]
+time       844.0ms
+status     RATE_LIMIT
+
+[TOOL]
+name       mediacrawler/search_douyin_via_mediacrawler
+input      {"keyword": "杭州 旅游", "limit": 10, "timeout": 240.0 ... 
+[truncated 1 chars]
+output     UNAVAILABLE · 0 条 · fetched_at=2026-09-18 14:41:26 ... [truncated 
+190 chars]
+time       15.0ms
+status     UNAVAILABLE
+
+[TOOL]
+name       tavily/web_search
+input      {"query": "杭州3天2晚旅游攻略自然拍照", "max_results": 5}
+output     OK · 6 条 · fetched_at=2026-09-18 14:41:28.846926+0 ... [truncated 4
+chars]
+time       2782.0ms
+status     OK
+
+[TOOL]
+name       tavily/web_search
+input      {"query": "十一国庆杭州旅游避坑排雷", "max_results": 5}
+output     OK · 8 条 · fetched_at=2026-09-18 14:41:31.821509+0 ... [truncated 4
+chars]
+time       2953.0ms
+status     OK
+
+[LLM]
+model      kimi-k3
+context    -
+decision   OK
+output     {"places":[{"name":"杭州","city":"杭州","district":nul ... 
+[truncated 713 chars]
+time       82750.0ms
+tokens     in=891 | out=2,183
+cache      hit=0
+
+[LLM]
+model      kimi-k3
+context    -
+decision   OK
+output     {"places": [{"name": "白堤", "city": "杭州", "district ... 
+[truncated 1682 chars]
+time       177516.0ms
+tokens     in=904 | out=4,594
+cache      hit=512
+
+[LLM]
+model      kimi-k3
+context    -
+decision   TIMEOUT · 模型调用超过 180s 未返回，已放弃等待并按失败降级
+time       180016.0ms
+tokens     in=0 | out=0
+cache      hit=0
+
+[LLM]
+model      kimi-k3
+context    -
+decision   TIMEOUT · 模型调用超过 180s 未返回，已放弃等待并按失败降级
+time       180015.0ms
+tokens     in=0 | out=0
+cache      hit=0
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "杭州", "region": "杭州", "page": 1, "pag ... 
+[truncated 12 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 14:51:54.586149+ ... [truncated 5
+chars]
+time       2391.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "西湖", "region": "杭州", "page": 1, "pag ... 
+[truncated 12 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 14:51:57.185729+ ... [truncated 5
+chars]
+time       2578.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "靈隱寺", "region": "杭州", "page": 1, "pa ... 
+[truncated 13 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 14:52:01.009250+ ... [truncated 5
+chars]
+time       3812.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "宋城", "region": "杭州", "page": 1, "pag ... 
+[truncated 12 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 14:52:03.477071+ ... [truncated 5
+chars]
+time       2452.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "白堤", "region": "杭州", "page": 1, "pag ... 
+[truncated 12 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 14:52:06.926333+ ... [truncated 5
+chars]
+time       3421.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "孤山", "region": "杭州", "page": 1, "pag ... 
+[truncated 12 chars]
+output     EMPTY · 0 条 · fetched_at=2026-09-18 14:52:09.53479 ... [truncated 7
+chars]
+time       2578.0ms
+status     EMPTY
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "杭州西湖觀荷區", "region": "杭州", "page": 1, ... 
+[truncated 17 chars]
+output     OK · 2 条 · fetched_at=2026-09-18 14:52:11.884662+0 ... [truncated 4
+chars]
+time       2344.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "西湖", "region": "杭州", "page": 1, "pag ... 
+[truncated 12 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 14:51:57.185729+ ... [truncated 
+11 chars]
+time       -
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "景点", "region": "杭州", "page": 1, "pag ... 
+[truncated 12 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 14:52:14.313827+ ... [truncated 5
+chars]
+time       2405.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "博物馆", "region": "杭州", "page": 1, "pa ... 
+[truncated 13 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 14:52:16.819022+ ... [truncated 5
+chars]
+time       2500.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "公园", "region": "杭州", "page": 1, "pag ... 
+[truncated 12 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 14:52:19.766590+ ... [truncated 5
+chars]
+time       2921.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "步行街", "region": "杭州", "page": 1, "pa ... 
+[truncated 13 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 14:52:28.100152+ ... [truncated 5
+chars]
+time       8312.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "古镇", "region": "杭州", "page": 1, "pag ... 
+[truncated 12 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 14:52:35.111066+ ... [truncated 5
+chars]
+time       7000.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "自然", "region": "杭州", "page": 1, "pag ... 
+[truncated 12 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 14:52:40.633536+ ... [truncated 5
+chars]
+time       5516.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "观景台", "region": "杭州", "page": 1, "pa ... 
+[truncated 13 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 14:52:44.083269+ ... [truncated 5
+chars]
+time       3437.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "小众自然风光拍照机位", "region": "杭州", "page": ... 
+[truncated 20 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 14:52:49.616207+ ... [truncated 5
+chars]
+time       5500.0ms
+status     OK
+
+[TOOL]
+name       amap/get_poi_detail
+input      {"poi_id": "B023B148F8"}
+output     OK · 1 条 · fetched_at=2026-09-18 14:53:03.290494+0 ... [truncated 4
+chars]
+time       2968.0ms
+status     OK
+
+[TOOL]
+name       amap/get_poi_detail
+input      {"poi_id": "B0KUX9XWXR"}
+output     OK · 1 条 · fetched_at=2026-09-18 14:53:06.901170+0 ... [truncated 4
+chars]
+time       3609.0ms
+status     OK
+
+[TOOL]
+name       amap/get_poi_detail
+input      {"poi_id": "B0FFGDHBEP"}
+output     OK · 1 条 · fetched_at=2026-09-18 14:53:13.631501+0 ... [truncated 4
+chars]
+time       6703.0ms
+status     OK
+
+[TOOL]
+name       amap/get_poi_detail
+input      {"poi_id": "B0FFFEDKS3"}
+output     OK · 1 条 · fetched_at=2026-09-18 14:53:19.001813+0 ... [truncated 4
+chars]
+time       5312.0ms
+status     OK
+
+[TOOL]
+name       amap/get_poi_detail
+input      {"poi_id": "BV10183236"}
+output     OK · 1 条 · fetched_at=2026-09-18 14:53:22.042349+0 ... [truncated 4
+chars]
+time       3030.0ms
+status     OK
+
+[TOOL]
+name       amap/get_poi_detail
+input      {"poi_id": "B0MGAXGH2Z"}
+output     OK · 1 条 · fetched_at=2026-09-18 14:53:25.042323+0 ... [truncated 4
+chars]
+time       2984.0ms
+status     OK
+
+[TOOL]
+name       amap/route
+input      {"origin": "120.212285,30.237933", "destination":  ... [truncated 56
+chars]
+output     OK · 1 条 · fetched_at=2026-09-18 14:53:29.443037+0 ... [truncated 4
+chars]
+time       4375.0ms
+status     OK
+
+[TOOL]
+name       amap/route
+input      {"origin": "120.222806,30.250250", "destination":  ... [truncated 56
+chars]
+output     OK · 1 条 · fetched_at=2026-09-18 14:53:34.349986+0 ... [truncated 4
+chars]
+time       4905.0ms
+status     OK
+
+[TOOL]
+name       amap/route
+input      {"origin": "119.109755,30.181901", "destination":  ... [truncated 56
+chars]
+output     OK · 1 条 · fetched_at=2026-09-18 14:53:37.620515+0 ... [truncated 4
+chars]
+time       3250.0ms
+status     OK
+
+[TOOL]
+name       amap/route
+input      {"origin": "120.217398,30.248649", "destination":  ... [truncated 56
+chars]
+output     OK · 1 条 · fetched_at=2026-09-18 14:53:40.869335+0 ... [truncated 4
+chars]
+time       3233.0ms
+status     OK
+
+[TOOL]
+name       amap/route
+input      {"origin": "120.151292,30.222870", "destination":  ... [truncated 56
+chars]
+output     OK · 1 条 · fetched_at=2026-09-18 14:53:42.959816+0 ... [truncated 4
+chars]
+time       2078.0ms
+status     OK
+
+[TOOL]
+name       amap/route
+input      {"origin": "120.224215,30.254642", "destination":  ... [truncated 56
+chars]
+output     OK · 1 条 · fetched_at=2026-09-18 14:53:46.377201+0 ... [truncated 4
+chars]
+time       3391.0ms
+status     OK
+
+[TOOL]
+name       amap/route
+input      {"origin": "118.869236,30.141530", "destination":  ... [truncated 56
+chars]
+output     OK · 1 条 · fetched_at=2026-09-18 14:53:53.370389+0 ... [truncated 4
+chars]
+time       6983.0ms
+status     OK
+
+[TOOL]
+name       tuniu/tuniu_search_scenic_tickets
+input      {"scenic_name": "西湖", "timeout": 60.0}
+output     TIMEOUT · 0 条 · fetched_at=2026-09-18 14:54:23.993 ... [truncated 
+60 chars]
+time       30453.0ms
+status     TIMEOUT
+
+[TOOL]
+name       tuniu/tuniu_search_scenic_tickets
+input      {"scenic_name": "宋城旅游区", "timeout": 60.0}
+output     EMPTY · 0 条 · fetched_at=2026-09-18 14:54:25.85528 ... [truncated 7
+chars]
+time       1842.0ms
+status     EMPTY
+
+[TOOL]
+name       tuniu/tuniu_search_scenic_tickets
+input      {"scenic_name": "杭州站", "timeout": 60.0}
+output     EMPTY · 0 条 · fetched_at=2026-09-18 14:54:28.59718 ... [truncated 7
+chars]
+time       2719.0ms
+status     EMPTY
+
+[LLM]
+model      kimi-k3
+context    -
+decision   TIMEOUT · 模型调用超过 180s 未返回，已放弃等待并按失败降级
+time       180015.0ms
+tokens     in=0 | out=0
+cache      hit=0
+
+[LLM]
+model      kimi-k3
+context    -
+decision   TIMEOUT · 模型调用超过 180s 未返回，已放弃等待并按失败降级
+time       180015.0ms
+tokens     in=0 | out=0
+cache      hit=0
+
+[WORKFLOW]
+name       travelplan_workflow
+status     OK
+run_id      : tp-20260918-223526-00317d
+状态        : completed
+行程        : 3 天，16 个安排
+预算        : 预计 ¥1,950 / 预算 ¥3,000（结余 ¥1,050，within_budget）
+大交通      : D203 动车 ¥33
+选择理由    : 去程选中 D203 动车 ¥33；门到门约 3 小时 0 分；价格 ¥33（CNY）；在 10 个候选里综合分最低；⚠️ 该方案的发车日是2026-10-01，与行程约定的2026-10-02相差 -1 天 —— 10 个候选里没有一个落在约定日期，这是数据源返回的日期，我们没有替它改；行程按该方案的实际日期排；若按此方案，抵达当天最早 10:51 才能开始行程；次选 D181 动车 ¥43 的差距：门到门多 0 小时 4 分、价格高 ¥10（注：门到门时长中的机场/车站接驳按具名常量估算，未取到真实路线时以常量计） 数据源状态：{"去程火车": "OK", "去程航班": "UNAVAILABLE", "回程火车": "TIMEOUT", "回程航班": "UNAVAILABLE"}
+住宿        : 全季酒店（杭州西溪海港城店）
+未解决告警  : 20 条
+  - [D0] ROUTE_UNVERIFIED: D203 上海松江→杭州南 → 全季酒店（杭州西溪海港城店）（办理入住） 的路线未经高德核实：缺少坐标与路线数据，按同城兜底值估算；排程按 15 分钟占位，不能当作真实路况
+  - [D0] HOTEL_CHECKIN_EARLY: 10:21 到达酒店，早于业界常规入住时间 14:00，一般只能先寄存行李（是否有寄存服务需确认）；若确认可寄存，可用 HOTEL_LUGGAGE_DROP_MINUTES 覆盖该段时长
+  - [D0] ROUTE_UNVERIFIED: 全季酒店（杭州西溪海港城店）（办理入住） → 小面包的拍照馆(衣之佳城市奥特莱斯店) 的路线未经高德核实：缺少坐标与路线数据，按同城兜底值估算；排程按 15 分钟占位，不能当作真实路况
+  - [D0] OPENING_TIME_CONFLICT: 小面包的拍照馆(衣之佳城市奥特莱斯店) 营业时间 周一至周日 12:00-21:00，11:16 早于开门时间 12:00
+  - [D0] ROUTE_UNVERIFIED: 小面包的拍照馆(衣之佳城市奥特莱斯店) → 杭州西湖风景名胜区-白堤-石拱桥与湖面游船(打卡点) 的路线未经高德核实：高德路线不可用，按直距 × 绕行系数估算（haversine*detour）；排程按 5 分钟占位，不能当作真实路况
+降级记录    : 5 条
+  - 模型调用 extract_places:tp-20260918-223526-00317d-src-015-w2 未成功（TIMEOUT：模型调用超过 180s 未返回，已放弃等待并按失败降级）；证据 tp-20260918-223526-00317d-src-015-w2 的地点抽取被跳过
+  - 模型调用 extract_places:tp-20260918-223526-00317d-src-015-w3 未成功（TIMEOUT：模型调用超过 180s 未返回，已放弃等待并按失败降级）；证据 tp-20260918-223526-00317d-src-015-w3 的地点抽取被跳过
+  - 去程车站/机场到酒店的真实接驳时间未取得，门到门时长按具名常量估算
+  - 模型调用 critic 未成功（TIMEOUT：模型调用超过 180s 未返回，已放弃等待并按失败降级）；本次只有规则 Critic 参与
+  - 模型调用 final_answer 未成功（TIMEOUT：模型调用超过 180s 未返回，已放弃等待并按失败降级）；plan.md 只包含代码生成的结构化明细
+产物 plan.json         : D:\Documents\MyWorkSpace\travelplan\outputs\tp-20260918-223526-00317d\plan.json
+产物 plan.md           : D:\Documents\MyWorkSpace\travelplan\outputs\tp-20260918-223526-00317d\plan.md
+产物 audit_report.json : D:\Documents\MyWorkSpace\travelplan\outputs\tp-20260918-223526-00317d\audit_report.json

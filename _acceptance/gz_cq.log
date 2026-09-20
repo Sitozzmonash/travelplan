@@ -1,0 +1,598 @@
+
+[WORKFLOW]
+selected   travelplan_workflow
+
+[WORKFLOW]
+name       travelplan_workflow
+
+[LLM]
+model      kimi-k3
+context    -
+decision   OK
+output     {"origin_city":"广州","destination_city":"重庆","start ... 
+[truncated 208 chars]
+time       7203.0ms
+tokens     in=650 | out=424
+cache      hit=0
+12306 MCP Server running on stdio @Joooook
+
+[TOOL]
+name       12306/railway_12306_get-tickets
+input      {"date": "2026-10-03", "fromStation": "广州", "toSta ... [truncated 
+119 chars]
+output     TIMEOUT · 0 条 · fetched_at=2026-09-18 15:56:31.940 ... [truncated 
+26 chars]
+time       60000.0ms
+status     TIMEOUT
+12306 MCP Server running on stdio @Joooook
+
+[TOOL]
+name       tuniu/tuniu_search_trains
+input      {"departure_city": "广州", "arrival_city": "重庆", "de ... 
+[truncated 45 chars]
+output     OK · 30 条 · fetched_at=2026-09-18 15:56:37.056484+ ... [truncated 5
+chars]
+time       5062.0ms
+status     OK
+
+[TOOL]
+name       tuniu/tuniu_search_flights
+input      {"departure_city": "广州", "arrival_city": "重庆", "de ... 
+[truncated 45 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 15:56:52.391864+ ... [truncated 5
+chars]
+time       15312.0ms
+status     OK
+12306 MCP Server running on stdio @Joooook
+
+[TOOL]
+name       12306/railway_12306_get-tickets
+input      {"date": "2026-10-06", "fromStation": "重庆", "toSta ... [truncated 
+119 chars]
+output     INVALID_RESPONSE · 0 条 · fetched_at=2026-09-18 15: ... [truncated 
+18 chars]
+time       47437.0ms
+status     INVALID_RESPONSE
+
+[TOOL]
+name       tuniu/tuniu_search_trains
+input      {"departure_city": "重庆", "arrival_city": "广州", "de ... 
+[truncated 45 chars]
+output     OK · 30 条 · fetched_at=2026-09-18 15:57:42.592193+ ... [truncated 5
+chars]
+time       2735.0ms
+status     OK
+
+[TOOL]
+name       tuniu/tuniu_search_flights
+input      {"departure_city": "重庆", "arrival_city": "广州", "de ... 
+[truncated 45 chars]
+output     UNAVAILABLE · 0 条 · fetched_at=2026-09-18 15:57:53 ... [truncated 
+109 chars]
+time       11000.0ms
+status     UNAVAILABLE
+
+[TOOL]
+name       tuniu/tuniu_search_hotels
+input      {"city": "重庆", "check_in": "2026-10-03", "check_ou ... [truncated 
+49 chars]
+output     OK · 7 条 · fetched_at=2026-09-18 15:57:57.717393+0 ... [truncated 4
+chars]
+time       4094.0ms
+status     OK
+
+[LLM]
+model      kimi-k3
+context    -
+decision   OK
+output     ["重庆4天3晚自由行路线攻略", "重庆国庆旅游避坑指南", 
+"重庆看夜景最佳机位推荐", "重庆 ... [truncated 141 chars]
+time       10016.0ms
+tokens     in=479 | out=892
+cache      hit=0
+
+[TOOL]
+name       tikhub/search_xiaohongshu
+input      {"keyword": "重庆4天3晚自由行路线攻略", "page": 1}
+output     FREE_CREDIT_EXHAUSTED · 0 条 · fetched_at=2026-09-1 ... [truncated 
+146 chars]
+time       937.0ms
+status     FREE_CREDIT_EXHAUSTED
+
+[TOOL]
+name       mediacrawler/search_xhs_via_mediacrawler
+input      {"keyword": "重庆4天3晚自由行路线攻略", "limit": 10, "timeout ... 
+[truncated 9 chars]
+output     UNAVAILABLE · 0 条 · fetched_at=2026-09-18 15:58:08 ... [truncated 
+190 chars]
+time       0.0ms
+status     UNAVAILABLE
+
+[TOOL]
+name       tikhub/search_xiaohongshu
+input      {"keyword": "重庆国庆旅游避坑指南", "page": 1}
+output     RATE_LIMIT · 0 条 · fetched_at=2026-09-18 15:58:09. ... [truncated 
+40 chars]
+time       687.0ms
+status     RATE_LIMIT
+
+[TOOL]
+name       mediacrawler/search_xhs_via_mediacrawler
+input      {"keyword": "重庆国庆旅游避坑指南", "limit": 10, "timeout":  ... 
+[truncated 6 chars]
+output     UNAVAILABLE · 0 条 · fetched_at=2026-09-18 15:58:09 ... [truncated 
+190 chars]
+time       14.0ms
+status     UNAVAILABLE
+
+[TOOL]
+name       tikhub/search_xiaohongshu
+input      {"keyword": "重庆看夜景最佳机位推荐", "page": 1}
+output     FREE_CREDIT_EXHAUSTED · 0 条 · fetched_at=2026-09-1 ... [truncated 
+146 chars]
+time       719.0ms
+status     FREE_CREDIT_EXHAUSTED
+
+[TOOL]
+name       mediacrawler/search_xhs_via_mediacrawler
+input      {"keyword": "重庆看夜景最佳机位推荐", "limit": 10, "timeout": ... 
+[truncated 7 chars]
+output     UNAVAILABLE · 0 条 · fetched_at=2026-09-18 15:58:10 ... [truncated 
+190 chars]
+time       0.0ms
+status     UNAVAILABLE
+
+[TOOL]
+name       tikhub/search_douyin
+input      {"keyword": "重庆 旅游", "page": 1}
+output     RATE_LIMIT · 0 条 · fetched_at=2026-09-18 15:58:10. ... [truncated 
+40 chars]
+time       766.0ms
+status     RATE_LIMIT
+
+[TOOL]
+name       mediacrawler/search_douyin_via_mediacrawler
+input      {"keyword": "重庆 旅游", "limit": 10, "timeout": 240.0 ... 
+[truncated 1 chars]
+output     UNAVAILABLE · 0 条 · fetched_at=2026-09-18 15:58:11 ... [truncated 
+190 chars]
+time       0.0ms
+status     UNAVAILABLE
+
+[TOOL]
+name       tavily/web_search
+input      {"query": "重庆4天3晚自由行路线攻略", "max_results": 5}
+output     OK · 5 条 · fetched_at=2026-09-18 15:58:13.579073+0 ... [truncated 4
+chars]
+time       2531.0ms
+status     OK
+
+[TOOL]
+name       tavily/web_search
+input      {"query": "重庆国庆旅游避坑指南", "max_results": 5}
+output     OK · 5 条 · fetched_at=2026-09-18 15:58:16.094377+0 ... [truncated 4
+chars]
+time       2500.0ms
+status     OK
+
+[LLM]
+model      kimi-k3
+context    -
+decision   OK
+output     {
+  "places": [
+    {
+      "name": "怀化火车站",
+      ... [truncated 1751 chars]
+time       129203.0ms
+tokens     in=823 | out=2,945
+cache      hit=0
+
+[LLM]
+model      kimi-k3
+context    -
+decision   OK
+output     {
+  "places": [
+    {
+      "name": "解放碑附近酒店",
+    ... [truncated 574 chars]
+time       7967.0ms
+tokens     in=834 | out=820
+cache      hit=0
+
+[LLM]
+model      kimi-k3
+context    -
+decision   OK
+output     {
+  "places": [
+    {
+      "name": "Wujiang Galle ... [truncated 1127 chars]
+time       6546.0ms
+tokens     in=726 | out=1,169
+cache      hit=0
+
+[LLM]
+model      kimi-k3
+context    -
+decision   OK
+output     {
+  "places": [
+    {
+      "name": "洪崖洞",
+      " ... [truncated 3950 chars]
+time       13844.0ms
+tokens     in=849 | out=3,413
+cache      hit=0
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "怀化火车站", "region": "重庆", "page": 1, " ... 
+[truncated 15 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 16:00:55.905603+ ... [truncated 5
+chars]
+time       2172.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "重庆北火车站", "region": "重庆", "page": 1,  ... 
+[truncated 16 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 16:00:59.209735+ ... [truncated 5
+chars]
+time       3297.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "解放碑", "region": "重庆", "page": 1, "pa ... 
+[truncated 13 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 16:01:02.363460+ ... [truncated 5
+chars]
+time       3141.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "武隆", "region": "重庆", "page": 1, "pag ... 
+[truncated 12 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 16:01:07.464870+ ... [truncated 5
+chars]
+time       5094.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "仙女山", "region": "重庆", "page": 1, "pa ... 
+[truncated 13 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 16:01:09.687853+ ... [truncated 5
+chars]
+time       2203.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "天生三桥", "region": "重庆", "page": 1, "p ... 
+[truncated 14 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 16:01:14.068419+ ... [truncated 5
+chars]
+time       4375.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "重庆", "region": "重庆", "page": 1, "pag ... 
+[truncated 12 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 16:01:18.752007+ ... [truncated 5
+chars]
+time       4655.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "解放碑附近酒店", "region": "重庆", "page": 1, ... 
+[truncated 17 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 16:01:21.495790+ ... [truncated 5
+chars]
+time       2733.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "景点", "region": "重庆", "page": 1, "pag ... 
+[truncated 12 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 16:01:27.193865+ ... [truncated 5
+chars]
+time       5687.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "博物馆", "region": "重庆", "page": 1, "pa ... 
+[truncated 13 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 16:01:32.390343+ ... [truncated 5
+chars]
+time       5171.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "公园", "region": "重庆", "page": 1, "pag ... 
+[truncated 12 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 16:01:34.631927+ ... [truncated 5
+chars]
+time       2219.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "步行街", "region": "重庆", "page": 1, "pa ... 
+[truncated 13 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 16:01:38.738435+ ... [truncated 5
+chars]
+time       4093.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "古镇", "region": "重庆", "page": 1, "pag ... 
+[truncated 12 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 16:01:40.980824+ ... [truncated 5
+chars]
+time       2217.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "美食", "region": "重庆", "page": 1, "pag ... 
+[truncated 12 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 16:01:44.469883+ ... [truncated 5
+chars]
+time       3469.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "夜景", "region": "重庆", "page": 1, "pag ... 
+[truncated 12 chars]
+output     OK · 10 条 · fetched_at=2026-09-18 16:01:46.766191+ ... [truncated 5
+chars]
+time       2282.0ms
+status     OK
+
+[TOOL]
+name       amap/search_poi
+input      {"keywords": "看夜景最佳机位", "region": "重庆", "page": 1, ... 
+[truncated 17 chars]
+output     OK · 9 条 · fetched_at=2026-09-18 16:01:49.066312+0 ... [truncated 4
+chars]
+time       2296.0ms
+status     OK
+
+[TOOL]
+name       amap/get_poi_detail
+input      {"poi_id": "B0FFGHJVK7"}
+output     OK · 1 条 · fetched_at=2026-09-18 16:02:00.993634+0 ... [truncated 4
+chars]
+time       2155.0ms
+status     OK
+
+[TOOL]
+name       amap/get_poi_detail
+input      {"poi_id": "B02E9017OV"}
+output     OK · 1 条 · fetched_at=2026-09-18 16:02:03.215043+0 ... [truncated 4
+chars]
+time       2203.0ms
+status     OK
+
+[TOOL]
+name       amap/get_poi_detail
+input      {"poi_id": "BV11455126"}
+output     OK · 1 条 · fetched_at=2026-09-18 16:02:05.525195+0 ... [truncated 4
+chars]
+time       2297.0ms
+status     OK
+
+[TOOL]
+name       amap/get_poi_detail
+input      {"poi_id": "B02E9017JB"}
+output     OK · 1 条 · fetched_at=2026-09-18 16:02:08.914215+0 ... [truncated 4
+chars]
+time       3359.0ms
+status     OK
+
+[TOOL]
+name       amap/get_poi_detail
+input      {"poi_id": "BV11473696"}
+output     OK · 1 条 · fetched_at=2026-09-18 16:02:15.389745+0 ... [truncated 4
+chars]
+time       6469.0ms
+status     OK
+
+[TOOL]
+name       amap/get_poi_detail
+input      {"poi_id": "BV11500507"}
+output     OK · 1 条 · fetched_at=2026-09-18 16:02:17.592971+0 ... [truncated 4
+chars]
+time       2187.0ms
+status     OK
+
+[TOOL]
+name       amap/route
+input      {"origin": "106.575989,29.558119", "destination":  ... [truncated 56
+chars]
+output     OK · 1 条 · fetched_at=2026-09-18 16:02:21.982702+0 ... [truncated 4
+chars]
+time       4375.0ms
+status     OK
+
+[TOOL]
+name       amap/route
+input      {"origin": "106.540183,29.551101", "destination":  ... [truncated 56
+chars]
+output     OK · 1 条 · fetched_at=2026-09-18 16:02:24.398917+0 ... [truncated 4
+chars]
+time       2390.0ms
+status     OK
+
+[TOOL]
+name       amap/route
+input      {"origin": "106.554468,29.563106", "destination":  ... [truncated 56
+chars]
+output     OK · 1 条 · fetched_at=2026-09-18 16:02:28.293146+0 ... [truncated 4
+chars]
+time       3875.0ms
+status     OK
+
+[TOOL]
+name       amap/route
+input      {"origin": "106.462431,29.557122", "destination":  ... [truncated 56
+chars]
+output     OK · 1 条 · fetched_at=2026-09-18 16:02:31.416857+0 ... [truncated 4
+chars]
+time       3093.0ms
+status     OK
+
+[TOOL]
+name       amap/route
+input      {"origin": "106.582175,29.557259", "destination":  ... [truncated 56
+chars]
+output     OK · 1 条 · fetched_at=2026-09-18 16:02:38.084985+0 ... [truncated 4
+chars]
+time       6657.0ms
+status     OK
+
+[TOOL]
+name       amap/route
+input      {"origin": "106.546783,29.561194", "destination":  ... [truncated 56
+chars]
+output     OK · 1 条 · fetched_at=2026-09-18 16:02:40.399522+0 ... [truncated 4
+chars]
+time       2312.0ms
+status     OK
+
+[TOOL]
+name       amap/route
+input      {"origin": "106.581235,29.555152", "destination":  ... [truncated 56
+chars]
+output     EMPTY · 0 条 · fetched_at=2026-09-18 16:02:46.59346 ... [truncated 7
+chars]
+time       6172.0ms
+status     EMPTY
+
+[TOOL]
+name       amap/route
+input      {"origin": "106.577034,29.557204", "destination":  ... [truncated 56
+chars]
+output     EMPTY · 0 条 · fetched_at=2026-09-18 16:02:48.96941 ... [truncated 7
+chars]
+time       2360.0ms
+status     EMPTY
+
+[TOOL]
+name       amap/route
+input      {"origin": "107.727958,29.450834", "destination":  ... [truncated 56
+chars]
+output     EMPTY · 0 条 · fetched_at=2026-09-18 16:02:51.31690 ... [truncated 7
+chars]
+time       2344.0ms
+status     EMPTY
+
+[TOOL]
+name       amap/route
+input      {"origin": "108.147362,31.018389", "destination":  ... [truncated 56
+chars]
+output     EMPTY · 0 条 · fetched_at=2026-09-18 16:02:53.87372 ... [truncated 7
+chars]
+time       2546.0ms
+status     EMPTY
+
+[TOOL]
+name       amap/route
+input      {"origin": "106.391370,29.527548", "destination":  ... [truncated 56
+chars]
+output     EMPTY · 0 条 · fetched_at=2026-09-18 16:02:56.06283 ... [truncated 7
+chars]
+time       2171.0ms
+status     EMPTY
+
+[TOOL]
+name       amap/route
+input      {"origin": "107.749641,29.495371", "destination":  ... [truncated 56
+chars]
+output     OK · 1 条 · fetched_at=2026-09-18 16:02:58.475487+0 ... [truncated 4
+chars]
+time       2389.0ms
+status     OK
+
+[TOOL]
+name       tuniu/tuniu_search_scenic_tickets
+input      {"scenic_name": "怀化站", "timeout": 60.0}
+output     EMPTY · 0 条 · fetched_at=2026-09-18 16:03:00.96759 ... [truncated 7
+chars]
+time       2328.0ms
+status     EMPTY
+
+[TOOL]
+name       tuniu/tuniu_search_scenic_tickets
+input      {"scenic_name": "怀化站地下停车场", "timeout": 60.0}
+output     EMPTY · 0 条 · fetched_at=2026-09-18 16:03:03.06927 ... [truncated 7
+chars]
+time       2094.0ms
+status     EMPTY
+
+[TOOL]
+name       tuniu/tuniu_search_scenic_tickets
+input      {"scenic_name": "重庆北站北广场地下停车场", "timeout": 60.0}
+output     EMPTY · 0 条 · fetched_at=2026-09-18 16:03:04.59592 ... [truncated 7
+chars]
+time       1516.0ms
+status     EMPTY
+
+[LLM]
+model      kimi-k3
+context    -
+decision   OK
+output     {
+  "verdict": "reject",
+  "issues": [
+    {
+      ... [truncated 2139 chars]
+time       9500.0ms
+tokens     in=7,457 | out=1,219
+cache      hit=0
+
+[LLM]
+model      kimi-k3
+context    -
+decision   OK
+output     
+这份行程根据当前计算生成的结构化方案整理。整体预算存在超支情况，且部分路线与营
+业时间存在冲突，具体安 ... [truncated 3950 chars]
+time       19764.0ms
+tokens     in=7,375 | out=7,653
+cache      hit=0
+
+[WORKFLOW]
+name       travelplan_workflow
+status     OK
+run_id      : tp-20260918-235342-3b2407
+状态        : completed
+行程        : 4 天，19 个安排
+预算        : 预计 ¥8,934 / 预算 ¥7,000（结余 ¥-1,934，over_budget）
+大交通      : JD5227 新海航｜首都航空 ¥640
+选择理由    : 去程选中 JD5227 新海航｜首都航空 ¥640；门到门约 5 小时 45 分；价格 ¥640（CNY）；在 40 个候选里综合分最低；若按此方案，抵达当天最早 11:00 才能开始行程；次选 CA4354 国航 ¥680 的差距：门到门多 0 小时 10 分、价格高 ¥40（注：门到门时长中的机场/车站接驳按具名常量估算，未取到真实路线时以常量计） 回程：回程选中 G2965 direct ¥574；门到门约 7 小时 16 分；价格 ¥574（CNY）；在 30 个候选里综合分最低；最后一天最晚 14:18 必须结束市内活动；次选 G2941 direct ¥573 的差距：门到门多 0 小时 3 分、价格低 ¥1（注：门到门时长中的机场/车站接驳按具名常量估算，未取到真实路线时以常量计） 数据源状态：{"去程火车": "OK", "去程航班": "OK", "回程火车": "OK", "回程航班": "UNAVAILABLE"}
+住宿        : 桔子酒店（重庆西站新桥医院店）
+未解决告警  : 21 条
+  - [D0] ROUTE_UNVERIFIED: JD5227 白云T3→江北T3 → 桔子酒店（重庆西站新桥医院店）（办理入住） 的路线未经高德核实：缺少坐标与路线数据，按同城兜底值估算；排程按 15 分钟占位，不能当作真实路况
+  - [D0] HOTEL_CHECKIN_EARLY: 10:00 到达酒店，早于业界常规入住时间 14:00，一般只能先寄存行李（是否有寄存服务需确认）；若确认可寄存，可用 HOTEL_LUGGAGE_DROP_MINUTES 覆盖该段时长
+  - [D0] ROUTE_UNVERIFIED: 桔子酒店（重庆西站新桥医院店）（办理入住） → 一只烧鸡公(大礼堂总店) 的路线未经高德核实：缺少坐标与路线数据，按同城兜底值估算；排程按 15 分钟占位，不能当作真实路况
+  - [D0] OPENING_TIME_CONFLICT: 一只烧鸡公(大礼堂总店) 营业时间 周一至周日 11:00-22:00，10:50 早于开门时间 11:00
+  - [D0] MEAL_TIME_ODDITY: 一只烧鸡公(大礼堂总店) 是午餐安排，但落在 10:50（合理区间 11:00-14:00）
+降级记录    : 2 条
+  - 5 段市内路线未能从高德取得（DEGRADED），这些路段在行程里标为未核实，Critic 会相应下调置信度；没有用估算值冒充实测
+  - 去程车站/机场到酒店的真实接驳时间未取得，门到门时长按具名常量估算
+产物 plan.json         : D:\Documents\MyWorkSpace\travelplan\outputs\tp-20260918-235342-3b2407\plan.json
+产物 plan.md           : D:\Documents\MyWorkSpace\travelplan\outputs\tp-20260918-235342-3b2407\plan.md
+产物 audit_report.json : D:\Documents\MyWorkSpace\travelplan\outputs\tp-20260918-235342-3b2407\audit_report.json

@@ -1,0 +1,133 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* TravelPlan 语义色（FRONTEND_DESIGN §31）：低饱和、干净。
+   Primary 只用于操作与选中；Success / Warning / Danger 只表达状态，不做装饰。 */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --font-heading: var(--font-geist-sans);
+
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-success-subtle: var(--success-subtle);
+  --color-success-subtle-foreground: var(--success-subtle-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-warning-subtle: var(--warning-subtle);
+  --color-warning-subtle-foreground: var(--warning-subtle-foreground);
+  --color-danger: var(--danger);
+  --color-danger-foreground: var(--danger-foreground);
+  --color-danger-subtle: var(--danger-subtle);
+  --color-danger-subtle-foreground: var(--danger-subtle-foreground);
+  --color-info: var(--info);
+  --color-info-subtle: var(--info-subtle);
+  --color-info-subtle-foreground: var(--info-subtle-foreground);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+}
+
+:root {
+  --radius: 0.75rem;
+
+  --background: oklch(0.983 0.004 220);
+  --foreground: oklch(0.235 0.012 250);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.235 0.012 250);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.235 0.012 250);
+
+  /* Primary：克制的青蓝，不是 AI 科技蓝 */
+  --primary: oklch(0.505 0.083 213);
+  --primary-foreground: oklch(0.99 0.005 213);
+  --secondary: oklch(0.962 0.006 240);
+  --secondary-foreground: oklch(0.3 0.014 250);
+  --muted: oklch(0.964 0.005 240);
+  --muted-foreground: oklch(0.545 0.014 250);
+  --accent: oklch(0.958 0.011 213);
+  --accent-foreground: oklch(0.35 0.03 213);
+  --destructive: oklch(0.55 0.176 25);
+  --destructive-foreground: oklch(0.99 0.01 25);
+  --border: oklch(0.912 0.006 240);
+  --input: oklch(0.905 0.007 240);
+  --ring: oklch(0.62 0.07 213);
+
+  --success: oklch(0.545 0.098 158);
+  --success-foreground: oklch(0.99 0.005 158);
+  --success-subtle: oklch(0.962 0.026 158);
+  --success-subtle-foreground: oklch(0.42 0.081 158);
+
+  --warning: oklch(0.665 0.126 72);
+  --warning-foreground: oklch(0.26 0.05 72);
+  --warning-subtle: oklch(0.965 0.036 82);
+  --warning-subtle-foreground: oklch(0.44 0.086 62);
+
+  --danger: oklch(0.55 0.176 25);
+  --danger-foreground: oklch(0.99 0.01 25);
+  --danger-subtle: oklch(0.963 0.028 25);
+  --danger-subtle-foreground: oklch(0.45 0.15 25);
+
+  --info: oklch(0.545 0.072 245);
+  --info-subtle: oklch(0.963 0.02 245);
+  --info-subtle-foreground: oklch(0.42 0.07 245);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family:
+      var(--font-sans),
+      ui-sans-serif,
+      system-ui,
+      "PingFang SC",
+      "Microsoft YaHei",
+      "Noto Sans SC",
+      sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  html {
+    @apply font-sans;
+  }
+}
+
+@utility tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 时间线左侧竖线 */
+@utility timeline-rail {
+  background-image: linear-gradient(
+    to bottom,
+    var(--color-border) 0%,
+    var(--color-border) 100%
+  );
+}
