@@ -43,6 +43,9 @@ def _bundle(result: dict[str, Any], hub: FakeHub, *, stages=("transport", "hotel
         hotels=list(result["hotels"].items) if "hotels" in stages else [],
         evidences=list(result["social"].evidences) if "social" in stages else [],
         places=list(result["places"].places) if "places" in stages else [],
+        # 与生产侧 sessions._bundle_from 保持一致：计划 query 与真正搜过的 query 都要过户
+        social_queries=list(result["social"].queries) if "social" in stages else [],
+        social_served_queries=list(result["social"].served_queries) if "social" in stages else [],
         provider_calls=hub.audit_entries(),
         discovery=dict(result.get("stages") or {}),
     )
@@ -111,6 +114,39 @@ class TestDiscoveryHandoff:
         assert "search_poi" in run_hub.calls
         assert not ({"search_trains", "search_flights"} & set(run_hub.calls))
         assert not ({"search_xiaohongshu", "search_douyin", "web_search"} & set(run_hub.calls))
+
+    def test_one_direction_only_still_queries_the_missing_direction(self, tmp_path):
+        """只复用了去程时，回程必须**真的去查**，不能被静默当成"已复用"。
+
+        这是上一版的真实缺陷：复用判据是 `bundle.outbound or bundle.inbound`（只要有一个
+        方向有数据就整体复用），于是"Discovery 只跑完了去程"会让回程候选被置空 ——
+        用户看到的是"回程没票"，真相是"回程没查"。少查一个方向是 bug，不是优化。
+        """
+
+        store = make_store(tmp_path / "t.db")
+        intent, result, hub = _discover_all(store)
+        partial = _bundle(result, hub, stages=("transport",))
+        # 去掉回程，模拟"Discovery 只跑完去程"
+        partial.inbound = []
+
+        run, run_hub = _run(store, intent, partial, run_id="tp-h-one-direction")
+
+        assert run.status == "completed", run.error
+        # 回程确实发起了查询：不能因为去程有数据就跳过它
+        assert "search_trains" in run_hub.calls
+        # 而且交接状态不能再自称"交通已复用" —— 一半复用一半补查要如实说成补查
+        assert _handoff(run)["transport"] == "fallback_query"
+
+    def test_both_directions_reused_does_not_touch_transport(self, tmp_path):
+        """去程与回程都在 bundle 里时，交通必须一次 Provider 都不打（对照组）。"""
+
+        store = make_store(tmp_path / "t.db")
+        intent, result, hub = _discover_all(store)
+        run, run_hub = _run(store, intent, _bundle(result, hub, stages=("transport",)), run_id="tp-h-both-ways")
+
+        assert run.status == "completed", run.error
+        assert _handoff(run)["transport"] == "reused"
+        assert not ({"search_trains", "search_flights"} & set(run_hub.calls))
 
     def test_no_discovery_result_falls_back_to_workflow(self, tmp_path):
         store = make_store(tmp_path / "t.db")
@@ -210,3 +246,49 @@ class TestDiscoveryHandoff:
         assert attributes["transport"] == "reused"
         assert attributes["hotels"] == "reused"
         assert "grace_waited_ms" in attributes
+
+
+class TestSocialQueryHandoff:
+    """Discovery 计划搜的 query 必须随 bundle 过户给正式 run（省掉一次 query_expansion）。"""
+
+    def test_bundle_roundtrips_social_queries(self):
+        bundle = PrefetchBundle(
+            session_id="ps-q",
+            social_queries=["成都 攻略", "成都 美食"],
+            social_served_queries=["成都 攻略"],
+        )
+        restored = PrefetchBundle.load(bundle.dump())
+        assert restored.social_queries == ["成都 攻略", "成都 美食"]
+        assert restored.social_served_queries == ["成都 攻略"]
+
+    def test_old_payload_without_query_keys_loads_empty(self):
+        # 本次改动之前存的 payload：根本没有这两个键，必须落到空列表而不是抛异常
+        old_payload = {"session_id": "ps-old", "discovery_status": "READY", "evidences": []}
+        restored = PrefetchBundle.load(old_payload)
+        assert restored.social_queries == []
+        assert restored.social_served_queries == []
+        # 空 payload / None 同样不能抛
+        assert PrefetchBundle.load(None).social_queries == []
+        assert PrefetchBundle.load({}).social_served_queries == []
+
+    def test_missing_social_queries_is_case_and_space_insensitive(self):
+        bundle = PrefetchBundle(social_served_queries=["成都 攻略", "Chengdu Food"])
+        # 大小写 / 空白变体都算"已搜过"，不能误判成缺失（否则会白搜一遍）
+        assert bundle.missing_social_queries(["成都攻略", "chengdu   food", "CHENGDU FOOD"]) == []
+        # 只把真正没收到的原样返回，并保留传入顺序
+        assert bundle.missing_social_queries(["成都 攻略", "成都 夜市"]) == ["成都 夜市"]
+        # 一条都没搜过时，需要的就是全部
+        assert PrefetchBundle().missing_social_queries(["成都 攻略"]) == ["成都 攻略"]
+
+    def test_discovery_records_planned_and_served_queries(self, tmp_path):
+        store = make_store(tmp_path / "t.db")
+        intent, result, hub = _discover_all(store)
+        social = result["social"]
+        assert social.queries, "完成的 Discovery 必须记录它实际使用的检索词"
+        assert social.served_queries, "完成的 Discovery 必须记录真正发起过的检索词"
+
+        bundle = _bundle(result, hub)
+        assert bundle.social_queries == list(social.queries)
+        assert bundle.social_served_queries == list(social.served_queries)
+        # 差集只补缺的那条，已搜过的（含空白变体）不回锅
+        assert bundle.missing_social_queries([*social.queries, "成都 夜市"]) == ["成都 夜市"]

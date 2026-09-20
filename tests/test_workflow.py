@@ -45,17 +45,18 @@ from app.models import (
 )
 from app.prompts import (
     CRITIC_PROMPT,
+    EXTRACT_PLACES_BATCH_PROMPT,
     EXTRACT_PLACES_PROMPT,
     FINAL_ANSWER_PROMPT,
     INTENT_PARSE_PROMPT,
 )
 from app.providers import ProviderCall, ProviderResult
 from app.store import TravelPlanStore
+from app.config import current_config
 from app.workflow import (
     HOTEL_PREFERENCE_BONUS,
     HOTEL_UNKNOWN_PRICE_PENALTY,
     RESEARCH_QUERY_EXPANSION_PROMPT,
-    SOCIAL_QUERY_LIMIT,
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_NEEDS_CLARIFICATION,
@@ -63,7 +64,6 @@ from app.workflow import (
     TRANSPORT_PREFERENCE_BONUS,
     TRANSPORT_UNKNOWN_DURATION_PENALTY,
     TRANSPORT_UNKNOWN_PRICE_PENALTY,
-    WEB_QUERY_LIMIT,
     TravelState,
     _BUDGET_BARE_RE,
     _BUDGET_RES,
@@ -308,7 +308,11 @@ class FakeHub:
         ]
 
     # --- 大交通 ---
-    def search_trains(self, origin: str, destination: str, on: date) -> ProviderResult[TrainOption]:
+    def search_trains(
+        self, origin: str, destination: str, on: date, *, hedge: bool = False
+    ) -> ProviderResult[TrainOption]:
+        # 这个假 Hub 只放一份数据源，所以对冲与串行在这里没有区别；接受这个参数是为了
+        # 与真实 Hub 的签名一致（真实 Hub 会按它决定要不要提前并发发途牛备胎）。
         index = self._note("search_trains", origin=origin, destination=destination, date=str(on))
         items = list(self.trains.get((origin, destination), []))
         return self._finish("12306", "train", "search_trains", items, index)
@@ -442,12 +446,26 @@ class FakeChatModel:
     def invoke(self, messages: list[Any]) -> Any:
         system = str(getattr(messages[0], "content", "")) if messages else ""
         self.prompts.append(system)
+        user = str(getattr(messages[1], "content", "")) if len(messages) > 1 else ""
         # 按 prompt 对象本身分派，而不是靠关键词猜：关键词猜错会让整条模型分支
         # 静默退化成"模型不可用"，测试却照样绿。
         if system == INTENT_PARSE_PROMPT:
             payload: Any = self.intent
         elif system == RESEARCH_QUERY_EXPANSION_PROMPT:
             payload = self.queries if self.queries is not None else []
+        elif system == EXTRACT_PLACES_BATCH_PROMPT:
+            # 批量抽取：按输入里给的证据 id 逐条归属，这样"同一份攻略不做第二遍"
+            # 与"归属不能串篇"这两件事都在测试里可断言。
+            ids = [
+                line.split("：", 1)[1].strip()
+                for line in user.splitlines()
+                if line.startswith("### 证据 id：") and line.split("：", 1)[1].strip()
+            ]
+            payload = {
+                "results": [
+                    {"evidence_id": item_id, "places": self.places or []} for item_id in ids
+                ]
+            }
         elif system == EXTRACT_PLACES_PROMPT:
             payload = {"places": self.places or []}
         elif system == CRITIC_PROMPT:
@@ -1544,7 +1562,7 @@ class TestExecuteTravelRunEndToEnd:
         assert hub.calls.count("search_trains") == 2  # 去程 + 回程
         assert hub.calls.count("search_flights") == 2
         assert hub.calls.count("search_hotels") == 1
-        assert hub.calls.count("search_xiaohongshu") == SOCIAL_QUERY_LIMIT
+        assert hub.calls.count("search_xiaohongshu") == current_config().social_query_limit
         assert "search_poi" in hub.calls
         assert "search_scenic_tickets" in hub.calls
         assert "route" in hub.calls
@@ -1605,9 +1623,9 @@ class TestExecuteTravelRunEndToEnd:
 
         assert result.status == STATUS_COMPLETED
         social_kw = [kwargs["keyword"] for name, kwargs in hub.call_args if name == "search_xiaohongshu"]
-        assert social_kw == queries[:SOCIAL_QUERY_LIMIT]
+        assert social_kw == queries[: current_config().social_query_limit]
         web = [kwargs["query"] for name, kwargs in hub.call_args if name == "web_search"]
-        assert web == queries[:WEB_QUERY_LIMIT]
+        assert web == queries[: current_config().web_query_limit]
         social_stage = next(
             stage for stage in result.audit["stages"] if stage["id"] == "search_social_guides"
         )
@@ -1635,7 +1653,7 @@ class TestExecuteTravelRunEndToEnd:
         assert set(model.prompts) == {
             INTENT_PARSE_PROMPT,
             RESEARCH_QUERY_EXPANSION_PROMPT,
-            EXTRACT_PLACES_PROMPT,
+            EXTRACT_PLACES_BATCH_PROMPT,
             CRITIC_PROMPT,
             FINAL_ANSWER_PROMPT,
         }

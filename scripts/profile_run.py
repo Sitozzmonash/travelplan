@@ -30,7 +30,13 @@ from app.store import TravelPlanStore  # noqa: E402
 
 
 def _duration_ms(span: dict[str, Any]) -> int:
-    value = (span.get("attributes") or {}).get("duration_ms")
+    attributes = span.get("attributes") or {}
+    # Jev / LLM 这些子调用记的是 latency_ms（上游协议给的字段名），
+    # Provider 子调用记的是 duration_ms。只看 duration_ms 会把**真实发生过的**
+    # Jev 调用显示成 0.0s（实测 3 次各 ~0.95s 被算成 0s），profiler 因此低估这一项。
+    value = attributes.get("duration_ms")
+    if not isinstance(value, (int, float)):
+        value = attributes.get("latency_ms")
     if isinstance(value, (int, float)):
         return int(value)
     started, finished = span.get("started_at"), span.get("finished_at")

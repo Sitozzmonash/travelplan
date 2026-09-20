@@ -486,13 +486,36 @@ class FakeLLM:
     def tags(self) -> list[str]:
         return [call.tag for call in self.calls]
 
-    def _json(self, tag: str) -> Any:
+    @staticmethod
+    def _evidence_ids(user: str) -> list[str]:
+        """从批抽取的 user payload 里取出证据 id（每条以 `### 证据 id：<id>` 起头）。
+
+        批量抽取把多篇合并成一次调用，假模型必须**按输入给的 id 归属**结果 ——
+        否则就测不出"归属是否真的按 id 走"这件事。
+        """
+
+        ids: list[str] = []
+        for line in str(user or "").splitlines():
+            if line.startswith("### 证据 id："):
+                value = line.split("：", 1)[1].strip()
+                if value:
+                    ids.append(value)
+        return ids
+
+    def _json(self, tag: str, user: str = "") -> Any:
         if tag == "parse_intent":
             if self.intent_payload is not None:
                 return self.intent_payload
             # 只给 origin/destination/days：把日期/人数/预算留给规则回填，覆盖交叉校验路径。
             return {"origin_city": "北京", "destination_city": "成都", "days": 5}
         if tag.startswith("extract_places"):
+            ids = self._evidence_ids(user)
+            if ids:
+                return {
+                    "results": [
+                        {"evidence_id": item_id, "places": self.PLACES} for item_id in ids
+                    ]
+                }
             return {"places": self.PLACES}
         if tag == "query_expansion":
             return list(self.QUERIES)
@@ -522,7 +545,7 @@ class FakeLLM:
     def invoke_json(self, system, user, *, tag=""):
         result = self.invoke(system, user, tag=tag)
         if result.ok:
-            result.value = self._json(tag)
+            result.value = self._json(tag, user)
         return result
 
     @property

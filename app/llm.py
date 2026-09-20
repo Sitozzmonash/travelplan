@@ -22,10 +22,11 @@ import json
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from app.models import coerce_str, parse_envelope
 
@@ -145,6 +146,17 @@ def _timeout_from_env(default: float | None = None) -> float:
     return value if value > 0 else base
 
 
+def _config_concurrency() -> int:
+    """读 `config.llm_max_concurrency`；配置层不可用时退回 1（宁可慢，不可失控并发）。"""
+
+    try:
+        from app.config import current_config
+
+        return max(1, int(current_config().llm_max_concurrency))
+    except Exception:  # noqa: BLE001 —— 配置层出问题不该让模型调用不可用
+        return 1
+
+
 def degraded_note(result: LLMResult, fallback: str) -> str:
     """把「模型这次为什么没用上」拼成一句话，保证不会出现没有前因的「；...」。
 
@@ -186,11 +198,19 @@ class LLM:
         model: Any | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         emit: Any | None = None,
+        max_concurrency: int | None = None,
     ) -> None:
         self._model = model
+        #: 单次调用的**硬上限**。按用途的更紧预算只能在这个值之下收紧（见 `_budget_for`），
+        #: 不能把它放大 —— 调用方/环境变量显式指定的上限必须始终算数。
         self._timeout = timeout
         self._emit_hook = emit
         self._model_name = ""
+        #: 互不依赖的模型调用并发闸门。装在**唯一收口点**上，而不是各调用点：
+        #: 否则新增一个调用点（或某处忘了加锁）就悄悄绕过了限流，而且从外部看不出来。
+        #: 上限来自 config.llm_max_concurrency；显式传参是为了测试能构造"必串行"的句柄。
+        limit = max_concurrency if max_concurrency is not None else _config_concurrency()
+        self._semaphore = threading.BoundedSemaphore(max(1, int(limit)))
         self.calls: list[LLMResult] = []
         if model is not None:
             self._model_name = str(
@@ -240,6 +260,26 @@ class LLM:
     @property
     def model_name(self) -> str:
         return self._model_name
+
+    def _budget_for(self, tag: str) -> float:
+        """这次调用的预算：按用途从 config 收紧，但**不超过** `self._timeout` 这道硬上限。
+
+        为什么要按用途分：一次 critic 调用实测 108.8s，而 finalize 的正文是用户直接要
+        看的 —— "值不值得等"本来就不同。用一个值管所有 tag 只有两种结果：要么让 critic
+        把整条 run 拖到 180s，要么为了掐 critic 把正文也砍短。
+        为什么是 `min` 而不是覆盖：构造期/环境变量给的是**上限**，用途只能在上限之内收紧。
+        """
+
+        cap = float(self._timeout)
+        try:
+            from app.config import llm_timeout_for_tag
+
+            per_tag = float(llm_timeout_for_tag(tag))
+        except Exception:  # noqa: BLE001 —— 配置层异常时退回硬上限，不阻断调用
+            return cap
+        if per_tag <= 0:
+            return cap
+        return min(cap, per_tag)
 
     # ------------------------------------------------------------------
     # 调用
@@ -326,10 +366,14 @@ class LLM:
             except BaseException as exc:  # noqa: BLE001 —— 线程里任何异常都要带回主线程
                 box["error"] = exc
 
+        budget = self._budget_for(tag)
         # daemon 线程：即使模型一直不返回，也不该拖住进程退出。
         thread = threading.Thread(target=worker, daemon=True, name=f"llm-{tag or 'call'}")
-        thread.start()
-        thread.join(self._timeout)
+        # 并发闸门只圈住"我们**在等**的这段"。到点放弃等待后立刻放行下一个调用 ——
+        # 闸门限的是同时等待的调用数，不是同时活着的线程数（被放弃的线程本来就还在）。
+        with self._semaphore:
+            thread.start()
+            thread.join(budget)
         duration_ms = int((time.monotonic() - started) * 1000)
 
         if thread.is_alive():
@@ -337,7 +381,7 @@ class LLM:
                 status=STATUS_TIMEOUT,
                 model=self._model_name,
                 tag=tag,
-                error=f"模型调用超过 {self._timeout:g}s 未返回，已放弃等待并按失败降级",
+                error=f"模型调用超过 {budget:g}s 未返回，已放弃等待并按失败降级",
                 duration_ms=duration_ms,
             )
             self.calls.append(result)
@@ -391,6 +435,50 @@ class LLM:
 
     def audit_entries(self) -> list[dict[str, Any]]:
         return [call.to_audit() for call in self.calls]
+
+
+def invoke_json_in_batches(
+    llm: LLM,
+    *,
+    system: str,
+    batches: Sequence[tuple[Sequence[str], str]],
+    tag: str,
+    max_workers: int = 1,
+) -> list[tuple[list[str], LLMResult]]:
+    """把多个互相独立的 JSON 抽取调用**分批并发**发出去，返回 ``[(批内 id, 结果), ...]``。
+
+    为什么要有这一层：同样的"分批 + 限并发 + 失败降级"如果在 workflow 与 discovery 里
+    各写一遍，两处的批大小与并发上限迟早会漂移 —— 而这两个数字正是性能开关，只能有一处
+    实现。并发上限由调用方从 config 传入；`LLM` 客户端自身还有一道闸门，两道都生效。
+
+    ``batches`` 是 ``(批内 id 列表, 该批的 user payload)``；返回值的顺序与传入顺序一致，
+    因此"哪条结果属于哪个 id"不依赖线程完成顺序，同一份输入在任何调度下产出同一份结果。
+    """
+
+    ordered = list(batches)
+    if not ordered:
+        return []
+    workers = max(1, int(max_workers))
+
+    def run(index: int, ids: Sequence[str], payload: str) -> tuple[list[str], LLMResult]:
+        # tag 保留调用方前缀（``extract_places:b0``），这样按用途取预算、按前缀分派的
+        # 假模型与真实审计口径都仍然只看前缀。
+        return [*ids], llm.invoke_json(system, payload, tag=f"{tag}:b{index}" if tag else "")
+
+    if workers == 1 or len(ordered) == 1:
+        return [run(index, ids, payload) for index, (ids, payload) in enumerate(ordered)]
+
+    results: dict[int, tuple[list[str], LLMResult]] = {}
+    with ThreadPoolExecutor(
+        max_workers=min(workers, len(ordered)), thread_name_prefix="tp-llm-batch"
+    ) as pool:
+        futures = [
+            (index, pool.submit(run, index, ids, payload))
+            for index, (ids, payload) in enumerate(ordered)
+        ]
+        for index, future in futures:
+            results[index] = future.result()
+    return [results[index] for index in range(len(ordered))]
 
 
 def _parse_json_loose(text: str) -> Any | None:

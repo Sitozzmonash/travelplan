@@ -115,9 +115,26 @@ REVISE_ACTIONS = {"replace", "remove", "lock", "relax_day", "lower_budget"}
 # ======================================================================
 
 
+_STORE: TravelPlanStore | None = None
+
+
 def get_store() -> TravelPlanStore:
-    """每次调用新建一个 store；它内部是「每次操作一条 SQLite 连接」，线程安全。"""
-    return TravelPlanStore()
+    """进程内**复用**一份 store。
+
+    为什么不每次新建：`TravelPlanStore.__init__` 会跑一遍建表 DDL，Postgres 下那是
+    二十多条 `CREATE TABLE IF NOT EXISTS` **走网络**。每次请求都付一遍的后果是实测过的：
+    Render 的 5 秒健康探针超时 → 部署被判不健康而回滚（`update_failed`），
+    管理端接口也白等这些往返。store 自身线程安全（SQLite 每次操作一条短连接，
+    Postgres 复用进程内连接池），可以直接复用。
+
+    测试会把这个函数整体换掉（`monkeypatch.setattr(api_module, "get_store", ...)`），
+    所以这里的缓存不会影响用例。
+    """
+
+    global _STORE
+    if _STORE is None:
+        _STORE = TravelPlanStore()
+    return _STORE
 
 
 _APP: Any | None = None
@@ -187,8 +204,9 @@ def health() -> dict[str, Any]:
 
     顶层另有两个**契约字段**（PRD §14 字面要求，供部署/监控直接消费，不必再解析
     `store` 嵌套结构）：`database_backend = sqlite|postgres`、
-    `database_connected = true|false`。`database_connected` 就是"这次真的把库连上
-    并建表成功"；配了 `DATABASE_URL` 却连不上时它为 `false` 且 `status=degraded`，
+    `database_connected = true|false`。`database_connected` 表示"这次真的把库连上了"
+    （一次 `SELECT 1` 走通；建表在 store 构造时已经做过，探针里不重复跑 DDL）；
+    配了 `DATABASE_URL` 却连不上时它为 `false` 且 `status=degraded`，
     **绝不会**因为退回本地 SQLite 而变成 `true`。
     """
     store_ok = True
@@ -196,7 +214,11 @@ def health() -> dict[str, Any]:
     store_info: dict[str, Any] = {}
     try:
         store = get_store()
-        store.init_schema()
+        # 只做一次 `SELECT 1`，**不跑建表**。建表在 store 构造时就做过；把二十多条
+        # `CREATE TABLE IF NOT EXISTS` 放在健康检查里意味着每次探针都走一遍远端网络 ——
+        # Render 的健康检查只给 5 秒，Neon 冷启动时必然超时，部署会被判为不健康回滚
+        # （实测 update_failed: "HTTP health check failed (timed out after 5 seconds)"）。
+        store.ping()
         store_info = store.describe()
     except Exception as exc:  # noqa: BLE001 —— 健康检查要能报告"库坏了"而不是自己崩
         store_ok = False

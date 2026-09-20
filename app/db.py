@@ -453,6 +453,22 @@ class SqliteBackend:
     def describe(self) -> dict[str, Any]:
         return {"backend": "sqlite", "path": str(self.path)}
 
+    def ping(self) -> None:
+        """一条最轻的连通性验证（不做任何 DDL）。
+
+        健康检查以前直接调 `init_schema()`，在远端库上是二十多条 `CREATE TABLE IF NOT
+        EXISTS` 走网络 —— Render 的健康检查只给 5 秒，Neon 冷启动时必然超时，
+        于是**部署被判定为不健康而回滚**（实测 update_failed：
+        "HTTP health check failed (timed out after 5 seconds)"）。
+        建表本来就在 store 构造时做过一次，健康检查只需要回答"库还连得上吗"。
+        """
+
+        conn = self.connect()
+        try:
+            _execute_raw(conn, "SELECT 1").fetchone()
+        finally:
+            conn.close()
+
     def close(self) -> None:
         return None
 
@@ -506,6 +522,16 @@ class PostgresBackend:
 
     def describe(self) -> dict[str, Any]:
         return {"backend": "postgres", "host": self._host, "target": mask_dsn(self._dsn)}
+
+    def ping(self) -> None:
+        """一条最轻的连通性验证（不做任何 DDL）。
+
+        理由同 SqliteBackend.ping：健康检查不该跑建表。这份连接是 context manager，
+        退出时把连接还给池子（别自己 close，那会绕过池的回收）。
+        """
+
+        with self.connect() as conn:
+            _execute_raw(conn, "SELECT 1").fetchone()
 
     def close(self) -> None:
         if self._pool is not None:

@@ -481,6 +481,11 @@ def _bundle_from(session_id: str, intent: TripIntent, result: Mapping[str, Any],
         hotels=list(getattr(hotels, "items", []) or []),
         evidences=list(getattr(social, "evidences", []) or []),
         places=list(getattr(places, "places", []) or []),
+        # 把 Discovery 计划要搜的检索词与真正搜过的检索词一并过户给正式 run：
+        # 少了前者，run 会为了重新算出同样的 queries 再付一次 query_expansion 模型调用；
+        # 少了后者，run 无法只补差集（全量重搜/全量复用都不对）。
+        social_queries=list(getattr(social, "queries", []) or []),
+        social_served_queries=list(getattr(social, "served_queries", []) or []),
         provider_calls=list(hub.audit_entries()) if hub is not None else [],
         degradations=degradations,
         # Discovery 的复用/降级计数（Part C）：正式 run 的 perf 摘要要用它回答

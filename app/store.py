@@ -441,6 +441,11 @@ class TravelPlanStore:
 
         return self._backend.describe()
 
+    def ping(self) -> None:
+        """轻量连通性验证（`SELECT 1`，不做 DDL）。供 /health 使用。"""
+
+        self._backend.ping()
+
     def close(self) -> None:
         """释放后端资源（Postgres 连接池）。SQLite 无状态，是空操作；幂等。"""
 

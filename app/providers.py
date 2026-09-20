@@ -762,9 +762,13 @@ class ProviderHub:
     # ------------------------------------------------------------------
 
     def _next_source_id(self) -> str:
-        self._counter += 1
+        # 读-改-写必须原子：并发下两个线程各自读到同一个 counter，就会发出同一个
+        # source_id，两条 provenance 指向同一处，审计里"这个地点来自哪次调用"就错了。
+        with self._lock:
+            self._counter += 1
+            counter = self._counter
         prefix = self.run_id or "run"
-        return f"{prefix}-src-{self._counter:03d}"
+        return f"{prefix}-src-{counter:03d}"
 
     def _timeout_for(self, provider: str) -> float:
         """这个 Provider 本次的调用预算（秒）。Part E：每个 Provider 一份。"""
@@ -781,7 +785,8 @@ class ProviderHub:
     def _cache_get(self, kind: str, key: str) -> _CacheEntry | None:
         if not self.use_cache:
             return None
-        entry = self._cache.get(key)
+        with self._lock:
+            entry = self._cache.get(key)
         if entry is None:
             return None
         if time.monotonic() - entry.stored_at > CACHE_TTL_SECONDS.get(kind, 0):
@@ -789,7 +794,12 @@ class ProviderHub:
         return entry
 
     def _cache_put(self, key: str, entry: _CacheEntry) -> None:
-        if self.use_cache:
+        if not self.use_cache:
+            return
+        # entry 由调用方**先完整构造**再传进来（_CacheEntry(...) 在函数返回前就已求值），
+        # 这里只负责发布。加锁是为了把"发布"这件事的意图写清楚，不依赖 CPython
+        # 字典赋值的原子性这一实现细节。锁内只有一次赋值，不会阻塞别人。
+        with self._lock:
             self._cache[key] = entry
 
     def _emit_tool(self, call: ProviderCall) -> None:
@@ -820,13 +830,18 @@ class ProviderHub:
 
     def _record(self, call: ProviderCall) -> ProviderCall:
         """留痕：进内存列表 + 落 sources 表。落库失败不让 run 挂掉，但会写进 notes。"""
-        self.calls.append(call)
+        # 只在"把这条完整的 call 挂进账本"这一瞬间持锁：call 在进入 _record 之前
+        # 就已经构造完毕（没有一个字段是稍后补的），别的线程要么看不到它、要么看到
+        # 完整的一条，不会读到半成品。上报/落库是 I/O，放在锁外做。
+        with self._lock:
+            self.calls.append(call)
         self._emit_tool(call)
         if self.store is not None and self.run_id:
             try:
                 self.store.save_source(self.run_id, call.to_source())
             except Exception as exc:  # noqa: BLE001 —— 审计写不进去不应该毁掉这次规划
-                call.notes.append(f"source 落库失败：{type(exc).__name__}: {_scrub_secrets(str(exc))}")
+                with self._lock:
+                    call.notes.append(f"source 落库失败：{type(exc).__name__}: {_scrub_secrets(str(exc))}")
         return call
 
     # ------------------------------------------------------------------
@@ -850,9 +865,18 @@ class ProviderHub:
         ``timeout`` 是**这个 Provider 自己的**预算（Part E）。Tool 签名里声明了 timeout
         就传给 Tool（让子进程 / httpx 自己收敛）；没声明就在 Hub 层用 ``_invoke_bounded``
         兜住 —— 两条路径产生的都只是"这一次调用超时"，不会丢掉已经拿到的别的结果。
-        """
 
+        Tool 级更紧的预算（``config.tool_timeout``）优先于 Provider 预算：同一个 Provider
+        下"拉列表"和"按名查价"需要不同的预算 —— 途牛火车/酒店是拉列表，几十秒都可能；
+        门票只是按景区名查渠道价，正常 2~6s 就返回。若给它共用途牛那份 90s 预算，
+        一次挂死就独占整个 run；所以这里按 (provider, tool) 覆盖成更紧的那份。
+        """
+        # Tool 级覆盖总是比 Provider 预算更紧（config 里就是这么定义的），有就优先用；
+        # 没有命中的 Tool 仍走调用方显式传入的 timeout 或 Provider 那一份。
         budget = float(timeout if timeout is not None else self._timeout_for(provider))
+        override = tool_timeout(provider, tool_name)
+        if override is not None:
+            budget = float(override)
         args = {key: value for key, value in args.items() if value is not None}
         key = self._cache_key(provider, tool_name, args)
 
@@ -970,29 +994,56 @@ class ProviderHub:
     # ------------------------------------------------------------------
 
     def _mcp_handle(self, server: str) -> MCPServerHandle | None:
-        """拿到 MCP Server 句柄；连不上就记录原因并返回 None（不抛）。"""
-        if server in self._mcp:
-            return self._mcp[server]
-        if server in self._mcp_failures:
-            return None
+        """拿到 MCP Server 句柄；连不上就记录原因并返回 None（不抛）。
 
-        spec = next((item for item in self._mcp_specs if item.name == server), None)
-        if spec is None:
-            self._mcp_failures[server] = f"未注册 MCP Server {server!r}"
-            return None
+        并发安全：12306 的火车查询会从多个方向同时打进来，若两个线程同时发现
+        "还没有句柄"就会各建一个 `MCPServerHandle`、各拉一个 npx 子进程 —— 同一份
+        tools/list 握手做两遍，还多留一个进程。这里用"状态锁 + per-server 建句柄锁"
+        两层保证**同一个 Server 只会建出一个句柄**；`handle.tools()` 是真子进程调用，
+        必须在锁外做，否则一个 Server 的冷启动会把整个 Hub（包括其它 Server）卡死。
+        """
+        with self._lock:
+            if server in self._mcp:
+                return self._mcp[server]
+            if server in self._mcp_failures:
+                return None
 
-        if self._runtime is None:
-            self._runtime = _AsyncRuntime()
-        handle = MCPServerHandle(spec, self._runtime, tool_timeout=self.mcp_timeout)
-        try:
-            # 立刻探一次 tools/list：连不上要在第一次调用时就暴露，
-            # 而不是留到真正查询时才失败（那时错误信息会混在业务失败里）。
-            handle.tools()
-        except Exception as exc:  # noqa: BLE001
-            self._mcp_failures[server] = _scrub_secrets(f"{type(exc).__name__}: {exc}")
-            return None
-        self._mcp[server] = handle
-        return handle
+            spec = next((item for item in self._mcp_specs if item.name == server), None)
+            if spec is None:
+                self._mcp_failures[server] = f"未注册 MCP Server {server!r}"
+                return None
+
+            if self._runtime is None:
+                # _AsyncRuntime 只起一个线程 + 一个 loop，不含网络 / 子进程，锁内建可接受。
+                self._runtime = _AsyncRuntime()
+            runtime = self._runtime
+            create_lock = self._mcp_locks.setdefault(server, threading.Lock())
+
+        with create_lock:
+            # 双重检查：等锁期间可能已经有别的线程把句柄建好或把失败原因记下了。
+            with self._lock:
+                existing = self._mcp.get(server)
+                if existing is not None:
+                    return existing
+                if server in self._mcp_failures:
+                    return None
+
+            handle = MCPServerHandle(spec, runtime, tool_timeout=self.mcp_timeout)
+            try:
+                # 立刻探一次 tools/list：连不上要在第一次调用时就暴露，
+                # 而不是留到真正查询时才失败（那时错误信息会混在业务失败里）。
+                handle.tools()
+            except Exception as exc:  # noqa: BLE001
+                with self._lock:
+                    self._mcp_failures[server] = _scrub_secrets(f"{type(exc).__name__}: {exc}")
+                return None
+
+            with self._lock:
+                existing = self._mcp.get(server)
+                if existing is not None:  # 竞态兜底：采用先放进去的那一个
+                    return existing
+                self._mcp[server] = handle
+            return handle
 
     def mcp_unavailable_reason(self, server: str) -> str | None:
         """某个 MCP Server 为什么不可用（没试过 → None）。用于 CLI / API 的降级说明。"""
@@ -1159,15 +1210,55 @@ class ProviderHub:
         filters: str | None = None,
         sort: str = "startTime",
         limit: int = 10,
+        hedge: bool = False,
     ) -> ProviderResult[TrainOption]:
         """查火车票：**先 12306，失败才回退途牛**（PRD §9 / §32）。
 
         为什么 12306 是主源：车次、时刻、席别余票是一手数据；途牛是二手聚合。
         为什么失败才回退：两个源的车次集合可能不一致，混着用会让"我为什么看到这趟车"
         无法回答。所以只在主源**整体不可用**时切，且两条调用都留在 audit 里。
+
+        ``hedge=True``（交通对冲，受 ``transport_hedge_enabled`` 控制）：主源还在跑时
+        就**并发**发一次途牛火车当备胎，用来把"12306 超时要等 55~90s"这段墙钟省下来。
+        单源不变量不变 —— 备胎结果**只在主源失败/超时/结论为空时才可能被采用**，
+        绝不与主源结果混排；主源一旦给出结论，备胎即使已经拿到非空结果也只留痕
+        （``discarded=True``），不会被采用。
+
+        对冲的等待窗口是 ``transport_hedge_wait_seconds``：主源超过它还没返回、而备胎
+        已经有非空结果，就提前提交备胎。"备胎返回空"**不**触发提前提交 —— 否则一次慢查询
+        会把"这天真的没车"误判成结论；这种情况继续等主源。若主源最终仍没在
+        ``12306 预算 + 途牛预算`` 内返回，备胎有非空结果就用它，否则如实返回失败
+        （空 + 非 OK 状态，绝不用估算值兜底）。主源若在窗口内没等到、且备胎也没给结论，
+        本函数会在总预算到点时返回，后台线程余下的那次调用仍会自己补记到 ``self.calls``。
         """
         day = depart_date.isoformat() if isinstance(depart_date, date) else str(depart_date)
+        cfg = current_config()
+        if hedge and cfg.transport_hedge_enabled:
+            return self._search_trains_hedged(
+                day,
+                origin,
+                destination,
+                filters=filters,
+                sort=sort,
+                limit=limit,
+                wait_seconds=cfg.transport_hedge_wait_seconds,
+            )
+        # 关闭对冲（或默认）时走原来的顺序路径：行为与本改动前逐字节一致。
+        return self._search_trains_sequential(
+            day, origin, destination, filters=filters, sort=sort, limit=limit
+        )
 
+    def _search_trains_sequential(
+        self,
+        day: str,
+        origin: str,
+        destination: str,
+        *,
+        filters: str | None,
+        sort: str,
+        limit: int,
+    ) -> ProviderResult[TrainOption]:
+        """`hedge=False` 时的顺序取数：12306 主源 → （不可用时）途牛备用。"""
         primary = self._mcp_call(
             server="railway_12306",
             tool_name="railway_12306_get-tickets",
@@ -1223,18 +1314,11 @@ class ProviderHub:
         calls.append(fallback)
 
         if fallback.status == "OK" and fallback.items:
-            options = [
-                TrainOption.from_item(
-                    item,
-                    provider="tuniu",
-                    fetched_at=fallback.fetched_at,
-                    source_id=fallback.source_id,
-                    source_url="https://www.tuniu.com/",
-                )
-                for item in fallback.items
-            ]
             return ProviderResult(
-                status="OK", items=options, calls=calls, provider="tuniu"
+                status="OK",
+                items=self._tuniu_train_options(fallback),
+                calls=calls,
+                provider="tuniu",
             )
 
         reason = primary.error or primary.status
@@ -1244,6 +1328,281 @@ class ProviderHub:
             calls=calls,
             error=f"12306 不可用（{reason}），途牛火车也未能提供数据（{fallback.status}）",
             provider="tuniu",
+        )
+
+    @staticmethod
+    def _tuniu_train_options(call: ProviderCall) -> list[TrainOption]:
+        """途牛 train 条目 → `TrainOption`（顺序回退与对冲共用，保证映射口径一致）。"""
+        return [
+            TrainOption.from_item(
+                item,
+                provider="tuniu",
+                fetched_at=call.fetched_at,
+                source_id=call.source_id,
+                source_url="https://www.tuniu.com/",
+            )
+            for item in call.items
+        ]
+
+    def _search_trains_hedged(
+        self,
+        day: str,
+        origin: str,
+        destination: str,
+        *,
+        filters: str | None,
+        sort: str,
+        limit: int,
+        wait_seconds: float,
+    ) -> ProviderResult[TrainOption]:
+        """交通对冲取数：12306 与途牛火车**并发**发出，按单源不变量择一采用。
+
+        等待用 0.2s 粒度的轮询（两个结果 box），不是忙等。整个过程不会超过
+        ``12306 预算 + 途牛预算``：两个子调用各自被自己的预算兜住，这里的 deadline
+        只是"无论如何不再多等"的安全网。
+        """
+        primary_args = {
+            "date": day,
+            "fromStation": origin,
+            "toStation": destination,
+            "trainFilterFlags": filters or "",
+            "sortFlag": sort,
+            "sortReverse": False,
+            "limitedNum": limit,
+            "format": "json",
+        }
+        hedge_args = {
+            "departure_city": origin,
+            "arrival_city": destination,
+            "departure_date": day,
+        }
+        primary_budget = self._timeout_for("12306")
+        hedge_budget = self._timeout_for("tuniu")
+        started = time.monotonic()
+        deadline = started + primary_budget + hedge_budget
+
+        primary_box: dict[str, Any] = {}
+        hedge_box: dict[str, Any] = {}
+
+        def _run(box: dict[str, Any], fn: Callable[[], ProviderCall]) -> None:
+            # 线程里抛出的异常不会被调用方看到，必须原样收进 box 再判定，
+            # 否则一次奇怪的异常会变成"主源没记录、结果也不对"的黑洞。
+            try:
+                box["call"] = fn()
+            except BaseException as exc:  # noqa: BLE001
+                box["error"] = _scrub_secrets(f"{type(exc).__name__}: {exc}")
+
+        def _finished(box: dict[str, Any]) -> bool:
+            return "call" in box or "error" in box
+
+        primary_thread = threading.Thread(
+            target=_run,
+            args=(
+                primary_box,
+                lambda: self._mcp_call(
+                    server="railway_12306",
+                    tool_name="railway_12306_get-tickets",
+                    args=dict(primary_args),
+                    provider="12306",
+                    source_type="train",
+                    kind="train",
+                ),
+            ),
+            name="tp-train-primary",
+            daemon=True,
+        )
+        hedge_thread = threading.Thread(
+            target=_run,
+            args=(
+                hedge_box,
+                lambda: self._plugin_call(
+                    plugin="tuniu_travel",
+                    tool_name="tuniu_search_trains",
+                    args=dict(hedge_args),
+                    provider="tuniu",
+                    source_type="train",
+                    kind="train",
+                ),
+            ),
+            name="tp-train-hedge",
+            daemon=True,
+        )
+        primary_thread.start()
+        hedge_thread.start()
+
+        # 轮询两条子调用：先判主源 —— 主源一旦有结论就以它为准（单源不变量）。
+        poll = 0.2
+        while True:
+            if _finished(primary_box):
+                break
+            now = time.monotonic()
+            hedged = hedge_box.get("call")
+            if now - started >= wait_seconds and hedged is not None and hedged.items:
+                # 主源过了等待窗口还没回、备胎已有非空结果：提前提交，不再傻等主源。
+                return self._adopt_hedge(
+                    primary_call=None,
+                    hedge_call=hedged,
+                    note=(
+                        f"hedged 提前提交：主源在 {wait_seconds:g}s 内未返回，采用备胎结果"
+                    ),
+                )
+            if now >= deadline:
+                break
+            # 绝不忙等：sleep 到下一个轮询点，且不越过 deadline。
+            time.sleep(min(poll, max(0.0, deadline - now)))
+
+        primary_call = primary_box.get("call")
+        primary_error = primary_box.get("error")
+
+        # 1) 主源成功带条目：用主源，备胎结果绝不混入（PRD §32 单源不变量）。
+        if primary_call is not None and primary_call.status == "OK" and primary_call.items:
+            self._discard_hedge(
+                hedge_thread,
+                hedge_box,
+                deadline=deadline,
+                note="hedged：主源已成功，本次备胎结果未被采用",
+            )
+            return ProviderResult(
+                status="OK",
+                items=[_train_option_from_12306(item, primary_call) for item in primary_call.items],
+                calls=self._hedge_calls(primary_call, hedge_box),
+                provider="12306",
+            )
+
+        # 2) 主源明确 EMPTY：这是"这天没车"的结论，备胎同样不采用。
+        if primary_call is not None and primary_call.status == "EMPTY":
+            self._discard_hedge(
+                hedge_thread,
+                hedge_box,
+                deadline=deadline,
+                note="hedged：主源结论为 EMPTY（当天无车），本次备胎结果未被采用",
+            )
+            return ProviderResult(
+                status="EMPTY",
+                items=[],
+                calls=self._hedge_calls(primary_call, hedge_box),
+                provider="12306",
+            )
+
+        # 3) 主源失败 / 在总预算内未返回：等备胎（受 deadline 约束），有非空结果就采用。
+        hedge_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        hedge_call = hedge_box.get("call")
+
+        if primary_call is None:
+            reason = primary_error or f"{primary_budget:g}s 预算内未返回"
+            primary_call = self._pending_call(
+                provider="12306",
+                tool_name="railway_12306_get-tickets",
+                source_type="train",
+                args=primary_args,
+                status="TIMEOUT",
+                error=reason,
+            )
+            note = f"hedged 提前提交：主源在 {wait_seconds:g}s 内未返回，采用备胎结果"
+        else:
+            reason = primary_call.error or primary_call.status
+            note = f"hedged：主源 {primary_call.status}（{reason}），采用备胎结果"
+
+        if hedge_call is not None and hedge_call.status == "OK" and hedge_call.items:
+            return self._adopt_hedge(
+                primary_call=primary_call, hedge_call=hedge_call, note=note
+            )
+
+        # 4) 两边都没拿到数据：与顺序路径同形状的失败结果（空 items + 非 OK 状态）。
+        if hedge_call is None:
+            hedge_call = self._pending_call(
+                provider="tuniu",
+                tool_name="tuniu_search_trains",
+                source_type="train",
+                args=hedge_args,
+                status="UNAVAILABLE",
+                error=hedge_box.get("error") or f"{hedge_budget:g}s 预算内未返回",
+            )
+        else:
+            hedge_call.fallback = True
+            hedge_call.notes.append(f"fallback：12306 不可用（{reason}）后改用途牛火车")
+        return ProviderResult(
+            status=hedge_call.status,
+            items=[],
+            calls=[primary_call, hedge_call],
+            error=f"12306 不可用（{reason}），途牛火车也未能提供数据（{hedge_call.status}）",
+            provider=hedge_call.provider,
+        )
+
+    def _discard_hedge(
+        self,
+        hedge_thread: threading.Thread,
+        hedge_box: dict[str, Any],
+        *,
+        deadline: float,
+        note: str,
+    ) -> None:
+        """主源已给出结论 → 备胎结果不采用，只把它标成 discarded 留痕。
+
+        最多等 3s（且不越过总预算 deadline）：备胎只是"账本上要有这条记录"，
+        不该让用户为它继续等待；没等到就不硬等 —— 它自己的 ``_invoke_bounded``
+        会在超时后补记这条调用。
+        """
+        hedge_thread.join(timeout=min(3.0, max(0.0, deadline - time.monotonic())))
+        hedged = hedge_box.get("call")
+        if hedged is None:
+            return
+        hedged.fallback = True
+        hedged.discarded = True
+        hedged.notes.append(note)
+
+    @staticmethod
+    def _hedge_calls(
+        primary_call: ProviderCall, hedge_box: dict[str, Any]
+    ) -> list[ProviderCall]:
+        """主源为准时返回的调用清单：主源 + （已经跑完的）备胎。"""
+        hedged = hedge_box.get("call")
+        return [primary_call, hedged] if hedged is not None else [primary_call]
+
+    def _adopt_hedge(
+        self,
+        *,
+        primary_call: ProviderCall | None,
+        hedge_call: ProviderCall,
+        note: str,
+    ) -> ProviderResult[TrainOption]:
+        """采用备胎结果：provider/status 都来自途牛，并用 fallback 标记这次是备选。"""
+        hedge_call.fallback = True
+        hedge_call.notes.append(note)
+        calls = [primary_call, hedge_call] if primary_call is not None else [hedge_call]
+        return ProviderResult(
+            status=hedge_call.status,
+            items=self._tuniu_train_options(hedge_call),
+            calls=calls,
+            provider=hedge_call.provider,
+        )
+
+    def _pending_call(
+        self,
+        *,
+        provider: str,
+        tool_name: str,
+        source_type: str,
+        args: Mapping[str, Any],
+        status: str,
+        error: str,
+    ) -> ProviderCall:
+        """给"在总预算内仍未返回"的子调用造一条**不含任何数据**的结果说明。
+
+        真的 ProviderCall 由后台线程在自己的预算到点后补记（它不会漏），所以这里
+        **不**走 `_record`，避免同一份查询在账本里出现两条。status 如实填 TIMEOUT /
+        UNAVAILABLE，items 为空 —— 绝不用估算值冒充。
+        """
+        return ProviderCall(
+            source_id=self._next_source_id(),
+            provider=provider,
+            source_type=source_type,
+            tool=tool_name,
+            query=dict(args),
+            status=status,
+            fetched_at=utcnow(),
+            error=error,
+            notes=["hedged：此条仅用于结果说明，真实调用由后台线程补记"],
         )
 
     # ==================================================================
@@ -1672,6 +2031,9 @@ class ProviderHub:
                 "item_count": len(call.items),
                 "cached": call.cached,
                 "fallback": call.fallback,
+                # 对冲里**未被采用**的那次调用：它真实发生过（留在账本里），但不是这次
+                # 结果的来源。不标出来，管理端会把"备胎白跑了一次"当成一次有效调用。
+                "discarded": call.discarded,
                 "error": call.error,
                 "source_url": call.source_url,
                 "notes": list(call.notes),

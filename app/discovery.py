@@ -27,7 +27,7 @@ from typing import Any, Mapping, Sequence
 
 from app import planner
 from app.config import current_config
-from app.llm import LLM, degraded_note
+from app.llm import LLM, degraded_note, invoke_json_in_batches
 from app.models import (
     Decision,
     DecisionStatus,
@@ -44,22 +44,15 @@ from app.observability import (
     parallel_map,
     query_key,
 )
-from app.prompts import EXTRACT_PLACES_PROMPT, RESEARCH_QUERY_EXPANSION_PROMPT
+from app.prompts import EXTRACT_PLACES_BATCH_PROMPT, RESEARCH_QUERY_EXPANSION_PROMPT
 from app.providers import ProviderHub
 
 # ======================================================================
 # 上限与关键词表（原来散在 workflow.py 里，随取数逻辑一起搬过来；workflow 再 re-export）
 # ======================================================================
 
-SOCIAL_QUERY_LIMIT = 3
-WEB_QUERY_LIMIT = 2
-MAX_EVIDENCE = 40
-EXTRACT_EVIDENCE_LIMIT = 4
-EVIDENCE_TEXT_CHARS = 1200
-POI_QUERY_LIMIT = 8
-POI_PAGE_SIZE = 10
-#: Discovery 阶段最多验证多少个 POI 是真实存在的（不两两算路线，那太贵）
-DISCOVERY_POI_VERIFY_LIMIT = 20
+#: 取数上限（社交/网页/抽取/POI）**一律读 `app.config`**，这里不再留同名镜像：
+#: 镜像与 config 迟早漂移，而"节点实际读的是哪一个"从代码上看不出来。
 
 PREFERENCE_POI_QUERY = {"拍照": "观景台", "放松": "茶馆", "亲子": "乐园", "夜生活": "酒吧街"}
 
@@ -121,6 +114,10 @@ class HotelCandidates:
 class SocialEvidence:
     evidences: list[Evidence] = field(default_factory=list)
     queries: list[str] = field(default_factory=list)
+    #: 真正发起过 Provider 检索的 query（小红书线 + 网页线，含失败的尝试）。
+    #: 与 ``queries``（计划要搜的）分开：正式 run 只有知道"哪些真的搜过了"，
+    #: 才能只补差集，而不是全量重搜（白付一次模型调用）或全量复用（漏地点）。
+    served_queries: list[str] = field(default_factory=list)
     query_source: str = ""
     platforms: dict[str, int] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
@@ -301,7 +298,7 @@ def discover_social_evidence(
         result.degradations.append(degraded_note(expansion, "检索词退化为组合"))
 
     evidences: list[Evidence] = []
-    social_keywords = list(result.queries[:SOCIAL_QUERY_LIMIT])
+    social_keywords = list(result.queries[: current_config().social_query_limit])
     outcomes = parallel_map(
         [
             (
@@ -325,7 +322,7 @@ def discover_social_evidence(
         evidences.extend(social.items)
         if not social.items:
             result.notes.append(f"小红书「{keyword}」：{social.status}")
-        if len(evidences) >= MAX_EVIDENCE:
+        if len(evidences) >= current_config().evidence_max:
             break
 
     if not any(ev.provider == "xhs" for ev in evidences) and destination:
@@ -338,7 +335,7 @@ def discover_social_evidence(
         evidences.extend(douyin.items)
         result.notes.append(f"小红书没有返回可用攻略，回退抖音查询：{douyin.status}")
 
-    web_keywords = list(result.queries[:WEB_QUERY_LIMIT])
+    web_keywords = list(result.queries[: current_config().web_query_limit])
     web_outcomes = parallel_map(
         [
             (
@@ -380,7 +377,10 @@ def discover_social_evidence(
                 )
             )
 
-    result.evidences = evidences[:MAX_EVIDENCE]
+    result.evidences = evidences[: current_config().evidence_max]
+    # 记录"真的搜过哪些 query"：小红书线与网页线各取前 N 条发起过 Provider 调用
+    # （无论成败都算 attempt）。正式 run 用它与计划 queries 求差集，只补没收到的部分。
+    result.served_queries = _dedupe_queries([*social_keywords, *web_keywords])
     if not result.evidences:
         result.degradations.append(
             "社交与网页攻略都没有返回可用内容，Trust Score 的「多来源证据」分项会偏低；"
@@ -399,12 +399,129 @@ def _fallback_queries(intent: TripIntent) -> list[str]:
     for preference in intent.preferences[:2]:
         word = PREFERENCE_POI_QUERY.get(preference, preference)
         queries.append(f"{destination} {word}")
-    return [query.strip() for query in queries if query.strip()][:SOCIAL_QUERY_LIMIT + WEB_QUERY_LIMIT]
+    limit = current_config()
+    return [query.strip() for query in queries if query.strip()][
+        : limit.social_query_limit + limit.web_query_limit
+    ]
+
+
+def _normalize_query(query: Any) -> str:
+    """检索词比较用的归一化键：去掉所有空白 + 大小写折叠。
+
+    为什么这么宽：模型扩写与规则兜底对同一意图会产出带空格/不带空格的变体
+    （"成都 攻略" vs "成都攻略"），严格相等会把已搜过的 query 误判成"还没搜"，
+    于是又白搜一遍。空白与大小写不承载检索语义，比较时必须忽略。
+    """
+
+    return "".join(coerce_str(query).split()).casefold()
+
+
+def _dedupe_queries(queries: Sequence[str]) -> list[str]:
+    """按归一化键去重但保留首次出现的原始写法与顺序（顺序影响证据合并的截断点）。"""
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for query in queries:
+        text = coerce_str(query).strip()
+        key = _normalize_query(text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
 
 
 # ======================================================================
 # 地点
 # ======================================================================
+
+
+def extract_places_from_evidences(
+    llm: LLM,
+    evidences: Sequence[Evidence],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """从攻略证据里抽出 ``{...地点字段..., "evidence_id": 来源 id}`` 条目。
+
+    返回 ``(条目, 降级说明)``。正式 run 与 Discovery 共用这一个实现 —— 否则"批大小、
+    并发上限、归属规则、失败降级文案"会在两处各自漂移，而它们全是性能/正确性开关。
+
+    两件事同时做，缺一不可：
+      * **多篇合成一批**：一次模型往返处理多篇，减少往返次数；
+      * **批之间受控并发**：把墙钟压到最慢那一批，并发上限来自 config
+        （`LLM` 客户端还有第二道闸门）。
+    批大小、正文截断长度、最多抽几条，同样全部来自 config。
+    """
+
+    cfg = current_config()
+    targets = [
+        evidence
+        for evidence in evidences
+        if not evidence.place_mentions and len(evidence.text) >= 40
+    ][: cfg.extract_evidence_limit]
+    if not targets:
+        return [], []
+
+    batch_size = max(1, int(cfg.extract_batch_size))
+    batches: list[tuple[list[str], str]] = []
+    for start in range(0, len(targets), batch_size):
+        chunk = targets[start : start + batch_size]
+        payload = "\n\n".join(
+            f"### 证据 id：{evidence.id}\n"
+            f"标题：{evidence.title}\n"
+            f"来源：{evidence.provider}/{evidence.source_type}\n"
+            f"正文：\n{evidence.text[: cfg.extract_text_chars]}"
+            for evidence in chunk
+        )
+        batches.append(([evidence.id for evidence in chunk], payload))
+
+    batch_results = invoke_json_in_batches(
+        llm,
+        system=EXTRACT_PLACES_BATCH_PROMPT,
+        batches=batches,
+        tag="extract_places",
+        max_workers=cfg.llm_max_concurrency,
+    )
+
+    extracted: list[dict[str, Any]] = []
+    degradations: list[str] = []
+    known_ids = {evidence.id for evidence in targets}
+    # 按**批的定义顺序**消费：并发与批大小都不会改变抽出来的地点顺序。
+    for ids, response in batch_results:
+        if not (response.ok and isinstance(response.value, dict)):
+            for item_id in ids:
+                degradations.append(
+                    degraded_note(response, f"证据 {item_id} 的地点抽取被跳过（同批 {len(ids)} 条一起失败）")
+                )
+            continue
+        payload = response.value
+        entries = payload.get("results")
+        if not isinstance(entries, list):
+            # 模型只回了单篇结构：只有批里就一条证据时归属才是无歧义的；多篇时宁可丢掉
+            # 也不猜 —— 猜出来的归属会把地点挂到错误的证据上，比少一条地点更糟。
+            if len(ids) == 1:
+                entries = [{"evidence_id": ids[0], "places": payload.get("places") or []}]
+            else:
+                degradations.append(
+                    f"一批 {len(ids)} 条证据的抽取返回了单篇结构、无法判定归属，本批地点按缺失处理"
+                )
+                continue
+        attributed: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            owner = coerce_str(entry.get("evidence_id")).strip()
+            if owner not in known_ids:
+                continue
+            attributed.add(owner)
+            for item in entry.get("places") or []:
+                if isinstance(item, dict) and coerce_str(item.get("name")):
+                    extracted.append({**item, "evidence_id": owner})
+        missing = [item_id for item_id in ids if item_id not in attributed]
+        if missing:
+            degradations.append(
+                f"证据 {'、'.join(missing)} 的抽取结果里没有对应的归属条目，这几条按抽不到地点处理"
+            )
+    return extracted, degradations
 
 
 def extract_place_candidates(
@@ -430,27 +547,12 @@ def extract_place_candidates(
     result = PlaceCandidates()
     destination = _destination(intent) or ""
 
-    extracted: list[dict[str, Any]] = []
     provider_mentions: list[str] = []
     for evidence in evidences:
         provider_mentions.extend(evidence.place_mentions)
 
-    llm_targets = [
-        evidence for evidence in evidences if not evidence.place_mentions and len(evidence.text) >= 40
-    ][:EXTRACT_EVIDENCE_LIMIT]
-    for evidence in llm_targets:
-        response = llm.invoke_json(
-            EXTRACT_PLACES_PROMPT,
-            f"标题：{evidence.title}\n来源：{evidence.provider}/{evidence.source_type}\n"
-            f"证据 id：{evidence.id}\n正文：\n{evidence.text[:EVIDENCE_TEXT_CHARS]}",
-            tag=f"extract_places:{evidence.id}",
-        )
-        if response.ok and isinstance(response.value, dict):
-            for item in response.value.get("places", []) or []:
-                if isinstance(item, dict) and coerce_str(item.get("name")):
-                    extracted.append({**item, "evidence_id": evidence.id})
-        else:
-            result.degradations.append(degraded_note(response, f"证据 {evidence.id} 的地点抽取被跳过"))
+    extracted, extract_degradations = extract_places_from_evidences(llm, evidences)
+    result.degradations.extend(extract_degradations)
     result.extracted_from_evidence = len(extracted)
 
     if not evidences:
@@ -472,7 +574,7 @@ def extract_place_candidates(
         cleaned = coerce_str(name).strip()
         if cleaned and cleaned not in raw_names:
             raw_names.append(cleaned)
-    search_terms = [*raw_names[: cfg.discovery_max_places], *keywords]
+    search_terms = _dedupe_queries([*raw_names[: cfg.discovery_max_places], *keywords])
 
     # 关键词 POI 搜索互不依赖 → 受控并发；合并仍按关键词顺序（first-wins 的字段因此稳定）。
     outcomes = parallel_map(
@@ -834,6 +936,13 @@ class PrefetchBundle:
     hotels: list[HotelOption] = field(default_factory=list)
     evidences: list[Evidence] = field(default_factory=list)
     places: list[Place] = field(default_factory=list)
+    #: Discovery 计划要搜的社交/网页检索词（模型扩写或规则兜底的结果）。
+    #: 带回来是为了让正式 run 不再为"重新算出同样的检索词"再付一次 query_expansion
+    #: 模型调用（实测约 13.5s），也不必凭空猜检索词。
+    social_queries: list[str] = field(default_factory=list)
+    #: Discovery 真正发起过 Provider 检索的检索词（含失败的尝试）。缺失的 query 才需要
+    #: 正式 run 定向补搜 —— 全量重搜会白付模型调用与一串 Provider 请求，全量复用又会漏地点。
+    social_served_queries: list[str] = field(default_factory=list)
     #: Discovery 期间的 Provider 调用账本（要"过户"到正式 run 的 sources 表，保住来源链）
     provider_calls: list[dict[str, Any]] = field(default_factory=list)
     degradations: list[str] = field(default_factory=list)
@@ -850,6 +959,19 @@ class PrefetchBundle:
     def reused(self) -> bool:
         return bool(self.outbound or self.inbound or self.hotels or self.evidences or self.places)
 
+    def missing_social_queries(self, needed: Sequence[str]) -> list[str]:
+        """返回 ``needed`` 里 Discovery **没有真正搜过**的检索词（差集），供正式 run 定向补搜。
+
+        WHY：Discovery 可能只跑完了一部分 queries（还在 RUNNING 或某条线失败），全量重搜
+        会白付一次模型调用与一串 Provider 请求，全量复用又会漏地点 —— 所以要按 query 粒度
+        算差集。比较忽略大小写与所有空白（模型扩写与规则兜底对同一意图会产出
+        "成都 攻略" / "成都攻略" 这类变体，严格相等会误判成"还没搜"），
+        结果保留 ``needed`` 的原始写法与顺序，并按归一化键去重。
+        """
+
+        served = {_normalize_query(query) for query in self.social_served_queries}
+        return [query for query in _dedupe_queries(needed) if _normalize_query(query) not in served]
+
     def dump(self) -> dict[str, Any]:
         return {
             "session_id": self.session_id,
@@ -859,6 +981,8 @@ class PrefetchBundle:
             "hotels": [_dump_model(item) for item in self.hotels],
             "evidences": [_dump_model(item) for item in self.evidences],
             "places": [_dump_model(item) for item in self.places],
+            "social_queries": list(self.social_queries),
+            "social_served_queries": list(self.social_served_queries),
             "provider_calls": list(self.provider_calls),
             "degradations": list(self.degradations),
             "discovery_status": self.discovery_status,
@@ -880,6 +1004,12 @@ class PrefetchBundle:
             hotels=_load_models(data.get("hotels")),
             evidences=_load_models(data.get("evidences")),
             places=_load_models(data.get("places")),
+            # 纯字符串列表，不走 _load_models/_model_registry 的模型机制；
+            # 旧 payload（本次改动前存的）没有这两个键 → 空列表，绝不因此抛异常。
+            social_queries=[coerce_str(item) for item in (data.get("social_queries") or []) if coerce_str(item)],
+            social_served_queries=[
+                coerce_str(item) for item in (data.get("social_served_queries") or []) if coerce_str(item)
+            ],
             provider_calls=list(data.get("provider_calls") or []),
             degradations=[coerce_str(item) for item in (data.get("degradations") or []) if coerce_str(item)],
             discovery_status=coerce_str(data.get("discovery_status")) or "READY",
@@ -966,13 +1096,7 @@ __all__ = [
     "discover_social_evidence",
     "extract_place_candidates",
     "prefetch",
-    "SOCIAL_QUERY_LIMIT",
-    "WEB_QUERY_LIMIT",
-    "MAX_EVIDENCE",
-    "EXTRACT_EVIDENCE_LIMIT",
-    "EVIDENCE_TEXT_CHARS",
-    "POI_QUERY_LIMIT",
-    "POI_PAGE_SIZE",
+    "extract_places_from_evidences",
     "PREFERENCE_POI_QUERY",
     "NON_PLACE_QUERY_WORDS",
 ]

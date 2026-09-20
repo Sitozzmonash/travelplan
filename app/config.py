@@ -121,6 +121,58 @@ class TravelPlanConfig:
     #: 联网搜索（Tavily）：实测 3.5s，偏小
     web_search_timeout_seconds: float = 30.0
 
+    # --- 按 Tool 的更紧预算（Part E 的补充）---
+    # 同一个 Provider 下不同工具的合理预算差一个数量级：途牛酒店/火车要拉列表，几十秒
+    # 都可能；门票只是"按景区名查渠道价"，实测正常 2~6s 就返回。若给它共用途牛那份
+    # 90s 预算，一次挂死就独占整个 run —— 真实 run 里 1 次 TIMEOUT 185.3s 占了该次
+    # 墙钟的 70.7%（`tp-20260920-224653-f4e091`）。这里给轻查询一份更紧的预算，
+    # 没有覆盖的 Tool 仍走 Provider 那一份。
+    #: 门票（tuniu_search_scenic_tickets）：轻查询，给秒级预算
+    ticket_timeout_seconds: float = 15.0
+
+    # --- LLM：按用途的预算（Part F 的"这次调用值不值得等"）---
+    # 为什么不能只有一个统一值：一次 critic 调用实测 108.8s，而 finalize 的正文是用户
+    # 直接要看的。两者的"值得等"程度不一样，用一个值管所有 tag 要么让 critic 拖死 run，
+    # 要么把正文砍短。预算打满只是**如实降级**（status=TIMEOUT 落 Trace），不编造内容。
+    #: 单次模型调用的默认预算。默认与 `llm.DEFAULT_TIMEOUT_SECONDS` 一致，
+    #: 保证"不显式配置时行为不变"。
+    llm_timeout_seconds: float = 180.0
+    #: 抽取类（extract_places）：输入已截断，但**一批里有多篇** —— 预算要按整批给，
+    #: 不能按单篇给。按单篇给（75s）在 4 篇一批时会偶发打满，一次超时就丢掉整批地点。
+    llm_timeout_extract_seconds: float = 120.0
+    #: 批评类（critic）：规则批评已经先跑过，模型批评等不到就降级，不拖垮整次 run
+    llm_timeout_critic_seconds: float = 90.0
+    #: 成文类（final_answer）：用户直接读的正文，留足
+    llm_timeout_final_seconds: float = 120.0
+
+    # --- 抽取与攻略规模（Part D：控制"送给模型的攻略数量与文本长度"）---
+    #: 最多对几条攻略正文调用模型抽地点（数据源自带 place_mentions 的不占用名额）
+    extract_evidence_limit: int = 4
+    #: 单篇攻略送给模型的正文上限（字符）。攻略正文动辄上万字，全量送进去既慢又噪声大。
+    extract_text_chars: int = 1200
+    #: 一次模型调用合并几篇攻略。批内共享同一份 prompt，把"每篇一次往返"压成"每批一次"。
+    extract_batch_size: int = 4
+    #: 一次 run 最多保留多少条攻略/网页证据
+    evidence_max: int = 40
+    #: 社媒检索最多用几个 query
+    social_query_limit: int = 3
+    #: 联网搜索最多用几个 query
+    web_query_limit: int = 2
+    #: 路线初筛阈值（米）：两点直线距离超过它就判定为非相邻路段，不做市内路线查询
+    route_max_leg_meters: float = 60_000.0
+
+    # --- 交通对冲（Part A 的补充）---
+    #: 12306 是火车主源，但单次实测 55s 级、且会超时。开启后，主源还在跑时就**提前**
+    #: 并发发一次途牛火车当备胎；备胎结果**只在主源失败/超时时才被采用**，绝不与主源
+    #: 结果混排 —— "这趟车为什么出现"永远只有一个答案（PRD §32 的单源可信不变量）。
+    #: 代价是 12306 正常时多打一次途牛（调用留在账本里，标记为 hedged/discarded）。
+    transport_hedge_enabled: bool = True
+    #: 对冲时"最多先等主源多久"。超过它且备胎已经拿到非空结果，就直接采用备胎，
+    #: 不再傻等主源把预算耗完（实测 12306 单次 55s 级、超时打满 90s，而途牛火车
+    #: 平均 10s 就回来了）。**只对非空结果提前提交** —— 备胎返回空时继续等主源，
+    #: 否则"这天真的没车"会被一次慢查询误判成结论。
+    transport_hedge_wait_seconds: float = 25.0
+
     # --- 引导式旅程（Planning Session / Discovery）---
     discovery_enabled: bool = True
     planning_session_ttl_minutes: int = 45
@@ -254,6 +306,54 @@ class TravelPlanConfig:
                 "WEB_SEARCH_TIMEOUT_SECONDS", defaults.web_search_timeout_seconds
             )
             or defaults.web_search_timeout_seconds,
+            # --- 按 Tool 的更紧预算 / LLM 按用途预算 / 抽取规模 / 交通对冲 ---
+            ticket_timeout_seconds=decimal(
+                "TICKET_TIMEOUT_SECONDS", defaults.ticket_timeout_seconds
+            )
+            or defaults.ticket_timeout_seconds,
+            llm_timeout_seconds=decimal("LLM_TIMEOUT_SECONDS", defaults.llm_timeout_seconds)
+            or defaults.llm_timeout_seconds,
+            llm_timeout_extract_seconds=decimal(
+                "LLM_TIMEOUT_EXTRACT_SECONDS", defaults.llm_timeout_extract_seconds
+            )
+            or defaults.llm_timeout_extract_seconds,
+            llm_timeout_critic_seconds=decimal(
+                "LLM_TIMEOUT_CRITIC_SECONDS", defaults.llm_timeout_critic_seconds
+            )
+            or defaults.llm_timeout_critic_seconds,
+            llm_timeout_final_seconds=decimal(
+                "LLM_TIMEOUT_FINAL_SECONDS", defaults.llm_timeout_final_seconds
+            )
+            or defaults.llm_timeout_final_seconds,
+            extract_evidence_limit=max(
+                0, integer("EXTRACT_EVIDENCE_LIMIT", defaults.extract_evidence_limit)
+                if integer("EXTRACT_EVIDENCE_LIMIT", defaults.extract_evidence_limit) is not None
+                else defaults.extract_evidence_limit
+            ),
+            extract_text_chars=max(
+                200, integer("EXTRACT_TEXT_CHARS", defaults.extract_text_chars) or 200
+            ),
+            extract_batch_size=max(
+                1, integer("EXTRACT_BATCH_SIZE", defaults.extract_batch_size) or 1
+            ),
+            evidence_max=max(1, integer("EVIDENCE_MAX", defaults.evidence_max) or 1),
+            social_query_limit=max(
+                1, integer("SOCIAL_QUERY_LIMIT", defaults.social_query_limit) or 1
+            ),
+            web_query_limit=max(1, integer("WEB_QUERY_LIMIT", defaults.web_query_limit) or 1),
+            route_max_leg_meters=decimal(
+                "ROUTE_MAX_LEG_METERS", defaults.route_max_leg_meters
+            )
+            or defaults.route_max_leg_meters,
+            transport_hedge_enabled=flag(
+                "TRANSPORT_HEDGE_ENABLED", defaults.transport_hedge_enabled
+            ),
+            transport_hedge_wait_seconds=decimal(
+                "TRANSPORT_HEDGE_WAIT_SECONDS", defaults.transport_hedge_wait_seconds
+            )
+            if decimal("TRANSPORT_HEDGE_WAIT_SECONDS", defaults.transport_hedge_wait_seconds)
+            is not None
+            else defaults.transport_hedge_wait_seconds,
             discovery_enabled=flag("DISCOVERY_ENABLED", defaults.discovery_enabled),
             planning_session_ttl_minutes=integer(
                 "PLANNING_SESSION_TTL_MINUTES", defaults.planning_session_ttl_minutes
@@ -351,6 +451,22 @@ EDITABLE_KEYS: dict[str, tuple[str, float | None, float | None]] = {
     "TIKHUB_TIMEOUT_SECONDS": ("float", 5.0, 300.0),
     "MEDIACRAWLER_TIMEOUT_SECONDS": ("float", 5.0, 600.0),
     "WEB_SEARCH_TIMEOUT_SECONDS": ("float", 2.0, 120.0),
+    # 按 Tool 的更紧预算 / LLM 按用途预算
+    "TICKET_TIMEOUT_SECONDS": ("float", 2.0, 300.0),
+    "LLM_TIMEOUT_SECONDS": ("float", 5.0, 600.0),
+    "LLM_TIMEOUT_EXTRACT_SECONDS": ("float", 5.0, 600.0),
+    "LLM_TIMEOUT_CRITIC_SECONDS": ("float", 5.0, 600.0),
+    "LLM_TIMEOUT_FINAL_SECONDS": ("float", 5.0, 600.0),
+    # 抽取与攻略规模
+    "EXTRACT_EVIDENCE_LIMIT": ("int", 0, 20),
+    "EXTRACT_TEXT_CHARS": ("int", 200, 20000),
+    "EXTRACT_BATCH_SIZE": ("int", 1, 8),
+    "EVIDENCE_MAX": ("int", 1, 200),
+    "SOCIAL_QUERY_LIMIT": ("int", 1, 10),
+    "WEB_QUERY_LIMIT": ("int", 1, 10),
+    "ROUTE_MAX_LEG_METERS": ("float", 1000.0, 500000.0),
+    "TRANSPORT_HEDGE_ENABLED": ("bool", None, None),
+    "TRANSPORT_HEDGE_WAIT_SECONDS": ("float", 1.0, 300.0),
     # 功能开关
     "BADCASE_ENABLED": ("bool", None, None),
     "EVOLUTION_ENABLED": ("bool", None, None),
@@ -460,6 +576,49 @@ def provider_timeouts(config: TravelPlanConfig | None = None) -> dict[str, float
     }
 
 
+#: `(provider, tool)` → 它自己的更紧预算字段。没有命中的走 Provider 那一份。
+#: 键用 (provider, tool) 而不是只按 provider：同一个 Provider 下"拉列表"和"按名查价"
+#: 的合理预算不是一个量级，按 Provider 只能二选一，按 Tool 才既压得住长尾又不误杀。
+TOOL_TIMEOUT_FIELDS: dict[tuple[str, str], str] = {
+    ("tuniu", "tuniu_search_scenic_tickets"): "ticket_timeout_seconds",
+}
+
+
+def tool_timeout(provider: str, tool: str, config: TravelPlanConfig | None = None) -> float | None:
+    """按 `(provider, tool)` 查更紧的预算；没有覆盖时返回 None。
+
+    返回 None 而不是 Provider 预算，是为了让调用方明确表达"这次没有 Tool 级覆盖"，
+    避免两处各自回退、把"到底用了哪个值"埋掉。
+    """
+
+    resolved = config or current_config()
+    field = TOOL_TIMEOUT_FIELDS.get((provider, tool))
+    if field is None:
+        return None
+    return float(getattr(resolved, field))
+
+
+def llm_timeout_for_tag(tag: str, config: TravelPlanConfig | None = None) -> float:
+    """按调用用途（tag）给出单次模型预算。
+
+    为什么不按"模型名"或"消息长度"分：用途是唯一既稳定又和"值不值得等"直接相关的
+    维度。tag 前缀匹配（``extract_places:ev-3`` 命中 ``extract_places``）是为了让同一
+    用途的多个实例共用一份预算，不必逐个列举。
+    """
+
+    resolved = config or current_config()
+    base = str(tag or "")
+    prefix = base.split(":", 1)[0]
+    field = {
+        "extract_places": "llm_timeout_extract_seconds",
+        "critic": "llm_timeout_critic_seconds",
+        "final_answer": "llm_timeout_final_seconds",
+    }.get(prefix)
+    if field is None:
+        return float(resolved.llm_timeout_seconds)
+    return float(getattr(resolved, field))
+
+
 #: 性能摘要要快照的配置项（Part M）：管理端与 profiler 要能回答
 #: "这一次 run 是在什么并发上限 / 取数上限 / 超时下跑的"。
 PERFORMANCE_CONFIG_KEYS: tuple[str, ...] = (
@@ -482,6 +641,20 @@ PERFORMANCE_CONFIG_KEYS: tuple[str, ...] = (
     "tikhub_timeout_seconds",
     "mediacrawler_timeout_seconds",
     "web_search_timeout_seconds",
+    "ticket_timeout_seconds",
+    "llm_timeout_seconds",
+    "llm_timeout_extract_seconds",
+    "llm_timeout_critic_seconds",
+    "llm_timeout_final_seconds",
+    "extract_evidence_limit",
+    "extract_text_chars",
+    "extract_batch_size",
+    "evidence_max",
+    "social_query_limit",
+    "web_query_limit",
+    "route_max_leg_meters",
+    "transport_hedge_enabled",
+    "transport_hedge_wait_seconds",
 )
 
 

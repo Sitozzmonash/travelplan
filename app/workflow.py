@@ -37,7 +37,7 @@ from typing import Annotated, Any, Callable, Mapping, Sequence, TypedDict
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from app import planner, selection
+from app import discovery, planner, selection
 from app.badcase import BadCaseContext, detect_badcases, summarize as summarize_badcases
 from app.config import (
     current_config,
@@ -81,7 +81,6 @@ from app.models import (
 )
 from app.prompts import (
     CRITIC_PROMPT,
-    EXTRACT_PLACES_PROMPT,
     FINAL_ANSWER_PROMPT,
     INTENT_PARSE_PROMPT,
     RESEARCH_QUERY_EXPANSION_PROMPT,
@@ -127,27 +126,14 @@ STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
 STATUS_NEEDS_CLARIFICATION = "needs_clarification"
 
-#: 一次 run 的抓取预算。**这些数字现在是 app/config.py 的默认值的历史镜像**：
-#: 实际生效的值一律从 `current_config()` 读（Part D：散落的写死数字要收到 config 里，
-#: 才能通过环境变量 / 管理端在不重启服务的前提下调整）。这里保留同名常量只是为了
-#: 让"默认是多少"在节点代码旁边一眼可见，节点里不再直接使用它们。
-SOCIAL_QUERY_LIMIT = 3
-WEB_QUERY_LIMIT = 2
-MAX_EVIDENCE = 40
-EXTRACT_EVIDENCE_LIMIT = 4
-EVIDENCE_TEXT_CHARS = 1200
-POI_QUERY_LIMIT = 8
-POI_PAGE_SIZE = 10
-POI_DETAIL_LIMIT = 6
-TICKET_LOOKUP_LIMIT = 3
-MAX_ROUTE_LOOKUPS = 14
+#: 一次 run 的抓取预算**全部**集中在 `app/config.py`（Part D）。这里刻意不再保留任何
+#: "同名常量镜像"：镜像迟早与 config 漂移，而"节点里到底读的是哪一个"从代码上看不出来
+#: —— 排查"这个上限现在到底是多少"时最容易被镜像骗过去。要调值请改 config
+#: （支持环境变量与管理端运行时覆盖）。
+#:
+#: 唯一留在这里的是**展示用**的备选条数：它不参与取数、不影响任何 Provider 调用，
+#: 因此不属于"性能配置"。
 MAX_TRANSPORT_ALTERNATIVES = 4
-
-#: 路线查询的"坐标初筛"阈值（Part D §7）：两点直线距离超过这个值就判定为非相邻路段，
-#: 不做市内路线查询。60km 是"市内交通"与"跨城移动"的分界 —— 一天的行程本来就不该
-#: 出现跨城往返，真出现了也是排程问题，不该拿市内路线预算去掩盖它。
-#: 被跳过的段进 Trace（route_skipped），行程里仍按"未核实"处理，绝不用估算冒充实测。
-ROUTE_MAX_LEG_METERS = 60_000.0
 
 #: 偏好词不能直接当高德检索词："拍照" 在成都搜出来的是摄影工作室、"夜景" 搜出来的是
 #: 灯具店。只保留能搜到**地点**的词，需要换词的走这张映射。
@@ -2032,38 +2018,72 @@ def node_search_social(state: TravelState) -> dict:
             ],
         }
 
-    result = llm.invoke_json(
-        RESEARCH_QUERY_EXPANSION_PROMPT,
-        json.dumps(
-            {
-                "destination": intent.destination,
-                "days": intent.days,
-                "travelers": intent.travelers,
-                "preferences": intent.preferences,
-                "constraints": intent.constraints,
-                "raw_text": state["query"],
-            },
-            ensure_ascii=False,
-        ),
-        tag="query_expansion",
-    )
-    if result.ok and isinstance(result.value, list) and result.value:
-        queries = [coerce_str(item) for item in result.value if coerce_str(item)]
-        query_source = f"模型扩写（{len(queries)} 条）"
+    # 检索词**优先复用 Discovery 已经算出来的那批**：Discovery 为同一份 intent 已经做过
+    # 一次检索词扩写（实测 13.5s），正式 run 再问一遍模型只会得到同一批词。
+    ledger = _ledger(state)
+    planned = [coerce_str(item) for item in (getattr(bundle, "social_queries", None) or [])]
+    planned = [item for item in planned if item]
+    if planned:
+        queries = planned
+        query_source = f"复用 Discovery 扩写结果（{len(queries)} 条，未重复调用模型）"
+        ledger.mark(
+            "query_expansion",
+            MARK_PREFETCH_REUSED,
+            f"{len(queries)} 条检索词复用 Discovery（未重复调用模型）",
+        )
     else:
-        queries = _fallback_queries(intent)
-        query_source = "规则兜底检索词"
-        degradations.append(degraded_note(result, "检索词退化为规则组合"))
+        result = llm.invoke_json(
+            RESEARCH_QUERY_EXPANSION_PROMPT,
+            json.dumps(
+                {
+                    "destination": intent.destination,
+                    "days": intent.days,
+                    "travelers": intent.travelers,
+                    "preferences": intent.preferences,
+                    "constraints": intent.constraints,
+                    "raw_text": state["query"],
+                },
+                ensure_ascii=False,
+            ),
+            tag="query_expansion",
+        )
+        if result.ok and isinstance(result.value, list) and result.value:
+            queries = [coerce_str(item) for item in result.value if coerce_str(item)]
+            query_source = f"模型扩写（{len(queries)} 条）"
+        else:
+            queries = _fallback_queries(intent)
+            query_source = "规则兜底检索词"
+            degradations.append(degraded_note(result, "检索词退化为规则组合"))
+
+    # 只搜 Discovery **没有搜过**的那些 query（Part C：同一个 query 不做第二遍）。
+    # 全量重搜会白付一串 Provider 往返（TikHub 45s + MediaCrawler 180s 的链），
+    # 全量复用又会漏掉 Discovery 没跑完的部分 —— 所以按 query 粒度算差集。
+    search_set = set(queries)
+    if bundle is not None and planned:
+        search_set = set(bundle.missing_social_queries(queries))
+        skipped_queries = len(queries) - len(search_set)
+        if skipped_queries:
+            ledger.mark(
+                "social",
+                MARK_PREFETCH_REUSED,
+                f"{skipped_queries} 个检索词 Discovery 已搜过，本次不重复检索",
+            )
+        if not search_set:
+            degradations.append(
+                f"Discovery 已经搜过这批检索词（{len(queries)} 条）且没有返回可用攻略；"
+                "同一个 query 立刻再问一次不会变出内容，本次不重复检索（也没有用模型编造攻略）"
+            )
 
     evidences: list[Evidence] = []
     notes: list[str] = []
     platforms: dict[str, int] = {}
     cfg = current_config()
-    ledger = _ledger(state)
 
     # 社交检索之间互不依赖（都是"关键词 → 攻略"），所以受控并发；但**排序按检索词顺序**
-    # 合并，`MAX_EVIDENCE` 截断点因此与串行版本完全一致（可复现）。
-    social_keywords = list(queries[:SOCIAL_QUERY_LIMIT])
+    # 合并，证据上限的截断点因此与串行版本完全一致（可复现）。
+    social_keywords = [
+        query for query in queries[: cfg.social_query_limit] if query in search_set
+    ]
     social_results = _run_parallel(
         [
             (
@@ -2088,7 +2108,7 @@ def node_search_social(state: TravelState) -> dict:
         evidences.extend(social.items)
         if not social.items:
             notes.append(f"小红书「{keyword}」：{social.status}")
-        if len(evidences) >= MAX_EVIDENCE:
+        if len(evidences) >= cfg.evidence_max:
             break
 
     if not any(ev.provider == "xhs" for ev in evidences) and destination:
@@ -2102,7 +2122,7 @@ def node_search_social(state: TravelState) -> dict:
         evidences.extend(douyin.items)
         notes.append(f"小红书没有返回可用攻略，回退抖音查询：{douyin.status}")
 
-    web_keywords = list(queries[:WEB_QUERY_LIMIT])
+    web_keywords = [query for query in queries[: cfg.web_query_limit] if query in search_set]
     web_results = _run_parallel(
         [
             (
@@ -2145,7 +2165,7 @@ def node_search_social(state: TravelState) -> dict:
                 )
             )
 
-    evidences = evidences[:MAX_EVIDENCE]
+    evidences = evidences[: cfg.evidence_max]
     if not evidences:
         degradations.append(
             "社交与网页攻略都没有返回可用内容，Trust Score 的「多来源证据」分项会偏低；"
@@ -2154,7 +2174,7 @@ def node_search_social(state: TravelState) -> dict:
 
     steps = [
         f"检索词来源：{query_source}",
-        f"实际使用的检索词：{'、'.join(queries[:SOCIAL_QUERY_LIMIT])}",
+        f"实际使用的检索词：{'、'.join(queries[: cfg.social_query_limit])}",
         f"各平台返回条数：{json.dumps(platforms, ensure_ascii=False)}",
         "社交内容按「参考」使用：广告风险由 Ad Risk 六项分项评估，不直接采信",
     ]
@@ -2232,6 +2252,7 @@ def node_extract_places(state: TravelState) -> dict:
     # 只要那一步已经跑完（不是仍在 RUNNING），就不该拿同一批文本再调一次模型 ——
     # 实测 4 次串行抽取要 60s 以上，而它只会得出同一个结论。复用结论不是"少做一步"，
     # 而是"同一份内容不做第二遍"，因此这里即使抽不出地点也照常跳过并如实说明。
+    cfg = current_config()
     reused_extraction = _discovery_already_extracted(state, bundle)
     llm_targets = (
         []
@@ -2240,50 +2261,15 @@ def node_extract_places(state: TravelState) -> dict:
             evidence
             for evidence in state.get("evidences", [])
             if not evidence.place_mentions and len(evidence.text) >= 40
-        ][:EXTRACT_EVIDENCE_LIMIT]
+        ][: cfg.extract_evidence_limit]
     )
-    # 多篇攻略是**互相独立**的 batch，串行等它们是一笔白花的墙钟：
-    # 实测 4 条证据串行 63.6s（最快 10.7s、最慢 19.6s），并发后墙钟≈最慢的那条。
-    # 上限走 config 的 LLM_MAX_CONCURRENCY（独立模型调用可以并行，但必须限并发）。
-    cfg = current_config()
-
-    def _extract_one(evidence: Any) -> Any:
-        """抽一条证据的地点；异常不往外抛，交给调用方按 degraded 处理。"""
-
-        try:
-            return evidence, llm.invoke_json(
-                EXTRACT_PLACES_PROMPT,
-                f"标题：{evidence.title}\n来源：{evidence.provider}/{evidence.source_type}\n"
-                f"证据 id：{evidence.id}\n正文：\n{evidence.text[:EVIDENCE_TEXT_CHARS]}",
-                tag=f"extract_places:{evidence.id}",
-            )
-        except Exception as exc:  # noqa: BLE001 —— 单条失败不能带走整批
-            return evidence, exc
-
-    if llm_targets:
-        outcomes = _run_parallel(
-            [(f"e{index}", (lambda item=item: _extract_one(item))) for index, item in enumerate(llm_targets)],
-            limit=cfg.llm_max_concurrency,
-            thread_prefix="tp-extract",
-        ).values()
-    else:
-        outcomes = []
-
-    # 按**定义顺序**消费结果，所以并发不会改变抽取出来的地点顺序。
-    for outcome in outcomes:
-        if isinstance(outcome, tuple) and len(outcome) == 2:
-            evidence, result = outcome
-        else:  # pragma: no cover —— 形状不对时跳过，不让它变成一次假成功
-            continue
-        if isinstance(result, Exception):
-            degradations.append(f"证据 {evidence.id} 的地点抽取被跳过：{type(result).__name__}: {result}")
-            continue
-        if result.ok and isinstance(result.value, dict):
-            for item in result.value.get("places", []) or []:
-                if isinstance(item, dict) and coerce_str(item.get("name")):
-                    extracted.append({**item, "evidence_id": evidence.id})
-        else:
-            degradations.append(degraded_note(result, f"证据 {evidence.id} 的地点抽取被跳过"))
+    # 抽取本身（分批 + 受控并发 + 按证据 id 归属）与 Discovery 共用同一个实现：
+    # 这条链路里的"批大小、正文截断、并发上限、归属规则"全是性能/正确性开关，
+    # 两处各写一遍必然漂移。这里只负责"要不要抽"和怎么解释结果。
+    extracted: list[dict[str, Any]] = []
+    if not reused_extraction:
+        extracted, extract_degradations = discovery.extract_places_from_evidences(llm, llm_targets)
+        degradations.extend(extract_degradations)
 
     if reused_extraction:
         _ledger(state).mark("extract_places", MARK_PREFETCH_REUSED, "地点抽取复用 Discovery 结论（未重复调用模型）")
@@ -2370,7 +2356,15 @@ def node_extract_places(state: TravelState) -> dict:
         if cleaned and cleaned not in raw_names:
             raw_names.append(cleaned)
     raw_names = raw_names[: cfg.discovery_max_places]
-    search_terms = [*raw_names, *keywords]
+    # 两份来源要真的去重，不能只对 raw_names 内部去重：`raw_names` 与 `keywords` 撞名很常见
+    # （攻略里写的"博物馆"、兜底关键词里也有"博物馆"），而那是一次真实的高德调用。
+    # 并发下 hub 的"查缓存 → 没命中 → 发起调用"不是原子的，同一个词被两个线程同时看到
+    # 未命中就会真打两次，所以必须在这一层先去掉重复，而不是指望缓存兜住。
+    search_terms: list[str] = []
+    for term in [*raw_names, *keywords]:
+        cleaned = coerce_str(term).strip()
+        if cleaned and cleaned not in search_terms:
+            search_terms.append(cleaned)
     searched = len(search_terms)
 
     def search_one(term: str) -> Any:
@@ -2527,17 +2521,45 @@ def _deep_verify_places(
     return selected, skipped
 
 
+def _adopted_poi_detail_ids(state: TravelState) -> set[str]:
+    """Discovery 阶段**已经查过详情**的 poi_id 集合（Part C：同一件事不做第二遍）。
+
+    判据是"账本里有没有这次调用"，不是"营业时间是不是空的"：高德对一部分 POI 会正常
+    返回但不给营业时间，用后者当"没查过"会把它们每次 run 重查一遍 —— 实测一次 3 天
+    行程 23 次 `get_poi_detail` 里有 20 次是 Discovery 刚查过的同一批 poi_id。
+    """
+
+    ids: set[str] = set()
+    for entry in state.get("adopted_calls") or []:
+        if str(entry.get("tool") or "") != "get_poi_detail":
+            continue
+        raw = entry.get("arguments") or entry.get("query") or {}
+        if not isinstance(raw, Mapping):
+            continue
+        poi_id = coerce_str(raw.get("poi_id")).strip()
+        if poi_id:
+            ids.add(poi_id)
+    return ids
+
+
 def _station_to_hotel_minutes(
-    hub: Any, station: str, hotel: Any, city: str | None
+    state: TravelState, station: str, hotel: Any, city: str | None
 ) -> int | None:
     """车站/机场 → 酒店 的真实接驳分钟数（含入住缓冲）；取不到就返回 None。
 
     抽成独立函数是为了让"去程/回程两段"能并发：原来这段逻辑嵌在 for 循环里，
     想并发只能复制一遍（复制出来的两份迟早会不一致）。
+
+    两次外部调用（geocode + route）都要过兜底预算与账本：它们原来直接打 hub，
+    既没有超时上限、也不计入 `max_route_lookups` 预算 —— 一段接驳卡住就能把整个
+    verify 阶段拖长，而观测上看不出它属于哪个预算。
     """
 
-    geo = hub.geocode(coerce_str(station), city=city)
-    if not (geo.ok and geo.items):
+    hub = state["hub"]
+    geo, _ = _bounded_provider_call(
+        state, provider="amap", tool="geocode", func=lambda: hub.geocode(coerce_str(station), city=city)
+    )
+    if not (getattr(geo, "ok", False) and geo.items):
         return None
     coords = (
         coerce_float(geo.items[0].get("longitude") or geo.items[0].get("lng")),
@@ -2545,9 +2567,15 @@ def _station_to_hotel_minutes(
     )
     if coords[0] is None or coords[1] is None:
         return None
-    route = hub.route(coords, (hotel.lng, hotel.lat), "transit", city=city)
-    if route.ok and route.items and route.items[0].duration_minutes is not None:
-        return route.items[0].duration_minutes + planner.HOTEL_CHECKIN_MINUTES
+    route_result, _ = _bounded_provider_call(
+        state,
+        provider="amap",
+        tool="route",
+        func=lambda: hub.route(coords, (hotel.lng, hotel.lat), "transit", city=city),
+    )
+    items = getattr(route_result, "items", None) or []
+    if getattr(route_result, "ok", False) and items and items[0].duration_minutes is not None:
+        return items[0].duration_minutes + planner.HOTEL_CHECKIN_MINUTES
     return None
 
 
@@ -2590,16 +2618,38 @@ def node_verify_poi_and_routes(state: TravelState) -> dict:
     # --- 1) 补营业时间（可行性判定要用，PRD §22）---
     # 受益于并发的正是这一段与下一段：一条一条串行查（实测 6 次详情 + 9 段路线 ≈ 58s）
     # 和一起发出去，拿到的是同一批数据。
+    #
+    # "这个点查过详情了吗"必须按**是否真的查过**判断，不能按"有没有拿到营业时间"判断：
+    # 高德对一部分 POI 本来就会正常返回但不给营业时间，用 `not opening_hours` 当"没查过"
+    # 会让这些点每次 run 都重查一遍 —— 实测一次 3 天行程 23 次 get_poi_detail 里，
+    # 有 20 次是 Discovery 刚刚查过的同一批 poi_id。这里改成读过户过来的调用账本。
+    ledger = _ledger(state)
+    already_detailed = _adopted_poi_detail_ids(state)
     detail_targets = [
         place
         for place in places
-        if place.place_id in deep_ids and not place.opening_hours and place.amap_verified
+        if place.place_id in deep_ids
+        and not place.opening_hours
+        and place.amap_verified
+        and place.place_id not in already_detailed
     ][: cfg.poi_detail_limit]
+    detail_notes: dict[str, str] = {}
+
+    def _detail_call(place: Place) -> Any:
+        # 详情调用也要过 `_bounded_provider_call`：高德插件内部是 20s × 3 次重试，
+        # 实测单次最慢 43.5s，不套兜底预算就会自己决定这一次 run 要等多久。
+        value, note = _bounded_provider_call(
+            state,
+            provider="amap",
+            tool="get_poi_detail",
+            func=lambda: hub.poi_detail(place.place_id),
+        )
+        if note:
+            detail_notes[place.place_id] = note
+        return value
+
     detail_results = _run_parallel(
-        [
-            (place.place_id, (lambda place=place: hub.poi_detail(place.place_id)))
-            for place in detail_targets
-        ],
+        [(place.place_id, (lambda place=place: _detail_call(place))) for place in detail_targets],
         limit=cfg.poi_verify_max_concurrency,
         thread_prefix="tp-poi-detail",
     )
@@ -2620,6 +2670,10 @@ def node_verify_poi_and_routes(state: TravelState) -> dict:
         degradations.append(
             f"{detail_failures} 个地点的营业时间未能取得，可行性检查会把这些点按「营业时间未知」处理"
         )
+    # 超时/失败的详情调用按目标顺序补一句降级：谁先超时不影响用户看到的那条说明。
+    degradations.extend(
+        detail_notes[place.place_id] for place in detail_targets if place.place_id in detail_notes
+    )
 
     # --- 2) 计算地点之间的路线 ---
     hotel = state.get("hotel_plan").selected if state.get("hotel_plan") else None
@@ -2631,7 +2685,7 @@ def node_verify_poi_and_routes(state: TravelState) -> dict:
     routes: dict[Any, RouteOption] = {}
     route_ok = 0
     route_fail = 0
-    ledger = _ledger(state)
+    # ledger 在本节点开头已经取好（详情调用也要用它），这里不再重复取。
     # 只查"相邻一段"，**不做** POI × POI 全连接（Part D §7）。上限来自 config：
     # MAX_ROUTE_LOOKUPS 就是"最多查几段"。旧实现用 len(routes)（每段成功会写正反两条
     # 记录）当计数器，等于把配置的预算悄悄砍了一半；这里改成按调用次数计。
@@ -2645,6 +2699,9 @@ def node_verify_poi_and_routes(state: TravelState) -> dict:
     pair_tasks: list[tuple[str, Callable[[], Any]]] = []
     pair_order: list[tuple[Place, Place]] = []
     leg_skipped: list[dict[str, Any]] = []
+    # 初筛阈值来自 config（Part D）：它是"市内交通 vs 跨城移动"的分界，属于可调的行为
+    # 开关，不该写死在节点里 —— 调它不需要改流程代码。
+    max_leg_meters = float(cfg.route_max_leg_meters)
     attempted = 0
     for origin, target in zip(ordered, ordered[1:]):
         start, end = lnglat(origin), lnglat(target)
@@ -2654,7 +2711,7 @@ def node_verify_poi_and_routes(state: TravelState) -> dict:
             ledger.mark(label, MARK_ROUTE_SKIPPED, "缺少坐标")
             continue
         distance = planner.haversine_meters((origin.lat, origin.lng), (target.lat, target.lng))
-        if distance is not None and distance > ROUTE_MAX_LEG_METERS:
+        if distance is not None and distance > max_leg_meters:
             leg_skipped.append(
                 {
                     "leg": label,
@@ -2662,7 +2719,7 @@ def node_verify_poi_and_routes(state: TravelState) -> dict:
                     "reason_text": f"直线 {distance / 1000:.0f}km，判定为非相邻路段（不做全连接查询）",
                 }
             )
-            ledger.mark(label, MARK_ROUTE_SKIPPED, f"直线 {distance / 1000:.0f}km 超过 {ROUTE_MAX_LEG_METERS / 1000:.0f}km 初筛阈值")
+            ledger.mark(label, MARK_ROUTE_SKIPPED, f"直线 {distance / 1000:.0f}km 超过 {max_leg_meters / 1000:.0f}km 初筛阈值")
             continue
         if attempted >= cfg.max_route_lookups:
             leg_skipped.append(
@@ -2743,7 +2800,7 @@ def node_verify_poi_and_routes(state: TravelState) -> dict:
                     setter,
                     (
                         lambda station=station: _station_to_hotel_minutes(
-                            hub, station, hotel, destination or None
+                            state, station, hotel, destination or None
                         )
                     ),
                 )
@@ -4151,6 +4208,7 @@ def _provider_call_rows(hub: Any) -> list[dict[str, Any]]:
                 "source_id": entry.get("source_id"),
                 "cached": bool(entry.get("cached")),
                 "fallback": bool(entry.get("fallback")),
+                "discarded": bool(entry.get("discarded")),
                 "note": "；".join(entry.get("notes") or []) or entry.get("error") or None,
             }
         )
@@ -4675,6 +4733,10 @@ def _emit_run_spans(state: TravelState, *, llm: Any) -> None:
                 "prefetch_reused": reused,
                 "provider_called": not (cached or reused),
                 "fallback_query": fallback,
+                # Part E：超时要能一眼看出来，而不是让人从状态字符串里猜。
+                "timeout": status == "TIMEOUT",
+                # 对冲中未被采用的那次调用（真实发生过，但不是结果来源）。
+                "hedge_discarded": bool(entry.get("discarded")),
                 # 保留旧字段名，管理端与既有 Bad Case 规则读的是它。
                 "reused_from_discovery": reused,
                 "returned": entry.get("returned"),
