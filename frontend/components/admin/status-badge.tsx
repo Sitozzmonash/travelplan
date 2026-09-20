@@ -41,6 +41,7 @@ export function statusTone(status: string | null | undefined): AdminTone {
     case "ROLLBACK":
     case "medium":
     case "moderate":
+    case "RATE_LIMIT":
       return "warning";
     case "FAILED":
     case "fail":
@@ -52,6 +53,10 @@ export function statusTone(status: string | null | undefined): AdminTone {
     case "critical":
     case "high":
     case "severe":
+    // Provider 的「不可用」是真故障；而 UNKNOWN（无调用记录）刻意不在这里，
+    // 它落到下面的 default → muted（中性灰），避免把「没数据」画成「坏了」。
+    case "UNAVAILABLE":
+    case "AUTH_ERROR":
       return "danger";
     case "RUNNING":
     case "QUEUED":

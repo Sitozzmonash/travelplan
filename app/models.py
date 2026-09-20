@@ -351,6 +351,9 @@ class TripIntent(BaseModel):
     hotel_priority: str = "auto"
     hotel_max_price_per_night: float | None = None
     hotel_min_rating: float | None = None
+    #: 最低星级。**当前数据源（途牛）不返回星级字段**，所以它被记录但不参与排序 ——
+    #: 如实标注而不是拿评分冒充星级（见 docs/02 与会话接口的 capabilities）。
+    hotel_min_star: float | None = None
     hotel_room_type: str | None = None
     #: yes | no | auto —— 是否接受中途换酒店（当前产品全程只选一家，见 docs/02）
     hotel_allow_change: str | None = None

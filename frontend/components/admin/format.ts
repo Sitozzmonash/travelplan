@@ -58,6 +58,16 @@ export function formatPercentNumber(value: number | null | undefined): string {
 }
 
 /**
+ * 采样口径的比例（Provider 成功率 / 失败率）。
+ * 后端在没有样本时给 null，此时必须显示「—（无样本）」—— 落成 0% 会被读成「全部失败」，
+ * 恰好把「这段时间没被调用」误判成故障。
+ */
+export function formatSampleRatio(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—（无样本）";
+  return formatRatio(value);
+}
+
+/**
  * 通过率：契约只写了 latest_pass_rate，没有说明是 0~1 还是 0~100，
  * 因此两种都渲染，避免出现「0.86%」这种明显错误的读数。
  */
@@ -158,6 +168,11 @@ const STATUS_LABELS: Record<string, string> = {
   OK: "正常",
   HEALTHY: "正常",
   ERROR: "异常",
+  // Provider 状态与调用状态（Provider Health 页）。
+  UNAVAILABLE: "不可用",
+  AUTH_ERROR: "鉴权失败",
+  RATE_LIMIT: "被限流",
+  EMPTY: "无结果",
   UNKNOWN: "未知",
   unknown: "未知",
   critical: "严重",

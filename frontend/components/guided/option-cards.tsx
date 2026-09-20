@@ -96,9 +96,17 @@ interface ChipToggleProps<T extends string | number> {
   values: T[];
   onToggle: (value: T) => void;
   ariaLabel: string;
+  /** 后端声明这条过滤不可用时整组置灰，避免用户选了一个永远不生效的条件。 */
+  disabled?: boolean;
 }
 
-export function ChipToggle<T extends string | number>({ options, values, onToggle, ariaLabel }: ChipToggleProps<T>) {
+export function ChipToggle<T extends string | number>({
+  options,
+  values,
+  onToggle,
+  ariaLabel,
+  disabled = false,
+}: ChipToggleProps<T>) {
   return (
     <div role="group" aria-label={ariaLabel} className="flex flex-wrap gap-2">
       {options.map((option) => {
@@ -108,12 +116,14 @@ export function ChipToggle<T extends string | number>({ options, values, onToggl
             key={String(option.value)}
             type="button"
             aria-pressed={selected}
+            disabled={disabled}
             onClick={() => onToggle(option.value)}
             className={cn(
               "inline-flex min-h-[40px] items-center gap-1.5 rounded-full border px-3.5 text-xs transition-colors",
               selected
                 ? "border-primary/50 bg-accent text-accent-foreground"
                 : "border-border bg-card text-muted-foreground hover:text-foreground",
+              disabled && "cursor-not-allowed opacity-50 hover:border-border hover:text-muted-foreground",
             )}
           >
             {selected ? <Check className="size-3" aria-hidden /> : null}
@@ -133,9 +143,18 @@ interface SentinelRowProps {
   options: Option<PreferenceSentinel>[];
   /** 允许再点一次取消（回到「没表态」）。 */
   clearable?: boolean;
+  /** 同 ChipToggle：整组不可用（用于「最低星级」）。 */
+  disabled?: boolean;
 }
 
-export function SentinelRow({ value, onChange, ariaLabel, options, clearable = true }: SentinelRowProps) {
+export function SentinelRow({
+  value,
+  onChange,
+  ariaLabel,
+  options,
+  clearable = true,
+  disabled = false,
+}: SentinelRowProps) {
   return (
     <div role="group" aria-label={ariaLabel} className="flex flex-wrap gap-2">
       {options.map((option) => {
@@ -145,12 +164,14 @@ export function SentinelRow({ value, onChange, ariaLabel, options, clearable = t
             key={option.value}
             type="button"
             aria-pressed={selected}
+            disabled={disabled}
             onClick={() => onChange(selected && clearable ? null : option.value)}
             className={cn(
               "inline-flex min-h-[36px] items-center rounded-full border px-3 text-xs transition-colors",
               selected
                 ? "border-primary/50 bg-accent text-accent-foreground"
                 : "border-dashed border-border bg-card text-muted-foreground hover:text-foreground",
+              disabled && "cursor-not-allowed opacity-50 hover:border-border hover:text-muted-foreground",
             )}
           >
             {option.label}

@@ -125,6 +125,8 @@ class TravelWorkflowRunnable:
     model: Any | None = None
     store: Any | None = None
     debug: bool = False
+    #: 这次运行是谁发起的（quick/cli）。benchmark 由 Benchmark runner 直接传 execute_travel_run。
+    source: str = "quick"
     #: SuperHarness 原生 Observability 的上报口。由 `create_travel_app` 在装配完成后回填，
     #: 见 `_Emitter` 的说明。
     emit: Any | None = None
@@ -141,6 +143,7 @@ class TravelWorkflowRunnable:
             model=self.model,
             emit=self.emit,
             run_id=self._run_id(input),
+            source=self.source,
         )
         self._remember(result)
         return result
@@ -267,6 +270,7 @@ def run_travel(
     debug: bool = False,
     run_id: str | None = None,
     app: Any | None = None,
+    source: str = "quick",
 ) -> RunResult:
     """CLI 与 FastAPI 共用的唯一业务入口。
 

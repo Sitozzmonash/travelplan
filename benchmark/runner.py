@@ -115,6 +115,9 @@ def run_case(
                 jev=world.jev,
                 run_id=run_id,
                 output_dir=output_dir,
+                # 标注来源：管理端据此把评测用例运行从真实运行列表里过滤掉，
+                # Provider Health 也能区分"这是评测打的"还是"真实用户打的"。
+                source="benchmark",
             )
     except Exception as exc:  # noqa: BLE001 —— 一个 case 崩了不能带走整个套件
         return {

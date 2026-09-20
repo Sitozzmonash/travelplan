@@ -162,16 +162,16 @@ def transport_weights(intent: TripIntent) -> StrategyWeights:
     # 交通方式偏好：不是硬过滤（用户说"高铁"时如果当天没有高铁，硬过滤会让行程没有交通），
     # 而是强烈偏好 —— 与"必须如实披露"的原则一致。
     if mode == "train":
-        base["mode_train"] = tuning.transport_mode_match_bonus
+        base["mode_bonus"] = tuning.transport_mode_match_bonus
+        base["mode"] = "train"
     elif mode == "flight":
-        base["mode_flight"] = tuning.transport_mode_match_bonus
+        base["mode_bonus"] = tuning.transport_mode_match_bonus
+        base["mode"] = "flight"
     constraints = normalize_transport_constraints(intent.transport_constraints)
-    if "no_red_eye" in constraints:
-        base["red_eye_penalty"] = tuning.transport_red_eye_penalty
-    if "no_early" in constraints:
-        base["early_departure_penalty"] = tuning.transport_early_departure_penalty
-    if "few_transfers" in constraints:
-        base["transfer_penalty"] = tuning.transport_transfer_penalty
+    base["red_eye_penalty"] = tuning.transport_red_eye_penalty if "no_red_eye" in constraints else 0.0
+    base["early_penalty"] = tuning.transport_early_penalty if "no_early" in constraints else 0.0
+    base["transfer_penalty"] = tuning.transport_transfer_penalty if "few_transfers" in constraints else 0.0
+    base["mode_bonus"] = base.get("mode_bonus", 0.0)
     return StrategyWeights(values=base, label=_transport_strategy_label(mode, priority, constraints))
 
 
@@ -206,9 +206,70 @@ def hotel_weights(intent: TripIntent) -> StrategyWeights:
     elif priority == "transit":
         base["location"] *= 1.5
         base["comfort"] = tuning.hotel_transit_bonus
+    base["min_rating"] = coerce_float(intent.hotel_min_rating) or 0.0
+    base["max_price"] = coerce_float(intent.hotel_max_price_per_night) or 0.0
+    base["room_keyword"] = str(intent.hotel_room_type or "").strip()
     return StrategyWeights(
         values=base,
-        label=f"酒店策略 {HOTEL_PRIORITY_LABELS.get(priority, priority)}",
+        label=_hotel_strategy_label(intent, priority),
+    )
+
+
+def _hotel_strategy_label(intent: TripIntent, priority: str) -> str:
+    bits = [f"酒店策略 {HOTEL_PRIORITY_LABELS.get(priority, priority)}"]
+    if coerce_float(intent.hotel_max_price_per_night):
+        bits.append(f"每晚 ≤¥{coerce_float(intent.hotel_max_price_per_night):g}")
+    if coerce_float(intent.hotel_min_rating):
+        bits.append(f"评分 ≥{coerce_float(intent.hotel_min_rating):g}")
+    if intent.hotel_room_type:
+        bits.append(f"房型含「{intent.hotel_room_type}」")
+    if coerce_float(intent.hotel_min_star):
+        bits.append("星级（数据源无该字段，暂不生效）")
+    return "；".join(bits)
+
+
+def hotel_candidates_for(intent: TripIntent, hotels: Sequence[Any]) -> tuple[list[Any], str]:
+    """按用户的补充条件**硬过滤**酒店候选，返回 (可选候选, 过滤说明)。
+
+    过滤掉全部候选时回落到原列表并说明原因：用户填了个价格上限不是要我们交白卷，
+    而是"如果做不到要告诉我"。这条与"排不下就不排"不同 —— 住宿是行程必需项。
+    """
+
+    weights = hotel_weights(intent).values
+    max_price = float(weights.get("max_price") or 0.0)
+    min_rating = float(weights.get("min_rating") or 0.0)
+    room_keyword = str(weights.get("room_keyword") or "")
+
+    def keep(hotel: Any) -> bool:
+        price = coerce_float(getattr(hotel, "nightly", None))
+        rating = coerce_float(getattr(hotel, "rating", None))
+        if max_price and price is not None and price > max_price:
+            return False
+        if min_rating and rating is not None and rating < min_rating:
+            return False
+        if room_keyword:
+            haystack = " ".join(
+                filter(None, [str(getattr(hotel, "room_type", "") or ""), str(getattr(hotel, "name", "") or "")])
+            )
+            if room_keyword not in haystack:
+                return False
+        return True
+
+    kept = [hotel for hotel in hotels if keep(hotel)]
+    wanted: list[str] = []
+    if max_price:
+        wanted.append(f"每晚 ≤¥{max_price:g}")
+    if min_rating:
+        wanted.append(f"评分 ≥{min_rating:g}")
+    if room_keyword:
+        wanted.append(f"房型含「{room_keyword}」")
+    if not wanted:
+        return list(hotels), ""
+    if kept:
+        return kept, f"按「{'、'.join(wanted)}」过滤：{len(hotels)} 个候选 → {len(kept)} 个"
+    return (
+        list(hotels),
+        f"按「{'、'.join(wanted)}」过滤后没有候选，已放宽到全部 {len(hotels)} 个候选（价格/评分/房型以预订页为准）",
     )
 
 

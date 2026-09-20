@@ -72,6 +72,7 @@ PATCHABLE_FIELDS = (
     "hotel_priority",
     "hotel_max_price_per_night",
     "hotel_min_rating",
+    "hotel_min_star",
     "hotel_room_type",
     "hotel_allow_change",
     "pace",
@@ -131,6 +132,7 @@ def create_session(
             "hotel_priority": "auto",
             "hotel_max_price_per_night": None,
             "hotel_min_rating": None,
+            "hotel_min_star": None,
             "hotel_room_type": None,
             "hotel_allow_change": "auto",
             "pace": "auto",
@@ -158,7 +160,15 @@ def get_session(store: TravelPlanStore, session_id: str, *, expire: bool = True)
     """读会话。读取时顺手做一次过期判定 —— 不依赖后台定时任务。"""
 
     if expire:
-        store.expire_planning_sessions(now=_now().isoformat())
+        expired = store.expire_planning_sessions(now=_now().isoformat())
+        if expired:
+            # 补一条 session_expired 事件：状态变了但时间线上没有痕迹，运维会以为是别的原因。
+            for session in store.list_planning_sessions(limit=expired)[0]:
+                session["events"] = [
+                    *(session.get("events") or []),
+                    _event("session_expired", f"超过 TTL 未开始规划（{session.get('expires_at')}）"),
+                ]
+                store.save_planning_session(session)
     return store.get_planning_session(session_id)
 
 
@@ -199,8 +209,15 @@ def patch_session(
             value = normalize_hotel_priority(value)
         elif key == "pace":
             value = normalize_pace(value)
-        elif key in ("hotel_max_price_per_night", "hotel_min_rating"):
+        elif key in ("hotel_max_price_per_night", "hotel_min_rating", "hotel_min_star"):
             value = coerce_float(value)
+        elif key == "hotel_allow_change":
+            # 前端可能发布尔（true/false），后端契约是 yes/no/auto —— 两种都收，
+            # 免得一个类型不一致把整个 PATCH 打成 422。
+            if isinstance(value, bool):
+                value = "yes" if value else "no"
+            else:
+                value = coerce_str(value) or None
         else:
             value = coerce_str(value) or None
         if preferences.get(key) != value:
@@ -287,6 +304,7 @@ def run_discovery(
             ("transport", "transport_prefetch"),
             ("hotels", "hotel_prefetch"),
             ("social", "social_discovery"),
+            ("places", "place_extraction"),
         ):
             events.append(_event(f"{name}_started", stage))
         session["events"] = events
@@ -475,6 +493,7 @@ def intent_from_basic(basic: Mapping[str, Any], preferences: Mapping[str, Any] |
         hotel_priority=coerce_str(preferences.get("hotel_priority")) or "auto",
         hotel_max_price_per_night=coerce_float(preferences.get("hotel_max_price_per_night")),
         hotel_min_rating=coerce_float(preferences.get("hotel_min_rating")),
+        hotel_min_star=coerce_float(preferences.get("hotel_min_star")),
         hotel_room_type=coerce_str(preferences.get("hotel_room_type")) or None,
         hotel_allow_change=coerce_str(preferences.get("hotel_allow_change")) or None,
         source="guided",
@@ -569,9 +588,14 @@ def session_view(session: Mapping[str, Any]) -> dict[str, Any]:
         "evidence_summary": session.get("evidence_summary") or {},
         "degradations": session.get("degradations") or [],
         "events": session.get("events") or [],
-        # 能力声明：途牛目前不返回星级字段，前端据此把「最低星级」提示为暂不可用，
-        # 而不是让用户选了一个永远不生效的过滤器。
-        "capabilities": {"hotel_star_filter": False, "hotel_max_price_filter": True},
+        # 能力声明：途牛目前不返回星级字段，前端据此把「最低星级」置灰并说明原因，
+        # 而不是让用户选一个永远不生效的过滤器。价格上限是真实可用的。
+        "capabilities": {
+            "hotel_star_filter": False,
+            "hotel_star_note": "数据源当前不返回星级字段，星级筛选已记录但不参与排序；请用「每晚价格上限」或「评分下限」表达预算与品质要求。",
+            "hotel_max_price_filter": True,
+            "hotel_rating_filter": True,
+        },
     }
 
 

@@ -498,8 +498,11 @@ class PatchSessionRequest(BaseModel):
     hotel_priority: str | None = None
     hotel_max_price_per_night: float | None = None
     hotel_min_rating: float | None = None
+    #: 最低星级（当前数据源不返回星级，见 capabilities.hotel_star_filter）
+    hotel_min_star: float | None = None
     hotel_room_type: str | None = None
-    hotel_allow_change: str | None = None
+    #: 是否接受中途换酒店。前端发布尔、老客户端可能发 yes/no/auto —— 两种都收。
+    hotel_allow_change: bool | str | None = None
     pace: str | None = None
     budget_total: float | None = None
     poi_selections: dict[str, str] | None = None
@@ -1099,6 +1102,27 @@ PROVIDER_DEGRADED_FAILURE_RATE = 0.2
 PROVIDER_UNAVAILABLE_FAILURE_RATE = 0.6
 
 
+def _provider_status_reason(stats: dict[str, Any], status: str) -> str:
+    """给 `UNKNOWN` 一个具体说法。
+
+    "没有调用历史"与"样本不足以下结论"在运维上是两件事：前者要确认是不是没用起来，
+    后者只需要再攒几次调用。只给一个 UNKNOWN 会让人无从下手。
+    """
+
+    calls = int(stats.get("calls") or 0)
+    if calls == 0:
+        return "no_history"
+    if status == "UNKNOWN":
+        return "insufficient_sample"
+    if status == "HEALTHY":
+        return "ok"
+    if status == "DEGRADED":
+        return "elevated_failure_rate"
+    if status == "UNAVAILABLE":
+        return "high_failure_rate"
+    return "unknown"
+
+
 def _provider_status(stats: dict[str, Any]) -> str:
     """健康状态。没有调用历史时必须是 UNKNOWN，**不能**显示成失败。
 
@@ -1158,6 +1182,7 @@ def admin_providers(limit_per_provider: int = 200) -> dict[str, Any]:
                 "label": PROVIDER_LABELS.get(provider, provider),
                 "configured": configured.get(provider),
                 "status": _provider_status(stats),
+                "status_reason": _provider_status_reason(stats, _provider_status(stats)),
                 "success_rate": round(int(stats["successes"]) / int(stats["calls"]), 4)
                 if stats["calls"]
                 else None,
@@ -1177,6 +1202,7 @@ def admin_providers(limit_per_provider: int = 200) -> dict[str, Any]:
                 "label": PROVIDER_LABELS.get(provider, provider),
                 "configured": configured[provider],
                 "status": "UNKNOWN",
+                "status_reason": "no_history",
                 "calls": 0,
                 "successes": 0,
                 "failures": 0,
@@ -1233,6 +1259,9 @@ def admin_provider_detail(provider: str, limit: int = 20) -> dict[str, Any]:
         "label": PROVIDER_LABELS.get(provider, provider),
         "configured": _provider_configured().get(provider),
         "status": _provider_status(stats) if stats else "UNKNOWN",
+        "status_reason": (
+            _provider_status_reason(stats, _provider_status(stats)) if stats else "no_history"
+        ),
         "stats": stats,
         "calls": calls,
         "note": "调用明细不含任何密钥；query 只保留解释'查了什么'的键值。",

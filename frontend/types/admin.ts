@@ -551,12 +551,184 @@ export interface AdminPlanningEvent {
 /** 候选摘要形状由后端决定（可能是对象数组），展示层按 AdminRecord 兜底。 */
 export type AdminPlanningCandidate = AdminRecord;
 
-export interface AdminPlanningSessionDetail extends AdminPlanningSessionSummary {
-  place_candidates?: AdminPlanningCandidate[] | null;
-  transport_candidates?: AdminPlanningCandidate[] | null;
-  hotel_candidates?: AdminPlanningCandidate[] | null;
-  events?: AdminPlanningEvent[] | null;
-  degradations?: string[] | null;
+/* --------------- 会话详情（GET /admin/planning-sessions/{id} 的分块信封） --------------- */
+
+/**
+ * 会话详情是一份「分块信封」：session / basic_info / preferences / preference_labels /
+ * discovery / prefetch_summary / poi_selections / events / run_link。
+ *
+ * 为什么不是一个扁平大对象：后端任何一块没算出来（例如 Discovery 没跑完）时，
+ * 前端只需让那一块降级成 Empty/Partial，其余块照常渲染，而不是整页 invalid。
+ * 因此这里的每块都允许为 null，数组字段用空数组（[]）兜底。
+ */
+
+/** basic_intent：下游的原始意图（可能只有数字/字符串/哨兵值）。 */
+export interface AdminPlanningSessionBasicIntent {
+  origin?: string | null;
+  destination?: string | null;
+  start_date?: string | null;
+  end_date?: string | null;
+  days?: number | null;
+  travelers?: number | null;
+  /** 可能是数字、哨兵字符串（auto/undecided/unlimited）或 null。 */
+  budget_total?: number | string | null;
+}
+
+/**
+ * 结构化偏好（preferences 块）。
+ * 数值型字段保留哨兵字符串：`auto`=帮我选、`undecided`=不确定、`unlimited`=不限。
+ */
+export interface AdminPlanningSessionPreferences {
+  transport_mode?: string | null;
+  transport_priority?: string | null;
+  transport_constraints?: string[];
+  hotel_priority?: string | null;
+  hotel_max_price_per_night?: number | string | null;
+  hotel_min_rating?: number | string | null;
+  hotel_min_star?: number | string | null;
+  hotel_room_type?: string | null;
+  hotel_allow_change?: boolean | string | null;
+  pace?: string | null;
+}
+
+/** 后端给出的中文标签（preference_labels 块），前端优先用它而不是自己再翻译一遍。 */
+export interface AdminPlanningSessionPreferenceLabels {
+  transport_mode?: string | null;
+  transport_priority?: string | null;
+  transport_constraints?: string[];
+  hotel_priority?: string | null;
+  pace?: string | null;
+}
+/** 基础信息块：行程范围 + 会话的三个时间戳。 */
+export interface AdminPlanningSessionBasicInfo {
+  origin?: string | null;
+  destination?: string | null;
+  start_date?: string | null;
+  end_date?: string | null;
+  days?: number | null;
+  travelers?: number | null;
+  budget_total?: number | string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  expires_at?: string | null;
+}
+
+/**
+ * 能力声明。`hotel_star_filter === false` 表示数据源不返回星级，
+ * `hotel_star_note` 解释原因，展示层必须把它一起呈现，否则「星级不可用」会显得莫名其妙。
+ */
+export interface AdminPlanningSessionCapabilities {
+  hotel_star_filter?: boolean | null;
+  hotel_star_note?: string | null;
+  hotel_max_price_filter?: boolean | null;
+  hotel_rating_filter?: boolean | null;
+}
+
+export interface AdminPlanningSessionEvidenceSummary {
+  sources_used?: number | null;
+  places_verified?: number | null;
+  total_candidates?: number | null;
+  transport_candidates?: number | null;
+  hotel_candidates?: number | null;
+  evidence_count?: number | null;
+}
+
+export interface AdminPlanningSessionPlaceCategory {
+  category: string;
+  label?: string | null;
+  count?: number | null;
+}
+
+/** session 块：列表行 + session_view 的全部字段（详情视图的基础数据来源）。 */
+export interface AdminPlanningSessionBlock {
+  session_id: string;
+  status?: string | null;
+  discovery_status?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  expires_at?: string | null;
+  run_id?: string | null;
+  error?: string | null;
+  basic_intent?: AdminPlanningSessionBasicIntent | null;
+  preferences?: AdminPlanningSessionPreferences | null;
+  preference_labels?: AdminPlanningSessionPreferenceLabels | null;
+  /** place_id → MUST | WANT | REJECT */
+  poi_selections?: Record<string, string> | null;
+  transport_candidates?: AdminPlanningCandidate[];
+  hotel_candidates?: AdminPlanningCandidate[];
+  place_candidates?: AdminPlanningCandidate[];
+  place_categories?: AdminPlanningSessionPlaceCategory[];
+  evidence_summary?: AdminPlanningSessionEvidenceSummary | null;
+  degradations?: string[];
+  events?: AdminPlanningEvent[];
+  capabilities?: AdminPlanningSessionCapabilities | null;
+}
+
+/** Discovery 的单条线（transport / hotels / social / places）状态。 */
+export interface AdminDiscoveryStage {
+  status?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  duration_ms?: number | null;
+  result_count?: number | null;
+  degraded?: boolean | null;
+  error?: string | null;
+}
+
+export interface AdminDiscoveryBlock {
+  /** PENDING | RUNNING | READY | PARTIAL | FAILED（未登记取值原样显示） */
+  overall?: string | null;
+  stages?: Record<string, AdminDiscoveryStage>;
+  degradations?: string[];
+}
+
+/** Prefetch 摘要：五个数字。 */
+export interface AdminPrefetchSummary {
+  transport_candidates?: number | null;
+  hotel_candidates?: number | null;
+  evidence_count?: number | null;
+  place_candidates?: number | null;
+  provider_calls?: number | null;
+}
+
+export interface AdminPoiSelectionCounts {
+  must?: number | null;
+  want?: number | null;
+  reject?: number | null;
+  neutral?: number | null;
+}
+
+export interface AdminPoiSelectionItem {
+  place_id: string;
+  name?: string | null;
+  /** MUST | WANT | REJECT */
+  state?: string | null;
+}
+
+export interface AdminPlanningSessionPoiSelections {
+  counts?: AdminPoiSelectionCounts | null;
+  items?: AdminPoiSelectionItem[];
+}
+
+/** Session → Run 的关联摘要。 */
+export interface AdminRunLink {
+  has_run: boolean;
+  run_id?: string | null;
+  run_status?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+}
+
+export interface AdminPlanningSessionDetail {
+  session: AdminPlanningSessionBlock;
+  basic_info: AdminPlanningSessionBasicInfo | null;
+  preferences: AdminPlanningSessionPreferences | null;
+  preference_labels: AdminPlanningSessionPreferenceLabels | null;
+  discovery: AdminDiscoveryBlock | null;
+  prefetch_summary: AdminPrefetchSummary | null;
+  poi_selections: AdminPlanningSessionPoiSelections | null;
+  events: AdminPlanningEvent[];
+  run_link: AdminRunLink;
 }
 
 export interface AdminJevHealth {
@@ -572,6 +744,140 @@ export interface AdminJevHealth {
   timeout: number | null;
   invalid_response: number | null;
   last_error: string | null;
+}
+
+/* ------------------------------ Provider 健康 ------------------------------ */
+
+/**
+ * Provider 健康状态五态里的四态。
+ *
+ * `UNKNOWN` 的语义是「这段时间没有调用记录」，**不是**故障：
+ * 它必须是中性灰，不能因为拿不到成功率就画成红色。
+ */
+export const PROVIDER_STATUSES = ["HEALTHY", "DEGRADED", "UNAVAILABLE", "UNKNOWN"] as const;
+
+export type AdminProviderStatus = (typeof PROVIDER_STATUSES)[number];
+
+export const PROVIDER_STATUS_LABELS: Record<AdminProviderStatus, string> = {
+  HEALTHY: "健康",
+  DEGRADED: "降级",
+  UNAVAILABLE: "不可用",
+  UNKNOWN: "未知",
+};
+
+/**
+ * Provider 状态的中文标签。
+ *
+ * `UNKNOWN` 有两种来源：完全没被调用过（calls === 0），或最近样本太少、后端不下结论。
+ * 两者都不是故障，但必须说清是哪一种 —— 否则会把「刚被调用过几次」误读成「从没调用过」。
+ */
+export function providerStatusLabel(
+  status: AdminProviderStatus,
+  calls: number | null | undefined,
+): string {
+  if (status !== "UNKNOWN") return PROVIDER_STATUS_LABELS[status];
+  return (calls ?? 0) === 0 ? "无调用记录" : "样本不足";
+}
+
+/** 调用来源（source_type）。后端将来新增取值时原样显示，不做白名单丢弃。 */
+export const PROVIDER_SOURCE_LABELS: Record<string, string> = {
+  discovery: "Discovery 预取",
+  run: "正式 Run",
+  benchmark: "Benchmark",
+};
+
+export function providerSourceLabel(source: string | null | undefined): string {
+  if (!source) return "未知来源";
+  return PROVIDER_SOURCE_LABELS[source] ?? source;
+}
+
+/**
+ * 单个 Provider 的聚合统计（最近 N 次真实调用）。
+ * 所有字段都可能缺失：展示层统一降级成「—」，不放大成整页错误。
+ */
+export interface AdminProviderStats {
+  provider?: string | null;
+  calls?: number | null;
+  successes?: number | null;
+  failures?: number | null;
+  timeouts?: number | null;
+  auth_errors?: number | null;
+  rate_limited?: number | null;
+  empty?: number | null;
+  fallback_count?: number | null;
+  last_call_at?: string | null;
+  last_success_at?: string | null;
+  last_failure_at?: string | null;
+  avg_latency_ms?: number | null;
+  p95_latency_ms?: number | null;
+  tools?: string[] | null;
+  sources?: string[] | null;
+  last_error?: string | null;
+  last_status?: string | null;
+  /** 0~1；后端在没有样本时返回 null —— 页面必须显示「—」而不是 0%。 */
+  success_rate?: number | null;
+  failure_rate?: number | null;
+}
+
+/** 总览卡片行：统计字段 + 展示字段（label / configured / status）。 */
+export interface AdminProviderSummary extends AdminProviderStats {
+  provider: string;
+  label: string;
+  /** 后端不一定认识这个 Provider，认不出时为 null。 */
+  configured: boolean | null;
+  status: AdminProviderStatus;
+}
+
+export interface AdminProviderListSummary {
+  providers: number | null;
+  healthy: number | null;
+  degraded: number | null;
+  unavailable: number | null;
+  unknown: number | null;
+  /** 处于 DEGRADED / UNAVAILABLE 的 Provider id。 */
+  needs_attention: string[];
+}
+
+export interface AdminProviderList {
+  items: AdminProviderSummary[];
+  /** 后端没返回 summary 时为 null：页面显示 Partial，而不是整页失败。 */
+  summary: AdminProviderListSummary | null;
+  /** 统计口径说明；后端没返回时为空串。 */
+  note: string;
+}
+
+/**
+ * 单次 Provider 调用明细（Provider Health 详情）。
+ * 注意与上面 AdminRunDetail 里的 `AdminProviderCall` 区分：那个来自 `sources` 表，
+ * 这个来自 provider_calls 账本，字段口径不同。
+ */
+export interface AdminProviderHealthCall {
+  call_id: string | null;
+  provider: string | null;
+  tool: string | null;
+  status: string | null;
+  source_type: string | null;
+  source_id: string | null;
+  run_id: string | null;
+  session_id: string | null;
+  fetched_at: string | null;
+  duration_ms: number | null;
+  /** 后端未固定形状：可能是条数、布尔或空。 */
+  returned: unknown;
+  error: string | null;
+  fallback: boolean;
+  /** 后端已脱敏；页面默认折叠，不把原始参数平铺在主视图。 */
+  query: AdminRecord;
+}
+
+export interface AdminProviderDetail {
+  provider: string;
+  label: string;
+  configured: boolean | null;
+  status: AdminProviderStatus;
+  stats: AdminProviderStats | null;
+  calls: AdminProviderHealthCall[];
+  note: string;
 }
 
 /* ------------------------------ Evolution ------------------------------ */

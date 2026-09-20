@@ -80,6 +80,30 @@ Run 结束（finalize）
 
 `JEV_CATEGORIES` 常量列出了这七类，管理端据此分组。
 
+### 用户旅程（8 类，`app/badcase.py:JOURNEY_CATEGORIES` / `_journey_cases`）
+
+| category | severity | 触发条件 |
+| --- | --- | --- |
+| `rejected_poi_in_plan` | **high** | 最终行程里出现了用户标 `REJECT` 的 place_id（`journey.rejected_in_plan` 非空） |
+| `must_poi_missing` | **high** | 用户标 `MUST` 的点没有进入行程（`journey.must_missing` 非空）；`actual` 会带上 `day.notes` 里"为什么没排上"的原话 |
+| `prefetch_failed` | medium | Discovery 四条线里任一 `status=FAILED` |
+| `prefetch_not_reused` | medium | Discovery 已查到的线里，正式 run 又自己查了一遍（账本里出现交通/酒店/社交/搜索工具） |
+| `discovery_empty` | high | Discovery 四条线的 `result_count` 全为 0 |
+| `user_preference_ignored` | medium | 用户选了「必去/想去」但没有 `must_missing`/`rejected_in_plan` 时，若一个都没落进行程 |
+| `discovery_stale` | — | **只定义类别，当前没有规则产出** |
+| `guided_intent_mismatch` | — | **只定义类别，当前没有规则产出** |
+
+三条口径（很重要）：
+
+1. **这些规则只在 `source=guided` 的 run 上判定**（`_journey_cases` 开头 `journey.get("source") != "guided"` 直接返回）。一句话规划（quick）本来就没有前置选择，拿它去报"用户偏好被忽略"是误报 —— 误报会让 Bad Case 表失去可信度。
+2. `prefetch_reused` **是用证据推出来的，不是标记位**：由 `app/workflow.py:_user_journey_summary` 比对"Prefetch 已有的线"与"本次 run 账本里实际调用的工具"，两边都发生 = 没复用。
+3. `must_poi_missing` 的原因取自 `plan.days[].notes` 的原话（`_must_missing_reasons`），不是规则自己编一个理由。
+
+`journey` 上下文由 `app/workflow.py:_user_journey_summary` 提供，字段包括
+`source / source_session_id / transport_mode / transport_priority / hotel_priority / pace /
+place_selections / prefetch_available / prefetch_reused / prefetch_status / discovery /
+rejected_in_plan / must_missing`。`BadCaseContext.journey` 承接这份事实。
+
 ## 4. 关于 Jev 三类"判断错误"的取证方式
 
 它们不是"猜 Jev 想什么"，而是拿**代码判定的事实**与 Jev 的结论对照：

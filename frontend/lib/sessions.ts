@@ -27,6 +27,7 @@ import {
   type PlanningSessionStatus,
   type PoiSelection,
   type PreferenceSentinel,
+  type SessionCapabilities,
   type SessionEvent,
   type SessionPatchInput,
   type SessionPreferences,
@@ -273,6 +274,69 @@ function normalizeEvents(value: unknown): SessionEvent[] {
   }));
 }
 
+/**
+ * 能力开关归一：只认真正的布尔值，其余（缺失 / 字符串 / 对象）都当「未声明」= 不限制。
+ * 缺字段时按「可用」处理，这样旧后端或创建接口的即时返回也不会把功能误关掉。
+ */
+function normalizeCapabilities(value: unknown): SessionCapabilities {
+  if (!isRecord(value)) return {};
+  return {
+    hotel_star_filter:
+      typeof value.hotel_star_filter === "boolean" ? value.hotel_star_filter : null,
+    hotel_max_price_filter:
+      typeof value.hotel_max_price_filter === "boolean" ? value.hotel_max_price_filter : null,
+  };
+}
+
+/**
+ * 「最低星级」是否可用。
+ * 只有后端明确说 `hotel_star_filter === false` 才禁用；未声明时保持可用（向后兼容）。
+ */
+export function hotelStarFilterAvailable(session: SessionView | null): boolean {
+  return session?.capabilities.hotel_star_filter !== false;
+}
+
+/* --------------------- 数值型偏好的哨兵字符串收敛 --------------------- */
+
+/** 引导式向导在数值字段上使用的三个显式取值。 */
+const NUMERIC_SENTINELS = new Set(["unlimited", "undecided", "auto"]);
+
+/**
+ * 把数值型偏好的哨兵字符串收敛成 null。
+ *
+ * 后端 Pydantic 对 `budget_total` / `hotel_max_price_per_night` 声明的是 `float | None`，
+ * 直接提交 "unlimited" / "undecided" / "auto" 会被判 422。这里统一收敛：
+ *   - 数字原样保留；
+ *   - 三个哨兵字符串 → null（等价于让后端走默认策略）；
+ *   - null / undefined 原样保留（PATCH 时不改动该字段）。
+ *
+ * 收敛放在这个唯一的数据出口，而不是分散在各步组件里 —— 只要请求经过 sessions.ts，
+ * 就不可能有哨兵字符串漏到后端。界面上的中文标签（不限 / 不确定 / 帮我选）来自本地草稿，
+ * 因此不受影响。
+ */
+function coerceNumericPreference(value: unknown): number | null | undefined {
+  if (value === null || value === undefined) return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string" && NUMERIC_SENTINELS.has(value)) return null;
+  return null;
+}
+
+function sanitizeCreateInput(input: CreateSessionInput): CreateSessionInput {
+  if (!("budget_total" in input)) return input;
+  return { ...input, budget_total: coerceNumericPreference(input.budget_total) };
+}
+
+function sanitizePatchInput(patch: SessionPatchInput): SessionPatchInput {
+  const next: SessionPatchInput = { ...patch };
+  if ("budget_total" in next) {
+    next.budget_total = coerceNumericPreference(next.budget_total);
+  }
+  if ("hotel_max_price_per_night" in next) {
+    next.hotel_max_price_per_night = coerceNumericPreference(next.hotel_max_price_per_night);
+  }
+  return next;
+}
+
 /** 任意返回体 → 一定能渲染的 SessionView（缺字段降级为空态，而不是抛给错误边界）。 */
 export function normalizeSession(payload: unknown): SessionView {
   const raw = isRecord(payload) ? payload : {};
@@ -306,6 +370,7 @@ export function normalizeSession(payload: unknown): SessionView {
       ? raw.degradations.filter((item): item is string => typeof item === "string")
       : [],
     events: normalizeEvents(raw.events),
+    capabilities: normalizeCapabilities(raw.capabilities),
   };
 }
 
@@ -313,7 +378,7 @@ export function normalizeSession(payload: unknown): SessionView {
 export async function createPlanningSession(input: CreateSessionInput): Promise<SessionView> {
   const payload = await request("/api/v1/planning-sessions", {
     method: "POST",
-    body: input,
+    body: sanitizeCreateInput(input),
     timeoutMs: CREATE_TIMEOUT_MS,
     notFound: {
       kind: "endpoint_missing",
@@ -343,7 +408,7 @@ export async function patchPlanningSession(
 ): Promise<SessionView> {
   const payload = await request(`/api/v1/planning-sessions/${encodeURIComponent(sessionId)}`, {
     method: "PATCH",
-    body: patch,
+    body: sanitizePatchInput(patch),
     timeoutMs: PATCH_TIMEOUT_MS,
     notFound: {
       kind: "not_found",

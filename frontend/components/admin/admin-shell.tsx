@@ -9,6 +9,7 @@ import {
   Bug,
   Compass,
   FlaskConical,
+  HeartPulse,
   LayoutDashboard,
   ListChecks,
   LogOut,
@@ -75,6 +76,7 @@ const NAV_GROUPS: { label: string; items: AdminNavItem[] }[] = [
       { href: "/admin/runs", label: "运行记录", icon: ListChecks },
       { href: "/admin/sessions", label: "引导式会话", icon: Compass },
       { href: "/admin/badcases", label: "问题案例", icon: Bug },
+      { href: "/admin/providers", label: "Provider 健康", icon: HeartPulse },
     ],
   },
   {

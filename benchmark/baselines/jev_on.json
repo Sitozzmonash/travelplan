@@ -1,6 +1,6 @@
 {
   "benchmark_version": "v0.1",
-  "travelplan_commit": "a27efb9",
+  "travelplan_commit": "1c64bee",
   "superharness_commit": "d013ee8",
   "model": "kimi-k3",
   "fixture_version": "fixtures.v1",
@@ -21,7 +21,16 @@
     "jev_base_url": "https://api.typesafe.ai/v1/systemone",
     "badcase_enabled": true,
     "benchmark_enabled": true,
-    "evolution_enabled": false
+    "evolution_enabled": false,
+    "model_price_input_per_million": null,
+    "model_price_output_per_million": null,
+    "model_price_cached_per_million": null,
+    "discovery_enabled": true,
+    "planning_session_ttl_minutes": 45,
+    "discovery_place_limit": 20,
+    "discovery_place_per_category": 5,
+    "discovery_hotel_pages": 3,
+    "discovery_workers": 4
   },
   "jev_enabled": true,
   "suites": [
@@ -62,7 +71,7 @@
     "provider_success_rate": 0.9689,
     "fallback_success_rate": 0.0233,
     "timeout_rate": 0.0,
-    "end_to_end_latency": 2185.4967,
+    "end_to_end_latency": 1723.96,
     "llm_latency": 1.0,
     "jev_latency": null,
     "provider_latency": 1.0,
@@ -82,5 +91,5 @@
     "quality_delta_with_jev": null,
     "latency_delta_with_jev": null
   },
-  "generated_at": "2026-09-20T10:08:08.551001+00:00"
+  "generated_at": "2026-09-20T12:45:58.220276+00:00"
 }

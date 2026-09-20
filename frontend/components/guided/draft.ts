@@ -315,24 +315,37 @@ function group(places: PlaceCandidate[]): PoiNameGroup {
   return { count: places.length, names: places.map((place) => place.name) };
 }
 
-export function hotelDetailLabels(hotel: HotelDraft): string[] {
+/**
+ * 酒店补充项的中文标签。
+ * `includeStar: false` 时不再展示「最低星级」——数据源不返回星级时这条过滤不生效，
+ * 摘要里也不应该出现一个做不到的承诺。
+ */
+export function hotelDetailLabels(hotel: HotelDraft, options: { includeStar?: boolean } = {}): string[] {
+  const includeStar = options.includeStar ?? true;
   const labels: string[] = [];
   if (hotel.maxPriceSentinel) {
     labels.push(`每晚价格上限：${sentinelLabel(hotel.maxPriceSentinel) ?? hotel.maxPriceSentinel}`);
   } else if (hotel.maxPriceText.trim()) {
     labels.push(`每晚价格上限：${formatCNY(Number(hotel.maxPriceText))}`);
   }
-  if (typeof hotel.minStar === "number") {
-    const matched = MIN_STAR_OPTIONS.find((item) => item.value === hotel.minStar);
-    labels.push(`最低星级：${matched ? matched.label : `${hotel.minStar} 星起`}`);
-  } else if (hotel.minStar) {
-    labels.push(`最低星级：${sentinelLabel(hotel.minStar) ?? hotel.minStar}`);
+  if (includeStar) {
+    if (typeof hotel.minStar === "number") {
+      const matched = MIN_STAR_OPTIONS.find((item) => item.value === hotel.minStar);
+      labels.push(`最低星级：${matched ? matched.label : `${hotel.minStar} 星起`}`);
+    } else if (hotel.minStar) {
+      labels.push(`最低星级：${sentinelLabel(hotel.minStar) ?? hotel.minStar}`);
+    }
   }
   if (typeof hotel.roomType === "string") {
-    const matched = ROOM_TYPE_OPTIONS.find((item) => item.value === hotel.roomType);
-    labels.push(`房型：${matched ? matched.label : hotel.roomType}`);
-  } else if (hotel.roomType) {
-    labels.push(`房型：${sentinelLabel(hotel.roomType) ?? hotel.roomType}`);
+    // 哨兵（auto / undecided / unlimited）本身也是字符串，必须先翻译成中文；
+    // 否则选项表里匹配不到，会把原始枚举值直接显示成「房型：auto」。
+    const sentinel = sentinelLabel(hotel.roomType);
+    if (sentinel) {
+      labels.push(`房型：${sentinel}`);
+    } else {
+      const matched = ROOM_TYPE_OPTIONS.find((item) => item.value === hotel.roomType);
+      labels.push(`房型：${matched ? matched.label : hotel.roomType}`);
+    }
   }
   if (typeof hotel.allowChange === "boolean") {
     labels.push(`换酒店：${hotel.allowChange ? "可以换" : "不想换"}`);
@@ -397,7 +410,10 @@ export function summarize(draft: GuidedDraft, session: SessionView | null): Summ
     transportPriority: optionLabel(TRANSPORT_PRIORITY_OPTIONS, draft.transport.priority) ?? "帮我选（默认）",
     transportConstraints: transportConstraintsLabel(draft.transport.constraints),
     hotelPriority: optionLabel(HOTEL_PRIORITY_OPTIONS, draft.hotel.priority) ?? "帮我选（默认）",
-    hotelExtras: hotelDetailLabels(draft.hotel),
+    // 后端声明星级过滤不可用时，摘要也不展示星级（来源是 Session 的能力声明）。
+    hotelExtras: hotelDetailLabels(draft.hotel, {
+      includeStar: session?.capabilities.hotel_star_filter !== false,
+    }),
     paceLabel: optionLabel(PACE_OPTIONS, draft.pace) ?? "帮我安排（默认）",
     must: group(must),
     want: group(want),

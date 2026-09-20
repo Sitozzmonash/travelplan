@@ -137,6 +137,18 @@ export interface SessionEvent {
   detail?: string | null;
 }
 
+/**
+ * 后端声明的能力开关（GET /planning-sessions/{id} 的 `capabilities`）。
+ *
+ * 目前途牛不返回星级字段，于是后端给出 `hotel_star_filter: false`。
+ * 前端据此把「最低星级」置灰并注明原因，而不是让用户选一个永远不生效的过滤器。
+ * 字段缺失（旧后端 / 创建接口的即时返回）一律按「可用」处理，保持向后兼容。
+ */
+export interface SessionCapabilities {
+  hotel_star_filter?: boolean | null;
+  hotel_max_price_filter?: boolean | null;
+}
+
 /** GET /api/v1/planning-sessions/{id} 的原始返回（字段可能缺失，必须能降级渲染）。 */
 export interface PlanningSessionPayload {
   session_id?: string;
@@ -155,6 +167,7 @@ export interface PlanningSessionPayload {
   evidence_summary?: EvidenceSummary | null;
   degradations?: string[] | null;
   events?: SessionEvent[] | null;
+  capabilities?: SessionCapabilities | null;
 }
 
 /** 归一化后的 Session：数组/对象字段一定有值，页面不需要再写防御代码。 */
@@ -175,6 +188,8 @@ export interface SessionView {
   evidence_summary: EvidenceSummary | null;
   degradations: string[];
   events: SessionEvent[];
+  /** 归一化后的能力开关：对象一定存在，字段可能是 null（后端未声明）。 */
+  capabilities: SessionCapabilities;
 }
 
 /** POST /api/v1/planning-sessions 的请求体。 */

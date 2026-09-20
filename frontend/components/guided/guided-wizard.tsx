@@ -16,6 +16,7 @@ import {
   describeSessionError,
   getPlanningSession,
   hasSocialDegradation,
+  hotelStarFilterAvailable,
   isDiscoverySettled,
   isSessionUnusable,
   patchPlanningSession,
@@ -53,6 +54,18 @@ const POLL_MAX_FAILURES = 4;
 const POI_SYNC_DEBOUNCE_MS = 700;
 
 /**
+ * 数据源不支持星级过滤时，从 PATCH 里删掉 `hotel_min_star`。
+ * 这一步是「不提交一个永远不生效的过滤条件」的最后一道保险：即使用户在能力声明
+ * 到达之前选过星级，也不会把它写回后端。
+ */
+function dropStarFilter(patch: SessionPatchInput): SessionPatchInput {
+  if (!("hotel_min_star" in patch)) return patch;
+  const next: SessionPatchInput = { ...patch };
+  delete next.hotel_min_star;
+  return next;
+}
+
+/**
  * Guided 向导（§17）唯一的状态机。
  *
  * 会话生命周期：
@@ -88,6 +101,8 @@ export function GuidedWizard() {
   const socialFailed = hasSocialDegradation(session?.degradations ?? []);
   const model = summarize(draft, session);
   const isConfirm = step === STEP_META.length - 1;
+  // 后端能力声明：false 时禁用「最低星级」并从 PATCH 里删掉该字段。
+  const starFilterAvailable = hotelStarFilterAvailable(session);
 
   useEffect(() => {
     if (!sessionId || settled || unusable || pollStalled) return;
@@ -230,7 +245,11 @@ export function GuidedWizard() {
       setStartError(null);
       if (hasAnyPreference(draft)) {
         try {
-          const replayed = await patchPlanningSession(created.session_id, preferenceReplayPatch(draft));
+          const replay = preferenceReplayPatch(draft);
+          const replayed = await patchPlanningSession(
+            created.session_id,
+            starFilterAvailable ? replay : dropStarFilter(replay),
+          );
           setSession(replayed);
         } catch {
           // 偏好补写失败不阻塞：用户继续往下走时还会再写一次。
@@ -251,21 +270,23 @@ export function GuidedWizard() {
       setStep(advanceTo);
       return;
     }
+    // 数据源不支持星级过滤时，绝不把 hotel_min_star 提交上去。
+    const effective = starFilterAvailable ? patch : dropStarFilter(patch);
     // 这次要发的就是最新的 POI 选择时，取消还在等待的防抖同步，避免重复 PATCH。
-    if (patch.poi_selections && poiTimer.current) {
+    if (effective.poi_selections && poiTimer.current) {
       clearTimeout(poiTimer.current);
       poiTimer.current = null;
     }
     setSyncing(true);
     try {
-      const view = await patchPlanningSession(id, patch);
+      const view = await patchPlanningSession(id, effective);
       setSession(view);
       setSyncError(null);
       setPendingPatch(null);
     } catch (cause) {
       // 写不回后端也不拦住用户：明确告知 + 提供重试，而不是把人卡在这一步。
       setSyncError(describeSessionError(cause));
-      setPendingPatch(patch);
+      setPendingPatch(effective);
     } finally {
       setSyncing(false);
       setStep(advanceTo);
@@ -434,7 +455,13 @@ export function GuidedWizard() {
               />
             ) : null}
             {step === 1 ? <StepTransport draft={draft} onChange={patchTransport} /> : null}
-            {step === 2 ? <StepHotel draft={draft} onChange={patchHotel} /> : null}
+            {step === 2 ? (
+              <StepHotel
+                draft={draft}
+                onChange={patchHotel}
+                hotelStarFilterAvailable={starFilterAvailable}
+              />
+            ) : null}
             {step === 3 ? (
               <StepPoi
                 session={session}

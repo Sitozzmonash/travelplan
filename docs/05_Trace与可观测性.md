@@ -2,19 +2,24 @@
 
 一句话：说明一次 run 产生了哪些 trace、怎么命名、落在哪，以及管理端每个面板的数据从哪来。
 
-## 1. 两个状态机
+## 1. 三个状态机
 
 ```text
-Run  （run_progress.status）：RUNNING → SUCCESS / DEGRADED / FAILED / CANCELLED
-Span （trace_spans.status） ：RUNNING → SUCCESS / WARNING / FAILED
+Run     （run_progress.status） ：RUNNING → SUCCESS / DEGRADED / FAILED / CANCELLED
+Span    （trace_spans.status）  ：RUNNING → SUCCESS / WARNING / FAILED
+Session （planning_sessions）   ：COLLECTING → DISCOVERING → READY → STARTING →（正式 run）
+                                 └──────────────┴────────────┴──► CANCELLED / EXPIRED
 ```
 
 - `RUNNING → SUCCESS|DEGRADED|FAILED|CANCELLED` 是**唯一**对外契约（前端轮询、管理端筛选用它）。
 - `runs.status` 保留历史小写值（`completed` / `failed` / `needs_clarification`）只为兼容旧接口；
   管理端一律读 `run_progress.status`。
 - `DEGRADED` = 产出了行程，但过程中有降级（模型/Provider/Jev 有失败）。
+- Session 状态与 Run 状态**刻意分开命名**，属于"正式 run 之前"的阶段，见
+  [11_用户旅程与PlanningSession.md](11_用户旅程与PlanningSession.md)。
 
-定义位置：`app/observability.py`（`RunStatus`、`StageStatus`、`SpanKind`、`span_id`）。
+定义位置：`app/observability.py`（`RunStatus`、`StageStatus`、`SpanKind`、`span_id`）、
+`app/sessions.py`（`SESSION_*`）。
 
 ## 2. Span 分类与命名
 
@@ -63,6 +68,9 @@ Run SUCCESS
 - provider / tool / mcp / llm span 在 `finalize` 之后由 `_emit_run_spans()` 从 ProviderHub 与
   LLM 的**调用账本**统一转录 —— 不要求每个调用点都记得埋点，也就不会漏；
 - tool span 的 id 与 Bad Case 的 `trace_refs` 完全一致，所以从一条 Bad Case 能直接跳到那条 span。
+- 引导式复用 Discovery 候选时，`node_extract_places` 会写一条 `planner` 子 span
+  `{run_id}:planner:user_place_selection`（attributes: reused/kept/must/want/rejected），
+  让"用户选择到底排除了几个点"在 trace 里可查。
 
 ## 3. 产物（`outputs/<run_id>/`）
 
@@ -87,24 +95,36 @@ Run SUCCESS
 - `run_metrics`：run 级汇总，字段为
   `duration_ms / input_tokens / output_tokens / cached_tokens / total_tokens / llm_calls /
   jev_calls / tool_calls / provider_failures / badcase_count / cost`。
-  **`cost` 拿不到可核实的价格回执时是 `null`**，不猜；token 同理（拿不到就 `null` 而不是 0）。
+  **`cost` 在没有模型单价或拿不到 token 时是 `null`**，不猜；配了 `MODEL_PRICE_*` 且拿到 token 时
+  按用户单价估算，并标 `cost_source="user_price"`（token 同理：拿不到就 `null` 而不是 0）。
 - `run_stages` / `run_progress`：轮询用的真实阶段状态。
+- `provider_calls`：Provider 调用账本（观测，**无 runs 外键**），供 Provider Health 聚合；见
+  [12_Provider健康与观测.md](12_Provider健康与观测.md)。
+- `planning_sessions`：引导式会话（含 `discovery_json` / `prefetch_json` / `events_json`），
+  与 `runs.source_session_id` 关联；见 [11](11_用户旅程与PlanningSession.md)。
+- `runtime_config`：管理端可运行时修改的非 Secret 配置覆盖（见 [02](02_配置说明.md) §3.5）。
 
 ## 5. 管理端怎么消费
 
 | 面板 | 接口 | 数据来源 |
 | --- | --- | --- |
 | Dashboard 摘要 | `GET /api/v1/admin/overview` | runs + run_metrics 聚合 + badcases 计数 + Jev 健康 |
-| 运行列表 | `GET /api/v1/admin/runs?status=&limit=&offset=` | `list_runs`（含 total） |
-| 运行详情 | `GET /api/v1/admin/runs/{run_id}` | `{run, metrics, progress, trace, decisions, provider_calls, jev_calls, llm_calls, badcases}` |
-| Trace 树 | 同上 | `trace[]`，前端按 `parent_span_id` 复原层级 |
-| Jev Calls | 同上 | `jev_calls[]`（从 component=jev 的 span 还原，含 decision_type / input_summary / confidence / latency / fallback reason / quota） |
-| LLM 调用 | 同上 | `llm_calls[]`（从 component=llm 的 span 还原） |
-| Token 明细 | 同上 | `metrics` |
+| 运行列表 | `GET /api/v1/admin/runs?status=&q=&include_benchmark=&limit=&offset=` | `list_runs`（含 total）；`q` 按 run_id / 原始需求搜索；`include_benchmark` 默认 false |
+| 运行详情 | `GET /api/v1/admin/runs/{run_id}` | `{run, metrics, user_journey, stages, progress, trace, decisions, provider_calls, jev_calls, llm_calls, badcases}` |
+| 用户旅程上下文 | 同上 | `user_journey`（source / source_session_id / 策略 / MUST·WANT·REJECT 计数 / prefetch_reused / discovery）默认折叠 |
+| 阶段明细 | `GET /api/v1/admin/runs/{run_id}/stages` | 每阶段 steps / facts / 该阶段的 tool_calls 与 llm_calls / tokens |
+| Trace 树 | 运行详情 | `trace[]`，前端按 `parent_span_id` 复原层级 |
+| Jev Calls | 运行详情 | `jev_calls[]`（从 component=jev 的 span 还原，含 decision_type / input_summary / confidence / latency / fallback reason / quota） |
+| LLM 调用 | 运行详情 | `llm_calls[]`（从 component=llm 的 span 还原） |
+| Token / 成本 | 运行详情 | `metrics`（含 `cost` / `cost_source` / `cost_breakdown`） |
 | Jev 健康 | `GET /api/v1/admin/jev/health` | 最近 20 个 run 的 jev span 汇总（quota 缺失时是 `unknown`） |
-| Provider 统计 | `GET /api/v1/admin/providers` | 最近 50 个 run 的 tool span 汇总 |
+| Planning Sessions | `GET /api/v1/admin/planning-sessions?status=&destination=&has_run=&q=&limit=&offset=` | `planning_sessions` 列表（每行带 Discovery 状态 / MUST·WANT·REJECT 计数 / run_id） |
+| Session 详情 | `GET /api/v1/admin/planning-sessions/{session_id}` | 信封 `{session, basic_info, preferences, preference_labels, discovery, prefetch_summary, poi_selections, events, run_link}` |
+| Provider Health | `GET /api/v1/admin/providers?limit_per_provider=` | `provider_calls` 聚合（每 Provider 一张卡 + `summary`；无历史 = UNKNOWN） |
+| Provider 明细 | `GET /api/v1/admin/providers/{provider}?limit=` | 最近 N 次调用（含 source_type / session_id / run_id，query 已脱敏） |
 
-Dashboard 默认只显示总量；LLM / Jev / Tool / Token 明细在运行详情里**默认折叠**。
+Dashboard 默认只显示总量；LLM / Jev / Tool / Token / 用户旅程 / Session 事件明细都**默认折叠**。
+Provider Health 只读 `provider_calls`，不做实时探活（见 [12](12_Provider健康与观测.md)）。
 
 ## 6. 两条工程约定
 

@@ -27,11 +27,13 @@ import {
 interface StepHotelProps {
   draft: GuidedDraft;
   onChange: (patch: Partial<GuidedDraft["hotel"]>) => void;
+  /** 后端能力声明：false 时「最低星级」置灰（数据源不返回星级）。缺省视为可用。 */
+  hotelStarFilterAvailable?: boolean;
 }
 
-export function StepHotel({ draft, onChange }: StepHotelProps) {
+export function StepHotel({ draft, onChange, hotelStarFilterAvailable = true }: StepHotelProps) {
   const hotel = draft.hotel;
-  const details = hotelDetailLabels(hotel);
+  const details = hotelDetailLabels(hotel, { includeStar: hotelStarFilterAvailable });
 
   return (
     <div className="grid gap-6">
@@ -74,19 +76,33 @@ export function StepHotel({ draft, onChange }: StepHotelProps) {
         />
       </StepSection>
 
-      <StepSection title="最低星级" hint="选具体星级表示「至少这个档次」。">
+      <StepSection
+        title="最低星级"
+        hint={
+          hotelStarFilterAvailable
+            ? "选具体星级表示「至少这个档次」。"
+            : "数据源当前不返回星级，暂不可用 —— 选了也不会生效，因此这里禁用。"
+        }
+      >
         <ChipToggle
           ariaLabel="最低星级"
           options={MIN_STAR_OPTIONS}
           values={typeof hotel.minStar === "number" ? [hotel.minStar] : []}
+          disabled={!hotelStarFilterAvailable}
           onToggle={(value) => onChange({ minStar: typeof hotel.minStar === "number" && hotel.minStar === value ? null : value })}
         />
         <SentinelRow
           ariaLabel="最低星级的其他选择"
           options={SENTINEL_OPTIONS}
           value={typeof hotel.minStar === "string" ? hotel.minStar : null}
+          disabled={!hotelStarFilterAvailable}
           onChange={(value) => onChange({ minStar: value })}
         />
+        {!hotelStarFilterAvailable ? (
+          <p className="rounded-md bg-muted/60 px-2.5 py-2 text-[11px] leading-5 text-muted-foreground">
+            数据源当前不返回星级，暂不可用。每晚价格上限等其他条件仍然生效。
+          </p>
+        ) : null}
       </StepSection>
 
       <StepSection title="房型" hint="人多或带小孩时，可以指定房型。">

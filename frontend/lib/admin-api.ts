@@ -24,6 +24,8 @@ import type {
   AdminConfigOverride,
   AdminConfigPatch,
   AdminCostBreakdown,
+  AdminDiscoveryBlock,
+  AdminDiscoveryStage,
   AdminEvolutionLaunchResult,
   AdminEvolutionOverview,
   AdminEvolutionRunDetail,
@@ -31,9 +33,29 @@ import type {
   AdminLlmCall,
   AdminOverview,
   AdminPlanningEvent,
+  AdminPlanningSessionBasicInfo,
+  AdminPlanningSessionBasicIntent,
+  AdminPlanningSessionBlock,
+  AdminPlanningSessionCapabilities,
   AdminPlanningSessionDetail,
+  AdminPlanningSessionEvidenceSummary,
   AdminPlanningSessionList,
+  AdminPlanningSessionPlaceCategory,
+  AdminPlanningSessionPoiSelections,
+  AdminPlanningSessionPreferenceLabels,
+  AdminPlanningSessionPreferences,
   AdminPlanningSessionSummary,
+  AdminPrefetchSummary,
+  AdminPoiSelectionCounts,
+  AdminPoiSelectionItem,
+  AdminRunLink,
+  AdminProviderDetail,
+  AdminProviderHealthCall,
+  AdminProviderList,
+  AdminProviderListSummary,
+  AdminProviderStats,
+  AdminProviderStatus,
+  AdminProviderSummary,
   AdminRecord,
   AdminRunDetail,
   AdminRunList,
@@ -482,6 +504,11 @@ function normalizeStageDetail(value: AdminRecord): AdminStageDetail {
 function normalizeStageList(payload: unknown): AdminStageDetail[] {
   if (Array.isArray(payload)) return payload.filter(isRecord).map(normalizeStageDetail);
   if (isRecord(payload)) {
+    // 后端返回的是 `{run_id, items: [...]}`（与其它管理端列表同一种信封）；
+    // 裸数组与 `{stages}` 也一并接受，这样后端换信封不会让阶段整块消失。
+    if (Array.isArray(payload.items)) {
+      return payload.items.filter(isRecord).map(normalizeStageDetail);
+    }
     if (Array.isArray(payload.stages)) {
       return payload.stages.filter(isRecord).map(normalizeStageDetail);
     }
@@ -661,23 +688,406 @@ function normalizePlanningEvent(value: AdminRecord): AdminPlanningEvent {
 
 function normalizePlanningSessionDetail(payload: unknown): AdminPlanningSessionDetail {
   const record = isRecord(payload) ? payload : {};
-  const base = normalizePlanningSessionSummary({
-    ...record,
-    session_id: record.session_id ?? "",
-  });
+  const session = normalizePlanningSessionBlock(record.session);
+
+  // 顶层块是权威来源；缺失时回落到 session 块里的同名字段（旧形状 / 部分部署的防御）。
+  const preferences = normalizePlanningPreferences(record.preferences) ?? session.preferences ?? null;
+  const preferenceLabels =
+    normalizePlanningPreferenceLabels(record.preference_labels) ?? session.preference_labels ?? null;
+
+  const topLevelEvents = toArray(record.events).filter(isRecord).map(normalizePlanningEvent);
+  const events = topLevelEvents.length > 0 ? topLevelEvents : (session.events ?? []);
+
   return {
-    ...record,
-    ...base,
-    place_candidates: toArray(record.place_candidates).filter(isRecord),
-    transport_candidates: toArray(record.transport_candidates).filter(isRecord),
-    hotel_candidates: toArray(record.hotel_candidates).filter(isRecord),
-    events: toArray(record.events).filter(isRecord).map(normalizePlanningEvent),
-    degradations: toArray(record.degradations).filter(isString),
+    session,
+    basic_info: normalizePlanningBasicInfo(record.basic_info, session),
+    preferences,
+    preference_labels: preferenceLabels,
+    discovery: normalizePlanningDiscovery(record.discovery, session),
+    prefetch_summary: normalizePlanningPrefetchSummary(record.prefetch_summary),
+    poi_selections: normalizePlanningPoiSelections(record.poi_selections),
+    events,
+    run_link: normalizePlanningRunLink(record.run_link, session.run_id ?? null),
   };
 }
 
+/** 新信封的顶层判据：必须有 session 块，且 session.session_id 是字符串。其余块允许缺失。 */
 function isPlanningSessionDetailPayload(value: unknown): value is AdminRecord {
-  return isRecord(value) && isString(value.session_id);
+  if (!isRecord(value)) return false;
+  const session = value.session;
+  return isRecord(session) && isString(session.session_id);
+}
+
+/* ------------ 会话详情分块归一（每块独立降级为 null / 空数组） ------------ */
+
+function toScalarOrNull(value: unknown): number | string | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.length > 0) return value;
+  return null;
+}
+
+function toBooleanOrStringOrNull(value: unknown): boolean | string | null {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string" && value.length > 0) return value;
+  return null;
+}
+
+function normalizePlanningSessionBlock(value: unknown): AdminPlanningSessionBlock {
+  const record = isRecord(value) ? value : {};
+  return {
+    session_id: toStringOrNull(record.session_id) ?? "",
+    status: toStringOrNull(record.status),
+    discovery_status: toStringOrNull(record.discovery_status),
+    created_at: toStringOrNull(record.created_at),
+    updated_at: toStringOrNull(record.updated_at),
+    expires_at: toStringOrNull(record.expires_at),
+    run_id: toStringOrNull(record.run_id),
+    error: toStringOrNull(record.error),
+    basic_intent: normalizePlanningBasicIntent(record.basic_intent),
+    preferences: normalizePlanningPreferences(record.preferences),
+    preference_labels: normalizePlanningPreferenceLabels(record.preference_labels),
+    poi_selections: normalizeStringRecord(record.poi_selections),
+    transport_candidates: toArray(record.transport_candidates).filter(isRecord),
+    hotel_candidates: toArray(record.hotel_candidates).filter(isRecord),
+    place_candidates: toArray(record.place_candidates).filter(isRecord),
+    place_categories: normalizePlanningPlaceCategories(record.place_categories),
+    evidence_summary: normalizePlanningEvidenceSummary(record.evidence_summary),
+    degradations: toArray(record.degradations).filter(isString),
+    events: toArray(record.events).filter(isRecord).map(normalizePlanningEvent),
+    capabilities: normalizePlanningCapabilities(record.capabilities),
+  };
+}
+
+function normalizeStringRecord(value: unknown): Record<string, string> {
+  if (!isRecord(value)) return {};
+  const result: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (isString(item)) result[key] = item;
+  }
+  return result;
+}
+
+function normalizePlanningBasicIntent(value: unknown): AdminPlanningSessionBasicIntent | null {
+  if (!isRecord(value)) return null;
+  return {
+    origin: toStringOrNull(value.origin),
+    destination: toStringOrNull(value.destination),
+    start_date: toStringOrNull(value.start_date),
+    end_date: toStringOrNull(value.end_date),
+    days: toNumberOrNull(value.days),
+    travelers: toNumberOrNull(value.travelers),
+    budget_total: toScalarOrNull(value.budget_total),
+  };
+}
+
+function normalizePlanningBasicInfo(
+  value: unknown,
+  session: AdminPlanningSessionBlock,
+): AdminPlanningSessionBasicInfo | null {
+  const record = isRecord(value) ? value : null;
+  const intent = session.basic_intent ?? null;
+  if (!record && !intent) return null;
+  const base = record ?? {};
+  return {
+    origin: toStringOrNull(base.origin) ?? intent?.origin ?? null,
+    destination: toStringOrNull(base.destination) ?? intent?.destination ?? null,
+    start_date: toStringOrNull(base.start_date) ?? intent?.start_date ?? null,
+    end_date: toStringOrNull(base.end_date) ?? intent?.end_date ?? null,
+    days: toNumberOrNull(base.days) ?? intent?.days ?? null,
+    travelers: toNumberOrNull(base.travelers) ?? intent?.travelers ?? null,
+    budget_total: toScalarOrNull(base.budget_total) ?? intent?.budget_total ?? null,
+    created_at: toStringOrNull(base.created_at) ?? session.created_at ?? null,
+    updated_at: toStringOrNull(base.updated_at) ?? session.updated_at ?? null,
+    expires_at: toStringOrNull(base.expires_at) ?? session.expires_at ?? null,
+  };
+}
+
+function normalizePlanningPreferences(value: unknown): AdminPlanningSessionPreferences | null {
+  if (!isRecord(value)) return null;
+  return {
+    transport_mode: toStringOrNull(value.transport_mode),
+    transport_priority: toStringOrNull(value.transport_priority),
+    transport_constraints: toArray(value.transport_constraints).filter(isString),
+    hotel_priority: toStringOrNull(value.hotel_priority),
+    hotel_max_price_per_night: toScalarOrNull(value.hotel_max_price_per_night),
+    hotel_min_rating: toScalarOrNull(value.hotel_min_rating),
+    hotel_min_star: toScalarOrNull(value.hotel_min_star),
+    hotel_room_type: toStringOrNull(value.hotel_room_type),
+    hotel_allow_change: toBooleanOrStringOrNull(value.hotel_allow_change),
+    pace: toStringOrNull(value.pace),
+  };
+}
+
+function normalizePlanningPreferenceLabels(
+  value: unknown,
+): AdminPlanningSessionPreferenceLabels | null {
+  if (!isRecord(value)) return null;
+  return {
+    transport_mode: toStringOrNull(value.transport_mode),
+    transport_priority: toStringOrNull(value.transport_priority),
+    transport_constraints: toArray(value.transport_constraints).filter(isString),
+    hotel_priority: toStringOrNull(value.hotel_priority),
+    pace: toStringOrNull(value.pace),
+  };
+}
+
+function normalizePlanningCapabilities(value: unknown): AdminPlanningSessionCapabilities | null {
+  if (!isRecord(value)) return null;
+  return {
+    hotel_star_filter: toBooleanOrNull(value.hotel_star_filter),
+    hotel_star_note: toStringOrNull(value.hotel_star_note),
+    hotel_max_price_filter: toBooleanOrNull(value.hotel_max_price_filter),
+    hotel_rating_filter: toBooleanOrNull(value.hotel_rating_filter),
+  };
+}
+
+function normalizePlanningEvidenceSummary(
+  value: unknown,
+): AdminPlanningSessionEvidenceSummary | null {
+  if (!isRecord(value)) return null;
+  return {
+    sources_used: toNumberOrNull(value.sources_used),
+    places_verified: toNumberOrNull(value.places_verified),
+    total_candidates: toNumberOrNull(value.total_candidates),
+    transport_candidates: toNumberOrNull(value.transport_candidates),
+    hotel_candidates: toNumberOrNull(value.hotel_candidates),
+    evidence_count: toNumberOrNull(value.evidence_count),
+  };
+}
+
+function normalizePlanningPlaceCategories(value: unknown): AdminPlanningSessionPlaceCategory[] {
+  return toArray(value)
+    .filter(isRecord)
+    .map((item) => ({
+      category: toStringOrNull(item.category) ?? "",
+      label: toStringOrNull(item.label),
+      count: toNumberOrNull(item.count),
+    }))
+    .filter((item) => item.category.length > 0);
+}
+
+function normalizePlanningDiscoveryStage(value: unknown): AdminDiscoveryStage {
+  const record = isRecord(value) ? value : {};
+  return {
+    status: toStringOrNull(record.status),
+    started_at: toStringOrNull(record.started_at),
+    finished_at: toStringOrNull(record.finished_at),
+    duration_ms: toNumberOrNull(record.duration_ms),
+    result_count: toNumberOrNull(record.result_count),
+    degraded: toBooleanOrNull(record.degraded),
+    error: toStringOrNull(record.error),
+  };
+}
+
+/**
+ * Discovery 块：stages 允许为空对象（后端还没写进度），此时依旧保留 overall，
+ * 由展示层把四条线各渲染成「无数据」，而不是让整块消失。
+ */
+function normalizePlanningDiscovery(
+  value: unknown,
+  session: AdminPlanningSessionBlock,
+): AdminDiscoveryBlock | null {
+  const record = isRecord(value) ? value : null;
+  const sessionDegradations = session.degradations ?? [];
+  if (!record) {
+    // 顶层缺 discovery 时，至少用 session.discovery_status 兜一个 overall。
+    if (!session.discovery_status && sessionDegradations.length === 0) return null;
+    return {
+      overall: session.discovery_status ?? null,
+      stages: {},
+      degradations: sessionDegradations,
+    };
+  }
+  const stages: Record<string, AdminDiscoveryStage> = {};
+  if (isRecord(record.stages)) {
+    for (const [key, item] of Object.entries(record.stages)) {
+      if (isRecord(item)) stages[key] = normalizePlanningDiscoveryStage(item);
+    }
+  }
+  const degradations = toArray(record.degradations).filter(isString);
+  return {
+    overall: toStringOrNull(record.overall) ?? session.discovery_status ?? null,
+    stages,
+    degradations: degradations.length > 0 ? degradations : sessionDegradations,
+  };
+}
+
+function normalizePlanningPrefetchSummary(value: unknown): AdminPrefetchSummary | null {
+  if (!isRecord(value)) return null;
+  return {
+    transport_candidates: toNumberOrNull(value.transport_candidates),
+    hotel_candidates: toNumberOrNull(value.hotel_candidates),
+    evidence_count: toNumberOrNull(value.evidence_count),
+    place_candidates: toNumberOrNull(value.place_candidates),
+    provider_calls: toNumberOrNull(value.provider_calls),
+  };
+}
+
+function normalizePlanningPoiSelections(value: unknown): AdminPlanningSessionPoiSelections | null {
+  if (!isRecord(value)) return null;
+  const countsRecord = isRecord(value.counts) ? value.counts : {};
+  const counts: AdminPoiSelectionCounts = {
+    must: toNumberOrNull(countsRecord.must),
+    want: toNumberOrNull(countsRecord.want),
+    reject: toNumberOrNull(countsRecord.reject),
+    neutral: toNumberOrNull(countsRecord.neutral),
+  };
+  const items: AdminPoiSelectionItem[] = toArray(value.items)
+    .filter(isRecord)
+    .map((item) => ({
+      place_id: toStringOrNull(item.place_id) ?? "",
+      name: toStringOrNull(item.name),
+      state: toStringOrNull(item.state),
+    }))
+    .filter((item) => item.place_id.length > 0);
+  return { counts, items };
+}
+
+function normalizePlanningRunLink(value: unknown, fallbackRunId: string | null): AdminRunLink {
+  const record = isRecord(value) ? value : {};
+  const runId = toStringOrNull(record.run_id) ?? fallbackRunId;
+  const declared = toBooleanOrNull(record.has_run);
+  return {
+    // 没有 run_id 就谈不上「有 Run」，即使后端声明 has_run=true 也不给假链接。
+    has_run: (declared ?? Boolean(runId)) && Boolean(runId),
+    run_id: runId,
+    run_status: toStringOrNull(record.run_status),
+    started_at: toStringOrNull(record.started_at),
+    finished_at: toStringOrNull(record.finished_at),
+  };
+}
+
+/* ------------------------------ Provider 健康 ------------------------------ */
+
+/**
+ * Provider Health 的归一化。
+ *
+ * 为什么这里用「宽容归一」而不是严格校验：
+ * 这一页的核心诉求是「一眼看出哪个数据源最近不稳」。后端某个统计字段没算出来
+ * （例如没有可用的延迟样本 → avg_latency_ms / p95_latency_ms 为 null），
+ * 不应该把整页变成错误页 —— 那样恰好掩盖了真正要看的其它 Provider。
+ * 只有「provider 不是字符串」这种无法定位卡片的情况才被丢掉。
+ */
+
+function isProviderStatus(value: unknown): value is AdminProviderStatus {
+  return value === "HEALTHY" || value === "DEGRADED" || value === "UNAVAILABLE" || value === "UNKNOWN";
+}
+
+function toStringArray(value: unknown): string[] {
+  return toArray(value).filter(isString);
+}
+
+function toBooleanOrNull(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
+function normalizeProviderStats(value: unknown): AdminProviderStats {
+  const record = isRecord(value) ? value : {};
+  return {
+    provider: toStringOrNull(record.provider),
+    calls: toNumberOrNull(record.calls),
+    successes: toNumberOrNull(record.successes),
+    failures: toNumberOrNull(record.failures),
+    timeouts: toNumberOrNull(record.timeouts),
+    auth_errors: toNumberOrNull(record.auth_errors),
+    rate_limited: toNumberOrNull(record.rate_limited),
+    empty: toNumberOrNull(record.empty),
+    fallback_count: toNumberOrNull(record.fallback_count),
+    last_call_at: toStringOrNull(record.last_call_at),
+    last_success_at: toStringOrNull(record.last_success_at),
+    last_failure_at: toStringOrNull(record.last_failure_at),
+    avg_latency_ms: toNumberOrNull(record.avg_latency_ms),
+    p95_latency_ms: toNumberOrNull(record.p95_latency_ms),
+    tools: toStringArray(record.tools),
+    sources: toStringArray(record.sources),
+    last_error: toStringOrNull(record.last_error),
+    last_status: toStringOrNull(record.last_status),
+    success_rate: toNumberOrNull(record.success_rate),
+    failure_rate: toNumberOrNull(record.failure_rate),
+  };
+}
+
+/** 认不出的状态一律按 UNKNOWN（中性灰）处理，绝不猜成失败。 */
+function normalizeProviderStatus(value: unknown): AdminProviderStatus {
+  return isProviderStatus(value) ? value : "UNKNOWN";
+}
+
+function normalizeProviderSummary(value: AdminRecord): AdminProviderSummary {
+  const provider = String(value.provider);
+  return {
+    ...normalizeProviderStats(value),
+    provider,
+    label: toStringOrNull(value.label) ?? provider,
+    configured: toBooleanOrNull(value.configured),
+    status: normalizeProviderStatus(value.status),
+  };
+}
+
+/** summary 允许整段缺失 → null；页面显示 Partial，而不是整页 invalid。 */
+function normalizeProviderListSummary(value: unknown): AdminProviderListSummary | null {
+  if (!isRecord(value)) return null;
+  return {
+    providers: toNumberOrNull(value.providers),
+    healthy: toNumberOrNull(value.healthy),
+    degraded: toNumberOrNull(value.degraded),
+    unavailable: toNumberOrNull(value.unavailable),
+    unknown: toNumberOrNull(value.unknown),
+    needs_attention: toStringArray(value.needs_attention),
+  };
+}
+
+function normalizeProviderList(payload: unknown): AdminProviderList {
+  const record = isRecord(payload) ? payload : {};
+  const items = toArray(record.items)
+    .filter(isRecord)
+    .filter((item) => isString(item.provider))
+    .map(normalizeProviderSummary);
+  return {
+    items,
+    summary: normalizeProviderListSummary(record.summary),
+    note: toStringOrNull(record.note) ?? "",
+  };
+}
+
+function isProviderListPayload(value: unknown): value is AdminRecord {
+  return isRecord(value) && Array.isArray(value.items);
+}
+
+function normalizeProviderCall(value: AdminRecord): AdminProviderHealthCall {
+  return {
+    call_id: toStringOrNull(value.call_id),
+    provider: toStringOrNull(value.provider),
+    tool: toStringOrNull(value.tool),
+    status: toStringOrNull(value.status),
+    source_type: toStringOrNull(value.source_type),
+    source_id: toStringOrNull(value.source_id),
+    run_id: toStringOrNull(value.run_id),
+    session_id: toStringOrNull(value.session_id),
+    fetched_at: toStringOrNull(value.fetched_at),
+    duration_ms: toNumberOrNull(value.duration_ms),
+    returned: value.returned ?? null,
+    error: toStringOrNull(value.error),
+    fallback: value.fallback === true,
+    query: isRecord(value.query) ? value.query : {},
+  };
+}
+
+function normalizeProviderDetail(payload: unknown): AdminProviderDetail {
+  const record = isRecord(payload) ? payload : {};
+  const provider = String(record.provider);
+  return {
+    provider,
+    label: toStringOrNull(record.label) ?? provider,
+    configured: toBooleanOrNull(record.configured),
+    status: normalizeProviderStatus(record.status),
+    stats: isRecord(record.stats) ? normalizeProviderStats(record.stats) : null,
+    calls: toArray(record.calls).filter(isRecord).map(normalizeProviderCall),
+    note: toStringOrNull(record.note) ?? "",
+  };
+}
+
+function isProviderDetailPayload(value: unknown): value is AdminRecord {
+  return isRecord(value) && isString(value.provider);
 }
 
 function isEvolutionOverview(value: unknown): value is AdminEvolutionOverview {
@@ -782,6 +1192,28 @@ export function getAdminPlanningSession(sessionId: string): Promise<AdminPlannin
     `/api/v1/admin/planning-sessions/${encodeURIComponent(sessionId)}`,
     { method: "GET", validate: isPlanningSessionDetailPayload },
   ).then(normalizePlanningSessionDetail);
+}
+
+/**
+ * Provider Health 总览。
+ * `limit_per_provider` 是「每个 Provider 看最近多少次真实调用」，不是时间窗：
+ * 样本量固定，成功率与 P95 才能在调用量差异极大的 Provider 之间比较。
+ */
+export function getAdminProviders(limitPerProvider = 200): Promise<AdminProviderList> {
+  return adminRequest<AdminRecord>("/api/v1/admin/providers", {
+    method: "GET",
+    query: { limit_per_provider: limitPerProvider },
+    validate: isProviderListPayload,
+  }).then(normalizeProviderList);
+}
+
+/** 单个 Provider 的最近调用明细；404 表示这个 Provider 没有任何调用账本。 */
+export function getAdminProvider(provider: string, limit = 20): Promise<AdminProviderDetail> {
+  return adminRequest<AdminRecord>(`/api/v1/admin/providers/${encodeURIComponent(provider)}`, {
+    method: "GET",
+    query: { limit },
+    validate: isProviderDetailPayload,
+  }).then(normalizeProviderDetail);
 }
 
 export interface AdminBadcasesQuery {

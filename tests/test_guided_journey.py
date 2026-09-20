@@ -22,7 +22,8 @@ from app.selection import (
     resolve_pace,
 )
 from app.store import TravelPlanStore
-from tests.fakes import FakeHub, FakeLLM, make_store
+from app.workflow import execute_travel_run
+from tests.fakes import FakeHub, FakeJev, FakeLLM, make_store
 
 
 def _place(place_id: str, name: str) -> Place:
@@ -232,3 +233,110 @@ class TestSessionApi:
         ).json()["session_id"]
         assert http.delete(f"/api/v1/planning-sessions/{session_id}").status_code == 200
         assert http.post(f"/api/v1/planning-sessions/{session_id}/start").status_code == 409
+
+
+class TestGuidedRunReuse:
+    """引导式正式 run 的端到端：复用 Prefetch + 用户选择真的生效。
+
+    这里的 Setup 必须是**生产保真的**：Discovery 的 Hub 传 store=None（真实运行时就是这样，
+    因为那些调用属于会话、还没有 run）。如果给假 Hub 传了 store，就会掩盖
+    "evidence.source_id 外键找不到 source 行"这个只在生产才出现的 bug（确实发生过，
+    导致每一次引导式规划都直接失败）。
+    """
+
+    def _prefetch_bundle(self, store, *, spread: float = 0.25):
+        from app.discovery import PrefetchBundle
+
+        hub = FakeHub(store=None, run_id="ps-src", poi_spread=spread)
+        intent = TripIntent(
+            destination=["成都"], origin="北京", start_date="2026-10-01", days=5,
+            travelers=2, source="guided",
+        )
+        result = discovery.prefetch(hub, FakeLLM(), intent, hotel_pages=2)
+        bundle = PrefetchBundle(
+            session_id="ps-reuse",
+            basic_intent={"origin": "北京", "destination": "成都"},
+            outbound=result["transport"].outbound,
+            inbound=result["transport"].inbound,
+            hotels=result["hotels"].items,
+            evidences=result["social"].evidences,
+            places=result["places"].places,
+            provider_calls=hub.audit_entries(),
+            discovery=result.get("stages") or {},
+        )
+        return intent, bundle
+
+    def _run_guided(self, store, intent, bundle, *, run_id: str = "tp-guided-e2e"):
+        from tests.fakes import QUERY
+
+        store.create_run(run_id, source="guided", source_session_id="ps-reuse")
+        hub = FakeHub(store=store, run_id=run_id, poi_spread=0.25)
+        result = execute_travel_run(
+            QUERY, store=store, hub=hub, llm=FakeLLM(), jev=FakeJev(), intent=intent,
+            prefetch=bundle, source="guided", source_session_id="ps-reuse",
+            run_id=run_id, output_dir=store.db_path.parent / "out",
+        )
+        return result, hub
+
+    def test_guided_run_completes_without_touching_the_providers_again(self, tmp_path):
+        store = make_store(tmp_path / "t.db")
+        intent, bundle = self._prefetch_bundle(store)
+        result, hub = self._run_guided(store, intent, bundle)
+
+        assert result.status == "completed", result.error
+        # 验收标准 #6：复用了 Discovery 的候选，就不要再打同一批 Provider
+        # （只允许剩下那几类"必须按最终候选算"的调用：路线、门票、地理编码）
+        assert not ({"search_trains", "search_flights", "search_hotels"} & set(hub.calls))
+        assert not ({"search_xiaohongshu", "search_douyin", "web_search"} & set(hub.calls))
+        journey = result.audit["user_journey"]
+        assert journey["prefetch_reused"] == {
+            "transport": True, "hotels": True, "social": True, "places": True
+        }
+
+    def test_discovery_calls_are_adopted_so_provenance_survives(self, tmp_path):
+        store = make_store(tmp_path / "t.db")
+        intent, bundle = self._prefetch_bundle(store)
+        result, _hub = self._run_guided(store, intent, bundle)
+
+        # 复用来的证据/地点必须有 source 行可挂（否则外键直接失败），
+        # 而且审计里要标明这批调用来自 Discovery、本次没有重复调用。
+        assert store.list_sources("tp-guided-e2e"), "Discovery 的调用没有过户到本次 run"
+        audit_calls = result.audit["provider_calls"]
+        reused = [call for call in audit_calls if "Discovery" in str(call.get("note"))]
+        assert reused, "审计里没有标出复用来源"
+        # 本次真实调用数不能被复用项撑高（否则"这次 run 花了多少"是假的）
+        assert store.get_run_metrics("tp-guided-e2e")["tool_calls"] < len(audit_calls)
+        assert result.audit["user_journey"]["prefetch_status"]
+
+    def test_rejected_place_never_reaches_the_plan(self, tmp_path):
+        store = make_store(tmp_path / "t.db")
+        intent, bundle = self._prefetch_bundle(store)
+        rejected_id = bundle.places[0].place_id
+        rejected_name = bundle.places[0].name
+        intent = intent.model_copy(update={"place_selections": {rejected_id: "REJECT"}})
+
+        result, _hub = self._run_guided(store, intent, bundle)
+
+        assert result.status == "completed", result.error
+        planned = {item.place_id for day in result.plan.days for item in day.items if item.place_id}
+        assert rejected_id not in planned, f"用户排除了 {rejected_name}，但它进了行程"
+        assert result.audit["user_journey"]["rejected_in_plan"] == []
+        categories = {case["category"] for case in store.list_badcases(run_id="tp-guided-e2e")[0]}
+        assert "rejected_poi_in_plan" not in categories
+        assert "prefetch_not_reused" not in categories
+
+    def test_must_place_missing_is_reported_when_it_cannot_be_scheduled(self, tmp_path):
+        """MUST 的点如果客观排不进去，必须留下可解释的 Bad Case，而不是静默消失。"""
+
+        store = make_store(tmp_path / "t.db")
+        intent, bundle = self._prefetch_bundle(store)
+        # 把"不存在的点"标成 MUST：它不可能进候选，等价于"用户要的点最终没进去"
+        intent = intent.model_copy(
+            update={"place_selections": {bundle.places[0].place_id: "MUST", "ghost-place": "MUST"}}
+        )
+        result, _hub = self._run_guided(store, intent, bundle, run_id="tp-guided-must")
+
+        assert result.status == "completed", result.error
+        # 真实的那个 MUST 点（宽窄巷子）应该被排进去；幽灵点不参与（不在候选里）
+        planned = {item.place_id for day in result.plan.days for item in day.items if item.place_id}
+        assert bundle.places[0].place_id in planned

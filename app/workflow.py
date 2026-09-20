@@ -30,6 +30,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -37,7 +38,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from app import planner, selection
 from app.badcase import BadCaseContext, detect_badcases, summarize as summarize_badcases
-from app.config import current_config
+from app.config import current_config, current_tuning
 from app.decision.jev import JevClient
 from app.decision.planner_decision import (
     DECISION_PLAN_CHOICE,
@@ -237,8 +238,10 @@ class TravelState(TypedDict, total=False):
     record_span: Any
     #: 引导式：用户确认过的结构化意图（有它就不再让模型猜一遍）
     intent_override: TripIntent | None
-    #: Discovery 已查好的候选（本轮只记录是否携带，复用见 docs/10 的待办）
+    #: Discovery 已查好的候选（正式 run 复用它，不重复打 Provider）
     prefetch: Any
+    #: 从 Discovery 过户到本 run 的调用（审计用；已标 reused）
+    adopted_calls: list[dict[str, Any]]
     source: str
     source_session_id: str | None
 
@@ -314,6 +317,39 @@ def _stamp(stage: str, text: str) -> dict[str, Any]:
 #: 让 Jev 比较的候选方案数上限。
 #: 给多了摘要变长、判断质量下降（还会挤占它 1.5s 的超时预算），给少了没有比较价值。
 MAX_PLAN_CANDIDATES = 5
+
+
+def _hotel_anchor(state: TravelState) -> Sequence[float] | None:
+    """"位置优先/交通方便"要用的中心点：用户所选地点（没选就用全部候选）的经纬度均值。"""
+
+    places = [
+        place
+        for place in (state.get("places") or [])
+        if place.lat is not None and place.lng is not None
+    ]
+    if not places:
+        return None
+    return (
+        sum(float(place.lat) for place in places) / len(places),
+        sum(float(place.lng) for place in places) / len(places),
+    )
+
+
+def _reuse_result(options: list[Any], model: type, provider: str) -> Any:
+    """把 Discovery 的候选包装成"与 ProviderResult 同形"的对象。
+
+    为什么包装而不是改下游：下游对 `ProviderResult` 的用法是 `.status/.items/.provider`
+    以及 `len(result.items)`。保留这三个字段，比选、文案、stage、决策链全都不用改 ——
+    上一版补丁正是因为删掉了这些局部变量，导致 8 处引用连带报错。
+    """
+
+    items = [option for option in options if isinstance(option, model)]
+    return SimpleNamespace(
+        status="REUSED" if items else "EMPTY",
+        items=items,
+        provider=provider,
+        degraded=False,
+    )
 
 
 def _record_subspan(
@@ -776,21 +812,28 @@ def _expected_date(direction: str, intent: TripIntent) -> date | None:
 
 
 def _transport_score(option: Any, *, direction: str, intent: TripIntent) -> tuple[float, dict]:
-    """比选得分（越低越好）。分项全部保留，审计能复述"为什么是它"。"""
+    """比选得分（越低越好）。分项全部保留，审计能复述"为什么是它"。
+
+    用户在向导里选的排序策略（价格最低 / 时间最短 / 舒适优先 / 性价比）通过
+    `selection.transport_weights` 变成这里的倍率与惩罚项。默认（帮我选）倍率是 1.0、
+    惩罚项是 0，因此**不选偏好时结果与历史完全一致**。
+    """
+    tuning_now = current_tuning()
+    strategy = selection.transport_weights(intent).values
     parts: dict[str, float] = {}
 
     price = coerce_float(getattr(option, "price", None))
     parts["价格"] = (
         TRANSPORT_UNKNOWN_PRICE_PENALTY
         if price is None
-        else price / TRANSPORT_PRICE_UNIT * TRANSPORT_PRICE_WEIGHT
+        else price / TRANSPORT_PRICE_UNIT * float(strategy.get("price", tuning_now.transport_price_weight))
     )
 
     door_to_door = _door_to_door_minutes(option)
     parts["门到门时长"] = (
         TRANSPORT_UNKNOWN_DURATION_PENALTY
         if door_to_door is None
-        else door_to_door / TRANSPORT_MINUTE_UNIT * TRANSPORT_MINUTE_WEIGHT
+        else door_to_door / TRANSPORT_MINUTE_UNIT * float(strategy.get("duration", tuning_now.transport_duration_weight))
     )
 
     offset = planner.departure_day_offset(option, _expected_date(direction, intent))
@@ -807,7 +850,35 @@ def _transport_score(option: Any, *, direction: str, intent: TripIntent) -> tupl
             penalty = TRANSPORT_EARLY_DEPARTURE_PENALTY
     parts["首末天影响"] = penalty
 
-    parts["偏好"] = -_transport_preference_bonus(option, intent)
+    parts["偏好"] = -_transport_preference_bonus(option, intent) * float(strategy.get("preference", 1.0))
+
+    # --- 用户在向导里点的附加约束：变成真实惩罚（不选就是 0，行为不变）---
+    mode_bonus = float(strategy.get("mode_bonus") or 0.0)
+    wanted_mode = str(strategy.get("mode") or "")
+    if mode_bonus and wanted_mode:
+        actual_mode = "flight" if isinstance(option, FlightOption) else "train"
+        parts["方式匹配"] = 0.0 if actual_mode == wanted_mode else mode_bonus
+
+    departure = getattr(option, "departure_at", None)
+    arrival = getattr(option, "arrival_at", None)
+    early_penalty = float(strategy.get("early_penalty") or 0.0)
+    if early_penalty and departure is not None and departure.hour < TRANSPORT_EARLY_DEPARTURE_MINUTES // 60:
+        parts["出发过早"] = early_penalty
+
+    red_eye_penalty = float(strategy.get("red_eye_penalty") or 0.0)
+    if red_eye_penalty and (
+        (departure is not None and (departure.hour >= 23 or departure.hour < 5))
+        or (arrival is not None and (arrival.hour >= 23 or arrival.hour < 5))
+    ):
+        parts["红眼班次"] = red_eye_penalty
+
+    transfer_penalty = float(strategy.get("transfer_penalty") or 0.0)
+    if transfer_penalty:
+        is_direct = getattr(option, "is_direct", None)
+        raw = getattr(option, "raw", None) or {}
+        transfers = raw.get("transfer_count") if isinstance(raw, dict) else None
+        if is_direct is False or (isinstance(transfers, int) and transfers > 0):
+            parts["需要换乘"] = transfer_penalty
 
     return round(sum(parts.values()), 2), {key: round(value, 2) for key, value in parts.items()}
 
@@ -902,29 +973,60 @@ def _annotate_transfer_minutes(option: Any, minutes: int | None) -> None:
 # ==================================================
 
 
-def _hotel_score(hotel: HotelOption, intent: TripIntent) -> tuple[float, dict]:
+def _hotel_score(
+    hotel: HotelOption,
+    intent: TripIntent,
+    *,
+    anchor: Sequence[float] | None = None,
+) -> tuple[float, dict]:
+    """酒店比选得分（越低越好）。策略与补充条件通过 `selection.hotel_weights` 生效。
+
+    `anchor` 是用户所选地点（或酒店候选群）的中心点：只有选了「位置优先」「交通方便」
+    或维护者调大了 `TP_HOTEL_LOCATION_WEIGHT` 时，距离才会进入打分（默认权重 0，
+    因此不选偏好时与历史行为一致）。
+    """
+
+    tuning_now = current_tuning()
+    strategy = selection.hotel_weights(intent).values
     parts: dict[str, float] = {}
     nightly = coerce_float(hotel.nightly)
     parts["每晚价格"] = (
-        HOTEL_UNKNOWN_PRICE_PENALTY if nightly is None else nightly / HOTEL_PRICE_UNIT
+        HOTEL_UNKNOWN_PRICE_PENALTY
+        if nightly is None
+        else nightly * float(strategy.get("price", tuning_now.hotel_price_weight))
     )
     rating = coerce_float(hotel.rating)
-    parts["评分"] = -(rating or 0.0) * HOTEL_RATING_WEIGHT
+    parts["评分"] = -(rating or 0.0) * float(strategy.get("rating", tuning_now.hotel_rating_weight))
     prefs = coerce_str_list(intent.hotel_preferences)
     haystack = " ".join(
         filter(None, [hotel.name, hotel.room_type, hotel.business_area, hotel.address, hotel.price_note])
     )
     hits = [pref for pref in prefs if pref and pref in haystack]
-    parts["住宿偏好"] = -HOTEL_PREFERENCE_BONUS * len(hits)
+    parts["住宿偏好"] = -float(strategy.get("preference", tuning_now.hotel_preference_bonus)) * len(hits)
+
+    location_weight = float(strategy.get("location") or 0.0)
+    if location_weight and anchor is not None and hotel.lat is not None and hotel.lng is not None:
+        distance = planner.haversine_meters((hotel.lat, hotel.lng), anchor)
+        if distance is not None:
+            # 离所选地点中心越远扣分越多；超出 RANGE 记满额惩罚。
+            ratio = min(1.0, distance / 1000.0 / max(0.1, tuning_now.hotel_location_range_km))
+            parts["位置"] = location_weight * ratio
     return round(sum(parts.values()), 2), {**{k: round(v, 2) for k, v in parts.items()}, "命中偏好": len(hits)}
 
 
-def _select_hotel(options: list[HotelOption], intent: TripIntent) -> tuple[HotelOption | None, list[HotelOption], str]:
+def _select_hotel(
+    options: list[HotelOption],
+    intent: TripIntent,
+    *,
+    anchor: Sequence[float] | None = None,
+) -> tuple[HotelOption | None, list[HotelOption], str]:
     if not options:
         return None, [], ""
+    # 先按用户补充条件硬过滤（价格上限/评分下限/房型），过滤空了就放宽并说明。
+    filtered, filter_note = selection.hotel_candidates_for(intent, options)
     scored: list[tuple[float, dict, HotelOption]] = []
-    for hotel in options:
-        score, parts = _hotel_score(hotel, intent)
+    for hotel in filtered:
+        score, parts = _hotel_score(hotel, intent, anchor=anchor)
         scored.append((score, parts, hotel))
     scored.sort(key=lambda item: (item[0], item[2].name))
 
@@ -944,10 +1046,15 @@ def _select_hotel(options: list[HotelOption], intent: TripIntent) -> tuple[Hotel
     prefs = coerce_str_list(intent.hotel_preferences)
     if prefs:
         bits.append(f"住宿偏好「{'/'.join(prefs)}」")
+    if filter_note:
+        bits.append(filter_note)
+    bits.append(selection.hotel_weights(intent).label)
     reason = "；".join(bits)
     selected.selection_reason = reason
     for hotel in alternatives:
-        hotel.selection_reason = f"未选中：综合分 {_hotel_score(hotel, intent)[0]:g} 高于「{selected.name}」"
+        hotel.selection_reason = (
+            f"未选中：综合分 {_hotel_score(hotel, intent, anchor=anchor)[0]:g} 高于「{selected.name}」"
+        )
     return selected, alternatives, reason
 
 
@@ -1026,7 +1133,6 @@ def node_parse_intent(state: TravelState) -> dict:
         )
         return {
             "intent": intent,
-            "status": STATUS_CONTINUE,
             "decisions": [
                 _decision(run_id, DecisionStatus.PASS, "parse_intent",
                           ["GUIDED_INTENT", "USER_CONFIRMED"], summary,
@@ -1144,8 +1250,16 @@ def node_search_transport(state: TravelState) -> dict:
     back = _last_date(intent)
     travelers = max(1, intent.travelers)
 
-    out_trains = hub.search_trains(origin, destination, start)
-    out_flights = hub.search_flights(origin, destination, start, travelers=travelers)
+    # 引导式把 Discovery 已经查到的候选带进来了。复用时**不重复打 12306/途牛**，
+    # 但仍然按用户最终选的排序策略重新比选（偏好可能是在 Prefetch 之后才定的）。
+    bundle = state.get("prefetch")
+    reuse_transport = bool(bundle is not None and (bundle.outbound or bundle.inbound))
+    if reuse_transport:
+        out_trains = _reuse_result(bundle.outbound, TrainOption, "12306")
+        out_flights = _reuse_result(bundle.outbound, FlightOption, "tuniu")
+    else:
+        out_trains = hub.search_trains(origin, destination, start)
+        out_flights = hub.search_flights(origin, destination, start, travelers=travelers)
     provider_status["去程火车"] = out_trains.status
     provider_status["去程航班"] = out_flights.status
 
@@ -1156,11 +1270,17 @@ def node_search_transport(state: TravelState) -> dict:
     inbound = in_alts = None
     in_reason = ""
     if back is not None and back >= start:
-        in_trains = hub.search_trains(destination, origin, back)
-        in_flights = hub.search_flights(destination, origin, back, travelers=travelers)
+        if reuse_transport:
+            in_trains = _reuse_result(bundle.inbound, TrainOption, "12306")
+            in_flights = _reuse_result(bundle.inbound, FlightOption, "tuniu")
+        else:
+            in_trains = hub.search_trains(destination, origin, back)
+            in_flights = hub.search_flights(destination, origin, back, travelers=travelers)
         provider_status["回程火车"] = in_trains.status
         provider_status["回程航班"] = in_flights.status
-        if back == start:
+        if reuse_transport:
+            in_reason = "复用 Discovery 已查到的回程候选（未重复查询）"
+        elif back == start:
             in_reason = "当天往返，回程与去程同一天查询"
         inbound, in_alts, in_reason, _ = _select_transport(
             [*in_trains.items, *in_flights.items], direction="inbound", intent=intent
@@ -1295,8 +1415,18 @@ def node_search_hotels(state: TravelState) -> dict:
             "stages": [_stage("search_hotels", "查住宿", reason, [reason], 候选数=0)],
         }
 
-    result = hub.search_hotels(destination, check_in, check_out, travelers=max(1, intent.travelers))
-    selected, alternatives, reason = _select_hotel(list(result.items), intent)
+    # 复用 Discovery 的候选。它比正式 run 多翻了几页（见 discovery.fetch_hotel_candidates），
+    # 所以候选池更宽 —— 这是"酒店怎么老是那么贵"的正解：扩大可选范围，而不是改打分口径。
+    bundle = state.get("prefetch")
+    if bundle is not None and bundle.hotels:
+        result = SimpleNamespace(items=list(bundle.hotels), status="REUSED", provider="tuniu")
+    else:
+        result = hub.search_hotels(destination, check_in, check_out, travelers=max(1, intent.travelers))
+    selected, alternatives, reason = _select_hotel(
+        list(result.items), intent, anchor=_hotel_anchor(state)
+    )
+    if getattr(result, "status", "") == "REUSED":
+        reason = f"复用 Discovery 候选（{len(result.items)} 个，已翻页扩大范围）—— {reason}"
 
     degradations: list[str] = []
     if selected is None:
@@ -1370,6 +1500,29 @@ def node_search_social(state: TravelState) -> dict:
     destination = _destination(intent) or ""
 
     degradations: list[str] = []
+    bundle = state.get("prefetch")
+    if bundle is not None and bundle.evidences:
+        # 攻略正文不会因为用户改偏好而变，直接复用 Discovery 抓到的证据，不重复检索
+        # （省下的是一次可能几十秒的社交源往返）。
+        reused_evidences = sorted(bundle.evidences, key=lambda item: item.id)
+        summary = f"复用 Discovery 已抓到的 {len(reused_evidences)} 条攻略证据（未重复检索）"
+        return {
+            "evidences": reused_evidences,
+            "queries": [],
+            "degradations": list(bundle.degradations),
+            "timeline": [_stamp("search_social_guides", summary)],
+            "stages": [
+                _stage(
+                    "search_social_guides",
+                    "查攻略",
+                    summary,
+                    [summary, "偏好变化只影响排序，不需要重新抓原始攻略"],
+                    证据条数=len(reused_evidences),
+                    来源="Discovery 复用",
+                )
+            ],
+        }
+
     result = llm.invoke_json(
         RESEARCH_QUERY_EXPANSION_PROMPT,
         json.dumps(
@@ -1540,6 +1693,63 @@ def node_extract_places(state: TravelState) -> dict:
         )
     else:
         extraction_note = "攻略地点全部来自数据源自带的 place_mentions，本次没有为抽取地点调用模型"
+
+    # --- 1.5) 引导式：复用 Discovery 已经查好的地点候选 ---
+    # 用户点过的"不感兴趣"在这里就必须消失：再往后走只会让它有机会被排进行程。
+    bundle = state.get("prefetch")
+    if bundle is not None and bundle.places:
+        outcome = selection.apply_user_place_preferences(
+            bundle.places, intent.place_selections or {}
+        )
+        for evidence in state.get("evidences", []):
+            store.save_evidence(run_id, evidence, source_id=evidence.source_id)
+        for place in outcome.kept:
+            store.save_place(run_id, place)
+        linked = _link_evidence(state.get("evidences", []), outcome.kept)
+        with_evidence = sum(1 for place in outcome.kept if linked.get(place.place_id))
+        steps = [
+            f"复用 Discovery 候选 {len(bundle.places)} 个（未重复查高德）",
+            f"用户选择：必去 {len(outcome.must_places)}、想去 {len(outcome.want_places)}、"
+            f"不感兴趣 {len(outcome.excluded)}（已硬排除，不会进入行程）",
+            f"进入打分的候选 {len(outcome.kept)} 个，其中 {with_evidence} 个有攻略证据支撑",
+        ]
+        steps.extend(f"用户排除：{place.name}" for place in outcome.excluded[:6])
+        summary = (
+            f"复用 Discovery 候选 {len(outcome.kept)} 个"
+            + (f"，已按用户选择硬排除 {len(outcome.excluded)} 个" if outcome.excluded else "")
+        )
+        _record_subspan(
+            state,
+            component=SpanKind.PLANNER,
+            name="user_place_selection",
+            status="SUCCESS",
+            started_at=now_iso(),
+            attributes={
+                "reused": len(bundle.places),
+                "kept": len(outcome.kept),
+                "must": len(outcome.must_places),
+                "want": len(outcome.want_places),
+                "rejected": len(outcome.excluded),
+            },
+            parent_span_id=f"{run_id}:extract_and_normalize_places",
+        )
+        return {
+            "places": outcome.kept,
+            "decisions": outcome.decisions,
+            "degradations": [],
+            "timeline": [_stamp("extract_and_normalize_places", summary)],
+            "stages": [
+                _stage(
+                    "extract_and_normalize_places",
+                    "抽取与归一化地点",
+                    summary,
+                    steps,
+                    候选数=len(outcome.kept),
+                    用户排除=len(outcome.excluded),
+                    来源="Discovery 复用",
+                )
+            ],
+        }
 
     # --- 2) 高德 POI 搜索 ---
     keywords = _keyword_candidates(intent, state.get("queries") or _fallback_queries(intent))
@@ -1788,6 +1998,14 @@ def node_score_candidates(state: TravelState) -> dict:
     routes = state.get("routes") or {}
     hotel = state.get("hotel_plan").selected if state.get("hotel_plan") else None
 
+    # 用户的 MUST/WANT/REJECT 对**所有**入口生效（Quick 也可能带着 place_selections 进来，
+    # 例如从会话里回填）。REJECT 是硬排除：不参与打分，也就不可能被排进行程。
+    preference_outcome = selection.apply_user_place_preferences(
+        places, intent.place_selections or {}
+    )
+    places = preference_outcome.kept
+    selection_decisions: list[Decision] = list(preference_outcome.decisions)
+
     trust_scores: dict[str, float] = {}
     trust_details: dict[str, dict] = {}
     ad_risks: dict[str, float] = {}
@@ -1828,7 +2046,7 @@ def node_score_candidates(state: TravelState) -> dict:
         return coerce_float(candidate_scores.get(place.place_id, {}).get("score"), 0.0) or 0.0
 
     ordered = sorted(places, key=lambda place: (-trust_scores.get(place.place_id, 0.0), place.name))
-    decisions: list[Decision] = []
+    decisions: list[Decision] = list(selection_decisions)
     for place in ordered:
         score = _score_of(place)
         status = DecisionStatus.KEEP if score >= planner.MIN_CANDIDATE_SCORE else DecisionStatus.REJECT
@@ -1878,6 +2096,8 @@ def node_score_candidates(state: TravelState) -> dict:
         )
 
     summary = f"{len(places)} 个候选打分完毕：入选 {len(kept)}、剔除 {rejected}"
+    if preference_outcome.excluded:
+        summary += f"（另有 {len(preference_outcome.excluded)} 个按用户选择硬排除）"
     return {
         "places": places,
         "trust_scores": trust_scores,
@@ -3093,6 +3313,50 @@ LLM_STAGE_MAP: dict[str, str] = {
 }
 
 
+def _adopt_prefetch_sources(
+    store: TravelPlanStore, run_id: str, bundle: Any
+) -> list[dict[str, Any]]:
+    """把 Discovery 的 Provider 调用写进本次 run 的 sources 表，并返回审计用的行。
+
+    `source_id` 沿用 Discovery 的原值：被复用的 Evidence 引用的就是它，
+    换 id 会让证据链断掉。会话与 run 一一对应，所以不会互相顶掉。
+    """
+
+    rows: list[dict[str, Any]] = []
+    for entry in getattr(bundle, "provider_calls", None) or []:
+        source_id = entry.get("source_id")
+        try:
+            store.save_source(
+                run_id,
+                {
+                    "source_id": source_id,
+                    "provider": entry.get("provider"),
+                    "source_type": entry.get("source_type"),
+                    "source_url": entry.get("source_url"),
+                    "query": entry.get("arguments") or {},
+                    "fetched_at": entry.get("fetched_at"),
+                    "status": entry.get("status"),
+                },
+            )
+        except Exception:  # noqa: BLE001 —— 过户失败只影响可追溯性，不该毁掉规划
+            continue
+        rows.append(
+            {
+                "provider": entry.get("provider"),
+                "tool": entry.get("tool"),
+                "query": entry.get("arguments") or {},
+                "status": entry.get("status"),
+                "returned": entry.get("item_count"),
+                "duration_ms": entry.get("duration_ms"),
+                "fetched_at": entry.get("fetched_at"),
+                "source_id": source_id,
+                "note": "Discovery 阶段已查询，本次 run 复用（未重复调用）",
+                "reused": True,
+            }
+        )
+    return rows
+
+
 def _record_provider_calls(state: TravelState) -> int:
     """把本次 run 的 Provider 调用写进观测账本 `provider_calls`。
 
@@ -3163,7 +3427,8 @@ def _emit_run_spans(state: TravelState, *, llm: Any) -> None:
         return f"{run_id}:{stage}" if stage else None
 
     emitted_groups: set[str] = set()
-    for entry in _provider_call_rows(state.get("hub")):
+    adopted = list(state.get("adopted_calls") or [])
+    for entry in [*_provider_call_rows(state.get("hub")), *adopted]:
         provider = str(entry.get("provider") or "unknown")
         tool = str(entry.get("tool") or "unknown")
         stage = PROVIDER_STAGE_MAP.get(tool)
@@ -3187,12 +3452,17 @@ def _emit_run_spans(state: TravelState, *, llm: Any) -> None:
             component=SpanKind.TOOL,
             name=tool,
             # 单个 tool 的成败就是它自己的状态；成组状态由管理端按子 span 聚合。
-            status="SUCCESS" if entry.get("status") == "OK" else "WARNING",
+            status=(
+                "SUCCESS"
+                if entry.get("status") == "OK"
+                else ("REUSED" if entry.get("reused") else "WARNING")
+            ),
             started_at=str(entry.get("fetched_at") or now_iso()),
             attributes={
                 "provider": provider,
                 "tool": tool,
                 "status": entry.get("status"),
+                "reused_from_discovery": bool(entry.get("reused")),
                 "returned": entry.get("returned"),
                 "duration_ms": entry.get("duration_ms"),
                 "query": entry.get("query"),
@@ -3363,7 +3633,11 @@ def _build_audit(
     """
     hub = state.get("hub")
     llm = state.get("llm")
-    provider_calls = _provider_call_rows(hub)
+    # 本次自己调的 + Discovery 过户来的（后者标 reused，避免读审计的人以为数据是凭空来的）
+    provider_calls = _provider_call_rows(hub) + [
+        {key: value for key, value in row.items() if key != "reused"}
+        for row in (state.get("adopted_calls") or [])
+    ]
     jev_calls = list(state.get("jev_calls") or [])
 
     sources = plan.sources
@@ -3771,7 +4045,9 @@ def execute_travel_run(
             "llm_calls": len(getattr(resolved_llm, "calls", [])),
             # 只统计**真实发出**的 Jev 调用：SKIPPED / 未配置 不是调用，记 0 才不会高估用量。
             "jev_calls": len(jev_records),
-            "tool_calls": len(provider_calls),
+            "tool_calls": len(_provider_call_rows(resolved_hub)),
+            # 复用的调用单列：把它算进 tool_calls 会让"这次 run 花了多少"虚高。
+            "adopted_tool_calls": len(adopted_calls),
             "provider_failures": sum(1 for call in provider_calls if call.get("status") != "OK"),
             "badcase_count": len(badcases),
             # 没配单价、或拿不到 token 时 cost 必须为 null（不猜）。
@@ -3830,6 +4106,12 @@ def execute_travel_run(
     # 所以调用方不需要知道 Jev 是否可用，也永远不会因为它不可用而拿不到行程。
     resolved_jev = jev or JevClient()
 
+    # 引导式：把 Discovery 的调用"过户"到本 run，再跑图。
+    # 必须在任何节点写 evidence/place 之前做，否则外键会挡住复用（生产路径必踩）。
+    adopted_calls: list[dict[str, Any]] = []
+    if prefetch is not None:
+        adopted_calls = _adopt_prefetch_sources(resolved_store, resolved_run_id, prefetch)
+
     state: TravelState = {
         "run_id": resolved_run_id,
         "query": query,
@@ -3843,6 +4125,8 @@ def execute_travel_run(
         "record_span": record_span,
         "intent_override": intent,
         "prefetch": prefetch,
+        #: 从 Discovery 过户过来的调用（审计里要标明"复用"，不是本次真的调了）
+        "adopted_calls": adopted_calls,
         "source": source,
         "source_session_id": source_session_id,
         "progress_hook": progress_hook,
