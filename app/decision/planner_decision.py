@@ -17,13 +17,15 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from app.decision.jev import JevClient, JevResult
-from app.models import TripIntent
+from app.models import TripIntent, coerce_str
 from app.observability import now_iso
 from app.planner import PlanCandidate, PlanQuality, quality_signals
+from app.prompts import PLAN_RANKING_PROMPT
 
 #: 允许发送给 Jev 的意图字段白名单。用白名单而不是"排除若干字段"：
 #: 以后 TripIntent 新增了敏感字段，默认不会外发。
@@ -46,6 +48,11 @@ MIN_OPTIONS_FOR_JEV = 2
 DECISION_PLAN_CHOICE = "plan_choice"
 DECISION_TRADEOFF = "tradeoff"
 DECISION_QUALITY_GATE = "quality_gate"
+#: Jev 不可用/失败时的普通 LLM Ranking（docs/14 §17 的中间层，不是 Jev 决策点）。
+DECISION_LLM_RANKING = "llm_ranking"
+
+#: LLM 排序回调：给定候选，返回它选中的标签（或 None 表示没给出可用选择）。
+LLMRanker = Callable[[list["PlanCandidate"]], str | None]
 
 
 class SpanRecorder(Protocol):
@@ -160,6 +167,87 @@ class PlanChoice:
         }
 
 
+def llm_rank_candidates(
+    candidates: list[PlanCandidate],
+    intent: TripIntent,
+    llm: Any,
+    *,
+    profile: Any = None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Jev 不可用时的**普通 LLM Ranking**（docs/14 §17 的中间降级层）。
+
+    只做"从若干同样可行的候选里选一份"的软选择；返回 ``(label | None, record | None)``。
+    任何失败（模型不可用 / 返回结构不合法 / 标签不在候选里）都返回 ``(None, record)``，
+    让调用方退回**动态权重 Top-1** —— 这就是 §17 描述的三层降级：
+    Jev 可用 → LLM Ranking → 动态权重 Top-1。
+    """
+
+    if llm is None or len(candidates) < 2:
+        return None, None
+    labels = {candidate.label: candidate for candidate in candidates}
+    criteria = {
+        candidate.label: (
+            f"{candidate.variant}：偏好匹配 {candidate.quality.preference_coverage:.0%}、"
+            f"节奏 {candidate.quality.pace_match:.0%}、折返容忍 {candidate.quality.backtracking_score:.0%}"
+        )
+        for candidate in candidates
+    }
+    payload = {
+        "intent": intent_summary(intent),
+        "profile": profile.model_dump(mode="json") if profile is not None else None,
+        "candidates": [candidate.summary() for candidate in candidates],
+    }
+    started = _now()
+    result = llm.invoke_json(
+        PLAN_RANKING_PROMPT, json.dumps(payload, ensure_ascii=False), tag=DECISION_LLM_RANKING
+    )
+    finished = _now()
+    record: dict[str, Any] = {
+        "decision_type": DECISION_LLM_RANKING,
+        "status": getattr(result, "status", "?"),
+        "choice": None,
+        "confidence": None,
+        "latency_ms": getattr(result, "duration_ms", None),
+        "model": getattr(result, "model", None),
+        "fallback": True,
+        "input_summary": f"{len(candidates)} 个候选（{', '.join(labels)}）",
+        "criteria": criteria,
+        "error": getattr(result, "error", None),
+    }
+    if not (getattr(result, "ok", False) and isinstance(getattr(result, "value", None), dict)):
+        return None, record
+    choice = coerce_str(result.value.get("choice")).strip().upper()
+    if choice not in labels:
+        return None, record
+    record["choice"] = choice
+    record["fallback"] = False
+    return choice, record
+
+
+def _ranked_fallback(
+    candidates: list[PlanCandidate],
+    by_label: dict[str, PlanCandidate],
+    llm_ranker: LLMRanker | None,
+    hard_violations: Any,
+) -> PlanCandidate | None:
+    """跑一次 LLM Ranking 并校验结果；不可用时返回 None（调用方退回默认方案）。"""
+
+    if llm_ranker is None:
+        return None
+    try:
+        label = llm_ranker(candidates)
+    except Exception:  # noqa: BLE001 —— 排序失败只是降级，不该中断规划
+        return None
+    label = coerce_str(label).strip().upper()
+    if label not in by_label:
+        return None
+    chosen = by_label[label]
+    # 软选择同样不得越过硬约束：LLM 选的方案必须能通过复核。
+    if callable(hard_violations) and list(hard_violations(chosen)):
+        return None
+    return chosen
+
+
 def choose_plan(
     candidates: list[PlanCandidate],
     intent: TripIntent,
@@ -168,27 +256,50 @@ def choose_plan(
     recorder: SpanRecorder | None = None,
     parent_span_id: str | None = None,
     hard_violations: Any = None,
+    llm_ranker: LLMRanker | None = None,
 ) -> PlanChoice:
     """在 Top-K 候选方案里选一份。
 
     ``hard_violations`` 是"Python 再次做硬约束复核"的回调：``callable(candidate) -> list[str]``。
     Jev 选中的方案必须通过它；不通过就退回默认方案并如实记录 —— 软决策不得越过硬约束。
+
+    ``llm_ranker`` 是 Jev 不可用/失败时的**普通 LLM Ranking** 兜底（docs/14 §17）。
+    它同样要过硬约束复核；再失败才退回动态权重 Top-1（``candidates[0]``）。
     """
 
     if not candidates:
         raise ValueError("choose_plan 需要至少一个候选方案")
     default = candidates[0]
-    if len(candidates) < MIN_OPTIONS_FOR_JEV or jev is None:
+    by_label = {candidate.label: candidate for candidate in candidates}
+    if len(candidates) < MIN_OPTIONS_FOR_JEV:
         return PlanChoice(
             candidate=default,
             jev_result=None,
             jev_record=None,
             fallback=True,
-            reason="候选不足或 Jev 不可用，直接采用默认方案",
+            reason="候选不足，直接采用默认方案",
+            candidate_labels=tuple(candidate.label for candidate in candidates),
+        )
+    if jev is None:
+        ranked = _ranked_fallback(candidates, by_label, llm_ranker, hard_violations)
+        if ranked is not None:
+            return PlanChoice(
+                candidate=ranked,
+                jev_result=None,
+                jev_record=None,
+                fallback=True,
+                reason=f"Jev 不可用，改用普通 LLM Ranking 选择 {ranked.label}",
+                candidate_labels=tuple(candidate.label for candidate in candidates),
+            )
+        return PlanChoice(
+            candidate=default,
+            jev_result=None,
+            jev_record=None,
+            fallback=True,
+            reason="Jev 不可用且 LLM Ranking 未给出可用选择，采用动态权重默认方案",
             candidate_labels=tuple(candidate.label for candidate in candidates),
         )
 
-    by_label = {candidate.label: candidate for candidate in candidates}
     criteria = {
         candidate.label: (
             f"{candidate.variant} 拓扑：偏好匹配 {candidate.quality.preference_coverage:.0%}、"
@@ -229,12 +340,30 @@ def choose_plan(
         parent_span_id=parent_span_id,
     )
     if not result.ok or result.choice not in by_label:
+        # Jev 没给出可用选择。只有在"Jev 真的被发起过却失败"（attempted=True）时才动用
+        # 普通 LLM Ranking 这层：那正是 docs/14 §17 说的"Jev 不可用"。若 Jev 是因为
+        # 未配置/被关闭（SKIPPED，attempted=False）而没参与，则保持一贯行为 —— 直接
+        # 走动态权重 Top-1，不为每次 run 多加一次模型调用（与 Part F"减少模型调用"一致）。
+        ranked = (
+            _ranked_fallback(candidates, by_label, llm_ranker, hard_violations)
+            if getattr(result, "attempted", False)
+            else None
+        )
+        if ranked is not None:
+            return PlanChoice(
+                candidate=ranked,
+                jev_result=result,
+                jev_record=record,
+                fallback=True,
+                reason=f"Jev 未给出可用选择（{result.status}），改用普通 LLM Ranking 选择 {ranked.label}",
+                candidate_labels=tuple(candidate.label for candidate in candidates),
+            )
         return PlanChoice(
             candidate=default,
             jev_result=result,
             jev_record=record,
             fallback=True,
-            reason=f"Jev 未给出可用选择（{result.status}），采用默认方案：{summary}",
+            reason=f"Jev 未给出可用选择（{result.status}）且 LLM Ranking 无结果，采用默认方案：{summary}",
             candidate_labels=tuple(candidate.label for candidate in candidates),
         )
 

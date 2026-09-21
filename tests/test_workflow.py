@@ -49,6 +49,7 @@ from app.prompts import (
     EXTRACT_PLACES_PROMPT,
     FINAL_ANSWER_PROMPT,
     INTENT_PARSE_PROMPT,
+    PREFERENCE_PROFILE_PROMPT,
 )
 from app.providers import ProviderCall, ProviderResult
 from app.store import TravelPlanStore
@@ -1631,8 +1632,8 @@ class TestExecuteTravelRunEndToEnd:
         )
         assert any("模型扩写" in step for step in social_stage["steps"])
 
-    def test_the_model_is_only_consulted_at_the_five_documented_sites(self, store, tmp_path):
-        """决定"做什么"的是代码；模型只在 5 个调用点被问。
+    def test_the_model_is_only_consulted_at_the_documented_sites(self, store, tmp_path):
+        """决定"做什么"的是代码；模型只在 6 个调用点被问（含动态偏好画像，docs/14 §4）。
 
         多一处就意味着流程把判断权交给了模型 —— 这条断言会把那种改动拦下来。
         """
@@ -1652,6 +1653,7 @@ class TestExecuteTravelRunEndToEnd:
         assert result.status == STATUS_COMPLETED
         assert set(model.prompts) == {
             INTENT_PARSE_PROMPT,
+            PREFERENCE_PROFILE_PROMPT,
             RESEARCH_QUERY_EXPANSION_PROMPT,
             EXTRACT_PLACES_BATCH_PROMPT,
             CRITIC_PROMPT,

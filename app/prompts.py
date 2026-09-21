@@ -1,10 +1,10 @@
 """Prompt 常量集中管理（PRD §16 / §25 / §32）。
 
 为什么单独一个文件：
-- 项目铁律是 "Evidence First, LLM Second"。LLM 只允许做四件事：把自然语言变成结构化 intent、
-  扩写检索关键词、从网页文本里抽地点、写最终人话总结/挑刺。**价格、时刻、路线、营业时间一律
-  由工具真实返回，LLM 不许自己编**。把这些约束写死在 prompt 常量里，比散落在 workflow 各处
-  更容易审计。
+- 项目铁律是 "Evidence First, LLM Second"。LLM 只允许做五件事：把自然语言变成结构化 intent、
+  扩写检索关键词、从网页文本里抽地点、生成一次旅行的动态偏好画像（只给偏好权重、不编事实）、
+  写最终人话总结/挑刺。**价格、时刻、路线、营业时间一律由工具真实返回，LLM 不许自己编**。
+  把这些约束写死在 prompt 常量里，比散落在 workflow 各处更容易审计。
 - 所有 prompt 都是纯字符串常量，不含任何运行时状态，方便单测直接断言关键约束句是否存在。
 
 约定：所有输出统一要求中文；要求 JSON 的 prompt 都要额外声明 "只输出 JSON，不要解释"。
@@ -159,7 +159,74 @@ EXTRACT_PLACES_BATCH_PROMPT = """请从给定的**多篇**网页/帖子文本中
 
 
 # ==================================================
-# 5. Critic（挑刺）
+# 5. Dynamic Preference Profile（docs/14 §4：LLM 决定"这个用户喜欢什么"）
+# ==================================================
+
+PREFERENCE_PROFILE_PROMPT = """请根据用户的旅行需求，生成一份**本次旅行专属的动态偏好画像（Dynamic Preference Profile）**。
+
+这份画像只表达"这个用户更看重什么"，用来调整后续的软性取舍（住哪个区域、一天排几个点、
+绕不绕路去吃某家店）。**你不负责也不允许编造任何事实**：价格、时刻、路线、营业时间由真实工具
+返回，这里只给"偏好权重"。
+
+只输出一个 JSON 对象，不要解释、不要 markdown 代码块。结构如下：
+{
+  "travel_style": "一句话概括这次旅行的风格，如 food_commercial_centered / relaxed_family / scenic_photo / compact_efficient",
+  "reason": "为什么这样设定（一两句，引用用户的原话要点）",
+  "hotel_area": {
+    "food_density": 0.0, "commercial_area": 0.0, "nightlife": 0.0,
+    "transit": 0.0, "poi_centrality": 0.0, "price": 0.0, "quietness": 0.0
+  },
+  "hotel": {
+    "location": 0.0, "food_access": 0.0, "rating": 0.0,
+    "transit": 0.0, "price": 0.0, "comfort": 0.0
+  },
+  "attraction": {
+    "user_interest": 0.0, "route_fit": 0.0, "evidence": 0.0,
+    "iconic": 0.0, "photo_value": 0.0, "popularity": 0.0
+  },
+  "food": {
+    "local_recommendation": 0.0, "distance": 0.0, "specific_dishes": 0.0,
+    "evidence": 0.0, "ad_risk": 0.0, "rating": 0.0, "price": 0.0
+  },
+  "pace": {
+    "target_poi_per_day": 2,
+    "prefer_free_time": true
+  }
+}
+
+规则：
+1. 每组权重用 0.0~1.0 的相对大小表达重要性，组内不必归一化到 1（代码会归一化）。
+2. 必须**明显体现用户差异**：例如"主要想吃、喜欢热闹、晚上想逛"应抬高 hotel_area 的
+   food_density/commercial_area/nightlife、降低 poi_centrality/quietness，并降低一天景点数；
+   "带父母、轻松、少走路、安静"应抬高 transit/quietness、降低 nightlife、target_poi_per_day 给 2 或更少。
+3. 用户没说到的维度给中间值（如 0.5），不要凭空极端。
+4. pace.target_poi_per_day 是 1~5 的整数，按用户节奏给。
+5. 全部键都要出现，缺键会被补成默认值。"""
+
+
+# ==================================================
+# 6. 方案软选择（docs/14 §16-§17：Jev 不可用时的 LLM Ranking 兜底）
+# ==================================================
+
+PLAN_RANKING_PROMPT = """你负责在几份**都已经通过可行性与硬约束校验**的行程方案之间，选出一份最符合这位用户的。
+
+输入会包含：用户意图与动态偏好画像、以及若干候选方案（每份带标签 A/B/C… 与它的偏好匹配度、
+节奏匹配度、折返容忍度）。
+
+只输出一个 JSON 对象，不要解释、不要 markdown 代码块：
+{
+  "choice": "A",
+  "reason": "为什么这份更适合这位用户（一两句）"
+}
+
+铁律：
+1. 只能从给定的候选标签里选一个，照抄标签本身（大小写都不许改）。
+2. 你**不得**改动任何事实（价格、营业时间、路线、候选地点）——你只做二选一式的软选择。
+3. 若无法判断，也要给出一个你认为最合适的标签，不要留空。"""
+
+
+# ==================================================
+# 7. Critic（挑刺）
 # ==================================================
 
 CRITIC_PROMPT = """你是行程审查员，负责对一份已经算好的行程提出质疑。

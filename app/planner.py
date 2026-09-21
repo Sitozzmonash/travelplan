@@ -27,6 +27,7 @@ from difflib import SequenceMatcher
 from typing import Any, Mapping, Sequence
 
 from app.config import PlannerTuning, current_tuning
+from app.decision.profile import emphasis
 from app.models import (
     BUDGET_CATEGORIES,
     BUDGET_CATEGORY_CITY_TRANSPORT,
@@ -45,6 +46,7 @@ from app.models import (
     ItineraryDay,
     ItineraryItem,
     Place,
+    PreferenceProfile,
     RouteOption,
     TrainOption,
     TransportPlan,
@@ -2353,6 +2355,8 @@ def score_candidate(
     user_preferences: Sequence[str],
     route_fit: float,
     evidences: Sequence[Evidence] = (),
+    *,
+    profile: PreferenceProfile | None = None,
 ) -> tuple[float, dict]:
     """候选得分（PRD §19 结尾 + §24）：Trust 与 Ad Risk 是主项，偏好与路线适配是修正项。
 
@@ -2360,17 +2364,25 @@ def score_candidate(
         score = 0.55×Trust − 0.45×AdRisk + min(12×命中偏好数, 24) + 15×路线适配%
     Ad Risk 高**不等于删除**：一个 Trust 90 / AdRisk 60 的地点依然可能被保留，
     而 Trust 40 / AdRisk 80 的网红店会被挤下去（PRD §19）。
+
+    ``profile`` 是动态偏好画像（E1）：个性化时按 profile.attraction 强调"用户兴趣 /
+    证据支撑 / 路线适配"三项在得分里的权重（emphasis = profile/default，均衡基线 = 1.0，
+    与历史公式完全一致）。
     """
     hits = preference_hits(place, user_preferences, evidences)
-    preference_bonus = min(
-        CANDIDATE_PREFERENCE_BONUS_PER_HIT * len(hits), CANDIDATE_PREFERENCE_BONUS_CAP
+    pref_emph = emphasis(profile, "attraction", "user_interest")
+    evidence_emph = emphasis(profile, "attraction", "evidence")
+    route_emph = emphasis(profile, "attraction", "route_fit")
+    preference_bonus = (
+        min(CANDIDATE_PREFERENCE_BONUS_PER_HIT * len(hits), CANDIDATE_PREFERENCE_BONUS_CAP)
+        * pref_emph
     )
     fit = min(1.0, max(0.0, route_fit))
     score = (
-        CANDIDATE_TRUST_WEIGHT * trust
+        CANDIDATE_TRUST_WEIGHT * trust * evidence_emph
         - CANDIDATE_AD_RISK_WEIGHT * ad_risk_score
         + preference_bonus
-        + CANDIDATE_ROUTE_FIT_BONUS * fit
+        + CANDIDATE_ROUTE_FIT_BONUS * fit * route_emph
     )
     detail = {
         "trust": round(trust, 2),
@@ -2455,6 +2467,7 @@ def _build_stay_items(
     ticket_prices: Mapping[str, float] | None,
     user_preferences: Sequence[str],
     anchor: Sequence[float] | None,
+    profile: PreferenceProfile | None = None,
 ) -> list[ItineraryItem]:
     """把候选地点变成"要停留的 item"，并写好 reason / evidence_ids / price_type。
 
@@ -2469,7 +2482,7 @@ def _build_stay_items(
         risk = coerce_float(ad_risks.get(place.place_id), 0.0) or 0.0
         fit_km = _proximity_km(place, anchor)
         fit = 0.0 if fit_km is None else max(0.0, 1.0 - fit_km / ROUTE_FIT_RANGE_KM)
-        score, detail = score_candidate(place, trust, risk, user_preferences, fit, place_evidences)
+        score, detail = score_candidate(place, trust, risk, user_preferences, fit, place_evidences, profile=profile)
 
         basis_parts: list[str] = []
         detail_map = trust_details.get(place.place_id) or {}
@@ -2744,6 +2757,7 @@ def build_initial_plan(
     city: str | None = None,
     mode_hint: str | None = None,
     variant: str = PLAN_VARIANT_NEAREST,
+    profile: PreferenceProfile | None = None,
 ) -> list[ItineraryDay]:
     """生成初始行程（PRD §21）。
 
@@ -2781,6 +2795,7 @@ def build_initial_plan(
             intent.preferences,
             fit,
             place_evidences,
+            profile=profile,
         )
     sorted_places = sorted(
         places, key=lambda place: (-candidate_scores[place.place_id][0], place.name)
@@ -2892,6 +2907,7 @@ def build_initial_plan(
             ticket_prices=ticket_prices,
             user_preferences=intent.preferences,
             anchor=anchor,
+            profile=profile,
         )
         meal_items = _build_stay_items(
             foods,
@@ -2903,6 +2919,7 @@ def build_initial_plan(
             ticket_prices=ticket_prices,
             user_preferences=intent.preferences,
             anchor=anchor,
+            profile=profile,
         )
         items.extend(_insert_meals(stay_items, meal_items))
 

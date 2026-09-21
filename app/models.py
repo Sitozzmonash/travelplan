@@ -1273,3 +1273,174 @@ def basic_name_key(name: str) -> str:
         for char in text
     )
     return _PUNCT_RE.sub("", text).lower()
+
+
+# ==================================================
+# Dynamic Preference Profile（docs/14 §4：LLM 决定"这个用户喜欢什么"）
+# ==================================================
+#
+# 为什么单独一个模型而不是散成几个 dict：
+#   - 五组权重 + travel_style + pace 是**一起生成、一起审计**的一个决策产物，
+#     分开存会在"profile 从 LLM 到打分"这条链上丢字段；
+#   - 默认值（balanced）就是"没人个性化时的固定基线"，从 LLM 拿不到时用它兜底，
+#     保证 Python 永远有一组能用的权重 —— 而不是因为一次模型失败就换一套打分逻辑。
+
+#: 五组动态权重（docs/14 §4）。每组归一化到 1.0；默认值是"均衡旅行者"的基线。
+DEFAULT_HOTEL_AREA_WEIGHTS: dict[str, float] = {
+    "food_density": 0.20,
+    "commercial_area": 0.18,
+    "nightlife": 0.12,
+    "transit": 0.18,
+    "poi_centrality": 0.20,
+    "price": 0.08,
+    "quietness": 0.04,
+}
+DEFAULT_HOTEL_WEIGHTS: dict[str, float] = {
+    "location": 0.25,
+    "food_access": 0.15,
+    "rating": 0.20,
+    "transit": 0.15,
+    "price": 0.15,
+    "comfort": 0.10,
+}
+DEFAULT_ATTRACTION_WEIGHTS: dict[str, float] = {
+    "user_interest": 0.25,
+    "route_fit": 0.25,
+    "evidence": 0.20,
+    "iconic": 0.10,
+    "photo_value": 0.10,
+    "popularity": 0.10,
+}
+DEFAULT_FOOD_WEIGHTS: dict[str, float] = {
+    "local_recommendation": 0.25,
+    "distance": 0.25,
+    "specific_dishes": 0.15,
+    "evidence": 0.15,
+    "ad_risk": 0.10,
+    "rating": 0.05,
+    "price": 0.05,
+}
+DEFAULT_PACE: dict[str, Any] = {"target_poi_per_day": 2, "prefer_free_time": True}
+
+#: 五组权重里各自的合法键。LLM 可能会塞进没见过的键，白名单之外一律丢弃 ——
+#: 一个拼错的键不会污染打分，也不该静默长出第 8 个维度。
+PROFILE_WEIGHT_KEYS: dict[str, tuple[str, ...]] = {
+    "hotel_area": tuple(DEFAULT_HOTEL_AREA_WEIGHTS),
+    "hotel": tuple(DEFAULT_HOTEL_WEIGHTS),
+    "attraction": tuple(DEFAULT_ATTRACTION_WEIGHTS),
+    "food": tuple(DEFAULT_FOOD_WEIGHTS),
+}
+
+PROFILE_GROUPS = tuple(PROFILE_WEIGHT_KEYS)
+
+
+def _coerce_profile_weights(raw: Any, group: str) -> tuple[dict[str, float], bool]:
+    """把 LLM 给的一组权重收口：只认白名单键、钳到 [0,1]、缺键用默认值、最后重归一化。
+
+    返回 (权重, 是否真的带有 LLM 信号)。"有没有信号"决定这组权重该不该影响打分：
+    返回空/坏数据时不该被当成"这个用户什么都不在乎"，而是要退回默认基线。
+
+    缺键**用默认值而不是 0**：prompt 明确要求"全部键都要出现，缺键会被补成默认值"，
+    模型偶尔漏一个键时，那个维度应当保持中性，而不是被悄悄压到最低（那会误伤
+    Trust 这类主项 —— 实测漏一个 `evidence` 键就会把 Trust 权重压到下限）。
+    """
+    keys = PROFILE_WEIGHT_KEYS[group]
+    base: dict[str, float] = {key: _default_weight(group, key) for key in keys}
+    meaningful = False
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if key not in base:
+                continue
+            number = coerce_float(value)
+            if number is None:
+                continue
+            base[key] = min(1.0, max(0.0, number))
+            meaningful = True
+    if not meaningful:
+        return {key: _default_weight(group, key) for key in keys}, False
+    total = sum(base.values()) or 1.0
+    return {key: round(base[key] / total, 4) for key in keys}, True
+
+
+def _default_weight(group: str, key: str) -> float:
+    return {
+        "hotel_area": DEFAULT_HOTEL_AREA_WEIGHTS,
+        "hotel": DEFAULT_HOTEL_WEIGHTS,
+        "attraction": DEFAULT_ATTRACTION_WEIGHTS,
+        "food": DEFAULT_FOOD_WEIGHTS,
+    }[group].get(key, 0.0)
+
+
+class PreferenceProfile(BaseModel):
+    """一次旅行专属的动态偏好（docs/14 §4）。
+
+    ``source`` 只有两种：
+      * ``llm``     —— LLM 真的生成了一份带信号的 profile，打分据此个性化；
+      * ``fallback``—— LLM 不可用/返回空，使用均衡基线（与"没有 profile"行为一致）。
+
+    Profile 只决定**软取舍**（哪一组更重要、一天排几个点）。真实性、时间可行性、
+    REJECT/MUST、预算这些硬规则照旧由 Python 强制，profile 碰不到它们。
+    """
+
+    travel_style: str = "balanced_explorer"
+    hotel_area: dict[str, float] = Field(default_factory=lambda: dict(DEFAULT_HOTEL_AREA_WEIGHTS))
+    hotel: dict[str, float] = Field(default_factory=lambda: dict(DEFAULT_HOTEL_WEIGHTS))
+    attraction: dict[str, float] = Field(default_factory=lambda: dict(DEFAULT_ATTRACTION_WEIGHTS))
+    food: dict[str, float] = Field(default_factory=lambda: dict(DEFAULT_FOOD_WEIGHTS))
+    pace: dict[str, Any] = Field(default_factory=lambda: dict(DEFAULT_PACE))
+    reason: str = ""
+    #: llm | fallback
+    source: str = "fallback"
+
+    @property
+    def personalized(self) -> bool:
+        """只有 LLM 真正生成了差异化 profile 才算个性化；均衡基线不算。"""
+        return self.source == "llm"
+
+    @classmethod
+    def from_llm(cls, payload: Any) -> "PreferenceProfile":
+        """从 LLM 输出构造 profile，**保证不抛异常**（与 TripIntent.from_llm 同一原则）。"""
+
+        data = parse_envelope(payload) if isinstance(payload, str) else payload
+        if not isinstance(data, dict):
+            data = {}
+
+        hotel_area, ha_signal = _coerce_profile_weights(data.get("hotel_area"), "hotel_area")
+        hotel, h_signal = _coerce_profile_weights(data.get("hotel"), "hotel")
+        attraction, a_signal = _coerce_profile_weights(data.get("attraction"), "attraction")
+        food, f_signal = _coerce_profile_weights(data.get("food"), "food")
+
+        style = coerce_str(data.get("travel_style")) or "balanced_explorer"
+        raw_pace = data.get("pace") if isinstance(data.get("pace"), dict) else {}
+        target = coerce_int(raw_pace.get("target_poi_per_day"), 2) or 2
+        target = max(1, min(target, 10))
+        pace = {
+            "target_poi_per_day": target,
+            "prefer_free_time": bool(raw_pace.get("prefer_free_time", True)),
+        }
+        personalized = bool(style != "balanced_explorer" or ha_signal or h_signal or a_signal or f_signal)
+        return cls(
+            travel_style=style,
+            hotel_area=hotel_area,
+            hotel=hotel,
+            attraction=attraction,
+            food=food,
+            pace=pace,
+            reason=coerce_str(data.get("reason")),
+            source="llm" if personalized else "fallback",
+        )
+
+    @classmethod
+    def default_profile(cls) -> "PreferenceProfile":
+        """均衡基线（LLM 不可用时的确定性兜底，与"无 profile"行为一致）。"""
+        return cls(
+            reason="LLM 未生成有效的偏好画像，采用均衡基线",
+            source="fallback",
+        )
+
+    def weight(self, group: str, key: str, default: float = 0.0) -> float:
+        """读一组权重里的某个键（不存在就回默认）。"""
+        mapping = getattr(self, group, None)
+        if not isinstance(mapping, dict):
+            return default
+        return float(mapping.get(key, default))

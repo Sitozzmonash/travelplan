@@ -10,8 +10,9 @@ state 的 12 个键，不需要再从日志里反推。副作用是每步都能�
 为什么没有把 Agent 塞进流程里
 --------------------------
 "Evidence First, LLM Second" 的工程含义是：**决定"做什么"的是代码，模型只负责
-"把自然语言变成结构化输入"和"把算好的结果讲成人话"**。所以流程骨架是固定边，
-模型只在 4 处被调用（见 `app/llm.py`），且任何一处失败都只是降级，不会改道。
+"把自然语言变成结构化输入"、"生成一份动态偏好画像（docs/14 §4）"和"把算好的结果
+讲成人话"**。所以流程骨架是固定边，模型只在 5 处被调用（见 `app/llm.py` 与
+`app/decision/profile.py`），且任何一处失败都只是降级，不会改道。
 
 State 里为什么能放 ProviderHub / Store 这种对象
 --------------------------------------------
@@ -52,9 +53,11 @@ from app.decision.planner_decision import (
     DECISION_TRADEOFF,
     QualityGate,
     choose_plan,
+    llm_rank_candidates,
     quality_gate,
     resolve_tradeoff,
 )
+from app.decision.profile import emphasis, generate_preference_profile
 from app.llm import LLM, degraded_note
 from app.models import (
     BudgetSummary,
@@ -67,6 +70,7 @@ from app.models import (
     HotelPlan,
     ItineraryDay,
     Place,
+    PreferenceProfile,
     RouteOption,
     SourceRef,
     TrainOption,
@@ -174,6 +178,9 @@ HOTEL_PRICE_UNIT = 100.0
 HOTEL_RATING_WEIGHT = 2.0
 HOTEL_PREFERENCE_BONUS = 20.0
 HOTEL_UNKNOWN_PRICE_PENALTY = 30.0
+#: 酒店落在推荐住宿区域内的加分（E4）。是"足够改变排序"的软加分，但不越过价格/评分主项，
+#: 更不越过价格上限/评分下限这类**硬过滤**（那些在 `hotel_candidates_for` 里先做）。
+HOTEL_AREA_BONUS = 20.0
 
 # ==================================================
 # 规则兜底用的正则（只在模型不可用时启用）
@@ -298,6 +305,14 @@ class TravelState(TypedDict, total=False):
     budget: BudgetSummary
     warnings: list[FeasibilityIssue]
     critic: dict
+
+    # --- Dynamic Preference Profile（docs/14 §4，角色 B：软取舍随用户而变）---
+    #: LLM 生成的一次旅行偏好画像；失败回落均衡基线（个性化打分只在 personalized 时生效）。
+    profile: PreferenceProfile
+    #: 住宿区域候选（E4）。由 Discovery 复用的地点聚类而来；Quick 模式没有预取地点时为 []。
+    hotel_areas: list[dict]
+    #: 最终选定的住宿区域名（E4：先选区域再选酒店）。
+    hotel_area_selected: str | None
 
     # --- Top-K 与 Jev 软决策（接管任务 §4） ---
     plan_candidates: list
@@ -762,6 +777,32 @@ def _stage(stage_id: str, title: str, summary: str, steps: list[str], **stats: A
         "steps": [step for step in steps if step],
         "stats": [{"label": key, "value": str(value)} for key, value in stats.items()],
     }
+
+
+#: contract 4 的六个可读阶段码（D 按它渲染"正在…"叙事）。
+STAGE_HOTEL_AREA_SELECTED = "hotel_area_selected"
+STAGE_HOTELS_COMPARED = "hotels_compared"
+STAGE_DAYS_ARRANGED = "days_arranged"
+STAGE_MEALS_MATCHED = "meals_matched"
+STAGE_ROUTES_CHECKED = "routes_checked"
+STAGE_BUDGET_CHECKED = "budget_checked"
+
+
+def _emit_progress_stage(
+    state: TravelState,
+    stage_id: str,
+    message: str,
+    *,
+    facts: dict[str, Any] | None = None,
+) -> None:
+    """把契约 4 的中间阶段码写进轮询进度（写库失败不影响规划本身）。"""
+    hook = state.get("progress_hook")
+    if hook is None:
+        return
+    try:
+        hook(stage_id, "SUCCESS", message, dict(facts or {}), utcnow().isoformat(), utcnow().isoformat())
+    except Exception:  # noqa: BLE001 —— 观测失败不该反过来弄坏一次规划
+        return
 
 
 def _decision(
@@ -1311,25 +1352,32 @@ def _hotel_score(
     intent: TripIntent,
     *,
     anchor: Sequence[float] | None = None,
+    profile: PreferenceProfile | None = None,
 ) -> tuple[float, dict]:
     """酒店比选得分（越低越好）。策略与补充条件通过 `selection.hotel_weights` 生效。
 
     `anchor` 是用户所选地点（或酒店候选群）的中心点：只有选了「位置优先」「交通方便」
     或维护者调大了 `TP_HOTEL_LOCATION_WEIGHT` 时，距离才会进入打分（默认权重 0，
     因此不选偏好时与历史行为一致）。
+
+    `profile` 是动态偏好画像（E1）：个性化时按 `profile.hotel` 强调价格/评分/位置
+    三项相对重要度（emphasis = profile/default，均衡基线 = 1.0，行为与历史完全一致）。
     """
 
     tuning_now = current_tuning()
     strategy = selection.hotel_weights(intent).values
+    price_emph = emphasis(profile, "hotel", "price")
+    rating_emph = emphasis(profile, "hotel", "rating")
+    location_emph = emphasis(profile, "hotel", "location")
     parts: dict[str, float] = {}
     nightly = coerce_float(hotel.nightly)
     parts["每晚价格"] = (
         HOTEL_UNKNOWN_PRICE_PENALTY
         if nightly is None
-        else nightly * float(strategy.get("price", tuning_now.hotel_price_weight))
+        else nightly * float(strategy.get("price", tuning_now.hotel_price_weight)) * price_emph
     )
     rating = coerce_float(hotel.rating)
-    parts["评分"] = -(rating or 0.0) * float(strategy.get("rating", tuning_now.hotel_rating_weight))
+    parts["评分"] = -(rating or 0.0) * float(strategy.get("rating", tuning_now.hotel_rating_weight)) * rating_emph
     prefs = coerce_str_list(intent.hotel_preferences)
     haystack = " ".join(
         filter(None, [hotel.name, hotel.room_type, hotel.business_area, hotel.address, hotel.price_note])
@@ -1343,8 +1391,26 @@ def _hotel_score(
         if distance is not None:
             # 离所选地点中心越远扣分越多；超出 RANGE 记满额惩罚。
             ratio = min(1.0, distance / 1000.0 / max(0.1, tuning_now.hotel_location_range_km))
-            parts["位置"] = location_weight * ratio
+            parts["位置"] = location_weight * location_emph * ratio
     return round(sum(parts.values()), 2), {**{k: round(v, 2) for k, v in parts.items()}, "命中偏好": len(hits)}
+
+
+def _hotel_in_area(hotel: HotelOption, area: str) -> bool:
+    """酒店是否落在推荐区域内（区域名出现在商圈/地址/名称里）。"""
+
+    if not area:
+        return False
+    return area in " ".join(filter(None, [hotel.business_area, hotel.address, hotel.name]))
+
+
+def _preferred_area(hotel_areas: Sequence[Mapping[str, Any]] | None) -> str | None:
+    """推荐住宿区域里排第一的名字（fit_score 已排序，取第一个）。"""
+
+    for area in hotel_areas or []:
+        name = coerce_str(area.get("name"))
+        if name:
+            return name
+    return None
 
 
 def _select_hotel(
@@ -1352,14 +1418,21 @@ def _select_hotel(
     intent: TripIntent,
     *,
     anchor: Sequence[float] | None = None,
+    profile: PreferenceProfile | None = None,
+    hotel_areas: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[HotelOption | None, list[HotelOption], str]:
     if not options:
         return None, [], ""
     # 先按用户补充条件硬过滤（价格上限/评分下限/房型），过滤空了就放宽并说明。
     filtered, filter_note = selection.hotel_candidates_for(intent, options)
+    area_key = _preferred_area(hotel_areas)
     scored: list[tuple[float, dict, HotelOption]] = []
     for hotel in filtered:
-        score, parts = _hotel_score(hotel, intent, anchor=anchor)
+        score, parts = _hotel_score(hotel, intent, anchor=anchor, profile=profile)
+        if area_key and _hotel_in_area(hotel, area_key):
+            # E4：先选区域再选酒店 —— 落在推荐区域内的酒店获得软加分（分数越低越好）。
+            score -= HOTEL_AREA_BONUS
+            parts = {**parts, "推荐区域": -HOTEL_AREA_BONUS}
         scored.append((score, parts, hotel))
     scored.sort(key=lambda item: (item[0], item[2].name))
 
@@ -1375,6 +1448,11 @@ def _select_hotel(
         bits.append(f"评分 {selected.rating:g}")
     if selected.business_area:
         bits.append(f"位置在{selected.business_area}")
+    if area_key:
+        bits.append(
+            f"推荐住宿区域「{area_key}」"
+            + ("（该酒店在此区域内，已加区域分）" if _hotel_in_area(selected, area_key) else "（该酒店未落入推荐区域）")
+        )
     bits.append(f"在 {len(options)} 个候选里综合分最低")
     prefs = coerce_str_list(intent.hotel_preferences)
     if prefs:
@@ -1386,7 +1464,7 @@ def _select_hotel(
     selected.selection_reason = reason
     for hotel in alternatives:
         hotel.selection_reason = (
-            f"未选中：综合分 {_hotel_score(hotel, intent, anchor=anchor)[0]:g} 高于「{selected.name}」"
+            f"未选中：综合分 {_hotel_score(hotel, intent, anchor=anchor, profile=profile)[0]:g} 高于「{selected.name}」"
         )
     return selected, alternatives, reason
 
@@ -1445,6 +1523,32 @@ def _backfill_intent(intent: TripIntent, raw: dict, rules: TripIntent) -> tuple[
     return intent.model_copy(update=updates), filled
 
 
+def _profile_for(state: TravelState, intent: TripIntent) -> PreferenceProfile:
+    """生成（或复用）本次 run 的动态偏好画像，失败回落均衡基线。
+
+    为什么不从 Discovery 直接带过来：画像在 Discovery 时还看不到用户最终的点选
+    （MUST/WANT/REJECT 是在 Prefetch 之后才定的）。run 里的这份以**最终意图**为输入，
+    才是真正决定软取舍的那一份；Discovery 那份只是给确认页的预览。
+    """
+    try:
+        return generate_preference_profile(intent, state.get("llm"))
+    except Exception:  # noqa: BLE001 —— 画像生成绝不拖垮规划
+        return PreferenceProfile.default_profile()
+
+
+def _profile_step(profile: PreferenceProfile) -> str:
+    if profile.personalized:
+        return f"偏好画像：{profile.travel_style}（每天约 {profile.pace.get('target_poi_per_day', 2)} 个点）"
+    return "偏好画像：LLM 未给出有效画像，采用均衡基线"
+
+
+def _profile_payload(profile: Any) -> dict[str, Any] | None:
+    """画像的 JSON 载荷（审计/前端用）；没生成过就返回 None，不编一个空画像。"""
+    if isinstance(profile, PreferenceProfile):
+        return profile.model_dump(mode="json")
+    return None
+
+
 def node_parse_intent(state: TravelState) -> dict:
     run_id = state["run_id"]
     query = state["query"]
@@ -1460,12 +1564,14 @@ def node_parse_intent(state: TravelState) -> dict:
         pace, pace_reason = selection.resolve_pace_with_reason(intent)
         intent.pace = pace
         store.save_trip_request(run_id, query, intent)
+        profile = _profile_for(state, intent)
         summary = (
             f"引导式：直接采用用户确认的结构化信息"
             f"（来源会话 {state.get('source_session_id') or '—'}）；{pace_reason}"
         )
         return {
             "intent": intent,
+            "profile": profile,
             "decisions": [
                 _decision(run_id, DecisionStatus.PASS, "parse_intent",
                           ["GUIDED_INTENT", "USER_CONFIRMED"], summary,
@@ -1478,6 +1584,7 @@ def node_parse_intent(state: TravelState) -> dict:
                     f"日期：{intent.start_date.isoformat() if intent.start_date else '未指定'}，"
                     f"{intent.days} 天，{intent.travelers} 人",
                     pace_reason,
+                    _profile_step(profile),
                 ], 来源="引导式")
             ],
         }
@@ -1496,6 +1603,7 @@ def node_parse_intent(state: TravelState) -> dict:
         source = "规则兜底（模型输出不可用）"
 
     store.save_trip_request(run_id, query, intent)
+    profile = _profile_for(state, intent)
 
     destination = _destination(intent)
     clarify = ""
@@ -1527,9 +1635,11 @@ def node_parse_intent(state: TravelState) -> dict:
         steps.append(f"交通偏好：{'、'.join(intent.transport_preferences)}")
     if intent.hotel_preferences:
         steps.append(f"住宿偏好：{'、'.join(intent.hotel_preferences)}")
+    steps.append(_profile_step(profile))
 
     return {
         "intent": intent,
+        "profile": profile,
         "status": status,
         "clarify": clarify,
         "degradations": degradations,
@@ -1860,6 +1970,23 @@ def node_search_hotels(state: TravelState) -> dict:
     ledger = _ledger(state)
     degradations: list[str] = []
     hotel_note = ""
+
+    # E1/E4：动态偏好画像 + 推荐住宿区域。引导式有 Discovery 预取的地点，直接聚类出区域；
+    # Quick 模式此时还没抽地点，区域为空 —— 酒店只按 profile 加权打分（无区域加分），
+    # 区域选择的完整呈现留给确认页（Discovery）与 run 的 user_journey 审计。
+    profile = state.get("profile") or PreferenceProfile.default_profile()
+    hotel_areas: list[dict[str, Any]] = []
+    if bundle is not None:
+        try:
+            hotel_areas = discovery.extract_hotel_areas(
+                intent, bundle.evidences, bundle.places, profile=profile
+            )
+        except Exception:  # noqa: BLE001 —— 区域聚类失败不该影响酒店选择
+            hotel_areas = []
+    area_key = _preferred_area(hotel_areas) or None
+    if area_key:
+        _emit_progress_stage(state, STAGE_HOTEL_AREA_SELECTED, f"已确定推荐住宿区域：{area_key}")
+
     if bundle is not None and bundle.hotels:
         result = SimpleNamespace(items=list(bundle.hotels), status="REUSED", provider="tuniu")
         # 登记复用：同一个酒店查询在本次 run 里再被请求会命中账本，不再打途牛（Part C）。
@@ -1925,10 +2052,20 @@ def node_search_hotels(state: TravelState) -> dict:
             steps_extra.append(hotel_evidence_note)
 
     selected, alternatives, reason = _select_hotel(
-        list(result.items), intent, anchor=_hotel_anchor(state)
+        list(result.items), intent, anchor=_hotel_anchor(state), profile=profile, hotel_areas=hotel_areas
     )
     if getattr(result, "status", "") == "REUSED":
         reason = f"复用 Discovery 候选（{len(result.items)} 个，已翻页扩大范围）—— {reason}"
+
+    if selected is None and area_key:
+        reason = (reason + f"；推荐住宿区域「{area_key}」但本次没有可用酒店落地") if reason else f"推荐住宿区域「{area_key}」"
+    if selected is not None:
+        _emit_progress_stage(
+            state,
+            STAGE_HOTELS_COMPARED,
+            f"已比较 {len(result.items)} 家酒店，选定 {selected.name}",
+            facts={"area": area_key, "candidates": len(result.items)},
+        )
 
     if selected is None:
         reason = hotel_evidence_note or (
@@ -1956,6 +2093,12 @@ def node_search_hotels(state: TravelState) -> dict:
         "比选口径：每晚价格、评分、住宿偏好命中；价格是「起价」，预算按真实单价相乘",
         *steps_extra,
     ]
+    if area_key:
+        steps.append(
+            f"先选住宿区域「{area_key}」（{len(hotel_areas)} 个区域里契合度最高），再在该区域内取酒店"
+        )
+    if profile.personalized:
+        steps.append(f"按偏好画像「{profile.travel_style}」对价格/评分/位置做了个性化加权")
     if selected is not None:
         steps.append(f"选定：{selected.name}")
 
@@ -1965,6 +2108,8 @@ def node_search_hotels(state: TravelState) -> dict:
             alternatives=alternatives,
             selection_reason=reason or "途牛未返回可用住宿候选",
         ),
+        "hotel_areas": hotel_areas,
+        "hotel_area_selected": area_key,
         "decisions": decisions,
         "degradations": degradations,
         "timeline": [_stamp("search_hotels", (reason or "无住宿候选")[:300])],
@@ -1976,6 +2121,7 @@ def node_search_hotels(state: TravelState) -> dict:
                 steps,
                 候选数=len(result.items),
                 数据源状态=result.status,
+                推荐区域=area_key or "—",
             )
         ],
     }
@@ -2863,6 +3009,12 @@ def node_verify_poi_and_routes(state: TravelState) -> dict:
         steps.append(f"回程 酒店 → 车站/机场 真实接驳 {inbound_transfer} 分钟（含入住）")
 
     summary = f"高德路线 {route_ok} 段成功 / {route_fail} 段失败，整体状态 {amap_status}"
+    _emit_progress_stage(
+        state,
+        STAGE_ROUTES_CHECKED,
+        f"已用高德检查路线：成功 {route_ok} 段、失败 {route_fail} 段",
+        facts={"route_ok": route_ok, "route_fail": route_fail, "status": amap_status},
+    )
     return {
         "places": places,
         "routes": routes,
@@ -2935,7 +3087,7 @@ def node_score_candidates(state: TravelState) -> dict:
             if distance is not None:
                 fit = max(0.0, 1.0 - (distance / 1000.0) / planner.ROUTE_FIT_RANGE_KM)
         score, score_detail = planner.score_candidate(
-            place, trust, risk, intent.preferences, fit, place_evidences
+            place, trust, risk, intent.preferences, fit, place_evidences, profile=state.get("profile")
         )
         # 用户点过的"必去/想去"必须真的改变结果，而不是只写进一句文案。
         bonus, bonus_reason = selection.preference_bonus(place, intent.place_selections or {})
@@ -3083,6 +3235,7 @@ def node_build_plan(state: TravelState) -> dict:
         "ticket_prices": state.get("ticket_prices") or {},
         "city": _destination(intent),
         "mode_hint": None,
+        "profile": state.get("profile"),
     }
     parent = f"{run_id}:build_initial_plan"
 
@@ -3143,6 +3296,11 @@ def node_build_plan(state: TravelState) -> dict:
         hard_violations=lambda candidate: planner.hard_constraint_violations(
             candidate.days, intent, outbound=outbound
         ),
+        # E7：Jev 不可用/失败时的普通 LLM Ranking 兜底（docs/14 §17）。它同样要过硬约束
+        # 复核，再失败才退回动态权重 Top-1。
+        llm_ranker=lambda cands: llm_rank_candidates(
+            cands, intent, state.get("llm"), profile=state.get("profile")
+        )[0],
     )
     chosen = choice.candidate
     single_viable = len(viable_candidates) == 1 and len(candidates) > 1
@@ -3168,6 +3326,19 @@ def node_build_plan(state: TravelState) -> dict:
     )
 
     item_count = sum(len(day.items) for day in days)
+    meal_count = sum(1 for day in days for item in day.items if item.type == "food")
+    _emit_progress_stage(
+        state,
+        STAGE_DAYS_ARRANGED,
+        f"已安排 {len(days)} 天行程（{item_count} 项）",
+        facts={"days": len(days), "items": item_count},
+    )
+    _emit_progress_stage(
+        state,
+        STAGE_MEALS_MATCHED,
+        f"已按当天位置与时间窗匹配 {meal_count} 顿餐食",
+        facts={"meals": meal_count},
+    )
     steps = [f"共 {len(days)} 天、{item_count} 个安排"]
     if len(candidates) > 1:
         steps.append(
@@ -3308,6 +3479,12 @@ def node_check_budget(state: TravelState) -> dict:
         steps.extend(f"优化建议：{item}" for item in budget.optimization_suggestions)
 
     summary = f"预计 ¥{budget.projected_total:,.0f}（真实 ¥{budget.known_real_cost:,.0f} + 估算 ¥{budget.estimated_cost:,.0f}），状态 {budget.status}"
+    _emit_progress_stage(
+        state,
+        STAGE_BUDGET_CHECKED,
+        f"已检查预算：预计 ¥{budget.projected_total:,.0f}（真实 ¥{budget.known_real_cost:,.0f} + 估算 ¥{budget.estimated_cost:,.0f}）",
+        facts={"projected_total": budget.projected_total, "status": budget.status},
+    )
     _record_subspan(
         state,
         component=SpanKind.BUDGET,
@@ -5097,6 +5274,12 @@ def _user_journey_summary(state: TravelState, plan: TripPlan) -> dict[str, Any]:
         "grace_waited_ms": int(getattr(bundle, "grace_waited_ms", 0) or 0) if bundle is not None else 0,
         "source": state.get("source") or "quick",
         "source_session_id": state.get("source_session_id"),
+        # --- 角色 B 的决策产物（contract 2 的 run 侧）：画像 / 住宿区域 / 候选池 ---
+        # 与 Discovery 的字段同名同结构，管理端与前端不必区分是哪个入口来的。
+        "profile": _profile_payload(state.get("profile")),
+        "hotel_areas": list(state.get("hotel_areas") or []),
+        "hotel_area_selected": state.get("hotel_area_selected"),
+        "poi_pools": discovery.split_poi_pools(list(state.get("places") or [])),
         "transport_mode": intent.transport_mode,
         "transport_priority": intent.transport_priority,
         "hotel_priority": intent.hotel_priority,

@@ -25,6 +25,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+from app import models
 from app import planner
 from app.config import current_config
 from app.llm import LLM, degraded_note, invoke_json_in_batches
@@ -34,6 +35,7 @@ from app.models import (
     Evidence,
     HotelOption,
     Place,
+    PreferenceProfile,
     TripIntent,
     coerce_str,
 )
@@ -46,6 +48,7 @@ from app.observability import (
 )
 from app.prompts import EXTRACT_PLACES_BATCH_PROMPT, RESEARCH_QUERY_EXPANSION_PROMPT
 from app.providers import ProviderHub
+from app.selection import place_category
 
 # ======================================================================
 # 上限与关键词表（原来散在 workflow.py 里，随取数逻辑一起搬过来；workflow 再 re-export）
@@ -733,6 +736,173 @@ def _apply_poi_detail(place: Place, detail: dict[str, Any]) -> None:
 
 
 # ======================================================================
+# 住宿区域与候选池（E3 / E4：docs/14 §7 / §9）
+# ======================================================================
+
+#: 类别 → 候选池。景点/历史/自然/亲子/拍照归"游玩"，美食归"美食"，其余归"体验"。
+#: contract 2 的三个 key 固定，前端按三张卡片列渲染；顺序也固定（attraction 在前）。
+_POOL_BY_CATEGORY: dict[str, str] = {
+    "attraction": "attraction",
+    "history": "attraction",
+    "nature": "attraction",
+    "family": "attraction",
+    "photo": "attraction",
+    "food": "food",
+    "experience": "experience",
+    "nightview": "experience",
+    "shopping": "experience",
+    "other": "experience",
+}
+
+POOL_KEYS = ("attraction", "food", "experience")
+
+#: 住宿区域候选的上限（docs/14 §9：3~4 个）。不放 config —— 这是角色 B 的产品口径，
+#: 与取数预算（归 A）不是一回事。
+HOTEL_AREA_LIMIT = 4
+
+_CATEGORY_AREA_TAG: dict[str, str] = {
+    "food": "美食多",
+    "shopping": "商圈便利",
+    "nightview": "夜生活",
+    "attraction": "景点集中",
+    "history": "景点集中",
+    "nature": "自然静谧",
+    "experience": "体验丰富",
+}
+
+
+def split_poi_pools(places: Sequence[Place]) -> dict[str, list[str]]:
+    """把候选地点按池拆开（docs/14 §7）：attraction / food / experience。
+
+    返回 ``{pool: [place_id, ...]}``，保留原候选顺序（攻略提过的在前）。
+    只有三个 key；前端按 place_id 合并回 place_candidates 的完整卡片。
+    """
+
+    pools: dict[str, list[str]] = {key: [] for key in POOL_KEYS}
+    for place in places:
+        pool = _POOL_BY_CATEGORY.get(place_category(place), "experience")
+        if place.place_id and place.place_id not in pools[pool]:
+            pools[pool].append(place.place_id)
+    return pools
+
+
+def extract_hotel_areas(
+    intent: TripIntent,
+    evidences: Sequence[Evidence],
+    places: Sequence[Place],
+    *,
+    profile: PreferenceProfile | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """推荐住宿区域（docs/14 §9）：从候选地点的商圈/行政区聚类出区域候选。
+
+    为什么用聚类而不是再调一次模型抽区域：区域本身就是高德给的地点的
+    ``business_area / district``，是真实数据的聚合；攻略推荐度用"提到该区域名的攻略条数"
+    近似，美食/商圈/夜生活密度用区域内候选点的类别占比近似 —— 全部确定性、可审计，
+    不会因为"模型抽区域失败"而空榜（真实优先、降级披露）。
+
+    排序是**动态权重 Top-K**（§9 的确定性一档）：先算密度信号，再用 profile.hotel_area
+    强调用户更在乎的维度。没有个性化 profile 时退化为带攻略推荐的密度排序。
+    """
+
+    area_map: dict[str, dict[str, Any]] = {}
+    for place in places:
+        name = coerce_str(place.business_area or place.district)
+        if not name:
+            continue
+        entry = area_map.setdefault(
+            name,
+            {"places": 0, "categories": {}, "evidence_mentions": 0, "has_coords": False},
+        )
+        entry["places"] += 1
+        if place.lat is not None and place.lng is not None:
+            entry["has_coords"] = True
+        category = place_category(place)
+        entry["categories"][category] = entry["categories"].get(category, 0) + 1
+
+    # 攻略推荐度：哪几篇攻略正文里出现过区域名（含攻略自带的地点提及）。
+    for evidence in evidences:
+        text = " ".join(
+            filter(None, [evidence.title, " ".join(evidence.place_mentions or []), evidence.text])
+        )
+        for name in list(area_map):
+            if name and name in text:
+                area_map[name]["evidence_mentions"] += 1
+
+    if not area_map:
+        return []
+
+    max_mentions = max((entry["evidence_mentions"] for entry in area_map.values()), default=1) or 1
+
+    def _signals(entry: dict[str, Any]) -> dict[str, float]:
+        categories = entry["categories"]
+        place_n = max(1, int(entry["places"]))
+        return {
+            "food_density": round(min(1.0, categories.get("food", 0) / place_n), 3),
+            "commercial_area": round(min(1.0, categories.get("shopping", 0) / place_n), 3),
+            "nightlife": round(min(1.0, categories.get("nightview", 0) / place_n), 3),
+            "poi_centrality": round(min(1.0, place_n / 5.0), 3),
+            "evidence": round(min(1.0, entry["evidence_mentions"] / max(2, max_mentions)), 3),
+        }
+
+    ranked: list[tuple[float, str, dict[str, Any]]] = []
+    for name, entry in area_map.items():
+        signals = _signals(entry)
+        fit = _area_fit_score(signals, profile)
+        tags = _area_tags(entry["categories"])
+        ranked.append((fit, name, {"signals": signals, "categories": entry["categories"], "tags": tags}))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+
+    areas: list[dict[str, Any]] = []
+    cap = max(1, int(limit if limit is not None else HOTEL_AREA_LIMIT))
+    for fit, name, meta in ranked[:cap]:
+        categories = meta["categories"]
+        place_n = sum(categories.values())
+        areas.append(
+            {
+                "key": name,
+                "name": name,
+                "reason": (
+                    f"{name}：{place_n} 个候选地点"
+                    + (f"，{meta['signals']['evidence']:.0%} 的攻略在此区域有提及" if max_mentions else "")
+                    + f"，以{'/'.join(meta['tags'][:2]) or '综合'}为主"
+                ),
+                "tags": meta["tags"],
+                "fit_score": fit,
+            }
+        )
+    return areas
+
+
+def _area_fit_score(signals: dict[str, float], profile: PreferenceProfile | None) -> float:
+    """区域综合契合度 = 0.5×攻略推荐 + 0.5×profile 加权的密度信号。
+
+    没有个性化 profile 时用均衡基线的 hotel_area 权重；个性化时用 LLM 给的权重，
+    "主要想吃"的用户会看到美食密度权重被抬高。
+    """
+
+    weights = (
+        profile.hotel_area
+        if profile is not None and profile.personalized
+        else models.DEFAULT_HOTEL_AREA_WEIGHTS
+    )
+    available = ("food_density", "commercial_area", "nightlife", "poi_centrality")
+    wsum = sum(float(weights.get(key, 0.0)) for key in available) or 1.0
+    core = sum(signals[key] * float(weights.get(key, 0.0)) for key in available) / wsum
+    return round(0.5 * core + 0.5 * signals["evidence"], 4)
+
+
+def _area_tags(categories: Mapping[str, int]) -> list[str]:
+    ordered = sorted(categories.items(), key=lambda item: (-item[1], item[0]))
+    tags: list[str] = []
+    for category, _count in ordered:
+        label = _CATEGORY_AREA_TAG.get(category)
+        if label and label not in tags:
+            tags.append(label)
+    return tags[:3]
+
+
+# ======================================================================
 # 组合入口
 # ======================================================================
 
@@ -915,18 +1085,43 @@ def prefetch(
             future.result()
 
     social: SocialEvidence = outcomes.get("social") or SocialEvidence()
-    places = PlaceCandidates()
-    places_started = _time.perf_counter()
-    if social.evidences:
+
+    # --- E1/E3/E4：动态偏好画像 + 住宿区域 + 候选池（角色 B 产物，contract 2 字段来源）---
+    # 画像只依赖 intent，和"抽取地点"这条最慢的线**并行**跑，因此不为 Discovery 增加墙钟。
+    # 区域与池是从已查好的地点/攻略**聚合**，确定性计算，不再打 Provider。
+    # 失败一律退回均衡基线/空集，绝不影响 Discovery 本身。A 透传（prefetch_json 拆分）时
+    # 必须原样带走 `profile` / `hotel_areas` / `poi_pools` 这三个键。
+    from app.decision.profile import generate_preference_profile
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="tp-disc-profile") as profile_pool:
+        profile_future = profile_pool.submit(generate_preference_profile, intent, llm)
+
+        places = PlaceCandidates()
+        places_started = _time.perf_counter()
+        if social.evidences:
+            try:
+                places = extract_place_candidates(
+                    hub, llm, intent, social.evidences, queries=social.queries, ledger=books
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors["places"] = f"{type(exc).__name__}: {exc}"
+        outcomes["places"] = places
+        started_at["places"] = places_started
+        report("places")
+
         try:
-            places = extract_place_candidates(
-                hub, llm, intent, social.evidences, queries=social.queries, ledger=books
-            )
-        except Exception as exc:  # noqa: BLE001
-            errors["places"] = f"{type(exc).__name__}: {exc}"
-    outcomes["places"] = places
-    started_at["places"] = places_started
-    report("places")
+            profile_obj: PreferenceProfile = profile_future.result()
+        except Exception:  # noqa: BLE001 —— 画像失败不该影响 Discovery
+            profile_obj = PreferenceProfile.default_profile()
+
+    hotel_areas: list[dict[str, Any]] = []
+    poi_pools: dict[str, list[str]] = {key: [] for key in POOL_KEYS}
+    try:
+        hotel_areas = extract_hotel_areas(intent, social.evidences, places.places, profile=profile_obj)
+        poi_pools = split_poi_pools(places.places)
+    except Exception:  # noqa: BLE001 —— 区域/池聚合失败不该让 Discovery 挂掉
+        hotel_areas = []
+        poi_pools = {key: [] for key in POOL_KEYS}
 
     transport: TransportCandidates | None = outcomes.get("transport")
     hotels: HotelCandidates | None = outcomes.get("hotels")
@@ -941,6 +1136,10 @@ def prefetch(
         # 本次 Discovery 的缓存/复用/降级计数（Part C）：写进会话，正式 run 与
         # 管理端因此能回答"Prefetch 阶段省了多少重复查询"。
         "ledger": books.summary(),
+        # 角色 B 的决策产物（contract 2）：画像 / 住宿区域 / 候选池。
+        "profile": profile_obj.model_dump(mode="json"),
+        "hotel_areas": hotel_areas,
+        "poi_pools": poi_pools,
     }
 
 
@@ -1159,6 +1358,8 @@ __all__ = [
     "fetch_hotel_candidates",
     "discover_social_evidence",
     "extract_place_candidates",
+    "extract_hotel_areas",
+    "split_poi_pools",
     "prefetch",
     "extract_places_from_evidences",
     "PREFERENCE_POI_QUERY",

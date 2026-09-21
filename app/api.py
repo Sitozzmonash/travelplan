@@ -615,7 +615,22 @@ def get_planning_session(session_id: str) -> dict[str, Any]:
     session = sessions.get_session(get_store(), session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"没有 session_id={session_id} 的会话")
-    return sessions.session_view(session)
+    view = sessions.session_view(session)
+    return _with_decision_fields(view, session)
+
+
+def _with_decision_fields(view: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
+    """把契约 2 的三个决策字段补到会话视图上（B 的追加，不改 A 的既有字段）。
+
+    用 ``setdefault``：一旦 A 在 `session_view` 里自己透传了这三个键（A3 的职责），
+    这里就自动让位，不会用一份可能为空的副本把 A 的数据盖掉。
+    """
+
+    prefetch = session.get("prefetch") or {}
+    view.setdefault("profile", prefetch.get("profile"))
+    view.setdefault("hotel_areas", prefetch.get("hotel_areas") or [])
+    view.setdefault("poi_pools", prefetch.get("poi_pools") or {})
+    return view
 
 
 @api.patch("/api/v1/planning-sessions/{session_id}")
@@ -625,7 +640,7 @@ def patch_planning_session(session_id: str, request: PatchSessionRequest) -> dic
     )
     if session is None:
         raise HTTPException(status_code=404, detail=f"没有 session_id={session_id} 的会话")
-    return sessions.session_view(session)
+    return _with_decision_fields(sessions.session_view(session), session)
 
 
 @api.delete("/api/v1/planning-sessions/{session_id}")
@@ -787,6 +802,14 @@ def admin_planning_session_detail(session_id: str) -> dict[str, Any]:
             "run_status": (progress or {}).get("status") if progress else (run or {}).get("status"),
             "started_at": (progress or {}).get("started_at") if progress else None,
             "finished_at": (progress or {}).get("finished_at") if progress else None,
+        },
+        # 角色 B 的追加（契约 2）：动态偏好画像 / 住宿区域 / 候选池。字段名与 user 会话视图、
+        # 与 run 的 user_journey 一致，管理端不必区分数据来自哪个入口。
+        # A 的 prefetch_json 透传（A3）就绪后这里即为真实数据；未就绪时为空占位。
+        "decision": {
+            "profile": prefetch.get("profile"),
+            "hotel_areas": prefetch.get("hotel_areas") or [],
+            "poi_pools": prefetch.get("poi_pools") or {},
         },
     }
 
