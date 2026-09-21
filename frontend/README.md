@@ -53,6 +53,10 @@ Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/bui
 `.env.production` 入库就是为了让平台自动构建时天然拿到正确的后端地址；
 EdgeOne 另外在 `edgeone.json` 的 `buildCommand` 里显式注入（因为平台会按过滤规则丢掉 `.env*`）。
 
+管理端 Token（`TRAVELPLAN_ADMIN_TOKEN`）**只放本地 `.env.local`**：配了它，`/admin` 打开就自动填入
+（同源路由 `/admin/default-token` 服务端读出，不进浏览器包）。前端托管平台上一律不要配这个变量——
+那条路由会把它原样返回给调用者；线上没有它时返回空值，管理台照旧手填。
+
 **Vercel 侧的固定配置**（改错会导致 Git 构建失败，因为 Next.js 应用在子目录里）：
 
 - Root Directory = `frontend`

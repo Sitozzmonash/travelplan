@@ -2,9 +2,9 @@
  * 管理台 API 客户端。
  *
  * 与用户端 `lib/api.ts` 分开的原因：
- * 1) 管理接口全部要求 `Authorization: Bearer <token>`，Token 由操作员输入并只存在
+ * 1) 管理接口全部要求 `Authorization: Bearer <token>`，Token 只存在
  *    localStorage（key: travelplan_admin_token）。它**不能**放在 NEXT_PUBLIC_* 环境变量里，
- *    那会被打进浏览器 bundle。
+ *    那会被打进浏览器 bundle；本地想免手输就由服务端路由（见 fetchDefaultAdminToken）下发。
  * 2) 管理台的失败语义更细：401 表示 Token 不对，503 表示服务端根本没配
  *    TRAVELPLAN_ADMIN_TOKEN。这两种必须能区分，否则操作员会去改一个改不对的地方。
  *
@@ -127,6 +127,64 @@ export function getAdminTokenSnapshot(): string | null {
 
 function emitAdminTokenChange(): void {
   for (const listener of tokenListeners) listener();
+}
+
+/* --------------------------- 本地默认 Token --------------------------- */
+
+/**
+ * 默认 Token 的下发端点：同源的 Next 服务端路由，读非 public 的
+ * `TRAVELPLAN_ADMIN_TOKEN`（见 `app/admin/default-token/route.ts`）。
+ *
+ * 刻意不放在 `/api/*` 下：Vercel 上 `/api/*` 常被 rewrite 转发到后端容器，
+ * 那条规则会把这条路由一起吞掉。
+ */
+export const ADMIN_DEFAULT_TOKEN_PATH = "/admin/default-token";
+
+/**
+ * 「不要再自动填入」的标记位。
+ *
+ * 默认 Token 只在「本地没有 Token」时生效，于是操作员点「清除 Token」之后会立刻被
+ * 重新填回来——那个按钮就等于空操作，401 的人也被锁死在同一个错 Token 上。
+ * 所以清除时置位，手动提交新 Token / 主动点「用默认 Token」时复位。
+ */
+export const ADMIN_AUTOFILL_OPT_OUT_KEY = "travelplan_admin_token_manual";
+
+export function isAdminAutofillOptedOut(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.localStorage.getItem(ADMIN_AUTOFILL_OPT_OUT_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function setAdminAutofillOptOut(optedOut: boolean): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (optedOut) window.localStorage.setItem(ADMIN_AUTOFILL_OPT_OUT_KEY, "1");
+    else window.localStorage.removeItem(ADMIN_AUTOFILL_OPT_OUT_KEY);
+  } catch {
+    // 隐私模式下写不进去：退化成「每次都自动填入」，不因为标记位失败而挡住管理台。
+  }
+}
+
+/**
+ * 读取本地默认 Token。
+ *
+ * 拿不到就返回 null —— 线上没配这个变量、静态托管下没有这条路由、请求失败，
+ * 三种情况一律退化成「手填 Token」，绝不因为这条路失败而让管理台打不开。
+ */
+export async function fetchDefaultAdminToken(): Promise<string | null> {
+  try {
+    const response = await fetch(ADMIN_DEFAULT_TOKEN_PATH, { cache: "no-store" });
+    if (!response.ok) return null;
+    const payload: unknown = await response.json();
+    if (!isRecord(payload)) return null;
+    const token = payload.token;
+    return typeof token === "string" && token.trim().length > 0 ? token.trim() : null;
+  } catch {
+    return null;
+  }
 }
 
 /* ------------------------------ 错误模型 ------------------------------ */

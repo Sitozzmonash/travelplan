@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useCallback, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import {
   Activity,
   ArrowLeft,
@@ -33,8 +33,11 @@ import { cn } from "@/lib/utils";
 import {
   ADMIN_API_BASE_URL,
   clearAdminToken,
+  fetchDefaultAdminToken,
   getAdminOverview,
   getAdminTokenSnapshot,
+  isAdminAutofillOptedOut,
+  setAdminAutofillOptOut,
   subscribeAdminToken,
   writeAdminToken,
 } from "@/lib/admin-api";
@@ -52,9 +55,12 @@ import { useAdminResource, useHydrated } from "@/components/admin/use-admin-reso
  * 职责边界：Token 门禁 + 导航 + 全局鉴权失败视图。
  * 具体页面的数据请求各自负责，这样任何一页失败都不会把整个控制台拖死。
  *
- * Token 只存在 localStorage 的 travelplan_admin_token，由操作员手输；
- * 它不参与构建（因此不能放进 NEXT_PUBLIC_*）。读取用 useSyncExternalStore：
- * 服务端快照为 null，浏览器拿到真实值后安全重渲染，不产生 hydration mismatch。
+ * Token 只存在 localStorage 的 travelplan_admin_token。本地开发时它会由
+ * `/admin/default-token`（服务端读非 public 的 TRAVELPLAN_ADMIN_TOKEN）**自动填入**，
+ * 操作员打开 /admin 就等于已经登录；线上前端没有这个变量，端点返回空值，
+ * 门禁照旧要求手输。默认值本身不参与构建（因此不能放进 NEXT_PUBLIC_*）。
+ * 读取用 useSyncExternalStore：服务端快照为 null，浏览器拿到真实值后安全重渲染，
+ * 不产生 hydration mismatch。
  *
  * 另外，外壳会先探测一次 /overview 来确认 Token 是否被接受 —— 401 与 503 必须
  * 在页面级数据之前就分辨出来，否则操作员会看到满屏"这一部分没能加载"而找不到原因。
@@ -103,6 +109,12 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
   const token = useSyncExternalStore(subscribeAdminToken, getAdminTokenSnapshot, () => null);
   const [navOpen, setNavOpen] = useState(false);
   const [tokenInput, setTokenInput] = useState("");
+  /** 服务端下发的默认 Token；null 表示这台部署没配（线上就是这种）。 */
+  const [defaultToken, setDefaultToken] = useState<string | null>(null);
+  /** 默认值是否已经问过一次：没问完之前不渲染门禁表单，避免表单闪一下。 */
+  const [defaultChecked, setDefaultChecked] = useState(false);
+  /** 操作员主动清除过 Token：此时不再自动填回，否则「清除」等于空操作。 */
+  const [autofillOptedOut, setAutofillOptedOut] = useState(false);
 
   const probe = useAdminResource<AdminOverview>(
     "admin-auth-probe",
@@ -110,21 +122,66 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
     Boolean(token),
   );
 
+  // 问一次服务端有没有默认 Token。只在浏览器里跑：服务端渲染时没有这条请求，
+  // 也就不存在「服务端和客户端拿到不同 Token」的 hydration 问题。
+  // 「不再自动填入」的标记位在同一个回调里一起落到 state，因此自动填入那一步
+  // 一定读到的是已经决定好的标记位，不会先把 Token 填回去。
+  useEffect(() => {
+    if (!hydrated) return;
+    let cancelled = false;
+    fetchDefaultAdminToken().then((value) => {
+      if (cancelled) return;
+      setDefaultToken(value);
+      setAutofillOptedOut(isAdminAutofillOptedOut());
+      setDefaultChecked(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [hydrated]);
+
+  // 本地没有 Token 且操作员没拒绝自动填入时，把默认值写进 localStorage，
+  // 之后的每次请求都走 useAdminResource，和手输 Token 完全没有区别。
+  useEffect(() => {
+    if (!hydrated || token || !defaultChecked || autofillOptedOut) return;
+    if (!defaultToken) return;
+    writeAdminToken(defaultToken);
+  }, [hydrated, token, defaultChecked, autofillOptedOut, defaultToken]);
+
   const applyToken = useCallback((next: string) => {
     const trimmed = next.trim();
     if (!trimmed) return;
+    setAdminAutofillOptOut(false);
+    setAutofillOptedOut(false);
     writeAdminToken(trimmed);
     setTokenInput("");
     setNavOpen(false);
   }, []);
 
+  /** 主动启用本地默认 Token：撤销「不再自动填入」，等价于自动登录。 */
+  const handleUseDefaultToken = useCallback(() => {
+    if (!defaultToken) return;
+    setAdminAutofillOptOut(false);
+    setAutofillOptedOut(false);
+    writeAdminToken(defaultToken);
+    setNavOpen(false);
+  }, [defaultToken]);
+
   const handleClearToken = useCallback(() => {
+    // 清除 = 「别再自动填回来」。不置位的话下一次渲染就把默认值写回去了，
+    // 操作员会以为按钮坏了，401 的人也换不成别的 Token。
+    setAdminAutofillOptOut(true);
+    setAutofillOptedOut(true);
     clearAdminToken();
     setTokenInput("");
     setNavOpen(false);
   }, []);
 
-  if (!hydrated) {
+  // 默认值还在路上、或马上要被自动填入时先给骨架：不要先闪一下门禁表单再跳进控制台。
+  const autofillPending =
+    !token && (!defaultChecked || (!autofillOptedOut && defaultToken !== null));
+
+  if (!hydrated || autofillPending) {
     return (
       <div className="mx-auto w-full max-w-[1440px] px-4 py-6 sm:px-6">
         <PageSkeleton rows={4} />
@@ -133,7 +190,15 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
   }
 
   if (!token) {
-    return <TokenGate value={tokenInput} onChange={setTokenInput} onSubmit={applyToken} />;
+    return (
+      <TokenGate
+        value={tokenInput}
+        onChange={setTokenInput}
+        onSubmit={applyToken}
+        defaultToken={defaultToken}
+        onUseDefaultToken={handleUseDefaultToken}
+      />
+    );
   }
 
   // 只有鉴权类失败才接管整屏；其它错误由各页面自己说明，避免在无关页面上叠加杂音。
@@ -261,15 +326,23 @@ function AdminNav({ pathname, onNavigate }: { pathname: string; onNavigate?: () 
  * Token 门禁。
  * 这里把 401 与 503 的差别写清楚：输错 Token 的人会反复重试，
  * 而 503 是他无论怎么输都不可能通过的，必须早点告诉他去找部署者。
+ *
+ * 本地 `.env.local` 配了 `TRAVELPLAN_ADMIN_TOKEN` 时不会走到这里（已自动填入）；
+ * 只有两种情况会看到它：这台部署没配默认值，或者操作员刚点过「清除 Token」。
+ * 后一种情况下把「用本地默认 Token」的入口留在页面上，操作员随时能一键回到免手输。
  */
 function TokenGate({
   value,
   onChange,
   onSubmit,
+  defaultToken,
+  onUseDefaultToken,
 }: {
   value: string;
   onChange: (value: string) => void;
   onSubmit: (value: string) => void;
+  defaultToken: string | null;
+  onUseDefaultToken: () => void;
 }) {
   return (
     <div className="mx-auto flex w-full max-w-xl flex-col gap-5 px-4 py-10 sm:px-6">
@@ -313,6 +386,19 @@ function TokenGate({
           <code className="mx-1 font-mono">Authorization: Bearer &lt;token&gt;</code>
           头发送。它不会进入前端构建产物，也不会上传到任何第三方。
         </p>
+        {defaultToken ? (
+          <p className="text-[11px] leading-4 text-muted-foreground">
+            本机 <code className="font-mono">.env</code> 里有默认 Token，已暂停自动填入。
+            <button
+              type="button"
+              className="mx-1 font-medium text-primary underline-offset-4 hover:underline"
+              onClick={onUseDefaultToken}
+            >
+              使用本地默认 Token
+            </button>
+            （等价于自动登录，下次打开 /admin 不再显示这一页）。
+          </p>
+        ) : null}
         <div className="flex flex-wrap items-center gap-2">
           <Button type="submit" size="sm" disabled={value.trim().length === 0}>
             进入管理台
