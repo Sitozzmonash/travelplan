@@ -4,7 +4,7 @@ import { GuidedWizard } from "@/components/guided/guided-wizard";
 export const metadata: Metadata = {
   title: "逐项选择旅行偏好",
   description:
-    "六步引导式旅行偏好：基础信息、交通、酒店、想去哪里、旅行节奏与确认。每一步都可以「随便 / 帮我选 / 不确定」，选完才开始正式规划。",
+    "三步引导式旅行偏好：基础信息、探索确认（住哪一带 / 想去什么 / 想吃什么）与交通酒店节奏，选完就开始正式规划。",
 };
 
 /**

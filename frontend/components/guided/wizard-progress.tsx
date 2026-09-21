@@ -2,17 +2,19 @@ import { Check } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 /**
- * 向导顶部进度条（§17）：6 步，已完成的步骤可点回去改。
- * 移动端压缩成「第 N 步 / 6 · 标题」，桌面端展开成 6 个可点步骤。
+ * 向导顶部进度条（§17）：3 步，已完成的步骤可点回去改。
+ * 移动端压缩成「第 N 步 / 3 · 标题」，桌面端展开成 3 个可点步骤。
+ *
+ * 为什么从 6 步并成 3 步：交通 / 酒店 / 节奏原来是三页，各自只问一两件事，
+ * 用户要点三次「继续」才走到开始，体感很磨。它们都是"选个偏好"而不是"填信息"，
+ * 合成一页不增加任何新的必填项，只少了两次跳转；末尾独立那页「确认」也去掉了 ——
+ * 右侧摘要卡（桌面）与顶部一行摘要（移动）本来就在实时复述，再让用户确认一遍是多余的。
  */
 
 export const STEP_META = [
-  { key: "basic", title: "基础信息", subtitle: "去哪、几天、几个人" },
-  { key: "transport", title: "交通", subtitle: "怎么去" },
-  { key: "hotel", title: "酒店", subtitle: "住哪一类" },
-  { key: "poi", title: "探索确认", subtitle: "住宿区域、想去的和想吃的" },
-  { key: "pace", title: "旅行节奏", subtitle: "每天怎么玩" },
-  { key: "confirm", title: "确认", subtitle: "开始规划前再看一眼" },
+  { key: "basic", title: "基础信息", subtitle: "去哪、几天、几个人、预算" },
+  { key: "explore", title: "探索确认", subtitle: "住哪一带、想去什么、想吃什么" },
+  { key: "preferences", title: "偏好", subtitle: "交通、酒店、节奏，一页选完" },
 ] as const;
 
 export type StepKey = (typeof STEP_META)[number]["key"];

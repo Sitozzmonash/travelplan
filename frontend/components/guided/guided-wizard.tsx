@@ -6,7 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, CircleAlert, LoaderCircle, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SectionCard } from "@/components/section-card";
-import { ErrorState, InlineWarning } from "@/components/state-views";
+import { ErrorState, InlineWarning, PartialNotice } from "@/components/state-views";
 import {
   API_BASE_URL,
   DISCOVERY_STATUS_LABELS,
@@ -42,12 +42,9 @@ import {
 import { bestValueSelections } from "./options";
 import { STEP_META, WizardProgress } from "./wizard-progress";
 import { StepBasic } from "./step-basic";
-import { StepConfirm } from "./step-confirm";
 import { DiscoveryResearch } from "./discovery-research";
-import { StepHotel } from "./step-hotel";
-import { StepPace } from "./step-pace";
 import { StepPoi } from "./step-poi";
-import { StepTransport } from "./step-transport";
+import { StepPreferences } from "./step-preferences";
 import { SummaryPanel } from "./summary-panel";
 
 /** 轮询间隔与上限：社交源再慢也不该让用户无限等（§17 不能因为 TikHub 慢而卡死）。 */
@@ -100,7 +97,14 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
   const [step, setStep] = useState(0);
   const [draft, setDraft] = useState<GuidedDraft>(() => {
     const empty = createEmptyDraft();
-    return { ...empty, basic: { ...empty.basic, ...initialBasic } };
+    // URL 上没带的参数是空字符串，不能直接 spread —— 那会把默认值（如"今天出发"）覆盖成空。
+    const fromUrl = initialBasic ?? {};
+    const basic = { ...empty.basic };
+    if (fromUrl.origin?.trim()) basic.origin = fromUrl.origin;
+    if (fromUrl.destination?.trim()) basic.destination = fromUrl.destination;
+    if (fromUrl.startDate?.trim()) basic.startDate = fromUrl.startDate;
+    if (fromUrl.days?.trim()) basic.days = fromUrl.days;
+    return { ...empty, basic };
   });
   const [session, setSession] = useState<SessionView | null>(null);
   const [sessionKey, setSessionKey] = useState<string | null>(null);
@@ -122,7 +126,7 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
   const unusable = isSessionUnusable(session);
   const socialFailed = hasSocialDegradation(session?.degradations ?? []);
   const model = summarize(draft, session);
-  const isConfirm = step === STEP_META.length - 1;
+  const isLast = step === STEP_META.length - 1;
   // 后端能力声明：false 时禁用「最低星级」并从 PATCH 里删掉该字段。
   const starFilterAvailable = hotelStarFilterAvailable(session);
   // 「接受换酒店」当前不影响排程（全程只订一家），后端声明不生效时同样置灰 —— 不留假按钮。
@@ -343,9 +347,21 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
       await syncNow(budgetPatch(draft), 1);
       return;
     }
-    if (step >= 1 && step <= 4) {
+    if (step >= 1 && step < STEP_META.length - 1) {
       await syncNow(stepPatch(step, draft), step + 1);
     }
+  }
+
+  /**
+   * 最后一页的「开始规划」：先把这一页改过的偏好写回，再开跑。
+   * 顺序不能反 —— 用户可能在偏好页直接点开始、从没点过「继续」，
+   * 那些交通 / 酒店 / 节奏就还没进过 PATCH。
+   * 写回失败时不静默开跑：`syncNow` 会把 patch 存进 `pendingPatch`，
+   * `handleStart` 随后会重试并在仍失败时明确报错，而不是制造"已确认"的假象。
+   */
+  async function handleFinish(): Promise<void> {
+    await syncNow(stepPatch(step, draft), step);
+    await handleStart();
   }
 
   async function handleStart(): Promise<void> {
@@ -395,7 +411,8 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
 
   function retrySync(): void {
     // 重试时留在当前步骤：偏好没写回去也要让用户能继续，而不是把人卡在这一步。
-    const patch = pendingPatch ?? stepPatch(Math.max(step - 1, 0), draft);
+    // 最后一页没有"上一步的 PATCH"，它自己那页（交通+酒店+节奏）就是要重试的对象。
+    const patch = pendingPatch ?? stepPatch(isLast ? step : Math.max(step - 1, 0), draft);
     void syncNow(patch, step);
   }
 
@@ -404,8 +421,8 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
     setPollNonce((value) => value + 1);
   }
 
-  const discoveryPending = step === 3 && !settled && !unusable;
-  const primaryLabel = isConfirm
+  const discoveryPending = step === 1 && !settled && !unusable;
+  const primaryLabel = isLast
     ? "开始规划"
     : step === 0
       ? creating
@@ -480,13 +497,31 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
               <InlineWarning title="会话报告了一个问题" description={session.error} />
             ) : null}
 
-            {session && step !== 3 ? <DiscoveryResearch session={session} settled={settled} /> : null}
+            {isLast && socialFailed ? (
+              <PartialNotice
+                title="社交攻略缺失，仍然可以继续"
+                description="本次没有拿到小红书 / 抖音内容，正式规划会以高德与网页数据为准。"
+                detail="结果里会标注哪部分信息没有社交来源印证。"
+              />
+            ) : null}
+
+            {startError ? (
+              <ErrorState
+                title="没能开始规划"
+                description={startError}
+                detail={session ? `session_id：${session.session_id}` : undefined}
+                onRetry={() => void handleFinish()}
+                retryLabel="再试一次"
+              />
+            ) : null}
+
+            {session && step !== 1 ? <DiscoveryResearch session={session} settled={settled} /> : null}
           </div>
 
           <SectionCard
             title={STEP_META[step].title}
             description={STEP_META[step].subtitle}
-            action={session ? <SessionStatusChip session={session} poiStep={step === 3} /> : null}
+            action={session ? <SessionStatusChip session={session} poiStep={step === 1} /> : null}
             className="mt-3 shadow-sm"
           >
             {step === 0 ? (
@@ -498,16 +533,7 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
                 busy={creating}
               />
             ) : null}
-            {step === 1 ? <StepTransport draft={draft} onChange={patchTransport} /> : null}
-            {step === 2 ? (
-              <StepHotel
-                draft={draft}
-                onChange={patchHotel}
-                hotelStarFilterAvailable={starFilterAvailable}
-                hotelAllowChangeAvailable={allowChangeAvailable}
-              />
-            ) : null}
-            {step === 3 ? (
+            {step === 1 ? (
               <StepPoi
                 session={session}
                 settled={settled}
@@ -523,16 +549,14 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
                 onRetryDiscovery={retryDiscovery}
               />
             ) : null}
-            {step === 4 ? <StepPace pace={draft.pace} onChange={patchPace} /> : null}
-            {step === 5 ? (
-              <StepConfirm
-                model={model}
-                session={session}
-                settled={settled}
-                socialFailed={socialFailed}
-                unusable={unusable}
-                startError={startError}
-                onRetryStart={() => void handleStart()}
+            {isLast ? (
+              <StepPreferences
+                draft={draft}
+                onTransport={patchTransport}
+                onHotel={patchHotel}
+                onPace={patchPace}
+                hotelStarFilterAvailable={starFilterAvailable}
+                hotelAllowChangeAvailable={allowChangeAvailable}
               />
             ) : null}
           </SectionCard>
@@ -548,12 +572,9 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
                 size="lg"
                 className="h-11 sm:h-9"
                 disabled={busy}
-                onClick={() => {
-                  if (isConfirm) setStep(0);
-                  else setStep((current) => Math.max(current - 1, 0));
-                }}
+                onClick={() => setStep((current) => Math.max(current - 1, 0))}
               >
-                {isConfirm ? "返回修改" : "上一步"}
+                上一步
               </Button>
             )}
 
@@ -562,7 +583,7 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
               className="h-11 min-w-[150px] sm:h-9 sm:min-w-[120px]"
               disabled={busy || (unusable && step > 0)}
               onClick={() => {
-                if (isConfirm) void handleStart();
+                if (isLast) void handleFinish();
                 else void handleContinue();
               }}
             >

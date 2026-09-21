@@ -359,7 +359,14 @@ def run_discovery(
             bundle = _bundle_from(session_id, intent, result, hub)
             # 缓存落库只是加速层，失败不能把一次 live Discovery 变成失败。
             try:
-                city_cache.write_candidates(destination, bundle.places, bundle.evidences, store=store)
+                city_cache.write_candidates(
+                    destination,
+                    bundle.places,
+                    bundle.evidences,
+                    store=store,
+                    social_queries=bundle.social_queries,
+                    social_served_queries=bundle.social_served_queries,
+                )
             except Exception:  # noqa: BLE001
                 bundle.degradations.append("城市缓存写入失败，本次仍使用实时结果")
             bundle.city_cache = {"source": "live", "updated_at": _now().isoformat(), "stale": False}
@@ -452,7 +459,14 @@ def _prefetch_with_city_cache(
     except Exception as exc:  # noqa: BLE001
         hotels = SimpleNamespace(items=[], degradations=[str(exc)])
         errors["hotels"] = f"{type(exc).__name__}: {exc}"
-    social = SimpleNamespace(evidences=[], queries=[], served_queries=[], degradations=[])
+    social = SimpleNamespace(
+        # 攻略正文与检索词也来自城市知识库：没有这两样，正式 run 会把社媒检索与
+        # 模型抽取全价重付一遍（这是"命中缓存却还是慢"的根因）。
+        evidences=list(cached.evidences),
+        queries=list(cached.social_queries),
+        served_queries=list(cached.social_served_queries),
+        degradations=[],
+    )
     places = SimpleNamespace(places=cached.places, degradations=[])
     elapsed = round((_now() - started).total_seconds() * 1000)
     stages = {
@@ -460,8 +474,9 @@ def _prefetch_with_city_cache(
         "hotels": _cached_stage(hotels, "items", errors.get("hotels"), elapsed),
         "social": {
             "status": "STALE_CACHE" if cached.stale else "CACHE",
-            "result_count": len(cached.mentions), "duration_ms": 0, "degraded": cached.stale,
+            "result_count": len(cached.evidences), "duration_ms": 0, "degraded": cached.stale,
             "error": None, "updated_at": cached.updated_at,
+            "mention_count": len(cached.mentions),
         },
         "places": {
             "status": "STALE_CACHE" if cached.stale else "CACHE",
@@ -473,7 +488,13 @@ def _prefetch_with_city_cache(
               "errors": errors, "stages": stages, "ledger": {"city_cache_hits": 1}}
     bundle = _bundle_from(session_id, intent, result, hub)
     bundle.city_cache = {
-        "source": "city_cache", "updated_at": cached.updated_at, "stale": cached.stale,
+        "source": "city_cache",
+        "updated_at": cached.updated_at,
+        "stale": cached.stale,
+        # 让会话视图能如实说"攻略正文也来自缓存，N 条、M 条检索词"。
+        "evidences": len(cached.evidences),
+        "mentions": len(cached.mentions),
+        "social_queries": len(cached.social_queries),
     }
     if cached.stale:
         bundle.degradations.append("城市攻略缓存已过期，已在后台刷新；当前先展示最近可用结果")
@@ -489,12 +510,21 @@ def _cached_stage(value: Any, count_attr: str, error: str | None, elapsed: int) 
     }
 
 
-def refresh_city_cache(store: TravelPlanStore, city: str) -> None:
-    """只刷新可复用的城市攻略/POI；没有出发地和日期时机酒函数会自然跳过。"""
+def refresh_city_cache(store: TravelPlanStore, city: str) -> dict[str, Any]:
+    """只刷新可复用的城市攻略/POI；没有出发地和日期时机酒函数会自然跳过。
+
+    返回一份摘要，供调用方（预热的 `scripts/preheat_cities.py`）如实报告。预热是把结果
+    写进**所有人共用**的库，所以"这次其实是降级的"必须能被看见 —— 典型情形是社媒全部
+    限流、只剩网页搜索，这时缓存里一条小红书/抖音证据都没有。打一行"完成"却不知道这件事，
+    等于让一份降级数据静静躺满一个 TTL，后续所有会话都吃它。
+    """
 
     normalized = city_cache.normalize_city(city)
     if not normalized:
-        return
+        return {
+            "city": city, "places": 0, "evidences": 0, "social_evidences": 0,
+            "queries": 0, "notes": [], "degradations": ["城市名为空"],
+        }
     from app.llm import LLM
     from app.providers import ProviderHub, default_mcp_servers
 
@@ -507,12 +537,45 @@ def refresh_city_cache(store: TravelPlanStore, city: str) -> None:
             hotel_pages=1, workers=max(1, config.discovery_workers),
         )
         bundle = _bundle_from(f"city-cache:{normalized}", intent, result, hub)
-        city_cache.write_candidates(normalized, bundle.places, bundle.evidences, store=store)
+        written = city_cache.write_candidates(
+            normalized,
+            bundle.places,
+            bundle.evidences,
+            store=store,
+            social_queries=bundle.social_queries,
+            social_served_queries=bundle.social_served_queries,
+        )
     finally:
         try:
             hub.close()
         except Exception:  # noqa: BLE001
             pass
+
+    social = result.get("social")
+    evidences = list(getattr(social, "evidences", []) or [])
+    return {
+        "city": normalized,
+        "places": written,
+        "evidences": len(evidences),
+        "social_evidences": sum(1 for item in evidences if is_social_evidence(item)),
+        "queries": len(list(getattr(social, "queries", []) or [])),
+        # `notes` 里记着"小红书「X」：调用失败（已按无结果处理）"这类事实。它们不进
+        # `degradations`，但正是解释"为什么一条社媒证据都没有"的关键，所以要带出来。
+        "notes": list(getattr(social, "notes", []) or [])[:5],
+        "degradations": list(bundle.degradations),
+    }
+
+
+def is_social_evidence(evidence: Any) -> bool:
+    """是不是社媒（小红书 / 抖音）证据。
+
+    判据与 `providers._evidences_from_social` 的写法对齐：它固定写 `source_type="social"`。
+    再容忍一次 provider 名，避免以后换了来源写法这里静默判错。
+    """
+
+    kind = str(getattr(evidence, "source_type", "") or "").lower()
+    provider = str(getattr(evidence, "provider", "") or "").lower()
+    return kind == "social" or provider in {"tikhub", "mediacrawler"}
 
 
 def _record_provider_calls(store: TravelPlanStore, calls: Sequence[Mapping[str, Any]], *, session_id: str) -> int:
@@ -713,6 +776,8 @@ def session_view(session: Mapping[str, Any]) -> dict[str, Any]:
         # 缓存命中时展示的是源数据时间，不用会话 PATCH 的时间冒充"数据刚更新"。
         "updated_at": freshness.get("updated_at") or session.get("updated_at"),
         "source": freshness.get("source"),
+        # 城市知识库的新鲜度明细（含复用了多少条攻略正文 / 提及 / 检索词）。
+        "city_cache": freshness or None,
         "expires_at": session.get("expires_at"),
         "run_id": session.get("run_id"),
         "error": session.get("error"),

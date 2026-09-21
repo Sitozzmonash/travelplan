@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 # 方言差异（占位符 / INSERT OR REPLACE / PRAGMA / 连接池）**全部**在 app/db.py 里，
 # 本模块的方法体继续只写 SQLite 原生 SQL —— 想看"两种库差在哪"，只需要读 app/db.py。
@@ -400,8 +400,41 @@ CREATE TABLE IF NOT EXISTS city_poi_mentions (
     PRIMARY KEY(city, source_url, raw_name)
 );
 
+-- 跨会话复用的**攻略正文**。
+-- 与 city_poi_mentions 的分工：后者是"某篇攻略提到了某个地点"的索引（供 trust/ad_risk
+-- 重算），这里是正文本身，让第二个去同一座城市的会话不必把社媒与模型抽取全价重付一遍。
+-- 主键用 ``evidence_key``（内容键 = source_url/title 的哈希）而不是 run 级 ``evidence_id``：
+-- 后者的形状是 ``{source_id}-e{n}``、内嵌 session_id，跨会话必然不同，用它做城市级键
+-- 会为同一篇文章反复累积新行。
+CREATE TABLE IF NOT EXISTS city_evidences (
+    city TEXT NOT NULL,
+    evidence_key TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    provider TEXT,
+    source_url TEXT,
+    title TEXT,
+    author TEXT,
+    published_at TEXT,
+    fetched_at TEXT,
+    text TEXT NOT NULL DEFAULT '',
+    place_mentions_json TEXT NOT NULL DEFAULT '[]',
+    specific_dishes_json TEXT NOT NULL DEFAULT '[]',
+    raw_metrics_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(city, evidence_key)
+);
+
+-- 城市级的检索词计划：复用它可以连 query_expansion 那次模型调用一起省掉。
+CREATE TABLE IF NOT EXISTS city_cache_meta (
+    city TEXT PRIMARY KEY,
+    social_queries_json TEXT NOT NULL DEFAULT '[]',
+    social_served_queries_json TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_city_pois_updated ON city_pois(city, updated_at);
 CREATE INDEX IF NOT EXISTS idx_city_poi_mentions_updated ON city_poi_mentions(city, place_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_city_evidences_updated ON city_evidences(city, updated_at);
 
 -- Provider 调用账本（观测用）。
 -- 与 sources 的分工：sources 是"这次 run 用了什么证据"；provider_calls 是"谁在什么时候
@@ -1011,6 +1044,119 @@ class TravelPlanStore:
                 "SELECT * FROM city_poi_mentions WHERE city=? ORDER BY updated_at DESC, raw_name", (city,)
             ).fetchall()
         return [dict(row) for row in pois], [dict(row) for row in mentions]
+
+    def upsert_city_evidences(self, city: str, rows: Iterable[dict[str, Any]]) -> int:
+        """写入城市攻略正文；同一篇（city, evidence_key）保留最新一次抓取。"""
+
+        values = [
+            (
+                city,
+                str(row["evidence_key"]),
+                str(row.get("source_type") or "social"),
+                row.get("provider"),
+                row.get("source_url"),
+                row.get("title"),
+                row.get("author"),
+                row.get("published_at"),
+                row.get("fetched_at"),
+                str(row.get("text") or ""),
+                _json(row.get("place_mentions") or []),
+                _json(row.get("specific_dishes") or []),
+                _json(row.get("raw_metrics") or {}),
+                row.get("updated_at") or utcnow().isoformat(),
+            )
+            for row in rows if row.get("evidence_key")
+        ]
+        if not values:
+            return 0
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO city_evidences"
+                " (city, evidence_key, source_type, provider, source_url, title, author,"
+                "  published_at, fetched_at, text, place_mentions_json, specific_dishes_json,"
+                "  raw_metrics_json, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(city, evidence_key) DO UPDATE SET"
+                " source_type=excluded.source_type, provider=excluded.provider,"
+                " source_url=excluded.source_url, title=excluded.title, author=excluded.author,"
+                " published_at=excluded.published_at, fetched_at=excluded.fetched_at,"
+                " text=excluded.text, place_mentions_json=excluded.place_mentions_json,"
+                " specific_dishes_json=excluded.specific_dishes_json,"
+                " raw_metrics_json=excluded.raw_metrics_json, updated_at=excluded.updated_at"
+                " WHERE excluded.updated_at >= city_evidences.updated_at",
+                values,
+            )
+        return len(values)
+
+    def get_city_evidence_rows(self, city: str) -> list[dict[str, Any]]:
+        """读取单个城市的攻略正文行（时间有效性由 city_cache 统一判断）。"""
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM city_evidences WHERE city=? ORDER BY updated_at DESC, evidence_key",
+                (city,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_city_cache_meta(
+        self,
+        city: str,
+        *,
+        social_queries: Sequence[str] = (),
+        social_served_queries: Sequence[str] = (),
+        updated_at: str | None = None,
+    ) -> None:
+        """记录该城市的检索词计划与真正搜过的检索词。"""
+
+        timestamp = updated_at or utcnow().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO city_cache_meta"
+                " (city, social_queries_json, social_served_queries_json, updated_at)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(city) DO UPDATE SET"
+                " social_queries_json=excluded.social_queries_json,"
+                " social_served_queries_json=excluded.social_served_queries_json,"
+                " updated_at=excluded.updated_at"
+                " WHERE excluded.updated_at >= city_cache_meta.updated_at",
+                (
+                    city,
+                    _json(list(social_queries)),
+                    _json(list(social_served_queries)),
+                    timestamp,
+                ),
+            )
+
+    def get_city_cache_meta(self, city: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM city_cache_meta WHERE city=?", (city,)
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def prune_city_cache(self, city: str, *, guide_before: str, poi_before: str) -> int:
+        """清掉该城市已经超过各自 TTL 的行，返回删除行数。
+
+        WHY 必须清：`city_cache` 的新鲜度口径是"**所有**行都在 TTL 内才算新鲜"
+        （最旧一条决定整座城市的年龄）。只增不删的话，一条再也搜不到的旧攻略会让
+        这座城市**永远 stale**，于是每个新会话都触发一次后台全量刷新 —— TTL 名存实亡。
+        删的是各自 TTL 之外的行，所以"用旧数据兜底再后台刷新"的语义不受影响。
+
+        `guide_before` / `poi_before` 是 ISO 时间戳阈值，由 city_cache 按 TTL 算好传入。
+        """
+
+        removed = 0
+        with self._connect() as conn:
+            for table, column, threshold in (
+                ("city_evidences", "updated_at", guide_before),
+                ("city_poi_mentions", "updated_at", guide_before),
+                ("city_pois", "updated_at", poi_before),
+            ):
+                cursor = conn.execute(
+                    f"DELETE FROM {table} WHERE city=? AND {column} < ?", (city, threshold)
+                )
+                removed += int(cursor.rowcount or 0)
+        return removed
 
     # ------------------------------------------------------------------
     # decision

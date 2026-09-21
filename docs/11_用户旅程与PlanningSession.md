@@ -1,6 +1,6 @@
 # 11 用户旅程与 Planning Session
 
-一句话：说明"引导式（Guided）"这条新入口怎么从六步向导走到一次正式 run，以及 Planning Session 的状态、Prefetch、结构化偏好与 MUST/WANT/REJECT 到底改变了什么。
+一句话：说明"引导式（Guided）"这条新入口怎么从三步向导走到一次正式 run，以及 Planning Session 的状态、Prefetch、结构化偏好与 MUST/WANT/REJECT 到底改变了什么。
 
 代码位置：`app/sessions.py`（会话）、`app/discovery.py`（取数）、`app/selection.py`（用户选择层）、`app/workflow.py`（节点消费）、`app/api.py`（HTTP）。
 
@@ -8,33 +8,34 @@
 
 ```text
 Quick（保留）   一句话自然语言 → parse_intent（模型/规则） → 12 步 Workflow
-Guided（新增）   六步向导 → Planning Session → 确认 → 12 步 Workflow（复用已查候选）
+Guided（新增）   三步向导 → Planning Session → 12 步 Workflow（复用已查候选）
 ```
 
 两条入口最终都汇聚到 `app/workflow.py:execute_travel_run`，**没有第二套 Planner**。Guided 由 `app/sessions.py:start_run` 直接调用 `execute_travel_run(intent=..., prefetch=..., source="guided", source_session_id=...)`；Quick 由 `app/agent.py:run_travel` 调用（不传 `intent`/`prefetch`，走原逻辑）。
 
 分开的是"规划前的准备"，不是规划算法本身。
 
-## 2. 六步向导 → 确认 → 正式 run
+## 2. 三步向导 → 正式 run
 
 ```text
-Step 1 基础信息  origin / destination / start_date / days / travelers / budget(可选)
-Step 2 交通      交通方式 + 排序优先级 + 附加约束
-Step 3 酒店      酒店优先级（+ 价格/评分/房型/可换酒店，均为可选）
-Step 4 想去哪里  攻略抽取出的 POI → 必去 / 想去 / 不感兴趣 / 不管
-Step 5 旅行节奏  轻松 / 正常 / 多玩一些 / 帮我安排
-Step 6 确认      偏好摘要 → 「开始规划」
+Step 1 基础信息  出发地 / 目的地 / 出发日期（默认今天）/ 天数 / 人数 / 预算(可选)
+Step 2 探索确认  推荐住宿区域 + 攻略抽取出的地点与美食 → 必去 / 想去 / 不感兴趣 / 不管
+Step 3 偏好      交通 + 酒店 + 节奏在同一页选完 → 「开始规划」
 ```
+
+向导从 6 步并到 3 步（`frontend/components/guided/wizard-progress.tsx` 的 `STEP_META`）：交通 / 酒店 / 节奏原来各占一页，每页只问一两件事，用户要点三次「继续」才走到开始；它们都是"选个偏好"而不是"填信息"，合成一页不增加任何必填项。原来的 Step 6「确认」页也去掉了 —— 桌面端右侧摘要卡与移动端顶部一行摘要本来就在实时复述，再让用户确认一遍是多余的。
 
 后端时序与 HTTP 的对应：
 
 ```text
-Step 1 「继续」 → POST /api/v1/planning-sessions        （建会话 + 后台立刻 Prefetch）
-Step 2/3/4/5     → PATCH /api/v1/planning-sessions/{id} （改偏好/POI，只重排序、不重取数）
-Step 6 「开始规划」→ POST /api/v1/planning-sessions/{id}/start （创建正式 run_id）
+Step 1 「继续」  → POST /api/v1/planning-sessions                （建会话 + 后台立刻 Prefetch）
+Step 2 「继续」  → PATCH /api/v1/planning-sessions/{id}          （写 POI 选择）
+Step 3 「开始规划」→ PATCH .../{id} 之后 POST .../{id}/start      （先把这一页改过的偏好写回，再创建正式 run_id）
 ```
 
-基础信息一确认就立刻在后台 Prefetch，而不是等用户把后面全选完 —— 用户在 Step 2~5 点选的几十秒里，交通/酒店/攻略已经在查了。
+Step 3 的顺序不能反：用户可能在这一页直接点「开始规划」、从没点过「继续」，那些交通 / 酒店 / 节奏就还没进过 PATCH。写回失败时不会静默开跑 —— 前端会重试并在仍失败时明确报错。
+
+基础信息一确认就立刻在后台 Prefetch，而不是等用户把后面全选完 —— 用户在 Step 2~3 点选的这段时间里，交通 / 酒店 / 攻略已经在查了。如果这座城市**预热过**（见 [15_城市知识库攻略正文复用.md](15_城市知识库攻略正文复用.md) §9），攻略那条线（Discovery 最贵的一段）直接命中城市知识库，只剩机酒火走实时查询。
 
 ## 3. Session 状态机与 TTL
 
@@ -57,7 +58,7 @@ COLLECTING ──► DISCOVERING ──► READY ──► STARTING ──►（
 
 - TTL = `max(5, PLANNING_SESSION_TTL_MINUTES)` 分钟，默认 **45**（`app/config.py`）。
 - **过期判定不依赖后台定时任务**：每次读会话（`sessions.get_session`）顺手调用 `store.expire_planning_sessions(now=...)`，把 `expires_at < now` 且非 CANCELLED/STARTING 的会话标成 `EXPIRED`。
-- 过期会话**不删除**：管理端仍要能看到"这个用户开了会话但没走到规划"。旧 Discovery 结果不再复用（避免用陈旧价格排行程）。
+- 过期会话**不删除**：管理端仍要能看到"这个用户开了会话但没走到规划"。`prefetch_json` 里的机酒候选不再复用（避免用陈旧价格排行程）；但**跨会话的「城市知识库」不受会话过期影响**——`city_pois` / `city_poi_mentions` / `city_evidences` / `city_cache_meta` 有自己独立的 TTL（攻略 7 天 / POI 15 天），见 [13_数据流与复用机制.md](13_数据流与复用机制.md) §2.1。
 
 Discovery 自己还有一个状态（`session["discovery_status"]`）：`PENDING / RUNNING / READY / PARTIAL / FAILED`。`PARTIAL` 表示四条取数线里有降级或报错，但用户仍可继续。
 
@@ -71,15 +72,26 @@ Discovery 自己还有一个状态（`session["discovery_status"]`）：`PENDING
 | `fetch_hotel_candidates(hub, intent, pages=...)` | 酒店候选；`pages>1` 翻多页扩大候选池 |
 | `discover_social_evidence(hub, llm, intent)` | 攻略证据：小红书 → 抖音（小红书空时）→ 网页 |
 | `extract_place_candidates(hub, llm, intent, evidences, ...)` | 攻略地名 + 关键词 → 高德 POI 候选（含去重） |
-| `prefetch(hub, llm, intent, *, hotel_pages, workers)` | 四条线并行取数，返回原始结果 + 逐阶段状态 |
+| `prefetch(hub, llm, intent, *, hotel_pages, workers)` | 取数入口：`transport / hotels / social` 三线并行，随后串行做 `places`；返回原始结果 + 逐阶段状态 |
 
 `prefetch` 用 `ThreadPoolExecutor(max_workers=discovery_workers)` 并行跑 `transport / hotels / social`，随后串行做 `places`（地点抽取依赖攻略结果）。每条线单独计时，返回**逐阶段**状态：
 
 ```text
 stages[stage] = {status, started_at, finished_at, duration_ms, result_count, degraded, error}
 stage ∈ {transport, hotels, social, places}
-status ∈ {OK, EMPTY, FAILED}     # 单条线崩溃只记 FAILED + error，不带走整个 Discovery
+
+# 实时取数（discovery.prefetch）
+status ∈ {RUNNING, OK, EMPTY, FAILED}   # 单条线崩溃只记 FAILED + error，不带走整个 Discovery
+# 城市知识库命中（sessions._prefetch_with_city_cache，此时根本不调 discovery.prefetch）
+status ∈ {CACHE, STALE_CACHE}           # 这两个阶段没有 started_at/finished_at，多一个 updated_at
 ```
+
+`discovery.prefetch` 只覆盖"实时取数"这一路。**命中城市知识库时它整个不被调用**：
+攻略正文、攻略提及、POI 与检索词分别来自 `city_evidences` / `city_poi_mentions` /
+`city_pois` / `city_cache_meta`，当中只有交通与酒店照旧现查
+（见 [13](13_数据流与复用机制.md) §2.1）。复用的正文会在跑图前被
+`workflow._materialize_city_evidence` 换成本次 run 自己的 `sources` / `evidence` 行
+（`sources.status = CACHED`），所以证据链不会因为"来自上一次会话"而断掉。
 
 一条线失败只让 `discovery_status=PARTIAL`，**绝不让用户卡在加载页**：社交/酒店/交通任一失败，POI 页仍可用。
 
@@ -99,17 +111,26 @@ Prefetch 结果通过 `discovery.PrefetchBundle` 在"会话 JSON ↔ 类型化�
 | `hotel_priority` | `value / location / rating / comfort / transit / auto` | 性价比优先 / 位置优先 / 评分优先 / 舒适优先 / 交通方便 / 帮我选 |
 | `pace` | `relaxed / balanced / packed / auto` | 轻松一点 / 正常 / 多玩一些 / 帮我安排 |
 
-`auto` 是**确定性推导**，不是随机（以下是 `app/selection.py` 里定义的规则；其中交通/酒店两条当前未接入正式打分，见本节末尾的诚实说明）：
+`auto` 是**确定性推导**，不是随机（规则定义在 `app/selection.py`；三条 `auto` 规则与结构化策略都已接入正式打分）：
 
 - **pace auto**（`selection.resolve_pace`，guided 的 `node_parse_intent` 会调用 `resolve_pace_with_reason` 并写进决策链）：按"候选数 / 可玩天数"的密度判定 —— `per_day ≤ 3.0` → `relaxed`，`per_day ≥ 4.5` → `packed`，否则 `balanced`；首/末日可用时间少时按 1.15 倍折算（阈值来自 `PlannerTuning.pace_auto_*`）。**这条已生效**。
 - **交通 auto/any**：使用 `PlannerTuning` 的一组基础权重（价格/门到门时长/舒适/偏好各为 1.0），固定规则是"日期正确 → 不明显浪费首末日 → 综合门到门时间与价格 → 再看舒适度"。
 - **酒店 auto**：基础权重为"位置/交通不能明显差 + 评分达到合理水平 + 再综合价格"。
 
-> **诚实说明（代码与任务书不一致的地方）**：`app/selection.py` 里的 `transport_weights()` / `hotel_weights()`（把策略映射成一组权重）目前**没有任何调用点**。正式 run 的选车/选酒店实际走 `app/workflow.py:_transport_score` / `_hotel_score`，它们用的是 `workflow.py` 顶部的固定常量（`TRANSPORT_PRICE_WEIGHT`、`HOTEL_PRICE_UNIT` 等）与 `intent.transport_preferences` / `intent.hotel_preferences`（自然语言偏好），**并没有按结构化策略重新加权**。因此交通方式/优先级/附加约束、酒店优先级这些按钮当前只被**记录并展示**，尚未真正改变最终选中的车次/酒店。真正会改变 Planner 结果的是：`pace auto`（guided）、以及 `MUST/WANT/REJECT`（见下节）。此外 `transport_weights()` 的 `no_early` 分支引用了不存在的 `PlannerTuning.transport_early_departure_penalty`（应为 `transport_early_penalty`）；因为该函数当前无人调用，这个错误不会在运行时触发。
+> **这些按钮确实生效**：`selection.transport_weights()` / `hotel_weights()` 是**真正的消费点**
+> ——`workflow._transport_score` 与 `workflow._hotel_score` 都调用它们（`app/workflow.py:1196`、
+> `:1368`，`hotel_weights` 的标签还用于 `:1462` 的策略说明），权重来自 `app/config.py` 的
+> `PlannerTuning`（`transport_price_weight` / `hotel_rating_weight` 等，可用 `TP_*` 环境变量覆盖；
+> 其中 10 个 `TP_*` 键在 `EDITABLE_KEYS` 里，可由管理端运行时改）。
+> 也就是说**交通方式 / 排序优先级 / 附加约束（少换乘、不要太早、不要红眼）与酒店优先级都会改变
+> 最终选中的车次与酒店**，不只是被记录。
+>
+> 此外用户补充的酒店条件在 `selection.hotel_candidates_for()` 里是**硬过滤**（价格上限 / 评分下限 /
+> 房型关键词），过滤后为空时回落原列表并说明原因（住宿是行程必需项，不能交白卷）。
 
 ## 6. MUST / WANT / REJECT 的执行语义
 
-用户在 Step 4 对每个 POI 的选择，最终变成 `intent.place_selections`（`place_id → MUST/WANT/REJECT`）。`app/selection.py:apply_user_place_preferences` 把它作用到候选集合：
+用户在 Step 2 对每个 POI 的选择，最终变成 `intent.place_selections`（`place_id → MUST/WANT/REJECT`）。`app/selection.py:apply_user_place_preferences` 把它作用到候选集合：
 
 ```text
 REJECT   硬排除 —— 直接移出候选，绝不进入最终行程（DecisionStatus.REJECT，reason_codes=[USER_REJECT, HARD_EXCLUDE]）
@@ -142,7 +163,7 @@ Jev 不能覆盖用户硬选择：REJECT 的点在 Jev 之前就已被移出候�
 6. 会话转 `STARTING`，追加 `session_confirmed` 与 `run_started` 事件；
 7. 后台线程执行 `_start_job` → `execute_travel_run(...)`，把 `intent` / `prefetch` / `source` / `source_session_id` 一起交给同一个 12 步流程。
 
-`store.create_run` 的 `source` / `source_session_id` 落在 `runs` 表，管理端据此从 Run 反查 Session。**注意**：`source="guided"` 只有这一条路径会写；Quick（Web `/plans`）与 CLI、Benchmark 目前都落在默认值 `"quick"`（`cli` / `benchmark` 是代码里预留但未被任何调用点写入的取值，详见 [12_Provider健康与观测.md](12_Provider健康与观测.md) 的说明）。
+`store.create_run` 的 `source` / `source_session_id` 落在 `runs` 表，管理端据此从 Run 反查 Session。`runs.source` 现有四个真实取值：`guided`（本路径）、`cli`（`main.py:70`）、`benchmark`（`benchmark/runner.py:120`）与默认的 `quick`（Quick Web `/plans`）。管理端的 Benchmark 过滤（`include_benchmark=false`）就是按 `runs.source <> 'benchmark'` 生效的，详见 [12_Provider健康与观测.md](12_Provider健康与观测.md)。
 
 ## 8. 为什么"改基础信息必须重建会话"
 
@@ -150,8 +171,8 @@ Jev 不能覆盖用户硬选择：REJECT 的点在 Jev 之前就已被移出候�
 
 ```text
 transport_mode / transport_priority / transport_constraints / hotel_priority /
-hotel_max_price_per_night / hotel_min_rating / hotel_room_type / hotel_allow_change /
-pace / budget_total / poi_selections
+hotel_max_price_per_night / hotel_min_rating / hotel_min_star / hotel_room_type /
+hotel_allow_change / pace / budget_total / poi_selections
 ```
 
 原因：基础信息决定 Discovery 的查询口径（查哪个城市的交通/酒店/攻略/POI）。若允许在 PATCH 里把目的地从成都改成重庆，而不重跑 Discovery，就会**拿着成都的攻略去排重庆的行程**。所以前端要改基础信息必须重新 `POST` 一个会话，由新会话重新 Prefetch。
@@ -165,17 +186,18 @@ pace / budget_total / poi_selections
 ```text
 session_created
 discovery_queued                                  # 已提交后台 Discovery
-transport_prefetch_started / hotel_prefetch_started / social_discovery_started
+transport_prefetch_started / hotel_prefetch_started /
+social_discovery_started / place_extraction_started   # 四条线一次性写入（含 places）
 transport_prefetch_finished / hotel_prefetch_finished /
 social_discovery_finished / place_extraction_finished
 discovery_finished                                # 汇总（候选数 + 总耗时）
 discovery_failed                                  # Discovery 整体异常
+discovery_grace_waited                            # 等 Discovery 的 grace period 结束
 user_preferences_updated                          # PATCH 改过哪些键
 session_confirmed / run_started                   # start_run
 session_cancelled                                 # DELETE
+session_expired                                   # 读会话时触发过期判定所补写
 ```
-
-> **诚实说明**：任务书列出的事件里，`session_expired` 与 `place_extraction_started` **当前不会产生** —— 过期只改状态不加事件（`store.expire_planning_sessions`）；四个阶段（transport/hotels/social/places）里只有 transport/hotels/social 有 `<stage>_started`（且是在 Prefetch 开始前一次性写入，因为这三条线并行），`places` 只有 `place_extraction_finished`，没有 started。
 
 ## 10. Session API
 
@@ -184,20 +206,34 @@ session_cancelled                                 # DELETE
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/v1/planning-sessions` | 建会话并后台 Prefetch（202）；`origin`/`destination` 必填 |
-| GET | `/api/v1/planning-sessions/{id}` | `session_view`：basic_intent / preferences(+labels) / poi_selections / 交通·酒店·POI 候选 / evidence_summary / degradations / events / capabilities |
+| GET | `/api/v1/planning-sessions/{id}` | `session_view`：basic_intent / source / preferences(+labels) / poi_selections / 交通·酒店·POI 候选(**按 `poi_pools` 分池 + `place_categories`**) / 推荐住宿区域 `hotel_areas` / 动态偏好 `profile` / evidence_summary / 逐阶段 discovery / degradations / events / capabilities |
 | PATCH | `/api/v1/planning-sessions/{id}` | 改偏好与 POI（白名单字段） |
 | DELETE | `/api/v1/planning-sessions/{id}` | 用户主动取消 → `CANCELLED` |
 | POST | `/api/v1/planning-sessions/{id}/start` | 创建正式 run（202）；取消/过期 → 409 |
+| GET | `/api/v1/city-cache/{city}` | 只读目的地级「城市知识库」（攻略提及 + 高德 POI；带 `updated_at` / `source` / `stale`） |
 
-`session_view` 的 `capabilities` 当前为 `{"hotel_star_filter": false, "hotel_max_price_filter": true}`。管理端只读接口见 [05_Trace与可观测性.md](05_Trace与可观测性.md)。
+`session_view` 的 `capabilities` 当前是 6 个键：
+
+```jsonc
+{
+  "hotel_star_filter": false,        // 数据源不返回星级，星级筛选只记录不排序
+  "hotel_star_note": "...",
+  "hotel_max_price_filter": true,    // 每晚价格上限：硬过滤
+  "hotel_rating_filter": true,       // 评分下限：硬过滤
+  "hotel_allow_change": false,       // 全程只订一家酒店，中途换酒店未支持
+  "hotel_allow_change_note": "..."
+}
+```
+
+`updated_at` 在城市知识库命中时取自**缓存新鲜度**（不是会话的更新时间），前端据此渲染「地点信息来自 X 天前整理的攻略库」。管理端只读接口见 [05_Trace与可观测性.md](05_Trace与可观测性.md)。
 
 ## 11. 已知边界（诚实说明）
 
-- **酒店星级**：后端没有星级字段（途牛不返回），`capabilities.hotel_star_filter=false`；`hotel_min_rating` 虽可写入会话与 `TripIntent`，但排程里没有可用数据去过滤。
-- **`hotel_allow_change`**：已记录并进入 `TripIntent`，但当前产品全程只选一家酒店（`_select_hotel` 返回单个 selected），该字段暂不影响排程。
-- **酒店价格/评分/房型过滤**：`hotel_max_price_per_night` / `hotel_room_type` 会被记录，但 `_hotel_score` 目前不消费它们。
-- **交通/酒店策略权重未接入**：见第 5 节的诚实说明。
-- **Bad Case 类别 `discovery_stale` / `guided_intent_mismatch`**：只定义了类别，当前**没有任何规则产出**（见 [06_BadCase机制.md](06_BadCase机制.md)）。
+- **酒店星级**：后端没有星级字段（途牛不返回），`capabilities.hotel_star_filter=false`；`hotel_min_star` 会记录进会话与 `TripIntent`，但不参与过滤或排序。品质/预算请用「评分下限」与「每晚价格上限」表达（这两个是**真生效的硬过滤**）。
+- **`hotel_allow_change`**：已记录并进入 `TripIntent`，但当前产品全程只选一家酒店（`_select_hotel` 返回单个 selected），该字段不影响排程（`capabilities.hotel_allow_change=false` 如实置灰）。
+- **酒店价格/评分/房型过滤**：`hotel_max_price_per_night` / `hotel_min_rating` / `hotel_room_type` 在 `selection.hotel_candidates_for()` 里作为**硬过滤**生效；全部候选被滤掉时回落原列表并附说明（住宿是行程必需项）。
+- **交通/酒店策略权重已接入**：见第 5 节。
+- **Bad Case 类别 `discovery_stale` / `guided_intent_mismatch`**：两者都**已有规则产出**（`app/badcase.py`），见 [06_BadCase机制.md](06_BadCase机制.md)。
 
 ## Discovery → 正式 Run 的数据交接（grace period）
 
@@ -224,13 +260,23 @@ session_cancelled                                 # DELETE
 ### 每个阶段都会记录交接结论
 
 `outputs/<run_id>/audit_report.json` 与 `run_metrics` 所在的同一次 run 里，
-`user_journey.discovery` 记录四个阶段各自的交接状态：
+`user_journey.discovery` 记录四个阶段各自的交接结论。**每个阶段是一个对象，不是一个字符串**：
 
-```text
-transport: reused | fallback_query | unavailable
-hotels:    reused | fallback_query | unavailable
-social:    reused | fallback_query | unavailable
-places:    reused | fallback_query | unavailable
+```jsonc
+{
+  "transport": {
+    "label": "交通",
+    "handoff": "reused | fallback_query | unavailable",   // 三选一的结论
+    "prefetch_available": true,      // Discovery 里有这条线的结果
+    "queried_in_run": false,         // 本次 run 自己打没打对应的工具
+    "resolved": true,                // 最终是否得到了可用结果
+    "status": "OK",                  // 若来自 Discovery，带上它的 status
+    "result_count": 18, "duration_ms": 4210, "degraded": false
+  },
+  "hotels": { /* 同上 */ },
+  "social": { /* 同上 */ },
+  "places": { /* 同上 */ }
+}
 ```
 
 判定口径（`app/workflow.py:_user_journey_summary`，全部由证据推出，不是标记位）：

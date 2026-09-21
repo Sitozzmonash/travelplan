@@ -1378,8 +1378,15 @@ class PreferenceProfile(BaseModel):
       * ``llm``     —— LLM 真的生成了一份带信号的 profile，打分据此个性化；
       * ``fallback``—— LLM 不可用/返回空，使用均衡基线（与"没有 profile"行为一致）。
 
-    Profile 只决定**软取舍**（哪一组更重要、一天排几个点）。真实性、时间可行性、
+    Profile 只决定**软取舍**（哪一组更重要）。真实性、时间可行性、
     REJECT/MUST、预算这些硬规则照旧由 Python 强制，profile 碰不到它们。
+
+    消费现状（`app/planner.py` / `app/workflow.py` 的 ``emphasis()`` 调用点）：
+      * ``hotel``      —— price / rating / location 三项已被消费；
+      * ``attraction`` —— user_interest / evidence / route_fit 三项已被消费；
+      * ``food``       —— **当前无消费点**（美食仍按当天位置与时间窗从已有候选插入）；
+      * ``pace``       —— **当前无消费点**：每日点位容量取 ``PlannerTuning.max_items_per_day``，
+         ``target_poi_per_day`` 目前只用于进度文案（``app/workflow.py`` 的 ``_profile_step``）。
     """
 
     travel_style: str = "balanced_explorer"

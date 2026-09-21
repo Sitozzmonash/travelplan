@@ -12,13 +12,18 @@
 → 过滤广告与低可信内容
 → 比较价格与门到门时间
 → 检查预算与时间可行性
-→ 生成每天行程（多份候选里由 Jev 选整体更好的那份）
+→ 生成每天行程（多份候选里由 Jev 软选整体更好的那份；Jev 不可用则退到 LLM Ranking，再退到动态权重 Top-1）
 → 输出「来源 / 实时价格 / 查询时间 / 完整决策记录 / Bad Case」
 ```
 
-Web 端默认走**引导式（Guided）**：先填基础信息 → 系统在后台把真实交通/酒店/攻略/POI 查好 →
-用户用极少的选择表达偏好（交通/酒店策略、必去/想去/不感兴趣、节奏）→ 点「开始规划」才创建正式
-run，并复用已查到的候选。CLI 与老用户仍可走**一句话（Quick）**入口。两条入口最终是同一个 12 步引擎。
+Web 端默认走**引导式（Guided）**，三步：① 基础信息（出发地/目的地/日期默认今天/天数/人数/预算）→
+系统在后台把真实交通/酒店/攻略/POI 查好 → ② 探索确认（系统推荐的住宿区域 + 景点/美食，用户标
+必去/想去/不感兴趣）→ ③ 偏好（交通/酒店/节奏一页选完）→ 点「开始规划」才创建正式 run，并复用
+已查到的候选。CLI 与老用户仍可走**一句话（Quick）**入口。两条入口最终是同一个 12 步引擎。
+
+城市攻略是半静态的，可以**预热**（`scripts/preheat_cities.py`）到共享的城市知识库：预热过的城市，
+第二个及以后的会话一个社媒 Provider 都不打、一次地点抽取模型都不调，见
+[docs/15](docs/15_城市知识库攻略正文复用.md)。
 
 核心红线：
 
@@ -39,9 +44,9 @@ run，并复用已查到的候选。CLI 与老用户仍可走**一句话（Quick
 | --- | --- | --- |
 | `super_harness/` | SuperHarness（独立仓库，submodule） | Harness 运行时 + 5 个能力：`tuniu_travel`、`railway_12306`(MCP)、`amap_cn`、`tikhub_social`、`mediacrawler_social` |
 | `app/` | TravelPlan | 旅行领域逻辑：模型、Store、Planner、固定 Workflow、引导式 Session/Discovery、用户选择层、Jev 决策、BadCase、Evolution、API |
-| `benchmark/` | TravelPlan | 离线评测套件（33 例确定性用例 + 5 例 Live Smoke + Jev OFF/ON 基线） |
+| `benchmark/` | TravelPlan | 评测套件（33 例确定性用例离线可复现 + 5 例联网 Live Smoke + Jev OFF/ON 基线） |
 | `frontend/` | TravelPlan | 用户端 + 管理端，不含业务判断，不持有任何 Provider Secret |
-| `docs/` | TravelPlan | 架构/配置/流程/数据源/Trace/BadCase/评测/进化/部署/开发指南 + 用户旅程与 Provider 健康 |
+| `docs/` | TravelPlan | 架构/配置/流程/数据源/Trace/BadCase/评测/进化/部署/开发指南 + 用户旅程 / Provider 健康 / 数据流与复用 / 决策与规划质量 |
 
 **没有自制的 Router / Plugin Loader / MCP Client / Memory / RAG / Retry / Trace** —— 这些一律复用 SuperHarness。
 
@@ -54,20 +59,22 @@ travelplan/
 │  ├─ api.py               # FastAPI（`app.api:api`）：用户接口 + 管理接口
 │  ├─ agent.py             # 装配：system prompt / HarnessContext / 12306 MCP / Workflow
 │  ├─ sessions.py          # Planning Session：引导式旅程的会话状态机 + 后台 Prefetch
+│  ├─ city_cache.py        # 跨会话「城市知识库」：攻略 + 高德 POI 的半静态缓存（stale-while-revalidate）
 │  ├─ discovery.py         # 取数逻辑唯一实现（交通/酒店/攻略/地点），Session 与 Workflow 共用
 │  ├─ selection.py         # 用户选择层：策略→权重、Pace auto、MUST/WANT/REJECT
 │  ├─ workflow.py          # 固定 12 步规划流程（LangGraph）+ 产物写出 + Prefetch 复用
 │  ├─ planner.py           # 去重、Trust、Ad Risk、打分、聚类、排程、预算、约束、质量度量、Top-K
-│  ├─ store.py             # SQLite：run/source/evidence/place/decision/plan/trace/badcase/benchmark/evolution + planning_sessions/provider_calls/runtime_config
-│  ├─ providers.py         # ProviderHub：5 个能力统一成「带 provenance 的调用」
+│  ├─ store.py             # 证据库（SQLite / Postgres 双后端）：run/source/evidence/place/decision/plan/trace/badcase/benchmark/evolution + planning_sessions/city_pois/city_poi_mentions/city_evidences/city_cache_meta/provider_calls/runtime_config
+│  ├─ db.py                # 后端选择与 SQLite→Postgres 方言翻译
+│  ├─ providers.py         # ProviderHub：各能力统一成「带 provenance 的调用」
 │  ├─ llm.py               # 模型调用与降级
-│  ├─ prompts.py           # 5 个提示词
+│  ├─ prompts.py           # 9 个提示词常量
 │  ├─ badcase.py           # Bad Case 规则引擎（含用户旅程 8 类）
 │  ├─ evolution.py         # Evolution：Bad Case → 经验
 │  ├─ observability.py     # Run/Span 状态与 span 分类
 │  ├─ config.py            # 集中配置 + 可运行时覆盖的 EDITABLE_KEYS
 │  ├─ version.py           # 版本信息（Trace / Baseline 要记是哪一版跑的）
-│  └─ decision/            # Jev 适配层 + 三处软决策（方案选择 / Trade-off / 质量门）
+│  └─ decision/            # Jev 适配层 + 动态偏好画像 + 三处软决策（方案选择 / Trade-off / 质量门）
 ├─ benchmark/              # 评测套件（cases / fixtures / baselines / results）
 ├─ frontend/               # Next.js 16 + React 19 + Tailwind 4（用户端 + /admin 管理端）
 ├─ tests/                  # pytest（全部离线）
@@ -114,12 +121,14 @@ TRAVELPLAN_ADMIN_TOKEN=...  # 管理端 Bearer Token（不配则 /api/v1/admin/*
 DATABASE_URL=...          # Neon PostgreSQL（生产必填）。不配则本地 SQLite；**配了却连不上会显式报错，绝不静默回退**
 ```
 
-生产部署的固定架构是 **Vercel（前端）+ Render（FastAPI 常驻容器）+ Neon PostgreSQL**，
-步骤、免费层特性与验收脚本见 [`docs/09_部署说明.md`](docs/09_部署说明.md)。
+生产部署的架构是 **前端托管（Vercel 或 EdgeOne Pages）+ Render（FastAPI 常驻容器）+ Neon PostgreSQL**。
+前端可以换托管，**后端换不了**：长任务 + 进程内后台线程决定了它必须是常驻容器。
+步骤、两种前端托管的差异、免费层特性与验收脚本见 [`docs/09_部署说明.md`](docs/09_部署说明.md)。
 
 可选覆盖：`RAILWAY_12306_COMMAND`、`TUNIU_COMMAND`、`MEDIACRAWLER_DIR`、`TRAVELPLAN_DB_PATH`、
 `TRAVELPLAN_OUTPUT_DIR`、`TRAVELPLAN_CORS_ORIGINS`、`TRAVELPLAN_LLM_TIMEOUT_SECONDS`、
 `JEV_*`、`TP_*`、`MODEL_PRICE_*`、`DISCOVERY_*`、`PLANNING_SESSION_TTL_MINUTES`、
+`CITY_CACHE_GUIDE_TTL_DAYS`、`CITY_CACHE_POI_TTL_DAYS`、
 `BADCASE_ENABLED`、`EVOLUTION_ENABLED`。完整清单见
 [`docs/02_配置说明.md`](docs/02_配置说明.md)（含默认值与风险）。管理端非 Secret 项也可在
 `/admin/config` 页面运行时修改（落库、重启后仍在）。
@@ -158,6 +167,7 @@ uvicorn app.api:api --reload
 | PATCH | `/api/v1/planning-sessions/{id}` | 引导式：改偏好与 POI（白名单字段，只重排序、不重取数） |
 | DELETE | `/api/v1/planning-sessions/{id}` | 引导式：取消会话 |
 | POST | `/api/v1/planning-sessions/{id}/start` | 引导式：创建正式 run（202 `{run_id, status}`；取消/过期 → 409） |
+| GET | `/api/v1/city-cache/{city}` | 读目的地级「城市知识库」（攻略提及 + 高德 POI；带 `updated_at` / `source` / `stale`） |
 
 管理侧（全部需要 `Authorization: Bearer $TRAVELPLAN_ADMIN_TOKEN`）：
 
@@ -184,6 +194,7 @@ GET   /api/v1/admin/jev/health            Jev 状态/延迟/额度(or unknown)/f
 GET   /api/v1/admin/evolution             待分析 BadCase + 历史 run + 可用杠杆
 GET   /api/v1/admin/evolution/runs/{id}   某轮演进的经验与来源 BadCase
 POST  /api/v1/admin/evolution/runs        触发 Evolution（需 EVOLUTION_ENABLED=true）
+POST  /api/v1/admin/city-cache/{city}/refresh  后台刷新某城市的「城市知识库」（202）
 ```
 
 ### 4.3 前端
@@ -199,8 +210,11 @@ NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
 NEXT_PUBLIC_USE_MOCK_API=false
 ```
 
-管理端在页面里填 `TRAVELPLAN_ADMIN_TOKEN`（存 localStorage，键 `travelplan_admin_token`）：
-没有 Token 时页面只显示 Token 输入框，拿不到任何 Trace / Config / Evolution 数据。
+管理端 Token 存 localStorage（键 `travelplan_admin_token`）。本地开发把同一份
+`TRAVELPLAN_ADMIN_TOKEN` 写进 `frontend/.env.local`，打开 `/admin` 就会**自动填入**
+（同源路由 `/admin/default-token` 由服务端读这个变量，不进浏览器包），不用再手输；
+线上前端没有这个变量，端点返回空值，仍然是在页面里填。点过「清除 Token」之后会暂停自动填入，
+门禁页留了「使用本地默认 Token」一键切回。
 `NEXT_PUBLIC_USE_MOCK_API=true` 可切到内置演示数据（不连后端）。
 
 ## 5. Workflow
@@ -217,6 +231,13 @@ Discovery 已查到的候选（`app/workflow.py:_reuse_result` 把候选包成�
 不再重复打 Provider；偏好只重新排序。两条入口都汇聚到 `execute_travel_run`，没有第二套 Planner。
 详见 [`docs/11_用户旅程与PlanningSession.md`](docs/11_用户旅程与PlanningSession.md)。
 
+建会话时还会先查**目的地级「城市知识库」**（`app/city_cache.py` + `city_pois` / `city_poi_mentions`
+/ `city_evidences` / `city_cache_meta` 四张表）：攻略正文、攻略提及、高德 POI 与检索词都是半静态数据，
+命中就秒出候选并标 `source="city_cache"`，过期则先回旧数据、再后台异步刷新（stale-while-revalidate）；
+复用的攻略正文会在跑图前被重新登记成本次 run 自己的 `sources` / `evidence` 行（`sources.status=CACHED`），
+证据链不会断。机酒火价格与时刻表始终实时查、不进这张缓存。
+详见 [`docs/13_数据流与复用机制.md`](docs/13_数据流与复用机制.md) §2.1。
+
 固定 12 步，唯一分支是「没识别出目的地就直接停下并追问」：
 
 ```text
@@ -225,11 +246,12 @@ parse_intent → search_intercity_transport → search_hotels → search_social_
 → build_initial_plan → check_budget → check_feasibility → critic_and_revise → finalize
 ```
 
-模型只在 5 处被调用：意图解析、检索词扩展、地点抽取、Critic、成文。
+模型只在 7 处被调用：意图解析、检索词扩展、地点抽取、动态偏好画像、候选方案软排序、Critic、成文。
 **所有数字（价格、时刻、时长、预算、可信度）都由代码计算并原样写入产物，不经过模型改写。**
 
 Jev（软决策）只在 3 处参与：`build_initial_plan` 的 Top-K 方案选择、`critic_and_revise` 的
-Trade-off 与质量门。任何失败都只是降级，行程照常产出。详见
+Trade-off 与质量门。Jev 不可用时方案选择退到普通 LLM Ranking，再不可用则退到动态权重 Top-1；
+任何失败都只是降级，行程照常产出。详见
 [`docs/03_项目流程图.md`](docs/03_项目流程图.md) 与 [`docs/04_数据源与工具.md`](docs/04_数据源与工具.md)。
 
 ## 6. Provider 与 fallback
@@ -257,18 +279,18 @@ P95 延迟 / fallback；**没有调用历史显示 UNKNOWN 而不是失败，也
 - TikHub 免费额度耗尽时小红书/抖音会降级，此时 Trust 的「多来源证据」分项会偏低，Critic 置信度相应下调。
 - 门到门时长里的机场/车站接驳，在未取得高德真实路线时按具名常量估算，并在 `selection_reason` 里注明。
 - 没有出发日期时查不到大交通：系统会如实告警并留下 Bad Case（`missing_disclosure`），**不猜日期**。
-- 后端不能部署到 Vercel Serverless（长任务、Node/MCP、产物落盘都不成立）：固定架构是 Vercel 前端 + Render 常驻容器 + Neon PostgreSQL，见 [`docs/09_部署说明.md`](docs/09_部署说明.md)（附 Vercel 官方限制数字与真实部署实测记录）。
+- 后端不能部署到 Vercel Serverless 或 EdgeOne Cloud Functions（长任务、Node/MCP、产物落盘都不成立）：架构是「前端托管 + Render 常驻容器 + Neon PostgreSQL」。EdgeOne 的 Cloud Functions 单请求最长 120 秒，同样扛不住 7~9 分钟的规划，见 [`docs/09_部署说明.md`](docs/09_部署说明.md) §6.2。
 
 ## 8. 测试与评测
 
 ```bash
-# 单元 / 集成测试（离线，869 条，约 1.5 分钟）
+# 单元 / 集成测试（离线，996 条 — `pytest --collect-only` 口径）
 python -m pytest -q
 
 # 引导式旅程专项（Selection / Discovery / Session；管理端 Session 与 Provider Health）
 python -m pytest tests/test_guided_journey.py tests/test_admin_observability.py -q
 
-# Benchmark：33 例确定性用例 + 5 例 Live Smoke（离线，可复现）
+# Benchmark：33 例确定性用例（离线可复现）+ 5 例 Live Smoke（联网）
 python -m benchmark.runner --jev on            # 生成/更新 Jev ON 基线
 python -m benchmark.runner --jev off           # 生成/更新 Jev OFF 基线
 python -m benchmark.runner --suite basic --limit 4   # 冒烟

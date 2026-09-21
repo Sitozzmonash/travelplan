@@ -92,7 +92,9 @@ export function createEmptyDraft(): GuidedDraft {
     basic: {
       origin: "",
       destination: "",
-      startDate: "",
+      // 默认今天出发；用户可以改。放在这里而不是挂载后 setState：
+      // `todayISO()` 钉死了时区，服务端与客户端算出的字符串一致，不会 hydration 不匹配。
+      startDate: todayISO(),
       durationMode: "days",
       days: "5",
       endDate: "",
@@ -242,20 +244,39 @@ export function budgetPatch(draft: GuidedDraft): SessionPatchInput {
   return { budget_total: budgetValue(draft.basic) };
 }
 
-/** 某一步「继续」时要写回后端的字段。基础信息与确认页不在这里（前者创建会话，后者开跑）。 */
+/**
+ * 某一步「继续」时要写回后端的字段（索引与 `STEP_META` 对齐）。
+ * 第 0 页（基础信息）不在这里 —— 它是创建会话、不是 PATCH；
+ * 最后一页（偏好）由向导先 PATCH 再开跑，两份合起来就是这一页改过的全部字段。
+ */
 export function stepPatch(stepIndex: number, draft: GuidedDraft): SessionPatchInput {
   switch (stepIndex) {
     case 1:
-      return transportPatch(draft);
-    case 2:
-      return hotelPatch(draft);
-    case 3:
       return poiPatch(draft);
-    case 4:
-      return pacePatch(draft);
+    case 2:
+      return { ...transportPatch(draft), ...hotelPatch(draft), ...pacePatch(draft) };
     default:
       return {};
   }
+}
+
+/**
+ * 出发日期的默认值：**中国时区的今天**（YYYY-MM-DD）。
+ *
+ * 两个约束决定了必须钉死时区，而不是用浏览器本地时间：
+ *  1. 这个组件会被 SSR 一次，服务端（UTC）与客户端（东八区）用各自的 `new Date()`
+ *     会在凌晨 00:00~08:00 算出**不同的日期**，造成 hydration 不一致；
+ *  2. 本产品只做中国国内旅行规划，用户与目的地都在 UTC+8，
+ *     用 Asia/Shanghai 既确定又符合实际。
+ */
+export function todayISO(): string {
+  // en-CA 的短日期格式恰好是 YYYY-MM-DD。
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
 }
 
 export function hasAnyPreference(draft: GuidedDraft): boolean {

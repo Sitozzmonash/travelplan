@@ -129,6 +129,9 @@ WORKFLOW_DESCRIPTION = (
 STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
 STATUS_NEEDS_CLARIFICATION = "needs_clarification"
+#: 城市知识库复用过来的证据在 `sources.status` 上的取值。刻意**不复用** Provider 词表里的
+#: `OK`：这条证据不是本次调用拿到的，写 OK 会让审计看起来像"这次真的打了 Provider"。
+STATUS_CACHED = "CACHED"
 
 #: 一次 run 的抓取预算**全部**集中在 `app/config.py`（Part D）。这里刻意不再保留任何
 #: "同名常量镜像"：镜像迟早与 config 漂移，而"节点里到底读的是哪一个"从代码上看不出来
@@ -268,6 +271,10 @@ class TravelState(TypedDict, total=False):
     prefetch: Any
     #: 从 Discovery 过户到本 run 的调用（审计用；已标 reused）
     adopted_calls: list[dict[str, Any]]
+    #: 从**城市知识库**过户到本 run 的攻略正文（审计用）。
+    #: 它不是 Provider 调用（本次没有出网），所以**不混进 `provider_calls`** ——
+    #: 混进去会把 Provider Health 的调用次数统计污染成"凭空多打了几次"。
+    cached_evidence: list[dict[str, Any]]
     #: 查询键复用账本（Part C）。**它是一个句柄，不是普通数据**：LangGraph 的 channel
     #: 只在节点返回同名键时才更新，就地改 `state["ledger"]` 不会传到下一个节点
     #: （实测：下一个节点看到的还是 None）。所以必须在初始 state 里传入**同一个对象**，
@@ -2153,13 +2160,24 @@ def node_search_social(state: TravelState) -> dict:
         # 攻略正文不会因为用户改偏好而变，直接复用 Discovery 抓到的证据，不重复检索
         # （省下的是一次可能几十秒的社交源往返）。
         reused_evidences = sorted(bundle.evidences, key=lambda item: item.id)
-        _ledger(state).mark(
-            "social", MARK_PREFETCH_REUSED, f"{len(reused_evidences)} 条攻略证据复用 Discovery（未重复检索）"
+        # 同会话 Prefetch 与跨会话城市知识库都会走到这里，但"从哪来"必须说清楚：
+        # 前者是本会话刚抓的，后者的正文可能已经放了几天（已由 _materialize_city_evidence
+        # 重新登记成 run 级 sources，并在 degradations 里如实披露）。
+        from_cache = (
+            str((getattr(bundle, "city_cache", None) or {}).get("source") or "") == "city_cache"
         )
-        summary = f"复用 Discovery 已抓到的 {len(reused_evidences)} 条攻略证据（未重复检索）"
+        origin = "城市知识库缓存" if from_cache else "Discovery"
+        _ledger(state).mark(
+            "social",
+            MARK_PREFETCH_REUSED,
+            f"{len(reused_evidences)} 条攻略证据复用{origin}（未重复检索）",
+        )
+        summary = f"复用{origin}已抓到的 {len(reused_evidences)} 条攻略证据（未重复检索）"
         return {
             "evidences": reused_evidences,
-            "queries": [],
+            # 检索词本身也是可复用的产物；命中正文时下游不再需要它，但如实带出来
+            # 比返回一个空列表更接近事实（会话视图与审计都会读它）。
+            "queries": list(getattr(bundle, "social_queries", None) or []),
             "degradations": list(bundle.degradations),
             "timeline": [_stamp("search_social_guides", summary)],
             "stages": [
@@ -2169,7 +2187,7 @@ def node_search_social(state: TravelState) -> dict:
                     summary,
                     [summary, "偏好变化只影响排序，不需要重新抓原始攻略"],
                     证据条数=len(reused_evidences),
-                    来源="Discovery 复用",
+                    来源=f"{origin}复用",
                 )
             ],
         }
@@ -4762,6 +4780,98 @@ def _adopt_prefetch_sources(
     return rows
 
 
+def _materialize_city_evidence(
+    store: TravelPlanStore, run_id: str, bundle: Any
+) -> list[dict[str, Any]]:
+    """把城市知识库里的攻略正文过户成本次 run 的 sources + Evidence，返回审计行。
+
+    **为什么必须重新分配 id**：`sources.source_id` 与 `evidence.evidence_id` 都是全局主键。
+    同会话 Discovery→Run 之所以能沿用原 id，是因为"会话与 run 一一对应，不会互相顶掉"；
+    跨会话复用不成立这个前提 —— 沿用原 id 会把**上一次** run 的 sources 行
+    `INSERT OR REPLACE` 成本次 run 的，上一轮的证据链当场断掉。所以这里给每条证据新分配
+    `{run_id}-cache-{n}` 的 source_id，同时把 `origin=city_cache` 与原始抓取时间写进
+    `sources.normalized_json`，"这条证据从哪来、什么时候抓的"仍然可查。
+
+    **必须在任何节点写 evidence/place 之前调用**：`evidence.source_id` 有外键，sources 行
+    不存在时插入会被 `PRAGMA foreign_keys=ON` 直接拒掉。
+    """
+
+    cache_info = dict(getattr(bundle, "city_cache", None) or {})
+    if str(cache_info.get("source") or "") != "city_cache":
+        return []
+    evidences = list(getattr(bundle, "evidences", None) or [])
+    if not evidences:
+        return []
+
+    cached_at = str(cache_info.get("updated_at") or "")
+    adopted: list[Evidence] = []
+    rows: list[dict[str, Any]] = []
+    failures = 0
+    for index, evidence in enumerate(evidences, start=1):
+        source_id = f"{run_id}-cache-{index:03d}"
+        fetched_at = (
+            evidence.fetched_at.isoformat() if evidence.fetched_at else None
+        ) or cached_at or utcnow().isoformat()
+        try:
+            store.save_source(
+                run_id,
+                {
+                    "source_id": source_id,
+                    "provider": evidence.provider,
+                    "source_type": evidence.source_type,
+                    "source_url": evidence.source_url,
+                    # 本次没有向 Provider 发过查询，所以 query 留空而不是编一个。
+                    "query": {},
+                    "fetched_at": fetched_at,
+                    "status": STATUS_CACHED,
+                    "normalized": {
+                        "origin": "city_cache",
+                        "city_cache_updated_at": cached_at,
+                    },
+                },
+            )
+        except Exception:  # noqa: BLE001 —— 登记失败只影响可追溯性，不该毁掉规划
+            failures += 1
+            # 登记失败时**丢掉**这条证据，而不是留一个空 source_id 继续用：
+            # 留着它等于让 Trust / Ad Risk 拿一条无法追溯的文本算分。
+            continue
+        adopted.append(
+            evidence.model_copy(update={"id": f"{source_id}-cached", "source_id": source_id})
+        )
+        rows.append(
+            {
+                "source_id": source_id,
+                "evidence_id": f"{source_id}-cached",
+                "provider": evidence.provider,
+                "source_type": evidence.source_type,
+                "source_url": evidence.source_url,
+                "title": evidence.title,
+                "fetched_at": fetched_at,
+                "city_cache_updated_at": cached_at,
+                "chars": len(evidence.text or ""),
+            }
+        )
+
+    if not adopted:
+        if failures:
+            bundle.degradations.append(
+                f"城市知识库的 {failures} 条攻略因来源登记失败被丢弃，本次攻略为空"
+            )
+        return []
+
+    bundle.evidences = adopted
+    age = f"，最早抓取于 {cached_at}" if cached_at else ""
+    bundle.degradations.append(
+        f"攻略正文复用城市知识库缓存（{len(adopted)} 条{age}），本次未重新检索社媒；"
+        "正文未重新抓取，因此这批复用证据的抓取时间早于本次 run"
+    )
+    if failures:
+        bundle.degradations.append(
+            f"另有 {failures} 条缓存攻略因来源登记失败被丢弃"
+        )
+    return rows
+
+
 def _record_provider_calls(state: TravelState) -> int:
     """把本次 run 的 Provider 调用写进观测账本 `provider_calls`。
 
@@ -5143,7 +5253,12 @@ def _build_audit(
                 f"数据源调用 {len(provider_calls)} 次（成功 {sum(1 for call in provider_calls if call['status'] == 'OK')} 次）",
                 f"模型调用 {len(llm.calls) if llm else 0} 次（成功 {sum(1 for call in (llm.calls if llm else []) if call.ok)} 次）",
                 f"成文方式：{prose_note}",
-                f"来源条目 {len(sources)} 条，证据 {len(state.get('evidences') or [])} 条",
+                f"来源条目 {len(sources)} 条，证据 {len(state.get('evidences') or [])} 条"
+                + (
+                    f"，其中 {len(state.get('cached_evidence') or [])} 条来自城市知识库缓存"
+                    if state.get("cached_evidence")
+                    else ""
+                ),
             ],
             数据源调用=len(provider_calls),
             模型调用=len(llm.calls) if llm else 0,
@@ -5160,6 +5275,9 @@ def _build_audit(
         "stages": stages,
         "decisions": [decision.model_dump(mode="json") for decision in decisions],
         "provider_calls": provider_calls,
+        # 城市知识库复用过来的攻略正文。**不并入 provider_calls**：本次没有出网，
+        # 并进去会让"数据源调用次数"与 Provider Health 看起来凭空多了几次调用。
+        "cached_evidence": list(state.get("cached_evidence") or []),
         "llm_calls": llm.audit_entries() if llm is not None else [],
         # Jev 调用明细进 audit：管理端 Run Detail 的 "Jev Calls" 直接读它，
         # 每条都带 decision_type / confidence / latency / fallback reason / quota。
@@ -5702,8 +5820,11 @@ def execute_travel_run(
     # 引导式：把 Discovery 的调用"过户"到本 run，再跑图。
     # 必须在任何节点写 evidence/place 之前做，否则外键会挡住复用（生产路径必踩）。
     adopted_calls: list[dict[str, Any]] = []
+    cached_evidence: list[dict[str, Any]] = []
     if prefetch is not None:
         adopted_calls = _adopt_prefetch_sources(resolved_store, resolved_run_id, prefetch)
+        # 城市知识库复用的攻略正文同样要在写 evidence/place 之前过户成 run 级 sources。
+        cached_evidence = _materialize_city_evidence(resolved_store, resolved_run_id, prefetch)
 
     # 复用账本在这里**只建一次**并作为句柄传进图（见 TravelState.ledger 的注释）。
     # Discovery 的调用也顺手播种进去：正式流程再问同一个键时会被记成 duplicate_query
@@ -5727,6 +5848,8 @@ def execute_travel_run(
         "prefetch": prefetch,
         #: 从 Discovery 过户过来的调用（审计里要标明"复用"，不是本次真的调了）
         "adopted_calls": adopted_calls,
+        #: 从城市知识库过户过来的攻略正文（审计用；不是 Provider 调用）
+        "cached_evidence": cached_evidence,
         "ledger": ledger,
         "source": source,
         "source_session_id": source_session_id,
