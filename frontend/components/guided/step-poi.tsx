@@ -8,7 +8,8 @@ import { hasSocialDegradation } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
 import type { PlaceCandidate, PoiSelection, SessionView } from "@/types/session";
 import type { PoiBulkMode } from "./draft";
-import { categoryIcon, categoryLabel, groupPlaces, poiActionLabels } from "./options";
+import { categoryIcon, categoryLabel, discoveryPlaces, groupPlaces, poiActionLabels } from "./options";
+import { DiscoveryResearch, HotelAreaRecommendations } from "./discovery-research";
 
 /**
  * Step 4 想去哪里（§8 / §17）。
@@ -51,7 +52,7 @@ export function StepPoi({
   onToggleExpand,
   onRetryDiscovery,
 }: StepPoiProps) {
-  const places = session?.place_candidates ?? [];
+  const places = discoveryPlaces(session);
   const groups = groupPlaces(session);
   const evidence = session?.evidence_summary;
   const candidateCount = evidence?.total_candidates ?? places.length;
@@ -73,6 +74,10 @@ export function StepPoi({
 
   return (
     <div className="grid gap-5">
+      <DiscoveryResearch session={session} settled={settled} />
+
+      {settled ? <HotelAreaRecommendations areas={session?.hotel_areas ?? []} /> : null}
+
       <div className="grid gap-2.5 rounded-xl border border-border bg-muted/30 p-3 sm:p-4">
         <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
           <WandSparkles className="size-3.5 shrink-0" aria-hidden />

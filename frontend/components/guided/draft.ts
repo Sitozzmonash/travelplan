@@ -27,6 +27,7 @@ import type {
 } from "@/types/session";
 import {
   BUDGET_MODE_LABELS,
+  discoveryPlaces,
   HOTEL_PRIORITY_OPTIONS,
   MIN_STAR_OPTIONS,
   PACE_OPTIONS,
@@ -366,7 +367,7 @@ export function hotelDetailLabels(
 /** 摘要模型：右侧常驻卡片与确认页共用同一份口径，避免两处说法不一致。 */
 export function summarize(draft: GuidedDraft, session: SessionView | null): SummaryModel {
   const places = new Map<string, PlaceCandidate>();
-  for (const place of session?.place_candidates ?? []) places.set(place.place_id, place);
+  for (const place of discoveryPlaces(session)) places.set(place.place_id, place);
 
   const must: PlaceCandidate[] = [];
   const want: PlaceCandidate[] = [];

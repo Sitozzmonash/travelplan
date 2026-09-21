@@ -1,9 +1,10 @@
 "use client";
 
-import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useState } from "react";
-import { ArrowRight, CircleAlert, Database, Lock, ShieldCheck, Sparkles } from "lucide-react";
+import type { FormEvent, ReactNode } from "react";
+import { ArrowRight, CalendarDays, CircleAlert, Compass, Database, Lock, MapPin, ShieldCheck, Sparkles, Users } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import type { CreatePlanResult, PlanningStepState } from "@/types/api";
 import {
   API_MODE,
@@ -82,30 +83,18 @@ export default function HomePage() {
             先查证，再规划
           </span>
           <h1 className="mt-5 text-[28px] leading-[1.25] font-semibold tracking-tight text-foreground sm:text-[38px] sm:leading-[1.2]">
-            说出你想怎么旅行
+            先把旅行研究明白
             <br />
-            剩下的交给 TravelPlan
+            再出发
           </h1>
           <p className="mx-auto mt-4 max-w-2xl text-sm leading-6 text-muted-foreground sm:text-[15px] sm:leading-7">
-            比较机票、高铁、酒店与门票，结合小红书/抖音攻略和真实路线，
-            自动生成预算合理、时间可行的国内旅行计划。
+            从交通、住宿策略到想吃想去的地方，先由你确认；TravelPlan 再把攻略、路线和预算组合成可执行的行程。
           </p>
         </div>
 
         <div className="mt-8">
           {phase === "idle" ? (
-            <div className="space-y-3">
-              <TripSearch onSubmit={runPlanning} />
-              <div className="flex justify-center">
-                <Link
-                  href="/guided"
-                  className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-3.5 py-2 text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
-                >
-                  不想写一句话？逐步选择偏好
-                  <ArrowRight className="size-3.5" aria-hidden />
-                </Link>
-              </div>
-            </div>
+            <HomeLaunchpad onQuickSubmit={runPlanning} />
           ) : null}
 
           {phase === "planning" ? (
@@ -268,3 +257,113 @@ function AboutCard({
     </div>
   );
 }
+
+function HomeLaunchpad({ onQuickSubmit }: { onQuickSubmit: (message: string) => void }) {
+  const router = useRouter();
+  const [origin, setOrigin] = useState("");
+  const [destination, setDestination] = useState("");
+  const [startDate, setStartDate] = useState("");
+  const [days, setDays] = useState("5");
+  const [travelers, setTravelers] = useState("2");
+
+  function startGuided(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const params = new URLSearchParams();
+    if (origin.trim()) params.set("origin", origin.trim());
+    if (destination.trim()) params.set("destination", destination.trim());
+    if (startDate) params.set("start_date", startDate);
+    if (days.trim()) params.set("days", days.trim());
+    router.push(`/guided${params.size ? `?${params.toString()}` : ""}`);
+  }
+
+  const destinations = ["成都", "重庆", "杭州", "西安"];
+  const styles = ["美食旅行", "亲子出行", "拍照漫游", "轻松度假"];
+
+  return (
+    <div className="space-y-4">
+      <form onSubmit={startGuided} className="overflow-hidden rounded-2xl border border-border bg-card shadow-[0_24px_60px_-36px_color-mix(in_oklab,var(--color-primary),transparent_35%)]">
+        <div className="border-b border-border/70 bg-[linear-gradient(120deg,color-mix(in_oklab,var(--color-accent),transparent_12%),transparent_68%)] px-4 py-4 sm:px-5">
+          <p className="flex items-center gap-2 text-sm font-medium text-foreground">
+            <Compass className="size-4 text-primary" aria-hidden />
+            你想去哪里？
+          </p>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">从基础信息开始，接着用六步确认你真正想要的旅行方式。</p>
+        </div>
+        <div className="grid gap-3 p-4 sm:grid-cols-2 sm:p-5">
+          <LabelField label="出发地" icon={MapPin}>
+            <input value={origin} onChange={(event) => setOrigin(event.target.value)} placeholder="例如 北京" className={HOME_INPUT_CLASS} />
+          </LabelField>
+          <LabelField label="目的地" icon={MapPin}>
+            <input value={destination} onChange={(event) => setDestination(event.target.value)} placeholder="例如 成都" className={HOME_INPUT_CLASS} />
+          </LabelField>
+          <LabelField label="出发日期" icon={CalendarDays}>
+            <input value={startDate} onChange={(event) => setStartDate(event.target.value)} type="date" className={HOME_INPUT_CLASS} />
+          </LabelField>
+          <div className="grid grid-cols-2 gap-3">
+            <LabelField label="玩几天" icon={CalendarDays}>
+              <input value={days} onChange={(event) => setDays(event.target.value)} inputMode="numeric" placeholder="5" className={HOME_INPUT_CLASS} />
+            </LabelField>
+            <LabelField label="几个人" icon={Users}>
+              <input value={travelers} onChange={(event) => setTravelers(event.target.value)} inputMode="numeric" placeholder="2" className={HOME_INPUT_CLASS} />
+            </LabelField>
+          </div>
+        </div>
+        <div className="flex flex-col gap-3 border-t border-border/70 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between sm:px-5">
+          <p className="text-[11px] leading-5 text-muted-foreground">不确定也没关系，向导里每一项都能交给系统决定。</p>
+          <Button type="submit" className="min-h-10 shrink-0">
+            开始逐步规划
+            <ArrowRight className="size-4" aria-hidden />
+          </Button>
+        </div>
+      </form>
+
+      <div className="grid gap-3 sm:grid-cols-[1fr_auto] sm:items-center">
+        <div className="flex flex-wrap gap-2" aria-label="热门目的地">
+          {destinations.map((place) => (
+            <button
+              key={place}
+              type="button"
+              onClick={() => setDestination(place)}
+              className="rounded-full border border-border bg-card px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:border-primary/35 hover:text-foreground"
+            >
+              {place}
+            </button>
+          ))}
+          {styles.map((style) => (
+            <span key={style} className="rounded-full bg-muted px-3 py-1.5 text-xs text-muted-foreground">{style}</span>
+          ))}
+        </div>
+        <details className="group text-left sm:text-right">
+          <summary className="cursor-pointer list-none text-xs text-muted-foreground transition-colors hover:text-foreground [&::-webkit-details-marker]:hidden">
+            我已经想好了，直接一句话规划 <ArrowRight className="ml-1 inline size-3" aria-hidden />
+          </summary>
+          <div className="mt-3 text-left sm:w-[560px]">
+            <TripSearch onSubmit={onQuickSubmit} />
+          </div>
+        </details>
+      </div>
+    </div>
+  );
+}
+
+function LabelField({
+  label,
+  icon: Icon,
+  children,
+}: {
+  label: string;
+  icon: LucideIcon;
+  children: ReactNode;
+}) {
+  return (
+    <label className="grid gap-1.5">
+      <span className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+        <Icon className="size-3.5" aria-hidden />
+        {label}
+      </span>
+      {children}
+    </label>
+  );
+}
+
+const HOME_INPUT_CLASS = "h-10 w-full rounded-lg border border-border bg-background px-3 text-sm text-foreground outline-none transition-colors placeholder:text-muted-foreground focus:border-primary/50 focus:ring-2 focus:ring-primary/15";

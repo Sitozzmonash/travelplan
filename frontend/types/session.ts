@@ -119,6 +119,38 @@ export interface PlaceCandidate {
   selected?: PoiSelection | string | null;
 }
 
+/** 契约 2：Discovery 找到的住宿区域，由后端排序；前端只展示，不自行打分。 */
+export interface HotelArea {
+  key: string;
+  name: string;
+  reason?: string | null;
+  tags: string[];
+  fit_score?: number | null;
+}
+
+/** 契约 2：按用途拆开的探索候选池。旧的 place_candidates 仍保留作向后兼容兜底。 */
+export interface PoiPools {
+  attraction: PlaceCandidate[];
+  food: PlaceCandidate[];
+  experience: PlaceCandidate[];
+}
+
+/**
+ * 契约 2：动态偏好画像由后端决策产生。前端保留固定顶层键，内部权重不参与计算，
+ * 避免把展示层变成第二个评分器。
+ */
+export interface DiscoveryProfile {
+  travel_style?: string | null;
+  hotel_area?: Record<string, unknown>;
+  hotel?: Record<string, unknown>;
+  attraction?: Record<string, unknown>;
+  food?: Record<string, unknown>;
+  pace?: Record<string, unknown>;
+}
+
+/** 契约 3：候选数据的新鲜度；缺失时不做“实时”或“缓存”断言。 */
+export type DiscoverySource = "live" | "city_cache";
+
 export interface PlaceCategory {
   category: string;
   label?: string | null;
@@ -171,6 +203,11 @@ export interface PlanningSessionPayload {
   hotel_candidates?: HotelCandidate[] | null;
   place_candidates?: PlaceCandidate[] | null;
   place_categories?: PlaceCategory[] | null;
+  hotel_areas?: HotelArea[] | null;
+  poi_pools?: Partial<PoiPools> | null;
+  profile?: DiscoveryProfile | null;
+  updated_at?: string | null;
+  source?: DiscoverySource | null;
   evidence_summary?: EvidenceSummary | null;
   degradations?: string[] | null;
   events?: SessionEvent[] | null;
@@ -192,6 +229,11 @@ export interface SessionView {
   hotel_candidates: HotelCandidate[];
   place_candidates: PlaceCandidate[];
   place_categories: PlaceCategory[];
+  hotel_areas: HotelArea[];
+  poi_pools: PoiPools;
+  profile: DiscoveryProfile | null;
+  updated_at: string | null;
+  source: DiscoverySource | null;
   evidence_summary: EvidenceSummary | null;
   degradations: string[];
   events: SessionEvent[];

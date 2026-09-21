@@ -12,7 +12,7 @@
  *   DELETE /api/v1/planning-sessions/{id}     用户主动取消（best-effort）
  */
 
-import { API_BASE_URL, ApiError, apiErrorKind } from "@/lib/api";
+import { API_BASE_URL, ApiError, apiErrorKind, USE_MOCK_API } from "@/lib/api";
 import {
   DISCOVERY_STATUSES,
   PLANNING_SESSION_STATUSES,
@@ -21,11 +21,15 @@ import {
   type CreateSessionInput,
   type DiscoveryStatus,
   type EvidenceSummary,
+  type DiscoveryProfile,
+  type DiscoverySource,
+  type HotelArea,
   type HotelCandidate,
   type PlaceCandidate,
   type PlaceCategory,
   type PlanningSessionStatus,
   type PoiSelection,
+  type PoiPools,
   type PreferenceSentinel,
   type SessionCapabilities,
   type SessionEvent,
@@ -257,6 +261,172 @@ function normalizePlaceCategories(value: unknown): PlaceCategory[] {
     .filter((item): item is PlaceCategory => item !== null);
 }
 
+function normalizeHotelAreas(value: unknown): HotelArea[] {
+  return asRecordArray(value)
+    .map((item): HotelArea | null => {
+      const key = asString(item.key);
+      const name = asString(item.name);
+      if (!key || !name) return null;
+      return {
+        key,
+        name,
+        reason: asString(item.reason),
+        tags: Array.isArray(item.tags) ? item.tags.filter((tag): tag is string => typeof tag === "string") : [],
+        fit_score: asNumber(item.fit_score),
+      };
+    })
+    .filter((item): item is HotelArea => item !== null);
+}
+
+function normalizePoiPools(value: unknown): PoiPools {
+  const raw = isRecord(value) ? value : {};
+  return {
+    attraction: normalizePlaceCandidates(raw.attraction),
+    food: normalizePlaceCandidates(raw.food),
+    experience: normalizePlaceCandidates(raw.experience),
+  };
+}
+
+function normalizeProfile(value: unknown): DiscoveryProfile | null {
+  if (!isRecord(value)) return null;
+  const dimension = (key: string): Record<string, unknown> | undefined => (isRecord(value[key]) ? value[key] : undefined);
+  return {
+    travel_style: asString(value.travel_style),
+    hotel_area: dimension("hotel_area"),
+    hotel: dimension("hotel"),
+    attraction: dimension("attraction"),
+    food: dimension("food"),
+    pace: dimension("pace"),
+  };
+}
+
+function normalizeDiscoverySource(value: unknown): DiscoverySource | null {
+  return value === "live" || value === "city_cache" ? value : null;
+}
+
+// ---------------------------------------------------------------------------
+// Guided 演示会话。正式 Run 的 mock 已在 lib/api.ts，这里补齐会话部分，
+// 让 `NEXT_PUBLIC_USE_MOCK_API=true` 能实际走完首页 → Guided → 确认 → 结果页。
+// 不会在 live 模式使用，也不会向真实服务发送模拟字段。
+// ---------------------------------------------------------------------------
+
+let mockSession: SessionView | null = null;
+let mockDiscoveryReads = 0;
+
+function cloneSession<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function mockSessionId(sessionId: string): SessionView {
+  if (!mockSession || mockSession.session_id !== sessionId) {
+    throw new ApiError("这个会话已经不存在了", "not_found", `mock 中没有 session_id=${sessionId}`);
+  }
+  return mockSession;
+}
+
+function createMockSession(input: CreateSessionInput): SessionView {
+  mockDiscoveryReads = 0;
+  const updatedAt = new Date(Date.now() - 3 * 86_400_000).toISOString();
+  mockSession = normalizeSession({
+    session_id: "guided-demo-session",
+    status: "DISCOVERING",
+    discovery_status: "DISCOVERING",
+    expires_at: new Date(Date.now() + 30 * 60_000).toISOString(),
+    basic_intent: input,
+    preferences: {},
+    poi_selections: {},
+    transport_candidates: [
+      { label: "G89 北京西 → 成都东", mode: "train", price: 864, duration_minutes: 471, reason: "时间合适且少换乘" },
+      { label: "CA4102 北京首都 → 成都双流", mode: "flight", price: 720, duration_minutes: 185, reason: "早到可多玩半天" },
+    ],
+    hotel_candidates: [
+      { name: "春熙路逸扉酒店", business_area: "春熙路", price_per_night: 468, rating: 4.7, reason: "步行可到商圈和地铁" },
+      { name: "天府广场亚朵酒店", business_area: "天府广场", price_per_night: 428, rating: 4.6, reason: "去主要景点较均衡" },
+    ],
+    place_candidates: [
+      { place_id: "panda-base", name: "成都大熊猫繁育研究基地", category: "attraction", area: "成华区", reason: "第一次来成都很值得安排在上午", evidence_count: 18, trust_score: 0.93, amap_verified: true },
+      { place_id: "wuhou-shrine", name: "武侯祠", category: "attraction", area: "武侯区", reason: "历史文化和锦里可顺路安排", evidence_count: 14, trust_score: 0.91, amap_verified: true },
+      { place_id: "kuanzhai", name: "宽窄巷子", category: "attraction", area: "青羊区", reason: "适合慢逛和拍照", evidence_count: 11, trust_score: 0.86, amap_verified: true },
+      { place_id: "hotpot", name: "蜀大侠火锅", category: "food", area: "春熙路", reason: "多篇攻略提及毛肚和黄喉", evidence_count: 9, trust_score: 0.88, amap_verified: true },
+      { place_id: "chuanchuan", name: "钢管厂五区小郡肝串串香", category: "food", area: "玉林", reason: "适合晚间安排的本地串串", evidence_count: 8, trust_score: 0.84, amap_verified: true },
+      { place_id: "tea-house", name: "鹤鸣茶社", category: "experience", area: "人民公园", reason: "在公园里喝茶，适合留白", evidence_count: 7, trust_score: 0.82, amap_verified: true },
+    ],
+    place_categories: [
+      { category: "attraction", label: "景点", count: 3 },
+      { category: "food", label: "美食", count: 2 },
+      { category: "experience", label: "体验", count: 1 },
+    ],
+    hotel_areas: [
+      { key: "chunxi", name: "春熙路 / 太古里", reason: "晚间方便、餐饮密集、地铁连接好", tags: ["美食多", "商圈", "夜生活"], fit_score: 0.94 },
+      { key: "tianfu", name: "天府广场", reason: "位置居中，去主要景点更均衡", tags: ["景点居中", "地铁方便"], fit_score: 0.86 },
+      { key: "kuanzhai", name: "宽窄巷子", reason: "适合慢逛和偏安静的旅行节奏", tags: ["人文", "慢旅行"], fit_score: 0.77 },
+    ],
+    poi_pools: {
+      attraction: [
+        { place_id: "panda-base", name: "成都大熊猫繁育研究基地", category: "attraction", area: "成华区", reason: "第一次来成都很值得安排在上午", evidence_count: 18, trust_score: 0.93, amap_verified: true },
+        { place_id: "wuhou-shrine", name: "武侯祠", category: "attraction", area: "武侯区", reason: "历史文化和锦里可顺路安排", evidence_count: 14, trust_score: 0.91, amap_verified: true },
+      ],
+      food: [
+        { place_id: "hotpot", name: "蜀大侠火锅", category: "food", area: "春熙路", reason: "多篇攻略提及毛肚和黄喉", evidence_count: 9, trust_score: 0.88, amap_verified: true },
+        { place_id: "chuanchuan", name: "钢管厂五区小郡肝串串香", category: "food", area: "玉林", reason: "适合晚间安排的本地串串", evidence_count: 8, trust_score: 0.84, amap_verified: true },
+      ],
+      experience: [
+        { place_id: "tea-house", name: "鹤鸣茶社", category: "experience", area: "人民公园", reason: "在公园里喝茶，适合留白", evidence_count: 7, trust_score: 0.82, amap_verified: true },
+      ],
+    },
+    profile: { travel_style: "food_commercial_centered", hotel_area: {}, hotel: {}, attraction: {}, food: {}, pace: {} },
+    updated_at: updatedAt,
+    source: "city_cache",
+    evidence_summary: { sources_used: 26, places_verified: 6, total_candidates: 34 },
+    events: [
+      { event: "transport", detail: "找到 2 个交通候选" },
+      { event: "hotels", detail: "找到 2 家酒店候选" },
+      { event: "social", detail: "已阅读 26 篇旅行攻略" },
+      { event: "places", detail: "已归类 6 个地点与美食候选" },
+      { event: "hotel_areas", detail: "找到 3 个常被推荐的住宿区域" },
+    ],
+    capabilities: {},
+  });
+  return cloneSession(mockSession);
+}
+
+async function readMockSession(sessionId: string): Promise<SessionView> {
+  const session = readMockSessionSync(sessionId);
+  mockDiscoveryReads += 1;
+  if (mockDiscoveryReads >= 2 && session.discovery_status === "DISCOVERING") {
+    mockSession = { ...session, status: "READY", discovery_status: "READY" };
+  }
+  return cloneSession(mockSession ?? session);
+}
+
+function readMockSessionSync(sessionId: string): SessionView {
+  return mockSessionId(sessionId);
+}
+
+async function patchMockSession(sessionId: string, patch: SessionPatchInput): Promise<SessionView> {
+  const session = readMockSessionSync(sessionId);
+  const preferences = { ...session.preferences };
+  for (const key of [
+    "transport_mode",
+    "transport_priority",
+    "transport_constraints",
+    "hotel_priority",
+    "hotel_max_price_per_night",
+    "hotel_min_star",
+    "hotel_room_type",
+    "hotel_allow_change",
+    "pace",
+  ] as const) {
+    if (key in patch) Object.assign(preferences, { [key]: patch[key] });
+  }
+  mockSession = {
+    ...session,
+    preferences,
+    poi_selections: patch.poi_selections ? { ...patch.poi_selections } : session.poi_selections,
+  };
+  return cloneSession(mockSession);
+}
+
 function normalizeEvidenceSummary(value: unknown): EvidenceSummary | null {
   if (!isRecord(value)) return null;
   return {
@@ -381,6 +551,11 @@ export function normalizeSession(payload: unknown): SessionView {
     hotel_candidates: normalizeHotelCandidates(raw.hotel_candidates),
     place_candidates: normalizePlaceCandidates(raw.place_candidates),
     place_categories: normalizePlaceCategories(raw.place_categories),
+    hotel_areas: normalizeHotelAreas(raw.hotel_areas),
+    poi_pools: normalizePoiPools(raw.poi_pools),
+    profile: normalizeProfile(raw.profile),
+    updated_at: asString(raw.updated_at),
+    source: normalizeDiscoverySource(raw.source),
     evidence_summary: normalizeEvidenceSummary(raw.evidence_summary),
     degradations: Array.isArray(raw.degradations)
       ? raw.degradations.filter((item): item is string => typeof item === "string")
@@ -392,6 +567,7 @@ export function normalizeSession(payload: unknown): SessionView {
 
 /** 创建会话：这一步之后后端就开始后台 Prefetch，前端不必等用户选完偏好。 */
 export async function createPlanningSession(input: CreateSessionInput): Promise<SessionView> {
+  if (USE_MOCK_API) return createMockSession(input);
   const payload = await request("/api/v1/planning-sessions", {
     method: "POST",
     body: sanitizeCreateInput(input),
@@ -406,6 +582,7 @@ export async function createPlanningSession(input: CreateSessionInput): Promise<
 }
 
 export async function getPlanningSession(sessionId: string): Promise<SessionView> {
+  if (USE_MOCK_API) return readMockSession(sessionId);
   const payload = await request(`/api/v1/planning-sessions/${encodeURIComponent(sessionId)}`, {
     method: "GET",
     timeoutMs: READ_TIMEOUT_MS,
@@ -422,6 +599,7 @@ export async function patchPlanningSession(
   sessionId: string,
   patch: SessionPatchInput,
 ): Promise<SessionView> {
+  if (USE_MOCK_API) return patchMockSession(sessionId, patch);
   const payload = await request(`/api/v1/planning-sessions/${encodeURIComponent(sessionId)}`, {
     method: "PATCH",
     body: sanitizePatchInput(patch),
@@ -436,6 +614,11 @@ export async function patchPlanningSession(
 }
 
 export async function startPlanningSession(sessionId: string): Promise<StartSessionResult> {
+  if (USE_MOCK_API) {
+    const session = readMockSessionSync(sessionId);
+    mockSession = { ...session, status: "STARTING" };
+    return { run_id: "tp-guided-demo", status: "RUNNING" };
+  }
   const payload = await request(`/api/v1/planning-sessions/${encodeURIComponent(sessionId)}/start`, {
     method: "POST",
     body: {},
@@ -456,6 +639,11 @@ export async function startPlanningSession(sessionId: string): Promise<StartSess
 
 /** 用户主动取消 / 重建前清理旧会话。取消失败不影响前端继续（旧会话会自己 TTL 过期）。 */
 export async function cancelPlanningSession(sessionId: string): Promise<void> {
+  if (USE_MOCK_API) {
+    const session = readMockSessionSync(sessionId);
+    mockSession = { ...session, status: "CANCELLED" };
+    return;
+  }
   try {
     await request(`/api/v1/planning-sessions/${encodeURIComponent(sessionId)}`, {
       method: "DELETE",

@@ -35,6 +35,7 @@ import {
   stepPatch,
   summarize,
   toCreateInput,
+  type BasicDraft,
   type GuidedDraft,
   type PoiBulkMode,
 } from "./draft";
@@ -42,6 +43,7 @@ import { bestValueSelections } from "./options";
 import { STEP_META, WizardProgress } from "./wizard-progress";
 import { StepBasic } from "./step-basic";
 import { StepConfirm } from "./step-confirm";
+import { DiscoveryResearch } from "./discovery-research";
 import { StepHotel } from "./step-hotel";
 import { StepPace } from "./step-pace";
 import { StepPoi } from "./step-poi";
@@ -88,10 +90,18 @@ function dropAllowChange(patch: SessionPatchInput): SessionPatchInput {
  * 基础信息（出发地 / 目的地 / 日期 / 天数）一变：旧会话取消、POI 清空、重新创建会话，
  * 绝不沿用旧城市的地点（§16）。
  */
-export function GuidedWizard() {
+interface GuidedWizardProps {
+  /** 首页只预填基础信息；最终校验仍由 Step 1 执行。 */
+  initialBasic?: Partial<Pick<BasicDraft, "origin" | "destination" | "startDate" | "days">>;
+}
+
+export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
   const router = useRouter();
   const [step, setStep] = useState(0);
-  const [draft, setDraft] = useState<GuidedDraft>(createEmptyDraft);
+  const [draft, setDraft] = useState<GuidedDraft>(() => {
+    const empty = createEmptyDraft();
+    return { ...empty, basic: { ...empty.basic, ...initialBasic } };
+  });
   const [session, setSession] = useState<SessionView | null>(null);
   const [sessionKey, setSessionKey] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -347,6 +357,22 @@ export function GuidedWizard() {
     setStarting(true);
     setStartError(null);
     try {
+      // syncNow 在网络失败时允许用户继续浏览下一步，但正式 Run 不能静默带着旧偏好启动。
+      // 这里先补写最后一份失败的 PATCH；仍失败就明确留在确认页，而不是制造“已确认”的假象。
+      if (pendingPatch) {
+        try {
+          const view = await patchPlanningSession(sessionId, pendingPatch);
+          setSession(view);
+          setSyncError(null);
+          setPendingPatch(null);
+        } catch (cause) {
+          const message = describeSessionError(cause);
+          setSyncError(message);
+          setStartError("部分偏好尚未写回会话，请先重试同步后再开始规划。");
+          setStarting(false);
+          return;
+        }
+      }
       const result = await startPlanningSession(sessionId);
       router.push(`/plan/${encodeURIComponent(result.run_id)}`);
     } catch (cause) {
@@ -453,6 +479,8 @@ export function GuidedWizard() {
             {session?.error ? (
               <InlineWarning title="会话报告了一个问题" description={session.error} />
             ) : null}
+
+            {session && step !== 3 ? <DiscoveryResearch session={session} settled={settled} /> : null}
           </div>
 
           <SectionCard

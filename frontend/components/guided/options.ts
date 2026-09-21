@@ -239,6 +239,18 @@ export interface PlaceGroup {
   places: PlaceCandidate[];
 }
 
+/** 契约 2 优先使用分池候选；旧后端只回 place_candidates 时无缝回退。 */
+export function discoveryPlaces(session: SessionView | null): PlaceCandidate[] {
+  if (!session) return [];
+  const pooled = [...session.poi_pools.attraction, ...session.poi_pools.food, ...session.poi_pools.experience];
+  const source = pooled.length ? pooled : session.place_candidates;
+  const unique = new Map<string, PlaceCandidate>();
+  for (const place of source) {
+    if (!unique.has(place.place_id)) unique.set(place.place_id, place);
+  }
+  return Array.from(unique.values());
+}
+
 /**
  * 按类别分组：优先用后端给的 place_categories 顺序与文案，
  * 后端没给（或给了新类别）时按 place_candidates 自己归类，绝不丢数据。
@@ -254,7 +266,7 @@ export function groupPlaces(session: SessionView | null): PlaceGroup[] {
       places: [],
     });
   }
-  for (const place of session.place_candidates) {
+  for (const place of discoveryPlaces(session)) {
     const key = place.category ?? "other";
     const existing = groups.get(key);
     if (existing) {

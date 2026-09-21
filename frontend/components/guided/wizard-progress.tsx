@@ -10,7 +10,7 @@ export const STEP_META = [
   { key: "basic", title: "基础信息", subtitle: "去哪、几天、几个人" },
   { key: "transport", title: "交通", subtitle: "怎么去" },
   { key: "hotel", title: "酒店", subtitle: "住哪一类" },
-  { key: "poi", title: "想去哪里", subtitle: "必去 / 想去 / 不感兴趣" },
+  { key: "poi", title: "探索确认", subtitle: "住宿区域、想去的和想吃的" },
   { key: "pace", title: "旅行节奏", subtitle: "每天怎么玩" },
   { key: "confirm", title: "确认", subtitle: "开始规划前再看一眼" },
 ] as const;
