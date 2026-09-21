@@ -383,8 +383,8 @@ CREATE INDEX IF NOT EXISTS idx_planning_sessions_updated ON planning_sessions(up
 -- 这里是按城市更新的攻略/POI 基础信息，绝不能共享 run_id 主键。
 CREATE TABLE IF NOT EXISTS city_pois (
     city TEXT NOT NULL, place_id TEXT NOT NULL,
-    name, normalized_name, category, lng REAL, lat REAL,
-    address, business_area, district, opening_hours, phone, rating REAL,
+    name TEXT, normalized_name TEXT, category TEXT, lng REAL, lat REAL,
+    address TEXT, business_area TEXT, district TEXT, opening_hours TEXT, phone TEXT, rating REAL,
     amap_verified INTEGER NOT NULL DEFAULT 0,
     trust_score REAL, ad_risk REAL,
     evidence_count INTEGER NOT NULL DEFAULT 0,
