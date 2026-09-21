@@ -42,3 +42,8 @@ next-env.d.ts
 
 .vercel
 .env*
+
+# 例外：生产构建期的公开配置必须入库。它只有 NEXT_PUBLIC_* 的非 secret 值，
+# 入库是为了让「推送到托管平台 → 自动构建」的站点天然指向真实后端；
+# 本地开发用 .env.local 覆盖（优先级更高，且始终不入库）。
+!.env.production
