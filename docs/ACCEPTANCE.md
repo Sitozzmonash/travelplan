@@ -8,6 +8,24 @@
 
 ---
 
+> ⚠️ **这是一次性验收的实测快照（2026-09-18 ~ 09-19），此后没有再更新。**
+> 里面的 **run_id、产物字节数、`verify_run 32/32`、逐阶段耗时**都是当时的真实数据，仍然可以
+> 用 `_acceptance/` 下的原始日志复现，是性能结论（`_acceptance/perf_report.md`）的唯一出处。
+>
+> 但下列**派生数字**已过期，引用时请注明"当时快照"：
+>
+> - `git submodule status` 的 `2c2c51a3` → 现为 `d013ee8`；本文写作时仓库"尚无提交"，现已有 27 个 commit。
+> - "pytest Passed: 716" / `_acceptance/pytest_final.log` 的 964 passed → 当前
+>   `pytest --collect-only` 收集 **996** 条（口径不同：前者含 parametrize 展开与当时的用例集）。
+> - "next build 4 条路由" → 现为 13 个 `page.tsx`（含 `/guided` 与 10 个 `/admin/*`）。
+> - `frontend/app/plan/[id]/loading.tsx` 已不存在（该目录只有 `page.tsx` 与 `error.tsx`）。
+> - 所有 `app/planner.py:NNNN` 行锚点已系统性偏移 +20 ~ +130 行（如 `check_feasibility` 1931 → 2063）。
+>
+> **当前怎么跑的**见 [05](05_Trace与可观测性.md) / [06](06_BadCase机制.md) / [07](07_评测体系.md) /
+> [12](12_Provider健康与观测.md)；**恢复命令**见文末"复现方式"。
+
+---
+
 # §35 验收标准
 
 ## A. 框架
@@ -58,7 +76,7 @@
 | 最终 Place 能定位 Evidence | ✅ | item 带 `evidence_ids`；`evidence_summary.places_verified=123`；verifier 逐 item 反查通过（「每个地点都能定位到 evidence/source（16 个地点）」—— 16 是**进了行程**的地点数，123 是通过验证的候选数） |
 | Evidence 能定位 Source | ✅ | `evidence_summary.sources_used=49`，全部可回指 `plan.sources[].source_id` 与 `audit.provider_calls[].source_id` |
 | REJECT 有理由 | ✅ | 32 条；例：`{"entity_id":"3U8896 川航 ¥1420","status":"REJECT","reason_codes":["TRANSPORT_ALTERNATIVE","OUTBOUND"],"reason_text":"去程未选中：综合分 53.7 高于 MU6649 东航 ¥1327","scores":{"价格":14.2,"门到门时长":39.5,"日期一致":0.0,"首末天影响":0.0,"偏好":-0.0}}` —— 带分数分解，且 `scores` 里含 §36.7-10 新增的「日期一致」分项 |
-| PASS 有理由 | ✅（本实现记作 `KEEP`） | 136 条 `KEEP`，例：`{"entity_id":"B0FFG1LBBY","reason_codes":["representative","merged:4"],"reason_text":"作为「海合安成都极地海洋公园-海底世界」的代表点，合并了 4 条重复候选"}`；PRD §933 的词表同时列了 `KEEP` 与 `PASS`，本项目统一用 `KEEP` |
+| PASS 有理由 | ✅（本实现记作 `KEEP`） | 136 条 `KEEP`，例：`{"entity_id":"B0FFG1LBBY","reason_codes":["representative","merged:4"],"reason_text":"作为「海合安成都极地海洋公园-海底世界」的代表点，合并了 4 条重复候选"}`；决策词表同时列了 `KEEP` 与 `PASS`，本项目统一用 `KEEP` |
 | NOT_USED 有理由 | ✅ | 10 条；例：`{"entity_id":"...-src-016-w0","status":"NOT_USED","reason_codes":["NO_ITINERARY_REFERENCE"],"reason_text":"没有被任何 itinerary item 采用（未通过筛选或与行程路线不匹配）","scores":{"provider":"tavily","source_type":"web"}}` |
 | audit_report 完整 | ✅ | 11 个顶层块：`run_id / query / generated_at / stages(12) / decisions(199) / provider_calls(49) / llm_calls(8) / timeline(12) / artifacts(3) / degradations(1) / evidence_summary`；决策分布 `KEEP 136 / REJECT 32 / REVISION 18 / NOT_USED 10 / SELECT 3` |
 

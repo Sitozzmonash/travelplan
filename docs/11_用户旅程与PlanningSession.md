@@ -58,7 +58,7 @@ COLLECTING ──► DISCOVERING ──► READY ──► STARTING ──►（
 
 - TTL = `max(5, PLANNING_SESSION_TTL_MINUTES)` 分钟，默认 **45**（`app/config.py`）。
 - **过期判定不依赖后台定时任务**：每次读会话（`sessions.get_session`）顺手调用 `store.expire_planning_sessions(now=...)`，把 `expires_at < now` 且非 CANCELLED/STARTING 的会话标成 `EXPIRED`。
-- 过期会话**不删除**：管理端仍要能看到"这个用户开了会话但没走到规划"。`prefetch_json` 里的机酒候选不再复用（避免用陈旧价格排行程）；但**跨会话的「城市知识库」不受会话过期影响**——`city_pois` / `city_poi_mentions` / `city_evidences` / `city_cache_meta` 有自己独立的 TTL（攻略 7 天 / POI 15 天），见 [13_数据流与复用机制.md](13_数据流与复用机制.md) §2.1。
+- 过期会话**不删除**：管理端仍要能看到"这个用户开了会话但没走到规划"。`prefetch_json` 里的机酒候选不再复用（避免用陈旧价格排行程）；但**跨会话的「城市知识库」不受会话过期影响**——`city_pois` / `city_poi_mentions` / `city_evidences` / `city_cache_meta` 有自己独立的 TTL（攻略 15 天 / POI 15 天），见 [13_数据流与复用机制.md](13_数据流与复用机制.md) §2.1。
 
 Discovery 自己还有一个状态（`session["discovery_status"]`）：`PENDING / RUNNING / READY / PARTIAL / FAILED`。`PARTIAL` 表示四条取数线里有降级或报错，但用户仍可继续。
 

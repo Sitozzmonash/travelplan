@@ -43,7 +43,7 @@ Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/bui
 | 平台 | 用途 | 域名 |
 | --- | --- | --- |
 | Vercel | 国外访问 | `https://travelplan-web.vercel.app` |
-| EdgeOne Pages | 国内访问 | `https://travelplan-web2-tf8jdorj.edgeone.dev` |
+| EdgeOne Pages | 国内访问 | `https://travelplan-web.edgeone.cool` |
 
 两个编译期变量都必须内联进浏览器包，**改了要重新构建才生效**：
 

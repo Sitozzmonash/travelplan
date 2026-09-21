@@ -7,6 +7,24 @@
 
 ---
 
+> ⚠️ **这是一次性的开发启动工单（2026-09-18），工程早已开工。** 它现在的价值有两处：
+> ① 代码注释里有 14 处 `START.md §x` 引用（§2.1 / §7 / §8.1 / §8.2 / §9 / §10）；
+> ② 记录了当初的边界约定（"必须用 SuperHarness""不要重造 Observability"）。
+>
+> 下列内容已过期，请以代码 + `docs/01`~`docs/14` 为准：
+>
+> - `§7` 的 `app/` 目录只划了 7~8 个文件，实际是 20 个模块 + `app/decision/` 4 个
+>   （`app/providers.py` 的注释自己就承认了这个偏差）。
+> - `§11` 的 9 步流程（`parse_intent → transport → stay → … → finalize`）实际是
+>   **固定 12 步且节点名全不同**（`app/workflow.py:5399-5410`）。
+> - `§9` 写每次 run 输出 3 件产物，实际 **6 件**。
+> - `§7` 写 `app/store.py` "使用 SQLite"，现已是 **SQLite + PostgreSQL 双后端**（`app/db.py`）。
+> - `§7` 提到 `app/agent.py` 含"Checkpointer（开发态可用）"，实际是裸 `graph.compile()`、**没有 checkpointer**。
+>
+> **不要按本文的"开发顺序"重新施工**——那些步骤都已完成。
+
+---
+
 ## 1. 先明确：这个项目是什么
 
 TravelPlan 是一个面向**中国国内旅行**的智能旅行规划 Agent。

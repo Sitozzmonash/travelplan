@@ -28,7 +28,7 @@ python -m benchmark.runner --live
 
 管理端也可以触发：`POST /api/v1/admin/benchmark/runs`（需要管理员 Token）。
 
-## 套件构成（32 例确定性 + 5 例 Live Smoke）
+## 套件构成（33 例确定性 + 5 例 Live Smoke）
 
 | 套件 | 例数 | 来源 | 是否联网 |
 | --- | --- | --- | --- |

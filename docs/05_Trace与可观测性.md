@@ -6,7 +6,7 @@
 
 ```text
 Run     （run_progress.status） ：RUNNING → SUCCESS / DEGRADED / FAILED / CANCELLED
-Span    （trace_spans.status）  ：RUNNING → SUCCESS / WARNING / FAILED
+Span    （trace_spans.status）  ：RUNNING → SUCCESS / WARNING / FAILED / REUSED / SKIPPED
 Session （planning_sessions）   ：COLLECTING → DISCOVERING → READY → STARTING →（正式 run）
                                  └──────────────┴────────────┴──► CANCELLED / EXPIRED
 ```
@@ -15,6 +15,8 @@ Session （planning_sessions）   ：COLLECTING → DISCOVERING → READY → ST
 - `runs.status` 保留历史小写值（`completed` / `failed` / `needs_clarification`）只为兼容旧接口；
   管理端一律读 `run_progress.status`。
 - `DEGRADED` = 产出了行程，但过程中有降级（模型/Provider/Jev 有失败）。
+- `REUSED` 用于**复用了 Discovery 结果、本次没有真的出网**的 tool span（`app/workflow.py:4910`）；
+  `SKIPPED` 用于 planner 主动跳过的节点（`app/workflow.py:438`，例如用户已排除或超过上限）。
 - Session 状态与 Run 状态**刻意分开命名**，属于"正式 run 之前"的阶段，见
   [11_用户旅程与PlanningSession.md](11_用户旅程与PlanningSession.md)。
 
@@ -34,18 +36,23 @@ workflow / llm / jev / provider / tool / mcp / planner / budget / feasibility / 
 | 类型 | span_id | 例子 |
 | --- | --- | --- |
 | workflow 节点 | `{run_id}:{stage_id}` | `tp-xxx:search_hotels` |
-| 其他组件 | `{run_id}:{component}:{name}` | `tp-xxx:jev:plan_choice`、`tp-xxx:tool:search_poi` |
+| 其他组件 | `{run_id}:{component}:{name}[:{suffix}]` | `tp-xxx:jev:plan_choice`、`tp-xxx:tool:search_poi:src-1` |
+
+`{suffix}` 是可选的（`app/observability.py:69-77`）：同一 run 下同一组件的同名 span 会重复出现
+（例如同名 tool 被调用 16 次、多个 LLM tag），靠它区分实例，否则后写的会把先写的顶掉；
+tool span 用的 suffix 是 `source_id`，provider / mcp 分组 span 不带 suffix。
 
 层级（parent_span_id）在真实的 run 里长这样：
 
 ```text
 Run SUCCESS
 ├─ parse_intent SUCCESS                     （workflow）
+│  └─ parse_intent SUCCESS                  （llm）
 ├─ search_intercity_transport WARNING       （workflow）
 │  ├─ railway_12306 SUCCESS                 （mcp）
-│  │  └─ get-tickets SUCCESS                （tool）
+│  │  └─ railway_12306_get-tickets SUCCESS  （tool）
 │  └─ tuniu SUCCESS                         （provider）
-│     └─ search_flights TIMEOUT             （tool）
+│     └─ tuniu_search_flights TIMEOUT       （tool）
 ├─ build_initial_plan SUCCESS               （workflow）
 │  ├─ build_candidates SUCCESS              （planner）
 │  ├─ plan_choice SUCCESS                   （jev）
@@ -55,11 +62,22 @@ Run SUCCESS
 ├─ critic_and_revise WARNING                （workflow）
 │  ├─ rule_critic SUCCESS                   （critic）
 │  ├─ tradeoff SUCCESS                      （jev）
-│  └─ quality_gate SUCCESS                  （jev）
+│  ├─ quality_gate SUCCESS                  （jev）
+│  └─ critic SUCCESS                        （llm）
 └─ finalize SUCCESS                         （workflow）
-   ├─ parse_intent / critic / final_answer …（llm，挂在对应节点下）
+   ├─ final_answer SUCCESS                  （llm）
    └─ persist SUCCESS                       （store）
 ```
+
+示例里写的是**真实 tool 名**：`PROVIDER_STAGE_MAP`（`app/workflow.py:4694-4706`）只认抽象名
+`search_trains` / `search_flights` / `search_hotels`，它们对应的真实 tool 名分别是
+`railway_12306_get-tickets`、`tuniu_search_flights`、`tuniu_search_hotels`。
+provider / mcp 分组 span 命名是 `{run}:provider:{provider}`（12306 走 MCP，即 `{run}:mcp:{server}`），
+**没有 suffix**，而 tool span 是 `{run}:tool:{tool}[:{source_id}]`。
+
+LLM span 按 `LLM_STAGE_MAP`（`app/workflow.py:4712-4718`）挂在**对应节点**下，不是都挂在 `finalize` 下：
+`parse_intent` → `{run}:parse_intent`、`critic` → `{run}:critic_and_revise`、
+`final_answer` → `{run}:finalize`。
 
 实现要点：
 
@@ -67,7 +85,11 @@ Run SUCCESS
 - 其余 span 由 `_record_subspan` / `record_span` 写；
 - provider / tool / mcp / llm span 在 `finalize` 之后由 `_emit_run_spans()` 从 ProviderHub 与
   LLM 的**调用账本**统一转录 —— 不要求每个调用点都记得埋点，也就不会漏；
-- tool span 的 id 与 Bad Case 的 `trace_refs` 完全一致，所以从一条 Bad Case 能直接跳到那条 span。
+- Bad Case 的 `trace_refs` 多数是真实 span_id（workflow 节点 `{run}:{stage_id}`、Jev 决策
+  `{run}:jev:{name}`），管理端按 span_id 精确匹配就能跳转；但 `provider_failure` 写的是
+  `{run}:provider:{provider}:{tool}`（`app/badcase.py:164`），真实 span 只有分组
+  `{run}:provider:{provider}` 与 tool `{run}:tool:{tool}[:{source_id}]` 两种，所以这类 ref
+  永远匹配不上、会显示 `missing`（`app/api.py:936-943` 只做精确匹配，不做前缀回退）。
 - 引导式复用 Discovery 候选时，`node_extract_places` 会写一条 `planner` 子 span
   `{run_id}:planner:user_place_selection`（attributes: reused/kept/must/want/rejected），
   让"用户选择到底排除了几个点"在 trace 里可查。
@@ -80,13 +102,20 @@ Run SUCCESS
 | --- | --- | --- |
 | `plan.json` | 结构化行程（intent / transport / hotel / days / budget / sources / decisions） | `workflow._write_artifacts` |
 | `plan.md` | 人读的行程说明（模型成文 + 代码生成的明细，失败则全代码生成） | 同上 |
-| `audit_report.json` | 这次查了什么、谁给的、信不信、用了没有（含 provider_calls / llm_calls / jev_calls / timeline） | `workflow._build_audit` |
+| `audit_report.json` | 这次查了什么、谁给的、信不信、用了没有（含 provider_calls / **cached_evidence** / llm_calls / jev_calls / timeline） | `workflow._build_audit` |
 | `trace.jsonl` | 全部 span，一行一个 JSON | `workflow._write_run_artifacts` |
 | `metrics.json` | run 级汇总（与 `run_metrics` 表同源） | 同上 |
 | `badcases.json` | 规则检测出的 Bad Case（含按严重度的 summary） | 同上 |
 
 `audit_report.json` 的 `artifacts[]` 是产物索引，新增的三件会被自动补进去。
 下载接口 `GET /api/v1/plans/{run_id}/artifacts/{filename}` 用白名单，只允许这六个文件名。
+
+**`cached_evidence` 段**（跨会话复用攻略正文时才有）：数组，每项是
+`{source_id, evidence_id, provider, source_type, source_url, title, fetched_at,
+city_cache_updated_at, chars}`。它**不并入 `provider_calls`**：复用的正文本次并没有出网，
+并进去会让"数据源调用次数"与 Provider Health 看起来凭空多了几次调用。
+对应的 `sources` 行状态是 `CACHED`（`app/workflow.py:STATUS_CACHED`），
+`normalized_json` 里带 `{origin: "city_cache", city_cache_updated_at: ...}`。
 
 ## 4. 数据库侧
 
@@ -119,7 +148,7 @@ Run SUCCESS
 | Token / 成本 | 运行详情 | `metrics`（含 `cost` / `cost_source` / `cost_breakdown`） |
 | Jev 健康 | `GET /api/v1/admin/jev/health` | 最近 20 个 run 的 jev span 汇总（quota 缺失时是 `unknown`） |
 | Planning Sessions | `GET /api/v1/admin/planning-sessions?status=&destination=&has_run=&q=&limit=&offset=` | `planning_sessions` 列表（每行带 Discovery 状态 / MUST·WANT·REJECT 计数 / run_id） |
-| Session 详情 | `GET /api/v1/admin/planning-sessions/{session_id}` | 信封 `{session, basic_info, preferences, preference_labels, discovery, prefetch_summary, poi_selections, events, run_link}` |
+| Session 详情 | `GET /api/v1/admin/planning-sessions/{session_id}` | 信封 `{session, basic_info, preferences, preference_labels, discovery, prefetch_summary, poi_selections, events, run_link, decision（profile / hotel_areas / poi_pools）}` |
 | Provider Health | `GET /api/v1/admin/providers?limit_per_provider=` | `provider_calls` 聚合（每 Provider 一张卡 + `summary`；无历史 = UNKNOWN） |
 | Provider 明细 | `GET /api/v1/admin/providers/{provider}?limit=` | 最近 N 次调用（含 source_type / session_id / run_id，query 已脱敏） |
 

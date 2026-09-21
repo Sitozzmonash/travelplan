@@ -26,3 +26,9 @@ build/
 benchmark/results/*
 !benchmark/results/.gitkeep
 .neon
+
+# Tencent Cloud EdgeOne
+.env
+.edgeone/*
+.tef_dist/*
+  

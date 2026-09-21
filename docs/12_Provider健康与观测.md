@@ -30,9 +30,17 @@ run_id  session_id  fetched_at  duration_ms  returned  error  fallback  query_js
 | 写入方 | `source_type` | `run_id` / `session_id` |
 | --- | --- | --- |
 | `app/sessions.py:_record_provider_calls` | `discovery` | 只带 `session_id` |
-| `app/workflow.py:_record_provider_calls`（在 `node_finalize` 里调用） | `run` | 带 `run_id` + `source_session_id` |
+| `app/workflow.py:_record_provider_calls`（在 `node_finalize` 里调用） | `run` / `benchmark` | 带 `run_id`；`session_id` 列取 `state["source_session_id"]`（`app/workflow.py:4789`，列名见 `app/store.py:409-424`） |
 
 两处都**顺手过滤凭据类键**（`api_key/token/authorization/secret`），并把 `store._scrub_query` 作为最后一道存储边界（见第 6 节）。写库失败只吞掉异常（观测不该反过来弄坏规划）。
+
+> **城市知识库复用的攻略不计入这张表。** 跨会话复用正文时本次并没有出网，所以
+> `workflow._materialize_city_evidence` 只往 `sources` 写 `status=CACHED` 的行，
+> **不写** `provider_calls` —— 否则 Provider Health 的调用次数 / 成功率 / P95 延迟会被
+> "凭空多出来的调用"污染，而它本来的用途正是回答"某 Provider 到底稳不稳"。
+> 要看复用明细，走 `audit_report.json` 的 `cached_evidence` 段或管理端 Run Detail 的
+> `sources` 列表（`GET /api/v1/admin/runs/{run_id}` 的 `provider_calls` 字段读的就是
+> `store.list_sources`，因此 CACHED 行会出现在那里，与真调用区分得开）。
 
 ## 3. 统计口径
 
@@ -99,9 +107,12 @@ calls < 5                         → 末次 OK 则 UNKNOWN，否则 DEGRADED
 | 方法 | 路径 | 返回 |
 | --- | --- | --- |
 | GET | `/api/v1/admin/providers?limit_per_provider=200` | `{items, summary, note}` |
-| GET | `/api/v1/admin/providers/{provider}?limit=20` | `{provider, label, configured, status, stats, calls, note}` |
+| GET | `/api/v1/admin/providers/{provider}?limit=20` | `{provider, label, configured, status, status_reason, stats, calls, note}` |
 
-`items[]` 每张卡：`provider / label / configured / status / calls / successes / failures / timeouts / auth_errors / rate_limited / empty / fallback_count / last_call_at / last_success_at / last_failure_at / avg_latency_ms / p95_latency_ms / tools / sources / last_error / last_status / success_rate / failure_rate`。
+`status_reason`（`app/api.py:1400-1402`，取值定义在 `:1243-1261`）给 `status` 一个具体说法：
+`no_history` / `insufficient_sample` / `ok` / `elevated_failure_rate` / `high_failure_rate`。
+
+`items[]` 每张卡：`provider / label / configured / status / status_reason / calls / successes / failures / timeouts / auth_errors / rate_limited / empty / fallback_count / last_call_at / last_success_at / last_failure_at / avg_latency_ms / p95_latency_ms / tools / sources / last_error / last_status / success_rate / failure_rate`（`status_reason` 见 `app/api.py:1323`）。
 
 `summary` = `{providers, healthy, degraded, unavailable, unknown, needs_attention[]}`；`needs_attention` 列出 DEGRADED/UNAVAILABLE 的 Provider。`note` 说明统计口径与"不主动打第三方接口"。
 
@@ -122,15 +133,23 @@ Provider Health **只基于真实调用数据**，不做"实时探活"，也不�
 ## 9. 与 Planning Session / Bad Case 的关系
 
 - Discovery 的调用（`source_type=discovery`）让人能区分"`tikhub` 在正式 Run 正常、但 Discovery 阶段大量超时"这类问题（任务书 §11）；
-- 正式 run 结束时，`app/workflow.py:_user_journey_summary` 会**用调用账本反推** `prefetch_reused`：如果本次 run 的账本里又出现了 `search_trains/search_flights/search_hotels/search_xiaohongshu/search_douyin/web_search/search_poi`，就说明它自己又查了一遍 = 没复用；这是**用证据推出来的**，不是标记位（见 [06_BadCase机制.md](06_BadCase机制.md) 的 `prefetch_not_reused`）。
+- 正式 run 结束时，`app/workflow.py:_user_journey_summary` 会**用调用账本反推** `prefetch_reused`：匹配的是**真实 Tool 名**（`app/workflow.py:5213-5232`），按线分组：
+  - transport = `get-tickets` / `railway_12306_get-tickets` / `tuniu_search_trains` / `flight` / `tuniu_search_flights`
+  - hotels = `hotel` / `tuniu_search_hotels`
+  - social = `xiaohongshu` / `search_xiaohongshu` / `search_xhs_via_mediacrawler` / `douyin` / `search_douyin` / `search_douyin_via_mediacrawler` / `web_search`
+  - places = `search_poi`
 
-> **诚实说明（代码与任务书不一致的地方）**：
-> `app/workflow.py:_record_provider_calls` 里有一支 `source_type="benchmark"` 的判断，但它的条件是
-> `state["source"] == "benchmark"`，而 Benchmark runner（`benchmark/runner.py`）与 CLI 调
-> `execute_travel_run` 时都**没有传 `source`**，于是所有非引导式 run 的 `source` 都是默认的 `"quick"`。
-> 实测：跑一条 Benchmark 用例后，`runs.source='quick'`、`provider_calls.source_type='run'`。
-> 因此：
-> - `provider_calls.source_type` 实际只有 `discovery` / `run` 两种，`benchmark` 分支**当前不可达**；
-> - `runs.source` 实际只有 `quick` / `guided` 两种，`cli` / `benchmark` 是代码里预留但未被任何调用点写入的取值；
-> - 于是 `GET /api/v1/admin/runs` 的 `include_benchmark=false` 过滤（按 `source <> 'benchmark'`）目前
->   **不会真的排除** Benchmark 产生的 run。
+  某条线的名字里**任意一个**出现在本次 run 的账本里，就说明它自己又查了一遍 = 没复用；
+  这是**用证据推出来的**，不是标记位（见 [06_BadCase机制.md](06_BadCase机制.md) 的 `prefetch_not_reused`）。
+  `app/workflow.py:5207-5212` 的注释专门记下了教训：上一版这里写的是 `search_trains` / `search_flights` 这类
+  **Hub 方法名**，三类名字里一个都匹配不上 —— 后果是"本次真的补查了交通"被审计写成"复用了 Discovery"，
+  读的人据此以为预取生效，实际那次 run 白等了一遍 Provider。
+
+> **benchmark / cli 已接通，过滤有效。** `benchmark/runner.py:120` 显式传 `source="benchmark"`，
+> `main.py:70` 传 `source="cli"`，`app/workflow.py:5484` 的默认值是 `"quick"`，并由 `:5497-5501`
+> 把它写进 `runs.source`。因此：
+> - `provider_calls.source_type` 有 `discovery` / `run` / `benchmark` 三种；
+> - `runs.source` 有 `quick` / `guided` / `cli` / `benchmark` 四种；
+> - `GET /api/v1/admin/runs` 的 `include_benchmark=false` 过滤（`app/store.py:759-762` 与
+>   `:794-795` 的 `COALESCE(r.source, 'quick') <> 'benchmark'`）**是有效的**，确实会把
+>   Benchmark 用例运行排除在运行列表之外。

@@ -125,7 +125,7 @@ class TestCityEvidenceStorage:
             updated_at=stale_at,
         )
         assert store.get_city_evidence_rows("成都"), "先确认旧行确实写进去了"
-        # 30 天前的行已超过攻略 TTL(7 天) 与 POI TTL(15 天)，下次写入时应被清掉。
+        # 30 天前的行已超过攻略 TTL(15 天) 与 POI TTL(15 天)，下次写入时应被清掉。
         city_cache.write_candidates(
             "成都",
             [],

@@ -7,6 +7,24 @@
 
 ---
 
+> ⚠️ **这是 v0 生成任务书（设计提案），不是当前前端的说明书。**
+> 代码注释里有 **57 处**引用它（`frontend/**` + `app/api.py`、`app/models.py`、`app/workflow.py` 的
+> `FRONTEND_DESIGN §x`），所以保留；但它写于前端动工之前，下列几处已被实现推翻：
+>
+> | 设计稿要求 | 实际实现 |
+> | --- | --- |
+> | `§5.2` Hero 文案"说出你想怎么旅行 / 剩下的交给 TravelPlan" | `frontend/app/page.tsx:85-89`："先把旅行研究明白 / 再出发" |
+> | `§7` 结果页"左时间线 / 右地图" | `frontend/components/plan-workspace.tsx:184-232`：地图与时间线**同在左栏**（地图在上），右栏是酒店/美食/交通/来源 |
+> | `§20` 要求展示 `source_url` | `frontend/components/sources-drawer.tsx:27` **有意不渲染任何 URL** |
+> | `§22` 五个修改动作对应三个后端端点 | 实际只有 `POST /api/v1/plans/{run_id}/revise`（V1 只登记不重规划）；`/items/{id}/replace`、`/lock` 无实现 |
+> | `§32` 首页可放图片、地点卡可放缩略图 | 全站没有任何图片引用（`next/image` / `<img>` / `background-image` 均 0 命中） |
+>
+> 仍然有效且被当规范用的部分：技术栈、`§33` 组件清单（15 个建议组件全部存在）、
+> 文案规范、色彩、移动端/桌面端断点、与后端集成原则。
+> **当前前端的入口与页面结构见 [01_项目架构.md](01_项目架构.md) 与 [11](11_用户旅程与PlanningSession.md)。**
+
+---
+
 # 1. 技术要求
 
 使用 v0 默认推荐技术栈：

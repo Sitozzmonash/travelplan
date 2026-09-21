@@ -18,7 +18,8 @@ Run 结束（finalize）
   → 确认过的失败场景固化进 benchmark/cases/badcase_regression.jsonl（永久回归）
 ```
 
-`badcase_id` 是 `(run_id, category, symptom)` 的稳定哈希（`bc-{run_id}-{sha1[:10]}`），
+`badcase_id` 是 `category` 与 `symptom` 的稳定哈希（`bc-{run_id}-{sha1[:10]}`）：
+sha1 只覆盖 `category|symptom`（`app/badcase.py:105-109`），`run_id` 仅作前缀，
 因此同一次 run 反复检测会命中同一行、重跑同一条 run 不会把记录越积越多。
 
 ## 2. 字段
@@ -35,12 +36,17 @@ Run 结束（finalize）
 | `suspected_root_cause` | 疑似根因（规则给的推测） |
 | `root_cause_status` | `suspected` / `verified` / `rejected`（默认 `suspected`，只由人或 Evolution 改） |
 | `detected_by` | `rule` / `human` / `benchmark` / `llm_judge`（当前实现只产出 `rule`） |
-| `trace_refs` | 相关 span id 列表（可直接在 trace 里定位） |
+| `trace_refs` | 相关 span id 列表（多数可直接在 trace 里定位，例外见下） |
 | `analysis_status` | `pending` / `analyzed` |
 | `fixed_status` | `unfixed` / `fixed` / `wontfix` |
 | `introduced_in` | 引入版本（`app/version.py:travelplan_commit()`） |
 | `fixed_in` | 修复版本（人工填写） |
 | `created_at` | 产生时间 |
+
+> `trace_refs` 的例外：`provider_failure` 写的是 `{run}:provider:{provider}:{tool}`，与真实 span_id
+> （分组 `{run}:provider:{provider}`、tool `{run}:tool:{tool}[:{source_id}]`）对不上，
+> 管理端会把它显示为 `missing`（`app/api.py:936-943` 只做精确匹配）；其余类别用的是 workflow
+> 节点 id，可以正常命中。
 
 ## 3. 全部类别与触发条件
 
@@ -78,7 +84,9 @@ Run 结束（finalize）
 | `jev_unnecessary_replan` | medium | 没有任何硬问题时 Jev 却要求 REPLAN |
 | `jev_missed_replan` | high | 存在硬问题时 Jev 却判定 KEEP |
 
-`JEV_CATEGORIES` 常量列出了这七类，管理端据此分组。
+`JEV_CATEGORIES` 常量列出了这七类，但当前**零引用**（只在 `app/badcase.py:71` 定义处出现），
+管理端实际用 `badcase_facets()`（`app/api.py:925`）拿分组计数，前端另有一份自维护的
+`BADCASE_CATEGORY_LABELS`（`frontend/types/admin.ts:39-56`）。
 
 ### 用户旅程（8 类，`app/badcase.py:JOURNEY_CATEGORIES` / `_journey_cases`）
 
@@ -90,8 +98,8 @@ Run 结束（finalize）
 | `prefetch_not_reused` | medium | Discovery 已查到的线里，正式 run 又自己查了一遍（账本里出现交通/酒店/社交/搜索工具） |
 | `discovery_empty` | high | Discovery 四条线的 `result_count` 全为 0 |
 | `user_preference_ignored` | medium | 用户选了「必去/想去」但没有 `must_missing`/`rejected_in_plan` 时，若一个都没落进行程 |
-| `discovery_stale` | — | **只定义类别，当前没有规则产出** |
-| `guided_intent_mismatch` | — | **只定义类别，当前没有规则产出** |
+| `discovery_stale` | **high** | 复用了另一次行程的 Discovery（目的地/出发日期与本次不符，`_stale_prefetch`，`app/badcase.py:595-611`）；规则已实现并接入 `detect_badcases()`，属**正常不触发的回归哨兵** |
+| `guided_intent_mismatch` | **high** | 正式规划用的 intent 与会话里确认过的结构化基础信息不一致（`_intent_mismatch`，`app/badcase.py:575-591`）；规则已实现并接入 `detect_badcases()`，属**正常不触发的回归哨兵** |
 
 三条口径（很重要）：
 

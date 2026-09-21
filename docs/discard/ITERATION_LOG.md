@@ -16,7 +16,7 @@
 
 ### 问题（当前仍未解决，按真实来源登记）
 
-来源列 = `docs/ACCEPTANCE.md` §36.7 条目（或 `docs/review/ARCHITECTURE_CURRENT.md` §7）。
+来源列 = `docs/ACCEPTANCE.md` §36.7 条目（或同目录下的 `ARCHITECTURE_CURRENT.md` §7）。
 
 | # | 问题 | severity | category | 来源 |
 |---|---|---|---|---|
@@ -52,7 +52,7 @@
 
 ### Notes
 
-- 验收口径见 `docs/ACCEPTANCE.md`；架构分析见 `docs/review/ARCHITECTURE_CURRENT.md`。
+- 验收口径见 `docs/ACCEPTANCE.md`；架构分析见同目录下的 `ARCHITECTURE_CURRENT.md`。
 
 ---
 

@@ -198,8 +198,11 @@ class TravelPlanConfig:
     discovery_grace_seconds: float = 3.0
 
     # --- 跨会话城市知识缓存（A）---
-    # 攻略文本变化快，POI 基础信息稳定得多；分开过期，避免为了地址重查而频繁刷新攻略。
-    city_cache_guide_ttl_days: int = 7
+    # 两个 knobs 分开是为了"能单独调"，不是因为默认值该不同：
+    # `read_candidates` 要求 POI 与攻略**同时**新鲜才算命中，所以谁小谁决定整座城市的寿命。
+    # 2026-09-21 把攻略从 7 天提到 15 天：攻略正文与检索词本来就是几周才变一次的东西，
+    # 7 天太短，会让刚预热好的城市过一周就失效、白白重付一次社媒检索 + 模型抽取。
+    city_cache_guide_ttl_days: int = 15
     city_cache_poi_ttl_days: int = 15
 
     @classmethod

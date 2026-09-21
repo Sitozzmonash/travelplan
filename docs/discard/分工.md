@@ -1,0 +1,189 @@
+# 分工（四个角色 A / B / C / D）
+
+> 怎么用这份文档：**用户会直接告诉 agent「你是 A」**。agent 只读自己的那一节 + 「共享契约与红线」这一节，
+> 就能独立开工，不需要读别的角色的完整章节。
+>
+> 四条线可以**并行**，各自只改自己标注的文件；统一验证 / 构建 / 重启由用户做。
+> git 当前是干净的（只有 4 个已就绪的 docs 未跟踪），大家只改自己文件，不要 `git add` 别人的文件、不要 commit、不要 push。
+
+---
+
+## 角色总览
+
+| 角色 | 定位（一句话） | 负责的缺陷 | 设计依据 |
+| --- | --- | --- | --- |
+| **A** | 后端·数据复用与缓存层：让人人可复用「城市知识库」 | A1–A6、B2(后端读接口)、C2、D2 | `docs/目前缺陷.md` A 类、`docs/13_数据流与复用机制.md` |
+| **B** | 后端·决策与规划质量：让 LLM 决定「用户喜欢什么」，Python 只保证能执行 | E1–E8 | `docs/目前缺陷.md` E 类、`docs/14_决策与规划质量优化.md` |
+| **C** | 前端·核心流与探索确认页：首页重做、Guided 默认入口、新增「探索确认页」 | F1–F5、B1、B3 | `docs/目前缺陷.md` F 类、`docs/TravelPlan_UI_优化方案.md` §3–§8 |
+| **D** | 前端·结果页可视化：Day Timeline + 地图 + 酒店/美食/预算卡片 | F6–F7 | `docs/目前缺陷.md` F 类、`docs/TravelPlan_UI_优化方案.md` §9–§13 |
+
+---
+
+## 共享契约与红线（四个角色都要读）
+
+### 文件所有权矩阵（冲突就在这里）
+
+| 文件 | 归属 | 规则 |
+| --- | --- | --- |
+| `app/city_cache.py`（新建） | A | A 独占 |
+| `app/db.py` / `app/store.py` / `app/sessions.py` / `app/config.py` / `app/providers.py` | A | A 独占 |
+| `app/planner.py` / `app/workflow.py` / `app/selection.py` / `app/decision/` / `app/models.py` / `app/prompts.py` / `app/llm.py` / `app/agent.py` | B | B 独占 |
+| `app/discovery.py` | A + B 共享 | **A 只许改 `PrefetchBundle` 类（约 959 行起，做 A3）**；其余全部（抽取/聚合/池化/住宿区域）归 B，A 一行都不碰 |
+| `app/api.py` | A + B 共享 | **append-only**：A 新增「城市缓存读/刷新」端点；B 只在 session/plan 载荷里**追加**字段（见契约 2），双方都不改对方的既有路由与字段 |
+| `frontend/app/page.tsx`、`frontend/app/guided/*`、`frontend/components/guided/*`、`frontend/lib/sessions.ts` | C | C 独占 |
+| `frontend/components/plan-workspace.tsx`、`itinerary-timeline.tsx`、`travel-map.tsx`、`planning-progress.tsx`、`day-tabs.tsx`、`frontend/app/plan/*` | D | D 独占 |
+| `frontend/lib/api.ts`、`frontend/types/*` | C | C 主改（append-only 加字段）；D **只读**，D 需要新类型放自己新建的 `types/` 文件里 |
+
+### 契约 1：城市知识库接口（A 产出，B/前端不直调）
+
+A 新建 `app/city_cache.py`，对后端与测试公开（前端不直调）：
+
+```python
+def read_candidates(city: str) -> CityCacheHit | None   # 命中返回 {places, mentions, updated_at, source}，未命中/全过期返回 None
+def refresh_in_background(city: str) -> None             # 惰性刷新：先回旧数据兜底，再后台异步补新
+```
+
+两张表名与字段**必须**按 `docs/目前缺陷.md` A1 的 SQL：`city_pois`、`city_poi_mentions`。
+A 把「读缓存→命中则直接用/未命中才抓→抓到回写表」包在 `sessions.run_discovery` 外层，**不改 `discovery.py` 的抓取逻辑**。
+
+### 契约 2：探索确认页 / 会话视图新增字段（B 产出 → A 透传 → C 消费）
+
+B 在 discovery 结果里产出以下字段，写入 `PrefetchBundle` / session 视图；**A 的 prefetch_json 拆分（A3）必须原样透传自己不认识的新字段，不得丢字段**。字段名固定为：
+
+```jsonc
+{
+  "hotel_areas": [ { "key": "chunxi", "name": "春熙路", "reason": "...", "tags": ["美食多","商圈"], "fit_score": 0.9 } ],
+  "poi_pools": { "attraction": [], "food": [], "experience": [] },
+  "profile": { "travel_style": "food_commercial_centered", "hotel_area": {}, "hotel": {}, "attraction": {}, "food": {}, "pace": {} }
+}
+```
+
+若 `api.py` 的会话视图是**显式字段拼装**的，C 与 B 都要能对得上这套字段名；A 在透传处不能把它们丢掉。
+
+### 契约 3：新鲜度字段（A 产出 → C 消费）
+
+候选/地点列表顶部要有 `updated_at`（ISO8601）与 `source: "live" | "city_cache"`，C 用它渲染「地点信息来自 X 天前整理的攻略库」（B3）。
+
+### 契约 4：规划进度阶段码（B 产出 → D 消费）
+
+B 在 workflow 进度事件里新增可读阶段码，D 按它渲染「正在…」叙事（F6）。阶段码固定为：
+`hotel_area_selected`、`hotels_compared`、`days_arranged`、`meals_matched`、`routes_checked`、`budget_checked`。
+D 先按这些阶段码 + mock 数据开发，B 后端就绪后接真事件。
+
+### 通用红线（人人遵守）
+
+1. 只改自己标注的文件；跨文件调用别的角色的新接口时，**按契约里的名字/字段**，不要自己另起一套。
+2. 改完自己只跑**自己那一部分**的验证（见各角色「完成标准」），不要跑全量、不要动别人的测试去迁就自己。
+3. 不 commit、不 push、不改 `AGENTS.md`、不重建/重启服务（用户统一做）。
+4. 不删除别人已写好的字段/端点/组件，只追加；发现对方代码有 bug 先记下来报给用户，不要顺手改。
+5. 不要为了「顺手」去重构不属于自己的文件。
+
+---
+
+## 角色 A · 后端·数据复用与缓存层
+
+> 定位：把「成都=谁去都能复用的半静态数据」落库，人人复用；机酒火等实时数据继续每 session 查。
+
+**你负责改的缺陷**：`docs/目前缺陷.md` 的 A1（核心）、A2、A3、A4、A5、A6、B2（后端读接口）、C2（配额/单源预算调参）、D2（并发写一致性）。
+
+**设计依据**：读 `docs/目前缺陷.md` A1–A6 的「方向」段（含建表 SQL）、D2、B2、C2；再读 `docs/13_数据流与复用机制.md` 第 2 节（三层复用）。
+
+**你独占的文件（随便改）**：`app/city_cache.py`（新建）、`app/db.py`、`app/store.py`、`app/sessions.py`、`app/config.py`、`app/providers.py`。
+
+**共享文件（按规则改）**：
+- `app/discovery.py`：只准改 `PrefetchBundle` 类（约 959 行起），做 A3 拆分；其余函数一律不碰。
+- `app/api.py`：只准**新增**「城市缓存读」「后台刷新」两类端点，并输出契约 3 的新鲜度字段；不改 B 的字段、不改已有路由。
+
+**你必须兑现的契约**：契约 1（`city_cache` 接口 + 两张表）、契约 3（新鲜度字段）、契约 2 的透传要求（prefetch_json 拆分时不得丢掉 B 新增的 `hotel_areas` / `poi_pools` / `profile`）。
+
+**红线（不能碰）**：`app/planner.py`、`app/workflow.py`、`app/selection.py`、`app/decision/`、`app/models.py`、`app/prompts.py`、`app/llm.py`、`app/agent.py`、前端所有文件、`app/discovery.py` 除 `PrefetchBundle` 外的部分。
+
+**完成标准（自己验）**：
+- `python -m pytest tests/ -q` 里与 store / sessions / city_cache 相关的用例通过，且不破坏其他既有用例；
+- 手写只读验证：同一 `city` 连续两次 `read_candidates` 第二次命中缓存、`updated_at` 正确回落；
+- 不伪造数据：缓存未命中仍走真实 Provider；命中时如实标 `source="city_cache"`。
+
+---
+
+## 角色 B · 后端·决策与规划质量
+
+> 定位：**本轮最重的一项**。让 LLM 生成 Dynamic Preference Profile，Python 只做候选/Top-K 与最终可行性；
+> 先选住宿区域 → 以酒店为中心 → 景点按区域成天 → 美食按当天位置插入 → Top-K + LLM 软选、Jev 降级。
+
+**你负责改的缺陷**：`docs/目前缺陷.md` 的 E1（核心地基）、E2、E3、E4、E5、E6、E7、E8。
+
+**设计依据**：读 `docs/14_决策与规划质量优化.md` 全文（§4 Profile、§3 硬/软分界、§7 分池、§9–§11 住宿区域与酒店、§12 景点区域、§13 美食、§15–§16 Feasibility 与 Top-K、§17 Jev 降级）；再看 `docs/目前缺陷.md` E1–E8。
+
+**你独占的文件（随便改）**：`app/planner.py`、`app/workflow.py`、`app/selection.py`、`app/decision/`、`app/models.py`、`app/prompts.py`、`app/llm.py`、`app/agent.py`。
+
+**共享文件（按规则改）**：
+- `app/discovery.py`：除 `PrefetchBundle` 类外全部归你——候选池拆分（E3）、住宿区域抽取（E4）、美食/体验抽取都在这里改。
+- `app/api.py`：只在 session/plan 载荷里**追加**契约 2 的三个字段，不改 A 的新端点、不改既有字段。
+
+**你必须兑现的契约**：契约 2（`hotel_areas` / `poi_pools` / `profile` 字段名与结构）、契约 4（六个规划阶段码写进进度事件）。
+
+**顺序（在一个角色内做，别乱序）**：先 E1+E2（生成 Profile + 硬/软规则分界，这是地基），再 E3→E4→E5→E6，最后 E7（Top-K 软选，依赖 Profile）、E8（路线延后查询）。
+
+**红线（不能碰）**：`app/store.py`、`app/db.py`、`app/sessions.py`、`app/city_cache.py`、`app/config.py`（若确需新配置，用代码内常量或读现有 `config.py`，**不要改这个文件**——它归 A）、前端所有文件。
+
+**完成标准（自己验）**：
+- `python -m pytest tests/ -q` 里与 workflow / planner / discovery / 决策相关的用例通过；
+- Profile 输出结构符合契约 2 / docs14 §4 的 JSON（五组权重 + `travel_style` + `pace`）；
+- 硬规则不被软决策破坏：REJECT 不出现、MUST 不丢、价格不伪造、时间不冲突仍然由 Python 强制。
+
+---
+
+## 角色 C · 前端·核心流与探索确认页
+
+> 定位：把「一句话直出」扭成「Guided 默认入口 + 探索确认页」，补齐住宿策略、美食偏好、Discovery 逐步进度。
+
+**你负责改的缺陷**：`docs/目前缺陷.md` 的 F1（核心）、F2、F3、F4、F5（核心）、B1、B3。
+
+**设计依据**：读 `docs/TravelPlan_UI_优化方案.md` §3–§8（入口调整、推荐流程、首页、Guided 六步与住宿卡片、Discovery 进度、探索确认页）；再看 `docs/目前缺陷.md` F1–F5、B1、B3。
+
+**你独占的文件（随便改）**：`frontend/app/page.tsx`、`frontend/app/guided/*`、`frontend/components/guided/*`、`frontend/lib/sessions.ts`、`frontend/lib/api.ts`、`frontend/types/*`。
+
+**共享文件（按规则改）**：无后端文件；与 D 的边界只在 `lib/api.ts` / `types/*`（你主改，D 只读）。新增字段**只追加**，不删 D 用得到的既有类型。
+
+**你必须兑现的契约**：契约 2（`hotel_areas` / `poi_pools` / `profile` 按固定字段名落 `types/session.ts` 并消费）、契约 3（用 `updated_at` + `source` 渲染新鲜度文案，B3）。
+
+**做法要点**：
+- 首页默认进 Guided（B1/F2），Quick Mode（一句话）降为次级链接；
+- Guided 拆 6 步、Step3 住宿策略做成**卡片**（F3，选项：商圈·美食优先 / 景点居中 / 交通方便 / 性价比 / 安静舒适 / 帮我选择）；
+- Discovery 期间前端逐步打勾（F4：找到 N 个航班/酒店/攻略/景点/美食/住宿区域）；
+- 新增「探索确认页」（F5）：推荐住宿区域（选/让我决定）+ 景点 MUST/WANT/REJECT + 美食品类勾选。
+
+**开发依赖（用 mock 先跑，不阻塞在后端上）**：B、A 的后端字段可能还没就绪，你按契约 2/3 定义 TS 类型 + mock 数据把 UI 做出来，字段接上即用。
+
+**完成标准（自己验）**：`npm run typecheck`、`npm run lint`、`npm run build` 通过；`npm run dev` 下能手动走通「首页→Guided→探索确认页」的假数据流程。
+
+---
+
+## 角色 D · 前端·结果页可视化
+
+> 定位：把结果页从「AI 报告」改成「地图 + Day Timeline + 酒店/美食/预算」的可拿走的计划。
+
+**你负责改的缺陷**：`docs/目前缺陷.md` 的 F6（规划进度实时阶段）、F7（Day Timeline + 地图 + 独立卡片）。
+
+**设计依据**：读 `docs/TravelPlan_UI_优化方案.md` §9–§13（规划进度、最终行程页、地图核心、地点卡片、Evidence 展示）；再看 `docs/目前缺陷.md` F6、F7。
+
+**你独占的文件（随便改）**：`frontend/components/plan-workspace.tsx`、`frontend/components/itinerary-timeline.tsx`、`frontend/components/travel-map.tsx`、`frontend/components/planning-progress.tsx`、`frontend/components/day-tabs.tsx`、`frontend/app/plan/*`。
+
+**共享文件（按规则改）**：`frontend/lib/api.ts`、`frontend/types/*` **只读**；需要新类型放你自己新建的 `frontend/types/` 文件（如 `types/itinerary.ts`），别改 C 的文件。
+
+**你必须兑现的契约**：契约 4（按 `hotel_area_selected` 等六个阶段码渲染「正在…」叙事，F6）。
+
+**做法要点**：
+- 结果页改为地图 + 时间线 + 酒店 + 美食 + 预算；Day 1/2/3 切换、地图同步切换路线（F7）；
+- 地点卡片只显示图片/名称/推荐原因/距离/预计停留/营业时间/价格/具体推荐内容，把 Trace/Trust/Evidence 收进「查看依据」展开层；
+- 规划进度按契约 4 的阶段码呈现 AI 的中间决策（先 mock，B 就绪后接）。
+
+**完成标准（自己验）**：`npm run typecheck`、`npm run lint`、`npm run build` 通过；`npm run dev` 下结果页能用 mock 数据渲染地图 + 时间线 + Day 切换。
+
+---
+
+## 执行顺序提示（给用户参考，不是给 agent 的）
+
+- A、C、D 三条线对 B **无硬依赖**（C/D 用契约 + mock 先跑），可以立刻全开；
+- B 内部 E1/E2 先行，其余逐步推进，B 是最长的一条线；
+- 全部改完后由用户统一：跑 `pytest -q`、`npm run typecheck/lint/build`、起服务实跑验证，再决定是否 commit。

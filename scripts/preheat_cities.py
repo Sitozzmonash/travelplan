@@ -24,16 +24,20 @@
 
 一个必须盯住的降级：社媒限流
 ----------------------------
-`tikhub` 免费额度很容易打成 HTTP 429。这时社媒那条线一条证据都拿不到，只剩网页搜索，
-但流程仍然"成功"——缓存里 POI 有、正文有，只是**没有任何小红书 / 抖音证据**。
-这种结果会被后续会话当成"攻略已就绪"吃满一个 TTL，所以本脚本把它单独标成
-**降级**并打印原因，而且**下次运行时默认会重跑降级城市**（除非它们真的补上了社媒证据）。
+`tikhub` 的免费额度很容易打完（先是 HTTP 429 限流，然后是 `FREE_CREDIT_EXHAUSTED`）。
+这时社媒那条线一条证据都拿不到，只剩网页搜索，但流程仍然"成功"——缓存里 POI 有、正文有，
+只是**没有任何小红书 / 抖音证据**。这种结果会被后续会话当成"攻略已就绪"吃满一个 TTL，
+所以本脚本把它单独标成**降级**并打印原因。
+
+默认**不重跑**降级城市（社媒不可用时重跑也是白跑，还会白烧网页搜索与高德的配额）。
+要补社媒得显式加 `--retry-degraded`：判断"什么时候值得重试"是人的判断，脚本不替用户猜。
 
 用法
 ----
-    python scripts/preheat_cities.py                    # 默认 6 个热门城市
+    python scripts/preheat_cities.py                    # 默认 20 个城市；只补空/过期的
     python scripts/preheat_cities.py --cities 成都 重庆
-    python scripts/preheat_cities.py --force            # 已新鲜的也重跑
+    python scripts/preheat_cities.py --retry-degraded   # 社媒恢复后，把无社媒的城市补回来
+    python scripts/preheat_cities.py --force            # 全部重跑
     python scripts/preheat_cities.py --list             # 只看现状，不跑
 
 退出码：0 = 全部成功（降级不算失败，但会打印警告）；1 = 有城市失败 / 未落库。
@@ -48,15 +52,25 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dotenv import load_dotenv  # noqa: E402 —— 必须先加载 .env，再导入 app
-
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-
+from dotenv import load_dotenv  # noqa: E402
 from app import city_cache, sessions  # noqa: E402
 from app.store import TravelPlanStore  # noqa: E402
 
-#: 默认预热清单。按"被搜得多、且攻略足够稠密"挑，命中率比覆盖面重要。
-DEFAULT_CITIES = ("成都", "重庆", "西安", "北京", "上海", "杭州")
+#: `.env` 的位置。**不在 import 时加载** —— 见 `main()` 里的说明。
+_ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
+
+#: 默认预热清单（20 个）。按"被搜得多 + 覆盖不同地域"挑，命中率比覆盖面重要。
+#: 除了常规热门，刻意放了几个中小城市（钦州 / 婺源 / 黄山 / 泉州），用来证明
+#: 这条预热链路不是只对一线城市有效。
+DEFAULT_CITIES = (
+    # 第一轮（2026-09-21 上午）
+    "成都", "重庆", "西安", "北京", "上海", "杭州",
+    # 第二轮：福建 / 安徽 / 广西 + 其它热门与中小城市
+    "厦门", "泉州", "福州",
+    "黄山", "合肥", "钦州",
+    "桂林", "长沙", "武汉", "青岛", "洛阳",
+    "婺源", "大理", "三亚",
+)
 
 
 def _row(city: str, *, store: TravelPlanStore) -> dict[str, object]:
@@ -89,11 +103,15 @@ def _print_row(info: dict[str, object]) -> None:
     )
 
 
-def _skip_reason(info: dict[str, object], *, force: bool) -> str | None:
+def _skip_reason(info: dict[str, object], *, force: bool, retry_degraded: bool) -> str | None:
     """该不该跳过这座城市；返回**跳过理由**，返回 None 表示要跑。
 
     注意返回值的方向：返回字符串 = 跳过，返回 None = 执行。这个约定加下面的单测
     一起用，避免再写出"把空的也跳过"这种反了的判断。
+
+    默认**不重跑**降级城市：社媒不可用（例如 TikHub 免费额度为 0）时重跑也是白跑，
+    还会白烧网页搜索与高德的配额。要补社媒得显式加 `--retry-degraded` ——
+    判断"什么时候值得重试"是人的判断，脚本不替用户猜。
     """
 
     if force:
@@ -101,8 +119,9 @@ def _skip_reason(info: dict[str, object], *, force: bool) -> str | None:
     if info["state"] != "新鲜":
         return None  # 空 / 已过期 → 必须跑
     if int(info["social"]) == 0:
-        # 新鲜但没有社媒证据 = 上一次很可能是限流期间跑的，应该再试一次。
-        return None
+        if retry_degraded:
+            return None
+        return "缓存新鲜但无社媒证据（要重试加 --retry-degraded）"
     return "缓存新鲜且社媒证据齐全"
 
 
@@ -110,6 +129,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="为热门城市预热城市知识库")
     parser.add_argument("--cities", nargs="*", default=list(DEFAULT_CITIES), help="要预热的城市")
     parser.add_argument("--force", action="store_true", help="已新鲜的城市也重跑")
+    parser.add_argument(
+        "--retry-degraded",
+        action="store_true",
+        help="额外重跑「新鲜但没有社媒证据」的城市（社媒恢复后用这个补）",
+    )
     parser.add_argument("--list", action="store_true", help="只报告现状，不跑 Provider")
     parser.add_argument(
         "--allow-sqlite",
@@ -117,6 +141,12 @@ def main() -> int:
         help="允许写到本地 SQLite（默认拒绝：预热的意义是写共享库）",
     )
     args = parser.parse_args()
+
+    # `.env` 只在这里加载，不在 import 时加载：这个模块会被测试 import（`tests/test_preheat_cities.py`），
+    # 而 `load_dotenv()` 会往 `os.environ` 里灌值 —— 那样同一进程里**后面跑的其它测试**会
+    # 悄悄读到 .env 的配置（实测会把 `tests/test_workflow.py` 的"模型只有 6 个调用点"断言打破）。
+    # 副作用只该发生在真正执行的时候。
+    load_dotenv(_ENV_PATH)
 
     store = TravelPlanStore()
     if store.backend_name != "postgres" and not args.allow_sqlite:
@@ -148,7 +178,7 @@ def main() -> int:
     started = time.perf_counter()
     for index, city in enumerate(cities, start=1):
         before = _row(city, store=store)
-        skip = _skip_reason(before, force=args.force)
+        skip = _skip_reason(before, force=args.force, retry_degraded=args.retry_degraded)
         if skip is not None:
             print(f"[{index}/{len(cities)}] {city}：跳过（{skip}）")
             continue
@@ -196,9 +226,9 @@ def main() -> int:
         print(
             f"\n注意：{len(degraded)} 座城市是**降级**结果（{'、'.join(degraded)}）——"
             "缓存里没有社媒证据。\n"
-            "  通常原因是 tikhub 限流（HTTP 429）+ mediacrawler 本地不可用，只剩网页搜索。\n"
-            "  等社媒恢复后重跑即可覆盖（本脚本默认会重跑这些城市，不必加 --force）：\n"
-            "      python scripts/preheat_cities.py --cities " + " ".join(degraded),
+            "  常见原因是 tikhub 免费额度耗尽 / 限流，且 mediacrawler 本地不可用，只剩网页搜索。\n"
+            "  社媒恢复后补回来（默认不会自动重跑降级城市）：\n"
+            "      python scripts/preheat_cities.py --retry-degraded --cities " + " ".join(degraded),
             file=sys.stderr,
         )
     if failed:

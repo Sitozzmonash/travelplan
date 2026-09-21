@@ -10,6 +10,27 @@
 
 ---
 
+> ⚠️ **这是设计期文档（成书 2026-09-18），不是当前实现的说明书。**
+> **代码注释里有 182 处 `PRD §x` 引用它，所以不要删。** 但下列内容已与实现不符，
+> 读到时请以代码 + `docs/01`~`docs/14` 为准：
+>
+> - **全文没有 Guided / Planning Session / 动态偏好画像**——PRD 成书早于引导式入口，
+>   而 Guided 现在是 Web 默认入口（见 [11](11_用户旅程与PlanningSession.md)、[14](14_决策与规划质量优化.md)）。
+> - `§6 仓库结构` 的 `app/` 只列 8 个文件，实际有 20 个模块 + `app/decision/` 4 个；
+>   `§28 输出文件` 写每次 run 3 件产物，实际 **6 件**（`app/api.py:42-49` 白名单）。
+> - `§27 日志与可观测性` 的 `[TRAVEL]/[COMPARE]/[TRUST]` 之类的日志前缀在 `app/` 下 **0 命中**；
+>   实际观测走 span/stage（`app/observability.py` + `outputs/<run_id>/trace.jsonl`）。
+> - `§10.1` 的途牛 Tool 名（`search_flights`/`search_hotels`…）实际全部带 `tuniu_` 前缀且有过改名；
+>   `§13` 的 `get_social_detail` 工具**不存在**（详情路由因与 `FREE_ONLY` 冲突被刻意移除，实际是 `get_tikhub_quota`）。
+> - `§14` 是 `mediacrawler_social`，**不是**部署契约章节。`app/api.py:243`、`render.yaml`、
+>   `docs/09` 里把 health 契约字段写成"PRD §14"是**误引用**。
+>
+> 仍然准确且被当作契约的部分：`§16` 核心数据模型（字段级 provenance）、
+> `§25` 的 12 步节点名（与 `app/workflow.py:5399-5410` 逐字一致）、`§18`/`§19` 的 Trust / Ad Risk 权重、
+> `§37` 外部接口事实参考。
+
+---
+
 # 1. 产品定义
 
 TravelPlan 是一个基于真实旅行数据的国内旅行规划 Agent。

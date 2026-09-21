@@ -1,6 +1,6 @@
 {
-  "buildCommand": "npm run build",
   "installCommand": "npm install",
+  "buildCommand": "NEXT_PUBLIC_API_BASE_URL=https://travelplan-api.onrender.com NEXT_PUBLIC_USE_MOCK_API=false npm run build",
   "outputDirectory": ".next",
   "nodeVersion": "22"
 }
