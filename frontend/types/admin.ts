@@ -136,6 +136,20 @@ export interface AdminRunSummary {
   source_session_id?: string | null;
   /** 详情补齐的字段（列表不一定有）：开始时间。 */
   started_at?: string | null;
+  /**
+   * 列表补齐的行程质量（后端按 run 现算 plan_quality 合成）。
+   * 这些字段是**可选**的：老后端不返回时页面显示「—」，不会因为缺一个字段就整页失败。
+   */
+  quality_score?: number | null;
+  quality_grade?: AdminGrade | null;
+  /** 现算质量失败的原因（如「无计划」）；有值时页面显示「—」并把原因放进 title。 */
+  quality_error?: string | null;
+  /** 结构化目的地（来自 plan.intent.destination，多个目的地用「、」连接）。 */
+  destination?: string | null;
+  /** 未解决的行程告警条数。 */
+  warnings?: number | null;
+  /** Bad Case 条数（= badcase_count 的别名，列表列用它语义更清楚）。 */
+  issue_count?: number | null;
 }
 
 export interface AdminRunList {
@@ -349,6 +363,16 @@ export interface AdminUserJourney {
   prefetch_stages?: Record<string, AdminDiscoveryStage> | null;
   /** 开始规划时为等待 Discovery 实际等待的毫秒数（0 = 无需等待）。 */
   grace_waited_ms?: number | null;
+  /** 本次 run 的动态偏好画像（与会话详情同源，run 侧由审计文件带回）。 */
+  profile?: AdminDecisionProfile | null;
+  /** 规划器选中的住宿区域；候选来源见 session 详情的 decision.hotel_areas。 */
+  hotel_area_selected?: string | null;
+  /** 住宿区域候选名列表。 */
+  hotel_areas?: string[] | null;
+  /** 用户标了 MUST 但最终没进计划的地点。 */
+  must_missing?: string[] | null;
+  /** 用户标了 REJECT 但最终进了计划的地点。 */
+  rejected_in_plan?: string[] | null;
 }
 
 export const BADCASE_ROOT_CAUSE_STATUSES = ["suspected", "verified", "rejected"] as const;
@@ -757,6 +781,37 @@ export interface AdminRunLink {
   finished_at?: string | null;
 }
 
+/**
+ * 动态偏好画像（`decision.profile`）。
+ * `source` 是关键：`llm` 表示模型真的生成了一份带信号的画像，`fallback` 表示模型没给出、
+ * 用的是均衡基线 —— 后者仍然能出计划，但个性化程度有限，管理端必须能看出来。
+ */
+export interface AdminDecisionProfile {
+  source?: string | null;
+  travel_style?: string | null;
+  hotel_area?: string | null;
+  hotel?: AdminRecord | null;
+  attraction?: AdminRecord | null;
+  food?: AdminRecord | null;
+  pace?: AdminRecord | null;
+  reason?: string | null;
+}
+
+/** 住宿区域候选：规划器就是从这组候选里选一家，所以它决定了「住哪一片」。 */
+export interface AdminHotelAreaCandidate {
+  key: string | null;
+  name: string | null;
+  reason: string | null;
+  tags: string[];
+  fit_score: number | null;
+}
+
+export interface AdminSessionDecision {
+  profile: AdminDecisionProfile | null;
+  hotel_areas: AdminHotelAreaCandidate[];
+  poi_pools: AdminRecord;
+}
+
 export interface AdminPlanningSessionDetail {
   session: AdminPlanningSessionBlock;
   basic_info: AdminPlanningSessionBasicInfo | null;
@@ -767,6 +822,8 @@ export interface AdminPlanningSessionDetail {
   poi_selections: AdminPlanningSessionPoiSelections | null;
   events: AdminPlanningEvent[];
   run_link: AdminRunLink;
+  /** 引导式决策块；旧部署可能整块缺失，此时为 null（页面显示「后端未返回」）。 */
+  decision: AdminSessionDecision | null;
 }
 
 export interface AdminJevHealth {
@@ -970,4 +1027,466 @@ export interface AdminEvolutionRunDetail {
 export interface AdminEvolutionLaunchResult {
   evolution_run_id: string;
   status: string;
+}
+
+/* ==================================================================
+ * 管理端聚合视图（对应 docs/TravelPlan_Admin_整体优化方案.md）
+ *
+ * 这五组契约服务四件事：首屏该看什么（Dashboard）、行程生成得好不好
+ * （Travel Quality）、用户在哪一步流失（Funnel）、一堆 Bad Case 里
+ * 哪几个才是真问题（聚类），以及一次 run 到底发生了什么（Timeline）。
+ *
+ * 与后端一致的两条约定：
+ * - 后端拿不到的数一律 `| null`，前端显示「—」，**不显示 0**；
+ * - 所有指标都按同一个时间窗算，环比字段由后端给，前端不做减法。
+ * ================================================================== */
+
+/* ------------------------------ 时间窗 ------------------------------ */
+
+export type AdminWindowKey = "1h" | "24h" | "7d" | "30d";
+
+export const ADMIN_WINDOW_OPTIONS: { key: AdminWindowKey; label: string }[] = [
+  { key: "1h", label: "最近 1 小时" },
+  { key: "24h", label: "最近 24 小时" },
+  { key: "7d", label: "最近 7 天" },
+  { key: "30d", label: "最近 30 天" },
+];
+
+export const DEFAULT_ADMIN_WINDOW: AdminWindowKey = "24h";
+
+/** 质量等级：与后端 `_grade()` 同一套词表，避免两边各有一套「多少分算好」。 */
+export type AdminGrade = "GOOD" | "FAIR" | "POOR" | "UNKNOWN";
+
+export const ADMIN_GRADE_LABELS: Record<string, string> = {
+  GOOD: "良好",
+  FAIR: "一般",
+  POOR: "差",
+  UNKNOWN: "无数据",
+};
+
+/* ------------------------------ Dashboard ------------------------------ */
+
+export type AdminKpiUnit = "ratio" | "ms" | "cny" | "count" | "score" | string;
+
+export interface AdminKpi {
+  key: string;
+  label: string;
+  value: number | null;
+  unit: AdminKpiUnit | null;
+  /** 等长上一周期的同一个指标；后端没有对照数据时为 null。 */
+  previous: number | null;
+  /** 与 value 同单位（比率指标就是百分点差）。 */
+  delta: number | null;
+  direction: "up" | "down" | "flat";
+  higher_is_better: boolean;
+  /** 这个方向是不是好事；方向为平或没有对照时为 null。 */
+  better: boolean | null;
+  hint: string | null;
+  detail: string | null;
+}
+
+export interface AdminAttentionItem {
+  id: string;
+  level: "high" | "medium" | "low" | string;
+  title: string;
+  detail: string;
+  /** 跳转目标：`{ kind, label, status?, category?, id?, focus? }`，形状由后端给、前端按 kind 渲染。 */
+  action: AdminRecord;
+  metric: AdminRecord;
+}
+
+export interface AdminTrendPoint {
+  t: string;
+  /** 该分桶没有样本时为 null（不是 0）—— 0 会被读成「真的是 0 次」。 */
+  value: number | null;
+}
+
+export interface AdminTrendSeries {
+  key: string;
+  label: string;
+  unit: AdminKpiUnit | null;
+  points: AdminTrendPoint[];
+  summary: {
+    latest: number | null;
+    min: number | null;
+    max: number | null;
+    avg: number | null;
+  };
+}
+
+export interface AdminDashboardProviderRow extends AdminProviderStats {
+  provider: string;
+  calls: number;
+  failures: number;
+  timeouts: number;
+  fallback_count: number;
+  /** OK / DEGRADED / UNAVAILABLE / IDLE —— 阈值由后端统一定义。 */
+  state: string;
+  needs_attention: boolean;
+}
+
+export interface AdminDashboard {
+  window: string;
+  window_label: string;
+  generated_at: string;
+  kpis: AdminKpi[];
+  statuses: AdminRecord;
+  volume: {
+    runs: number;
+    previous_runs: number;
+    finished: number;
+    previous_finished: number;
+    running: number;
+  };
+  trends: AdminTrendSeries[];
+  attention: AdminAttentionItem[];
+  cost: {
+    total: number | null;
+    avg_per_run: number | null;
+    previous_avg_per_run: number | null;
+    currency: string;
+    price_configured: boolean;
+  };
+  quality: {
+    score: number | null;
+    grade: AdminGrade;
+    sampled_runs: number;
+    /** true 表示窗口内运行比抽样数更多，分数只代表抽样。 */
+    sampled: boolean;
+  };
+  /**
+   * 决策健康：取代「Jev 是不是活着」的那组指标（文档 §10 把 Jev 降为可选增强）。
+   * 全部来自抽样运行的既有事实，不做任何推断。
+   */
+  decision_health: {
+    runs: number;
+    guided_runs: number;
+    profile_llm: number;
+    profile_fallback: number;
+    /** 既不是 llm 也不是 fallback：Quick 模式本来就没有画像。 */
+    profile_missing: number;
+    /** 分母是引导式运行；没有引导式运行时为 null。 */
+    profile_success_rate: number | null;
+    runs_with_hard_errors: number;
+    runs_with_rejected_in_plan: number;
+    runs_missing_must: number;
+    note: string;
+  };
+  badcases: {
+    open: number;
+    window: number;
+    previous: number;
+    by_severity: AdminRecord;
+  };
+  providers: {
+    total: number;
+    unhealthy: number;
+    /** 成功率的统计口径说明（按每个 Provider 最近 N 次调用，不是时间窗）。 */
+    window_note: string;
+    items: AdminDashboardProviderRow[];
+  };
+  benchmark: { latest_run_id: string | null; latest_pass_rate: number | null };
+  evolution: { enabled: boolean; last_run_id: string | null; last_decision: string | null };
+  /** 口径/数据缺口说明，页面必须原样展示（例如「未配置模型单价」）。 */
+  notes: string[];
+}
+
+/* ------------------------------ Travel Quality ------------------------------ */
+
+export interface AdminQualityMetric {
+  key: string;
+  label: string;
+  /** 可能是数字、比率、对象（如告警码分布）或 null。 */
+  value: unknown;
+  unit: string | null;
+  hint: string | null;
+}
+
+export interface AdminQualityFinding {
+  level: "high" | "medium" | "low" | string;
+  text: string;
+}
+
+export interface AdminQualityOffender {
+  run_id: string;
+  detail: string;
+  value: number | null;
+}
+
+export interface AdminQualityDimension {
+  key: string;
+  label: string;
+  /** 0~1；数据不足时为 null（显示「无数据」而不是 0 分）。 */
+  score: number | null;
+  score_percent: number | null;
+  grade: AdminGrade;
+  grade_label: string;
+  metrics: AdminQualityMetric[];
+  findings: AdminQualityFinding[];
+  offenders: AdminQualityOffender[];
+  note: string | null;
+}
+
+export interface AdminQualityRun {
+  run_id: string;
+  created_at: string | null;
+  status: string;
+  destination: string | null;
+  days: number | null;
+  score: number | null;
+  grade: AdminGrade;
+  profile_source: string | null;
+  hotel_area: string | null;
+  preference_coverage: number | null;
+  warnings: number | null;
+  errors: number | null;
+  route_verified_rate: number | null;
+  cost: number | null;
+  duration_ms: number | null;
+}
+
+export interface AdminQualityDestination {
+  name: string;
+  runs: number;
+  score: number | null;
+  grade: AdminGrade;
+  degraded: number;
+  failed: number;
+}
+
+export interface AdminTravelQuality {
+  window: string;
+  window_label: string;
+  generated_at: string;
+  scan: { runs_in_window: number; finished: number; scored: number; unscored: number };
+  overall: {
+    score: number | null;
+    grade: AdminGrade;
+    grade_label: string;
+    weights: AdminRecord;
+    note: string;
+  };
+  dimensions: AdminQualityDimension[];
+  runs: AdminQualityRun[];
+  destinations: AdminQualityDestination[];
+  quality_trend: AdminTrendSeries;
+  notes: string[];
+}
+
+export function findQualityDimension(
+  payload: AdminTravelQuality | null,
+  key: string,
+): AdminQualityDimension | null {
+  if (!payload) return null;
+  return payload.dimensions.find((dimension) => dimension.key === key) ?? null;
+}
+
+/* ------------------------------ Planning Funnel ------------------------------ */
+
+export interface AdminFunnelStage {
+  key: string;
+  label: string;
+  count: number;
+  /** 占第一步的比例（0~1）。 */
+  rate_of_total: number | null;
+  dropped: number;
+  /** 相对上一步的流失率（0~1）；第一步为 null。 */
+  drop_rate: number | null;
+  previous_count: number;
+  previous_dropped: number;
+}
+
+export interface AdminFunnelBreakdownRow {
+  key: string;
+  sessions: number;
+  /** 与 stages 一一对应的各阶段人数（保证单调不增）。 */
+  stages: number[];
+  plan_success: number;
+  conversion: number | null;
+}
+
+export interface AdminFunnel {
+  window: string;
+  window_label: string;
+  generated_at: string;
+  stages: AdminFunnelStage[];
+  sessions: number;
+  previous_sessions: number;
+  overall_conversion: number | null;
+  biggest_drop: {
+    from: string;
+    to: string;
+    from_key: string;
+    to_key: string;
+    drop_rate: number;
+    dropped: number;
+  } | null;
+  /** 当前拆解用的维度（与 dimension_options 的 key 对应）。 */
+  destination_dimension: string;
+  breakdown: Record<string, AdminFunnelBreakdownRow[]>;
+  dimension_options: { key: string; label: string }[];
+  notes: string[];
+}
+
+/* ------------------------------ Bad Case 聚类 ------------------------------ */
+
+export interface AdminBadcaseGroup {
+  key: string;
+  category: string;
+  severity: string;
+  occurrence_count: number;
+  previous_count: number;
+  /** 与上一周期相比的变化率；上一周期为 0 时为 null（不是 100%）。 */
+  trend_pct: number | null;
+  affected_runs: number;
+  first_seen: string | null;
+  last_seen: string | null;
+  last_seen_ago_seconds: number | null;
+  /** 该找哪个模块修；后端没登记这个 category 时为 null。 */
+  related_module: string | null;
+  related_providers: string[];
+  pending_analysis: number;
+  unfixed: number;
+  top_symptoms: { text: string; count: number }[];
+  sample_ids: string[];
+  sample_runs: string[];
+  sparkline: AdminTrendPoint[];
+}
+
+export interface AdminBadcaseGroups {
+  window: string;
+  window_label: string;
+  generated_at: string;
+  totals: {
+    badcases: number;
+    previous_badcases: number;
+    groups: number;
+    affected_runs: number;
+    pending: number;
+    open_total: number;
+  };
+  groups: AdminBadcaseGroup[];
+  facets: AdminBadcaseFacets;
+  notes: string[];
+}
+
+/* ------------------------------ Run Timeline ------------------------------ */
+
+export type AdminTraceEventType =
+  | "SYSTEM"
+  | "USER"
+  | "CONTEXT"
+  | "ASSISTANT"
+  | "TOOL"
+  | "PROVIDER"
+  | "VALIDATION"
+  | "ERROR";
+
+export interface AdminTraceBadcaseBrief {
+  badcase_id: string;
+  category: string | null;
+  severity: string | null;
+  symptom: string | null;
+  analysis_status: string | null;
+}
+
+export interface AdminTraceEvent {
+  event_id: string;
+  run_id: string;
+  /** 所属 workflow 阶段的序号；挂不上阶段时为 null。 */
+  round_index: number | null;
+  event_type: AdminTraceEventType | string;
+  event_type_label: string;
+  stage: string | null;
+  title: string;
+  summary: string | null;
+  input_preview: string | null;
+  output_preview: string | null;
+  status: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  duration_ms: number | null;
+  parent_event_id: string | null;
+  model: string | null;
+  provider: string | null;
+  tool: string | null;
+  tokens_in: number | null;
+  tokens_out: number | null;
+  cost: number | null;
+  cache_hit: boolean | null;
+  prefetch_reused: boolean | null;
+  fallback: boolean | null;
+  metadata: AdminRecord;
+  /** 口径说明（例如「模型输入正文未持久化」），展开详情时展示。 */
+  notes: string[];
+  badcases: AdminTraceBadcaseBrief[];
+}
+
+export interface AdminTimelineTrackBlock {
+  event_id: string;
+  title: string;
+  status: string | null;
+  stage: string | null;
+  /** 相对 run 开始时刻的偏移；没有起点时为 null。 */
+  start_ms: number | null;
+  duration_ms: number | null;
+  badcase_count: number;
+}
+
+export interface AdminTimelineTrack {
+  key: string;
+  label: string;
+  count: number;
+  blocks: AdminTimelineTrackBlock[];
+}
+
+export interface AdminTimelineStage {
+  stage_id: string;
+  title: string;
+  status: string | null;
+  ordinal: number;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface AdminTimeline {
+  run_id: string;
+  generated_at: string;
+  run: {
+    run_id: string;
+    status: string | null;
+    source: string | null;
+    original_query: string | null;
+    created_at: string | null;
+    started_at: string | null;
+    finished_at: string | null;
+    duration_ms: number | null;
+    cost: number | null;
+    total_tokens: number | null;
+    badcase_count: number | null;
+    error: string | null;
+  };
+  summary: {
+    events: number;
+    by_type: AdminRecord;
+    errors: number;
+    fallbacks: number;
+    badcases: number;
+    stages: number;
+  };
+  stages: AdminTimelineStage[];
+  tracks: AdminTimelineTrack[];
+  events: AdminTraceEvent[];
+  badcases: AdminTraceBadcaseBrief[];
+  /** 本次 run 的行程质量画像（与质量页同一份口径/同一份缓存）。 */
+  quality: {
+    score: number | null;
+    grade: AdminGrade;
+    /** `plan_quality()` 的 14 个原始字段；没有可解析的计划时为 null。 */
+    metrics: AdminRecord | null;
+    /** 现算失败的原因（如「无计划」）；有值时 score 一定为 null。 */
+    error: string | null;
+  };
+  type_options: { key: string; label: string }[];
+  notes: string[];
 }

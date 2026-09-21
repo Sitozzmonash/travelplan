@@ -1,22 +1,36 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { ExternalLink, RefreshCw, TriangleAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { AdminDetailDialog, JsonBlock, KeyValueList } from "@/components/admin/detail-dialog";
+import { AdminTable, type AdminColumn } from "@/components/admin/admin-table";
+import { FilterSelect } from "@/components/admin/filter-select";
 import { PageHeader } from "@/components/admin/page-header";
-import { PartialBanner, ResourceView } from "@/components/admin/admin-states";
+import { PartialBanner, ResourceView, SectionEmpty, InlineSpinner } from "@/components/admin/admin-states";
+import { PanelSection } from "@/components/admin/metric-list";
 import { StatCard } from "@/components/admin/stat-card";
 import { BooleanBadge, StatusBadge, ToneBadge } from "@/components/admin/status-badge";
-import { formatLatency, formatNumber, formatSampleRatio } from "@/components/admin/format";
-import { ProviderDetailDialog } from "@/components/admin/provider-detail-dialog";
+import {
+  formatDurationMs,
+  formatLatency,
+  formatMetricValue,
+  formatNumber,
+  formatSampleRatio,
+  statusLabel,
+} from "@/components/admin/format";
 import { useAdminResource } from "@/components/admin/use-admin-resource";
-import { formatDateTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import { clearAdminToken, getAdminProviders } from "@/lib/admin-api";
+import { clearAdminToken, getAdminProvider, getAdminProviders } from "@/lib/admin-api";
+import { formatDateTime, formatStamp } from "@/lib/format";
 import {
   providerSourceLabel,
   providerStatusLabel,
+  type AdminProviderDetail,
+  type AdminProviderHealthCall,
   type AdminProviderList,
+  type AdminProviderStats,
   type AdminProviderStatus,
   type AdminProviderSummary,
 } from "@/types/admin";
@@ -31,6 +45,10 @@ import {
  * 1) `calls === 0` → UNKNOWN（中性灰）+ 文案说明「没有调用记录，不代表故障」，
  *    绝不画成红色失败；
  * 2) `success_rate / failure_rate === null` → 显示「—（无样本）」，绝不落成 0%。
+ *
+ * 密度约定（方案 §8）：默认卡片只留「扫一眼就能判断健康」的字段 ——
+ * 成功率 / P95 / Timeout / Fallback / 最近错误；调用次数、失败率、平均延迟、来源、工具、
+ * 最近调用表、原始错误、查询参数全部收进详情弹窗，卡片不再一次铺开十几个数字。
  */
 
 /** 不同状态的卡片描边：只有真正的故障才用危险色。 */
@@ -49,7 +67,7 @@ export function ProvidersView() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Provider 健康"
-        description="按最近的真实调用账本聚合，快速判断哪个外部数据源最近不稳定。没有调用记录显示 UNKNOWN，不代表故障。"
+        description="按最近的真实调用账本聚合，快速判断哪个外部数据源最近不稳定。卡片只给关键读数，点开看完整口径。没有调用记录显示 UNKNOWN，不代表故障。"
         actions={
           <Button variant="outline" size="sm" onClick={resource.reload}>
             <RefreshCw />
@@ -197,14 +215,14 @@ function NeedsAttention({
           ))}
         </p>
         <p className="mt-0.5 text-warning-subtle-foreground/75">
-          这些 Provider 的状态是 DEGRADED / UNAVAILABLE，建议结合调用来源与最近错误排查。
+          这些 Provider 的状态是 DEGRADED / UNAVAILABLE，建议点开卡片看完整工具、调用来源与原始错误。
         </p>
       </div>
     </div>
   );
 }
 
-/* ------------------------------ 卡片 ------------------------------ */
+/* ------------------------------ 卡片（默认只给关键读数） ------------------------------ */
 
 function ProviderCard({
   item,
@@ -222,7 +240,7 @@ function ProviderCard({
     <button
       type="button"
       onClick={() => onSelect(item.provider)}
-      aria-label={`查看 ${item.label} 的最近调用`}
+      aria-label={`查看 ${item.label} 的调用明细`}
       className={cn(
         "flex min-w-0 flex-col gap-3 rounded-xl bg-card p-3.5 text-left ring-1 transition-colors hover:bg-muted/30 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
         STATUS_RING[item.status],
@@ -240,60 +258,42 @@ function ProviderCard({
         <StatusBadge status={item.status} label={providerStatusLabel(item.status, calls)} />
       </div>
 
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-[11px] text-muted-foreground">密钥</span>
-        {item.configured === null ? (
-          <span className="text-[11px] text-muted-foreground">—（后端未声明）</span>
-        ) : (
-          <BooleanBadge
-            value={item.configured}
-            onLabel="已配置"
-            offLabel="未配置"
-            onTone="success"
-          />
-        )}
-        <span className="ml-auto inline-flex items-center gap-1 text-[11px] text-muted-foreground">
-          查看最近调用
-          <ExternalLink className="size-3" aria-hidden />
-        </span>
-      </div>
-
       <dl className="grid grid-cols-2 gap-x-3 gap-y-2">
-        <Metric label="最近一次调用" value={formatDateTime(item.last_call_at)} />
-        <Metric label="最近成功" value={formatDateTime(item.last_success_at)} />
-        <Metric label="最近失败" value={formatDateTime(item.last_failure_at)} />
-        <Metric label="调用次数" value={formatNumber(calls)} />
         <Metric label="成功率" value={formatSampleRatio(item.success_rate)} />
-        <Metric label="失败率" value={formatSampleRatio(item.failure_rate)} />
+        <Metric label="P95 延迟" value={formatLatency(item.p95_latency_ms)} />
         <Metric label="Timeout 次数" value={formatNumber(item.timeouts)} />
         <Metric label="Fallback 次数" value={formatNumber(item.fallback_count)} />
-        <Metric label="平均延迟" value={formatLatency(item.avg_latency_ms)} />
-        <Metric label="P95 延迟" value={formatLatency(item.p95_latency_ms)} />
       </dl>
 
-      <TagRow label="来源" values={item.sources ?? []} renderLabel={providerSourceLabel} />
-      <TagRow label="工具" values={item.tools ?? []} />
-
-      {item.last_error ? (
-        <p
-          className="rounded-md bg-danger-subtle px-2.5 py-1.5 text-[11px] leading-4 break-words text-danger-subtle-foreground"
-          title={item.last_error}
-        >
-          最近错误：{item.last_error}
-        </p>
-      ) : null}
+      {/* 错误文本只给一行：完整内容放在 title 与详情弹窗里，卡片保持可扫读。 */}
+      <p
+        className={cn(
+          "rounded-md px-2.5 py-1.5 text-[11px] leading-4",
+          item.last_error
+            ? "bg-danger-subtle text-danger-subtle-foreground"
+            : "bg-muted/60 text-muted-foreground",
+        )}
+        title={item.last_error ?? "没有最近错误"}
+      >
+        <span className="block truncate">最近错误：{item.last_error || "—"}</span>
+      </p>
 
       {noHistory ? (
-        <p className="rounded-md bg-muted/60 px-2.5 py-2 text-[11px] leading-4 text-muted-foreground">
-          这段时间没有调用记录，不代表故障。状态按 UNKNOWN 展示，成功 / 失败率为「—」。
+        <p className="rounded-md bg-muted/60 px-2.5 py-1.5 text-[11px] leading-4 text-muted-foreground">
+          没有调用记录，不代表故障。
         </p>
       ) : null}
 
       {insufficientSample ? (
-        <p className="rounded-md bg-muted/60 px-2.5 py-2 text-[11px] leading-4 text-muted-foreground">
-          最近调用样本偏少，后端暂不下健康结论；这不代表故障。
+        <p className="rounded-md bg-muted/60 px-2.5 py-1.5 text-[11px] leading-4 text-muted-foreground">
+          样本偏少，后端暂不下健康结论；这不代表故障。
         </p>
       ) : null}
+
+      <span className="self-end inline-flex items-center gap-1 text-[11px] text-muted-foreground">
+        查看调用明细
+        <ExternalLink className="size-3" aria-hidden />
+      </span>
     </button>
   );
 }
@@ -309,27 +309,358 @@ function Metric({ label, value }: { label: string; value: string }) {
   );
 }
 
-function TagRow({
-  label,
-  values,
-  renderLabel,
+/* ------------------------------ 详情弹窗 ------------------------------ */
+
+/** 明细条数：把「看多深」交给操作员，而不是写死后端默认的 20 条。 */
+const CALL_LIMIT_OPTIONS = [
+  { value: "20", label: "最近 20 次调用" },
+  { value: "100", label: "最近 100 次调用" },
+  { value: "200", label: "最近 200 次调用" },
+];
+
+/**
+ * 详情弹窗：卡片上被删掉的技术字段全部收在这里（调用来源 / 工具 / 平均延迟 / 原始错误 …）。
+ *
+ * 「看多深」交给操作员（20 / 100 / 200 条），而不是写死后端默认的 20 条 ——
+ * 排查 TikHub 这类高频 Provider 时，20 条样本根本看不出失败是不是集中在某个工具上。
+ */
+function ProviderDetailDialog({
+  provider,
+  onOpenChange,
 }: {
-  label: string;
-  values: string[];
-  renderLabel?: (value: string | null | undefined) => string;
+  provider: string;
+  onOpenChange: (open: boolean) => void;
 }) {
+  const [limitKey, setLimitKey] = useState("20");
+  const limit = Number(limitKey);
+
+  const resource = useAdminResource<AdminProviderDetail>(
+    `admin-provider:${provider}:${limit}`,
+    () => getAdminProvider(provider, limit),
+  );
+
+  const data = resource.data;
+  const notFound = resource.error?.kind === "not_found";
+
   return (
-    <div className="flex flex-wrap items-center gap-1.5">
-      <span className="text-[11px] text-muted-foreground">{label}</span>
-      {values.length === 0 ? (
-        <span className="text-[11px] text-muted-foreground">—</span>
+    <AdminDetailDialog
+      open
+      onOpenChange={onOpenChange}
+      title={data?.label ?? provider}
+      description={<span className="font-mono">{provider}</span>}
+      badge={
+        data ? (
+          <StatusBadge
+            status={data.status}
+            label={providerStatusLabel(data.status, data.stats?.calls)}
+          />
+        ) : null
+      }
+    >
+      <div className="flex flex-col gap-1">
+        <FilterSelect
+          label="明细条数"
+          value={limitKey}
+          options={CALL_LIMIT_OPTIONS}
+          onChange={setLimitKey}
+          placeholder="最近 20 次调用"
+          className="w-48"
+        />
+        {/* 换条数时 useAdminResource 会保留上一批明细，这里明说正在重取，避免旧数据被当成新样本。 */}
+        {resource.loading && data ? <InlineSpinner label="正在重新取调用明细" /> : null}
+      </div>
+
+      {notFound ? (
+        <SectionEmpty
+          title="没有这个 Provider 的调用记录"
+          description={`后端没有 provider=${provider} 的任何调用账本。它可能只是这段时间没被用到，也可能这个 id 不存在 —— 两者都不代表故障。`}
+          hint="可以返回列表，选择一个出现在卡片里的 Provider 再看明细。"
+        />
       ) : (
-        values.map((value) => (
-          <ToneBadge key={value} tone="muted" className="text-[0.6875rem]">
-            <span title={value}>{renderLabel ? renderLabel(value) : value}</span>
-          </ToneBadge>
-        ))
+        <ResourceView resource={resource} loadingRows={5} onClearToken={clearAdminToken}>
+          {(detail) => <ProviderDetailBody data={detail} limit={limit} />}
+        </ResourceView>
       )}
+    </AdminDetailDialog>
+  );
+}
+
+function ProviderDetailBody({ data, limit }: { data: AdminProviderDetail; limit: number }) {
+  const withQuery = data.calls.filter((call) => Object.keys(call.query).length > 0);
+
+  return (
+    <div className="flex flex-col gap-5">
+      {!data.stats ? (
+        <PartialBanner
+          title="后端没有返回这个 Provider 的聚合统计"
+          description="最近调用明细仍然可用；统计数字缺失时不做二次推断，避免给出错误的健康结论。"
+        />
+      ) : null}
+
+      <PanelSection
+        title="统计口径"
+        description={data.note || "基于真实调用账本聚合，不做主动探活。"}
+      >
+        <KeyValueList entries={buildStatEntries(data.stats, data.configured)} />
+      </PanelSection>
+
+      <PanelSection
+        title="最近调用"
+        description={`后端按时间倒序返回 ${formatNumber(data.calls.length)} 条（本次请求 ${formatNumber(
+          limit,
+        )} 条）。逐条耗时就是延迟的分布读数：后端没有分位数直方图口径，这里不额外画分布图。`}
+      >
+        {data.calls.length > 0 ? (
+          <AdminTable
+            columns={CALL_COLUMNS}
+            rows={data.calls}
+            getRowKey={(call) => call.call_id ?? providerKey(call)}
+          />
+        ) : (
+          <SectionEmpty
+            title="这个 Provider 最近没有调用记录"
+            description="没有调用历史不代表故障：它可能只是这段时间没被用到。"
+          />
+        )}
+      </PanelSection>
+
+      <PanelSection
+        title="原始错误"
+        description="未经改写的文本，便于直接对照后端日志；同一条错误只列一次。"
+      >
+        <RawErrors data={data} />
+      </PanelSection>
+
+      <PanelSection
+        title="查询参数（默认折叠）"
+        description="后端已脱敏；这里只展示解释「查了什么」的键值，不会出现任何密钥。"
+      >
+        {withQuery.length > 0 ? (
+          <ul className="flex flex-col gap-2">
+            {withQuery.map((call, index) => (
+              <li key={call.call_id ?? `query-${index}`}>
+                <details className="rounded-lg border border-border p-2.5">
+                  <summary className="cursor-pointer text-xs text-foreground">
+                    {formatStamp(call.fetched_at)} · {call.tool ?? "未知工具"} ·{" "}
+                    {statusLabel(call.status)}
+                  </summary>
+                  <JsonBlock className="mt-2" value={call.query} maxHeight="16rem" />
+                </details>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="text-xs text-muted-foreground">这批调用没有可展开的查询参数。</p>
+        )}
+      </PanelSection>
     </div>
   );
+}
+
+function RawErrors({ data }: { data: AdminProviderDetail }) {
+  const lastError = data.stats?.last_error ?? null;
+  const errors = distinctErrors(data.calls);
+
+  if (!lastError && errors.length === 0) {
+    return <p className="text-xs text-muted-foreground">这批调用没有错误记录，也没有最近错误。</p>;
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      {lastError ? (
+        <p className="text-xs leading-5 break-words text-danger-subtle-foreground">
+          <span className="text-[11px] text-muted-foreground">最近错误：</span>
+          {lastError}
+        </p>
+      ) : null}
+      {errors.length > 0 ? (
+        <ul className="flex flex-col gap-1.5">
+          {errors.map((text) => (
+            <li
+              key={text}
+              className="rounded-md bg-muted/50 px-2.5 py-1.5 font-mono text-[11px] leading-4 break-words text-foreground"
+            >
+              {text}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
+function distinctErrors(calls: AdminProviderHealthCall[]): string[] {
+  const values = calls
+    .map((call) => call.error)
+    .filter((error): error is string => typeof error === "string" && error.length > 0);
+  return Array.from(new Set(values));
+}
+
+function configuredNode(configured: boolean | null) {
+  if (configured === null) return <span className="text-muted-foreground">—（后端未声明）</span>;
+  return <BooleanBadge value={configured} onLabel="已配置" offLabel="未配置" onTone="success" />;
+}
+
+function buildStatEntries(stats: AdminProviderStats | null, configured: boolean | null) {
+  const s = stats ?? {};
+  return [
+    { key: "configured", label: "密钥配置", value: configuredNode(configured) },
+    { key: "calls", label: "调用次数", value: formatNumber(s.calls) },
+    {
+      key: "success",
+      label: "成功 / 失败",
+      value: `${formatNumber(s.successes)} / ${formatNumber(s.failures)}`,
+    },
+    { key: "success_rate", label: "成功率", value: formatSampleRatio(s.success_rate) },
+    { key: "failure_rate", label: "失败率", value: formatSampleRatio(s.failure_rate) },
+    { key: "timeouts", label: "Timeout 次数", value: formatNumber(s.timeouts) },
+    { key: "auth_errors", label: "鉴权失败", value: formatNumber(s.auth_errors) },
+    { key: "rate_limited", label: "被限流", value: formatNumber(s.rate_limited) },
+    { key: "empty", label: "空结果", value: formatNumber(s.empty) },
+    { key: "fallback_count", label: "Fallback 次数", value: formatNumber(s.fallback_count) },
+    { key: "avg_latency_ms", label: "平均延迟", value: formatLatency(s.avg_latency_ms) },
+    { key: "p95_latency_ms", label: "P95 延迟", value: formatLatency(s.p95_latency_ms) },
+    { key: "last_call_at", label: "最近调用", value: formatDateTime(s.last_call_at) },
+    { key: "last_success_at", label: "最近成功", value: formatDateTime(s.last_success_at) },
+    { key: "last_failure_at", label: "最近失败", value: formatDateTime(s.last_failure_at) },
+    {
+      key: "last_status",
+      label: "最近一次状态",
+      value: <StatusBadge status={s.last_status ?? null} />,
+    },
+    {
+      key: "last_error",
+      label: "最近错误",
+      value: s.last_error ? (
+        <span className="break-words text-danger-subtle-foreground">{s.last_error}</span>
+      ) : (
+        "—"
+      ),
+    },
+    { key: "tools", label: "工具", value: joinOrDash(s.tools) },
+    {
+      key: "sources",
+      label: "调用来源",
+      value:
+        s.sources && s.sources.length > 0
+          ? s.sources.map((source) => providerSourceLabel(source)).join("、")
+          : "—",
+    },
+  ];
+}
+
+function joinOrDash(values: string[] | null | undefined): string {
+  return values && values.length > 0 ? values.join("、") : "—";
+}
+
+function providerKey(call: AdminProviderHealthCall): string {
+  return `${call.provider ?? "provider"}-${call.tool ?? "tool"}-${call.fetched_at ?? "time"}`;
+}
+
+const CALL_COLUMNS: AdminColumn<AdminProviderHealthCall>[] = [
+  {
+    key: "tool",
+    header: "工具 / 状态",
+    primary: true,
+    cell: (call) => (
+      <span className="flex flex-wrap items-center gap-1.5">
+        <span className="font-mono text-xs text-foreground">{call.tool ?? "未知工具"}</span>
+        <StatusBadge status={call.status} />
+      </span>
+    ),
+  },
+  {
+    key: "time",
+    header: "时间",
+    cell: (call) => (
+      <span className="font-mono text-[11px] whitespace-nowrap text-muted-foreground">
+        {formatStamp(call.fetched_at)}
+      </span>
+    ),
+  },
+  {
+    key: "duration",
+    header: "耗时",
+    align: "right",
+    cell: (call) => <span className="tabular text-xs">{formatDurationMs(call.duration_ms)}</span>,
+  },
+  {
+    key: "returned",
+    header: "返回",
+    align: "right",
+    cell: (call) => (
+      <span className="tabular text-xs text-foreground">{formatMetricValue(call.returned)}</span>
+    ),
+  },
+  {
+    key: "source",
+    header: "来源",
+    mobileHidden: true,
+    cell: (call) => (
+      <ToneBadge tone={call.source_type === "discovery" ? "info" : "muted"} className="text-[0.6875rem]">
+        <span title={call.source_type ?? "未知来源"}>{providerSourceLabel(call.source_type)}</span>
+      </ToneBadge>
+    ),
+  },
+  {
+    key: "fallback",
+    header: "Fallback",
+    cell: (call) => (
+      <BooleanBadge
+        value={call.fallback}
+        onLabel="是"
+        offLabel="否"
+        onTone="warning"
+        offTone="muted"
+      />
+    ),
+  },
+  {
+    key: "error",
+    header: "错误",
+    mobileHidden: true,
+    cell: (call) =>
+      call.error ? (
+        <span
+          className="block max-w-[16rem] truncate text-[11px] text-danger-subtle-foreground"
+          title={call.error}
+        >
+          {call.error}
+        </span>
+      ) : (
+        <span className="text-[11px] text-muted-foreground">—</span>
+      ),
+  },
+  {
+    key: "link",
+    header: "Run / Session",
+    mobileHidden: true,
+    cell: (call) => <RunOrSessionLink call={call} />,
+  },
+];
+
+function RunOrSessionLink({ call }: { call: AdminProviderHealthCall }) {
+  if (call.run_id) {
+    return (
+      <Link
+        href={`/admin/runs/${encodeURIComponent(call.run_id)}`}
+        title={`run_id=${call.run_id}`}
+        className="font-mono text-[11px] text-primary underline-offset-4 hover:underline"
+      >
+        {call.run_id}
+      </Link>
+    );
+  }
+  if (call.session_id) {
+    return (
+      <Link
+        href={`/admin/sessions?q=${encodeURIComponent(call.session_id)}`}
+        title={`session_id=${call.session_id}`}
+        className="font-mono text-[11px] text-primary underline-offset-4 hover:underline"
+      >
+        {call.session_id}
+      </Link>
+    );
+  }
+  return <span className="text-[11px] text-muted-foreground">—</span>;
 }

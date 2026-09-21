@@ -1,8 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
+  AlertTriangle,
   ArrowLeft,
   Bug,
   ChevronRight,
@@ -10,10 +11,10 @@ import {
   Cpu,
   GitBranch,
   RefreshCw,
-  Share2,
   Sparkles,
   Wrench,
 } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { AdminTable, type AdminColumn } from "@/components/admin/admin-table";
@@ -28,8 +29,9 @@ import {
   readGraceWaitedMs,
   readHandoffRows,
 } from "@/components/admin/run-performance";
+import { RunTimeline } from "@/components/admin/run-timeline";
 import { StatCard } from "@/components/admin/stat-card";
-import { SourceTag, StatusBadge, ToneBadge } from "@/components/admin/status-badge";
+import { SourceTag, StatusBadge, ToneBadge, type AdminTone } from "@/components/admin/status-badge";
 import { TraceTree } from "@/components/admin/trace-tree";
 import {
   badcaseCategoryLabel,
@@ -48,9 +50,11 @@ import { useAdminResource } from "@/components/admin/use-admin-resource";
 import {
   getAdminRun,
   getAdminRunStages,
+  getAdminRunTimeline,
   type AdminApiError,
 } from "@/lib/admin-api";
 import { formatDateTime, formatProviderQuery } from "@/lib/format";
+import { cn } from "@/lib/utils";
 import type {
   AdminBadcase,
   AdminCostBreakdown,
@@ -58,26 +62,72 @@ import type {
   AdminJevCall,
   AdminLlmCall,
   AdminProviderCall,
+  AdminRecord,
   AdminRunDetail,
   AdminStageDetail,
   AdminStageLlmCall,
   AdminStageProgress,
   AdminStageTokens,
+  AdminTimeline,
   AdminTraceSpan,
+  AdminUserJourney,
 } from "@/types/admin";
 
 /**
  * 运行详情。
  *
- * 默认展开的只有 Trace 与阶段这两块「回答运行卡在哪」的最短路径；
- * 所有明细（阶段详情、LLM / Jev 调用、Bad Case）都以弹窗呈现，主页面只留摘要。
+ * 五个页签回答五个不同的问题：概览回答「用户要什么 / 系统给了什么 / 质量怎么样 / 哪里有问题」，
+ * 轨迹回答「这次 run 到底发生了什么」，性能回答「哪里最慢」，Provider 回答「数据源稳不稳」，
+ * Bad Case 回答「这次触发了哪些问题」。技术明细（LLM / Jev / Token / 原始 Trace）不再堆在首屏，
+ * 但全部保留在对应页签里，只是位置变了。
  */
+type RunTabKey = "overview" | "timeline" | "performance" | "provider" | "badcase";
+
+const RUN_TABS: { key: RunTabKey; label: string }[] = [
+  { key: "overview", label: "概览" },
+  { key: "timeline", label: "轨迹" },
+  { key: "performance", label: "性能" },
+  { key: "provider", label: "Provider" },
+  { key: "badcase", label: "Bad Case" },
+];
+
+interface TimelineFocus {
+  stage: string | null;
+  query: string;
+  /** 每次跳转自增：轨迹页据此重新应用筛选（同一个阶段也可以反复跳）。 */
+  token: number;
+}
+
+interface StageFocus {
+  stage: string | null;
+  token: number;
+}
+
 export function RunDetailView({ runId }: { runId: string }) {
   const resource = useAdminResource<AdminRunDetail>(`admin-run:${runId}`, () => getAdminRun(runId));
   // 阶段明细来自独立端点，404/未实现时只影响「阶段」这一块，不会让整页失败。
   const stages = useAdminResource<AdminStageDetail[]>(`admin-run-stages:${runId}`, () =>
     getAdminRunStages(runId),
   );
+  // 首屏的「质量 / 告警 / Bad Case」要用轨迹侧的派生字段；轨迹面板由 RunTimeline 自行拉取同一 key。
+  const timeline = useAdminResource<AdminTimeline>(
+    `admin-run-timeline:${runId}`,
+    () => getAdminRunTimeline(runId),
+    Boolean(runId),
+  );
+
+  const [tab, setTab] = useState<RunTabKey>("overview");
+  const [timelineFocus, setTimelineFocus] = useState<TimelineFocus>({ stage: null, query: "", token: 0 });
+  const [stageFocus, setStageFocus] = useState<StageFocus>({ stage: null, token: 0 });
+
+  const openTimeline = (stage: string | null, query = "") => {
+    setTimelineFocus((previous) => ({ stage, query, token: previous.token + 1 }));
+    setTab("timeline");
+  };
+  const openPerformance = (stage: string | null) => {
+    setStageFocus((previous) => ({ stage, token: previous.token + 1 }));
+    setTab("performance");
+  };
 
   return (
     <div className="flex flex-col gap-4">
@@ -97,6 +147,7 @@ export function RunDetailView({ runId }: { runId: string }) {
               onClick={() => {
                 resource.reload();
                 stages.reload();
+                timeline.reload();
               }}
             >
               <RefreshCw />
@@ -111,8 +162,70 @@ export function RunDetailView({ runId }: { runId: string }) {
       />
 
       <ResourceView resource={resource} loadingRows={6}>
-        {(data) => <RunDetailBody data={data} stages={stages} />}
+        {(data) => (
+          <RunDetailBody
+            data={data}
+            stages={stages}
+            timeline={timeline.data}
+            tab={tab}
+            onTabChange={setTab}
+            timelineFocus={timelineFocus}
+            stageFocus={stageFocus}
+            onOpenTimeline={openTimeline}
+            onOpenPerformance={openPerformance}
+          />
+        )}
       </ResourceView>
+    </div>
+  );
+}
+
+/**
+ * 页签条。
+ *
+ * 为什么不用 components/ui/tabs：这一页不路由，且「轨迹」面板必须常驻（切走再切回来
+ * 不该丢掉筛选条件、也不该重新拉一次事件）；基础组件会给每个面板做挂载 / 卸载。
+ * 造型照抄 ui/tabs 的默认变体：muted 底、选中项浮起。
+ */
+function TabBar({
+  value,
+  onChange,
+  counts,
+}: {
+  value: RunTabKey;
+  onChange: (key: RunTabKey) => void;
+  counts: Partial<Record<RunTabKey, number | null>>;
+}) {
+  return (
+    <div
+      role="tablist"
+      aria-label="运行详情分区"
+      className="flex w-full items-center gap-1 overflow-x-auto rounded-lg bg-muted p-[3px] sm:w-fit"
+    >
+      {RUN_TABS.map((item) => {
+        const active = item.key === value;
+        const count = counts[item.key];
+        return (
+          <button
+            key={item.key}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            onClick={() => onChange(item.key)}
+            className={cn(
+              "inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-transparent px-2.5 text-sm font-medium whitespace-nowrap transition-all focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none",
+              active ? "bg-background text-foreground shadow-sm" : "text-foreground/60 hover:text-foreground",
+            )}
+          >
+            {item.label}
+            {typeof count === "number" ? (
+              <Badge variant="secondary" className="tabular text-[0.625rem]">
+                {formatNumber(count)}
+              </Badge>
+            ) : null}
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -120,15 +233,28 @@ export function RunDetailView({ runId }: { runId: string }) {
 function RunDetailBody({
   data,
   stages,
+  timeline,
+  tab,
+  onTabChange,
+  timelineFocus,
+  stageFocus,
+  onOpenTimeline,
+  onOpenPerformance,
 }: {
   data: AdminRunDetail;
   stages: ReturnType<typeof useAdminResource<AdminStageDetail[]>>;
+  timeline: AdminTimeline | null;
+  tab: RunTabKey;
+  onTabChange: (key: RunTabKey) => void;
+  timelineFocus: TimelineFocus;
+  stageFocus: StageFocus;
+  onOpenTimeline: (stage: string | null, query?: string) => void;
+  onOpenPerformance: (stage: string | null) => void;
 }) {
   const { run, metrics, progress } = data;
   const llmCalls = data.llm_calls.length > 0 ? data.llm_calls : deriveLlmCalls(data.trace);
   const stageRows =
     stages.data && stages.data.length > 0 ? stages.data : progress.stages.map(progressToStage);
-
   const tokensMissing =
     metrics.input_tokens === null &&
     metrics.output_tokens === null &&
@@ -137,215 +263,654 @@ function RunDetailBody({
 
   return (
     <div className="flex flex-col gap-4">
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex flex-wrap items-center gap-2">
-            <span>概览</span>
-            <StatusBadge status={run.status} />
-            <SourceTag source={run.source} />
-          </CardTitle>
-          <CardDescription className="break-words whitespace-pre-wrap">
-            {run.original_query || "后端没有记录原始请求文本。"}
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-4">
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-            <StatCard label="总耗时" value={formatDurationMs(metrics.duration_ms)} />
-            <StatCard
-              label="总 Token"
-              value={metrics.total_tokens === null ? "未知" : formatTokenCount(metrics.total_tokens)}
-              icon={Coins}
-              hint={metrics.total_tokens === null ? "后端未返回 usage" : undefined}
-            />
-            <StatCard label="LLM 调用" value={formatNumber(metrics.llm_calls)} icon={Cpu} />
-            <StatCard label="Jev 调用" value={formatNumber(metrics.jev_calls)} icon={Sparkles} />
-            <StatCard label="工具调用" value={formatNumber(metrics.tool_calls)} icon={Wrench} />
-            <StatCard
-              label="Provider 失败"
-              value={formatNumber(metrics.provider_failures)}
-              tone={metrics.provider_failures && metrics.provider_failures > 0 ? "warning" : "muted"}
-            />
-            <StatCard
-              label="Bad Case"
-              value={formatNumber(metrics.badcase_count)}
-              tone={metrics.badcase_count && metrics.badcase_count > 0 ? "warning" : "muted"}
-              icon={Bug}
-            />
-            <StatCard
-              label="成本"
-              value={formatCostWithCurrency(metrics.cost, metrics.cost_currency)}
-              hint={
-                metrics.cost_source === "user_price"
-                  ? "按「系统配置」里的每百万 token 单价计算"
-                  : metrics.cost_source
-                    ? "按后端定价计算"
-                    : "未配置单价"
-              }
-            />
-          </div>
-          <DescriptionList
-            items={[
-              { label: "开始", value: formatDateTime(run.started_at ?? run.created_at) },
-              { label: "结束", value: formatDateTime(run.finished_at) },
-              { label: "来源", value: <SourceTag source={run.source} /> },
-              {
-                label: "来源会话",
-                value: run.source_session_id ? (
-                  <Link
-                    href={`/admin/sessions?q=${encodeURIComponent(run.source_session_id)}`}
-                    className="font-mono text-primary underline-offset-4 hover:underline"
-                  >
-                    {run.source_session_id}
-                  </Link>
-                ) : (
-                  "无（这次不是引导式创建的）"
-                ),
-              },
-              { label: "进度状态", value: progress.status ? statusLabel(progress.status) : "—" },
-              { label: "进度说明", value: progress.message || "后端没有给出说明" },
-            ]}
-          />
-        </CardContent>
-      </Card>
-
-      <CostPanel metrics={metrics} />
-
-      <RunPerformanceSummary
-        metrics={metrics}
-        stages={stageRows}
-        trace={data.trace}
-        llmCalls={llmCalls}
-        jevCalls={data.jev_calls}
-        journey={data.user_journey}
+      <TabBar
+        value={tab}
+        onChange={onTabChange}
+        counts={{
+          timeline: timeline ? timeline.summary.events : null,
+          provider: data.provider_calls.length,
+          badcase: data.badcases.length,
+        }}
       />
 
-      <Card>
-        <CardHeader>
-          <CardTitle>阶段</CardTitle>
-          <CardDescription>
-            workflow 的 {stageRows.length} 个阶段；点击任意阶段查看步骤、事实、工具 / 模型调用与 Token。
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          {stages.error ? (
-            <InlineError
-              title="阶段明细没能加载"
-              description="阶段端点可能尚未部署或暂时不可用；下面的阶段摘要来自运行详情，仍然可以查看。"
-              detail={(stages.error as AdminApiError).detail}
-              onRetry={stages.reload}
-              className="mb-3"
-            />
-          ) : null}
-          {stages.loading && !stages.data ? (
-            <SectionSkeleton rows={3} />
-          ) : stageRows.length === 0 ? (
-            <SectionEmpty
-              title="没有阶段进度"
-              description="这次运行没有写入阶段记录，因此看不到分步进度。Trace 里通常仍有更细的 span。"
-            />
-          ) : (
-            <ul className="flex flex-col gap-2.5">
-              {stageRows.map((stage) => (
-                <StageRow key={stage.stage_id} stage={stage} runMetrics={metrics} />
-              ))}
-            </ul>
-          )}
-        </CardContent>
-      </Card>
+      {tab === "overview" ? (
+        <div className="flex flex-col gap-4">
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex flex-wrap items-center gap-2">
+                <span>概览</span>
+                <StatusBadge status={run.status} />
+                <SourceTag source={run.source} />
+              </CardTitle>
+              <CardDescription className="break-words whitespace-pre-wrap">
+                {run.original_query || "后端没有记录原始请求文本。"}
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="flex flex-col gap-4">
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+                <StatCard label="总耗时" value={formatDurationMs(metrics.duration_ms)} />
+                <StatCard
+                  label="总 Token"
+                  value={metrics.total_tokens === null ? "未知" : formatTokenCount(metrics.total_tokens)}
+                  icon={Coins}
+                  hint={metrics.total_tokens === null ? "后端未返回 usage" : undefined}
+                />
+                <StatCard label="LLM 调用" value={formatNumber(metrics.llm_calls)} icon={Cpu} />
+                <StatCard label="Jev 调用" value={formatNumber(metrics.jev_calls)} icon={Sparkles} />
+                <StatCard label="工具调用" value={formatNumber(metrics.tool_calls)} icon={Wrench} />
+                <StatCard
+                  label="Provider 失败"
+                  value={formatNumber(metrics.provider_failures)}
+                  tone={metrics.provider_failures && metrics.provider_failures > 0 ? "warning" : "muted"}
+                />
+                <StatCard
+                  label="Bad Case"
+                  value={formatNumber(metrics.badcase_count)}
+                  tone={metrics.badcase_count && metrics.badcase_count > 0 ? "warning" : "muted"}
+                  icon={Bug}
+                />
+                <StatCard
+                  label="成本"
+                  value={formatCostWithCurrency(metrics.cost, metrics.cost_currency)}
+                  hint={
+                    metrics.cost_source === "user_price"
+                      ? "按「系统配置」里的每百万 token 单价计算"
+                      : metrics.cost_source
+                        ? "按后端定价计算"
+                        : "未配置单价"
+                  }
+                />
+              </div>
+              <DescriptionList
+                items={[
+                  { label: "开始", value: formatDateTime(run.started_at ?? run.created_at) },
+                  { label: "结束", value: formatDateTime(run.finished_at) },
+                  { label: "来源", value: <SourceTag source={run.source} /> },
+                  {
+                    label: "来源会话",
+                    value: run.source_session_id ? (
+                      <Link
+                        href={`/admin/sessions?q=${encodeURIComponent(run.source_session_id)}`}
+                        className="font-mono text-primary underline-offset-4 hover:underline"
+                      >
+                        {run.source_session_id}
+                      </Link>
+                    ) : (
+                      "无（这次不是引导式创建的）"
+                    ),
+                  },
+                  { label: "进度状态", value: progress.status ? statusLabel(progress.status) : "—" },
+                  { label: "进度说明", value: progress.message || "后端没有给出说明" },
+                ]}
+              />
+            </CardContent>
+          </Card>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Trace</CardTitle>
-          <CardDescription>
-            共 {data.trace.length} 个 span；根节点是 parent_span_id 为空的 span。点击任意 span 查看完整属性与错误。
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
+          <RunFirstScreen data={data} timeline={timeline} onOpenTimeline={onOpenTimeline} />
+
+          <CostPanel metrics={metrics} />
+
+          <CollapsibleSection
+            title="引导式来源"
+            description="这次 run 对应的用户前置选择（没有就是不是引导式创建的）"
+            icon={GitBranch}
+          >
+            <UserJourneySection data={data} />
+          </CollapsibleSection>
+
+          <CollapsibleSection
+            title="决策链"
+            description="每个实体的取舍结论、原因码与打分"
+            count={data.decisions.length}
+            icon={GitBranch}
+          >
+            <DecisionList decisions={data.decisions} />
+          </CollapsibleSection>
+        </div>
+      ) : null}
+
+      {/* 轨迹面板常驻：切换页签不重拉事件、不丢筛选与滚动位置。 */}
+      <div className={cn("flex-col gap-4", tab === "timeline" ? "flex" : "hidden")}>
+        <RunTimeline
+          runId={run.run_id || timeline?.run_id || ""}
+          initialStage={timelineFocus.stage}
+          initialQuery={timelineFocus.query}
+          focusToken={timelineFocus.token}
+          onSelectStage={onOpenPerformance}
+          onOpenPerformance={(eventId) => {
+            // 事件级跳转：性能页是按阶段组织的，因此先把事件映射到它所属的阶段再跳。
+            const event = timeline?.events.find((item) => item.event_id === eventId);
+            onOpenPerformance(event?.stage ?? null);
+          }}
+        />
+
+        <CollapsibleSection
+          title="原始 Trace（工程视图）"
+          description="按 span 父子关系展开；轨迹页已经把同一份事实归并成人话时间轴"
+          count={data.trace.length}
+          icon={Cpu}
+        >
           <TraceTree spans={data.trace} />
-        </CardContent>
-      </Card>
+        </CollapsibleSection>
+      </div>
 
-      <CollapsibleSection
-        title="LLM 调用"
-        description="模型调用的标签、模型、状态、耗时与字符数"
-        count={llmCalls.length}
-        icon={Cpu}
-      >
-        <LlmCallList calls={llmCalls} />
-      </CollapsibleSection>
-
-      <CollapsibleSection
-        title="Jev 调用"
-        description="决策类型、输入摘要、选择结果、置信度与 fallback 原因"
-        count={data.jev_calls.length}
-        icon={Sparkles}
-      >
-        <JevCallList calls={data.jev_calls} />
-      </CollapsibleSection>
-
-      <CollapsibleSection
-        title="Provider 调用"
-        description="外部数据源的逐次请求与返回情况"
-        count={data.provider_calls.length}
-        icon={Share2}
-      >
-        {data.provider_calls.length === 0 ? (
-          <SectionEmpty
-            title="没有 Provider 调用记录"
-            description="这次运行可能全部命中缓存，或者后端没有落库 Provider 明细。"
+      {tab === "performance" ? (
+        <div className="flex flex-col gap-4">
+          <RunPerformanceSummary
+            metrics={metrics}
+            stages={stageRows}
+            trace={data.trace}
+            llmCalls={llmCalls}
+            jevCalls={data.jev_calls}
+            journey={data.user_journey}
           />
-        ) : (
-          <AdminTable
-            columns={PROVIDER_COLUMNS}
-            rows={data.provider_calls}
-            getRowKey={(call) =>
-              `${call.provider}-${call.tool}-${call.fetched_at ?? ""}-${formatProviderQuery(call.query)}`
-            }
+
+          <StageDetailCard
+            stages={stages}
+            stageRows={stageRows}
+            runMetrics={metrics}
+            focus={stageFocus}
+            onOpenTimeline={onOpenTimeline}
           />
-        )}
-      </CollapsibleSection>
 
-      <CollapsibleSection title="Token 明细" description="输入 / 输出 / 缓存的拆分" count="4 项" icon={Coins}>
-        <TokenBreakdown tokens={metrics} />
-      </CollapsibleSection>
+          <CollapsibleSection
+            title="LLM 调用"
+            description="模型调用的标签、模型、状态、耗时与字符数"
+            count={llmCalls.length}
+            icon={Cpu}
+          >
+            <LlmCallList calls={llmCalls} />
+          </CollapsibleSection>
 
-      <CollapsibleSection
-        title="引导式来源"
-        description="这次 run 对应的用户前置选择（没有就是不是引导式创建的）"
-        icon={GitBranch}
-      >
-        <UserJourneySection data={data} />
-      </CollapsibleSection>
+          <CollapsibleSection
+            title="Jev 调用"
+            description="决策类型、输入摘要、选择结果、置信度与 fallback 原因"
+            count={data.jev_calls.length}
+            icon={Sparkles}
+          >
+            <JevCallList calls={data.jev_calls} />
+          </CollapsibleSection>
 
-      <CollapsibleSection
-        title="决策链"
-        description="每个实体的取舍结论、原因码与打分"
-        count={data.decisions.length}
-        icon={GitBranch}
-      >
-        <DecisionList decisions={data.decisions} />
-      </CollapsibleSection>
+          <CollapsibleSection
+            title="Token 明细"
+            description="输入 / 输出 / 缓存的拆分（Token 与成本都按整次 run 统计）"
+            count="4 项"
+            icon={Coins}
+          >
+            <TokenBreakdown tokens={metrics} />
+          </CollapsibleSection>
 
-      <CollapsibleSection
-        title="Bad Cases"
-        description="本次运行被自动或人工登记的问题案例"
-        count={data.badcases.length}
-        icon={Bug}
-        actions={
-          <Button variant="outline" size="xs" nativeButton={false} render={<Link href="/admin/badcases" />}>
-            全部案例
-          </Button>
-        }
-      >
-        <RunBadcaseList badcases={data.badcases} />
-      </CollapsibleSection>
+          {tokensMissing ? (
+            <p className="text-[11px] text-muted-foreground">
+              提示：本次运行没有 usage（Benchmark 用例运行使用假模型），因此 Token 与成本都显示为「未知」。
+            </p>
+          ) : null}
+        </div>
+      ) : null}
 
-      {tokensMissing ? (
-        <p className="text-[11px] text-muted-foreground">
-          提示：本次运行没有 usage（Benchmark 用例运行使用假模型），因此 Token 与成本都显示为「未知」。
-        </p>
+      {tab === "provider" ? (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex flex-wrap items-center gap-2">
+              <span>Provider 调用</span>
+              <Badge variant="secondary" className="tabular text-[0.6875rem]">
+                {formatNumber(data.provider_calls.length)}
+              </Badge>
+            </CardTitle>
+            <CardDescription>外部数据源的逐次请求与返回情况；调用次数、状态与耗时都在这里。</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {data.provider_calls.length === 0 ? (
+              <SectionEmpty
+                title="没有 Provider 调用记录"
+                description="这次运行可能全部命中缓存，或者后端没有落库 Provider 明细。"
+                action={
+                  <Button variant="outline" size="xs" nativeButton={false} render={<Link href="/admin/providers" />}>
+                    打开 Provider 健康
+                  </Button>
+                }
+              />
+            ) : (
+              <AdminTable
+                columns={PROVIDER_COLUMNS}
+                rows={data.provider_calls}
+                getRowKey={(call) =>
+                  `${call.provider}-${call.tool}-${call.fetched_at ?? ""}-${formatProviderQuery(call.query)}`
+                }
+              />
+            )}
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {tab === "badcase" ? (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex flex-wrap items-center gap-2">
+              <span>Bad Cases</span>
+              <Badge variant="secondary" className="tabular text-[0.6875rem]">
+                {formatNumber(data.badcases.length)}
+              </Badge>
+            </CardTitle>
+            <CardDescription>本次运行被自动或人工登记的问题案例。</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <RunBadcaseList badcases={data.badcases} />
+          </CardContent>
+        </Card>
       ) : null}
     </div>
+  );
+}
+
+/* ------------------------------ 首屏四问（docs §11.1） ------------------------------ */
+
+/**
+ * 第一屏要能直接回答：用户要什么 / 系统给了什么 / 质量怎么样 / 哪里有问题。
+ * 所有字段都取自已经返回的数据：轨迹事件（intent / 告警）、user_journey（画像 / 区域 / 候选池）、
+ * 决策链（选中的酒店）与 run 指标；任何一项拿不到就写「—」并说明缺口，不用 0 冒充。
+ */
+function RunFirstScreen({
+  data,
+  timeline,
+  onOpenTimeline,
+}: {
+  data: AdminRunDetail;
+  timeline: AdminTimeline | null;
+  onOpenTimeline: (stage: string | null, query?: string) => void;
+}) {
+  return (
+    <div className="grid gap-3 lg:grid-cols-2">
+      <UserAskCard data={data} timeline={timeline} />
+      <SystemGaveCard data={data} timeline={timeline} />
+      <QualityCard data={data} timeline={timeline} onOpenTimeline={onOpenTimeline} />
+      <IssuesCard data={data} timeline={timeline} />
+    </div>
+  );
+}
+
+function UserAskCard({ data, timeline }: { data: AdminRunDetail; timeline: AdminTimeline | null }) {
+  const journey = data.user_journey;
+  const intent = readIntentHighlights(timeline);
+  const profile = readProfile(journey);
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex flex-wrap items-center gap-2">
+          <span>用户要什么</span>
+          <SourceTag source={data.run.source} />
+        </CardTitle>
+        <CardDescription>原始请求 + 结构化意图 + 动态偏好画像。</CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-4">
+        <section className="flex flex-col gap-1.5">
+          <h3 className="text-xs font-medium text-foreground">原始请求</h3>
+          <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs leading-5 break-words whitespace-pre-wrap text-foreground">
+            {data.run.original_query || timeline?.run.original_query || "后端没有记录原始请求文本。"}
+          </p>
+        </section>
+
+        <section className="flex flex-col gap-1.5">
+          <h3 className="text-xs font-medium text-foreground">结构化意图（TripIntent）</h3>
+          {intent ? (
+            <DescriptionList
+              items={[
+                { label: "目的地", value: intent.destination || "—" },
+                { label: "出发地", value: intent.origin || "—" },
+                { label: "出发日期", value: intent.startDate || "—" },
+                {
+                  label: "天数 / 人数",
+                  value: `${intent.days === null ? "—" : `${intent.days} 天`} / ${
+                    intent.travelers === null ? "—" : `${intent.travelers} 人`
+                  }`,
+                },
+                {
+                  label: "预算",
+                  value: intent.budgetTotal === null ? "—" : `¥${formatNumber(intent.budgetTotal)}`,
+                },
+                {
+                  label: "偏好关键词",
+                  value: intent.preferences.length > 0 ? intent.preferences.join("、") : "—",
+                },
+                { label: "节奏 / 住宿策略", value: `${intent.pace || "—"} / ${intent.hotelPriority || "—"}` },
+                { label: "MUST / WANT / REJECT", value: placeSelectionText(journey) },
+              ]}
+            />
+          ) : (
+            <p className="text-xs leading-5 text-muted-foreground">
+              {timeline
+                ? "这次 run 没有 user 事件（或没有落库 intent），看不到结构化意图；下面的引导式选择与原始请求仍然可用。"
+                : "正在加载轨迹，稍后这里会补上结构化意图。"}
+            </p>
+          )}
+        </section>
+
+        <section className="flex flex-col gap-1.5">
+          <h3 className="text-xs font-medium text-foreground">动态偏好画像</h3>
+          {profile ? (
+            <ProfileSummary profile={profile} />
+          ) : (
+            <p className="text-xs leading-5 text-muted-foreground">
+              user_journey 里没有 profile：这次 run 可能还没生成画像（非引导式、或旧版本记录）。
+            </p>
+          )}
+        </section>
+      </CardContent>
+    </Card>
+  );
+}
+
+function ProfileSummary({ profile }: { profile: AdminRecord }) {
+  const style = readString(profile, "travel_style");
+  const source = readString(profile, "source");
+  const reason = readString(profile, "reason");
+  const pace = isRecord(profile.pace) ? profile.pace : null;
+  const targetPerDay = pace ? readNumber(pace, "target_poi_per_day") : null;
+  const personalized = source === "llm";
+  const groups = PROFILE_GROUP_KEYS.filter((group) => isRecord(profile[group.key]));
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <ToneBadge tone={personalized ? "info" : "muted"}>
+          {personalized ? "已个性化" : "均衡基线"}
+        </ToneBadge>
+        <span className="text-xs text-foreground">{style || "未命名风格"}</span>
+        {targetPerDay !== null ? (
+          <span className="text-[11px] text-muted-foreground">每天约 {formatNumber(targetPerDay)} 个点</span>
+        ) : null}
+      </div>
+      {reason ? <p className="text-[11px] leading-5 break-words text-muted-foreground">{reason}</p> : null}
+      {groups.length > 0 ? (
+        <CollapsibleSection title="完整动态权重" description="画像对软取舍的加权（不影响硬规则）">
+          <div className="flex flex-col gap-3">
+            {groups.map((group) => (
+              <section key={group.key} className="flex flex-col gap-1.5">
+                <h4 className="text-[11px] font-medium text-foreground">{group.label}</h4>
+                <WeightList weights={profile[group.key] as AdminRecord} />
+              </section>
+            ))}
+          </div>
+        </CollapsibleSection>
+      ) : (
+        <p className="text-[11px] text-muted-foreground">后端没有返回权重分组，只能看到风格与来源。</p>
+      )}
+    </div>
+  );
+}
+
+/** 画像权重：键是后端内部英文名，这里补中文（未登记的键原样显示，新权重不会消失）。 */
+function WeightList({ weights }: { weights: AdminRecord }) {
+  const entries = Object.entries(weights);
+  if (entries.length === 0) return <p className="text-[11px] text-muted-foreground">这一组没有权重。</p>;
+  return (
+    <ul className="flex flex-wrap gap-1.5">
+      {entries.map(([key, value]) => (
+        <li key={key} className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
+          {PROFILE_WEIGHT_LABELS[key] ?? key}{" "}
+          <span className="tabular text-foreground">{formatMetricValue(value)}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+const PROFILE_WEIGHT_LABELS: Record<string, string> = {
+  food_density: "美食密度",
+  commercial_area: "商圈",
+  nightlife: "夜生活",
+  poi_centrality: "中心性",
+  evidence: "攻略推荐",
+  price: "价格",
+  rating: "评分",
+  location: "位置",
+  user_interest: "用户兴趣",
+  route_fit: "路线契合",
+  target_poi_per_day: "每天点数",
+  prefer_free_time: "偏好自由时间",
+};
+
+function SystemGaveCard({ data, timeline }: { data: AdminRunDetail; timeline: AdminTimeline | null }) {
+  const journey = data.user_journey;
+  const areas = readHotelAreas(journey);
+  const hotel = readSelectedHotel(data.decisions);
+  const pools = readPoiPools(journey);
+  const intent = readIntentHighlights(timeline);
+  const selectedArea = areas.selected || areas.areas[0]?.name || null;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>系统给了什么</CardTitle>
+        <CardDescription>住宿区域 / 酒店 / 候选池与预算。</CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        <DescriptionList
+          items={[
+            {
+              label: "住宿区域",
+              value: selectedArea ? (
+                <span>
+                  {selectedArea}
+                  {areas.selected ? "" : "（取契合度最高的区域）"}
+                </span>
+              ) : (
+                "—（后端没有返回 hotel_areas，这次可能没走到区域选择）"
+              ),
+            },
+            {
+              label: "酒店",
+              value: hotel ? (
+                <span className="flex flex-col gap-0.5">
+                  <span>{hotel.label}</span>
+                  {hotel.reason ? (
+                    <span className="text-[11px] break-words text-muted-foreground">{hotel.reason}</span>
+                  ) : null}
+                </span>
+              ) : (
+                "—（决策链里没有 search_hotels 的选定记录）"
+              ),
+            },
+            {
+              label: "核心景点 / 餐厅",
+              value:
+                pools.attraction === null && pools.food === null
+                  ? "—（后端没有返回 poi_pools）"
+                  : `${pools.attraction === null ? "—" : `${formatNumber(pools.attraction)} 个景点`} / ${
+                      pools.food === null ? "—" : `${formatNumber(pools.food)} 个餐厅`
+                    }${pools.experience === null ? "" : `（另有 ${formatNumber(pools.experience)} 个体验类）`}`,
+            },
+            {
+              label: "预算",
+              value: intent?.budgetTotal === null || intent === null ? "—" : `¥${formatNumber(intent.budgetTotal)}`,
+            },
+            {
+              label: "意图来源",
+              value: intent ? "轨迹 USER 事件的 TripIntent" : "轨迹未返回 intent，预算与意图暂缺",
+            },
+          ]}
+        />
+
+        {areas.areas.length > 0 ? (
+          <section className="flex flex-col gap-1.5">
+            <h3 className="text-xs font-medium text-foreground">住宿区域候选（契合度前 {Math.min(3, areas.areas.length)}）</h3>
+            <ul className="flex flex-col gap-1.5">
+              {areas.areas.slice(0, 3).map((area) => (
+                <li
+                  key={area.name}
+                  className="flex flex-wrap items-center gap-2 rounded-lg border border-border px-3 py-2"
+                >
+                  <span className="text-xs font-medium text-foreground">{area.name}</span>
+                  {area.fitScore !== null ? (
+                    <span className="tabular text-[11px] text-muted-foreground">
+                      契合度 {formatRatio(area.fitScore)}
+                    </span>
+                  ) : null}
+                  {area.tags.slice(0, 3).map((tag) => (
+                    <ToneBadge key={tag} tone="muted" className="text-[0.625rem]">
+                      {tag}
+                    </ToneBadge>
+                  ))}
+                </li>
+              ))}
+            </ul>
+          </section>
+        ) : null}
+      </CardContent>
+    </Card>
+  );
+}
+
+function QualityCard({
+  data,
+  timeline,
+  onOpenTimeline,
+}: {
+  data: AdminRunDetail;
+  timeline: AdminTimeline | null;
+  onOpenTimeline: (stage: string | null, query?: string) => void;
+}) {
+  const quality = readTimelineQuality(timeline);
+  const score = quality?.score ?? readNumber(data.run as unknown as AdminRecord, "quality_score");
+  const grade = quality?.grade ?? readString(data.run as unknown as AdminRecord, "quality_grade");
+  const error = quality?.error ?? readString(data.run as unknown as AdminRecord, "quality_error");
+  const warnings = readWarningCount(data, timeline);
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex flex-wrap items-center gap-2">
+          <span>质量怎么样</span>
+          {grade ? (
+            <ToneBadge tone={QUALITY_GRADE_TONES[grade] ?? "muted"} className="text-[0.6875rem]">
+              {QUALITY_GRADE_LABELS[grade] ?? grade}
+            </ToneBadge>
+          ) : null}
+        </CardTitle>
+        <CardDescription>分值全部来自后端对已落库计划的评估，管理台不做二次打分。</CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        <div className="grid grid-cols-2 gap-3">
+          <StatCard
+            label="质量分"
+            value={score === null ? "—" : formatRatio(score)}
+            tone={score === null ? "muted" : score >= 0.8 ? "success" : score >= 0.6 ? "warning" : "danger"}
+            hint={
+              quality
+                ? "来自轨迹接口的 quality"
+                : score === null
+                  ? error || "后端未返回质量分"
+                  : "来自运行记录现算质量"
+            }
+          />
+          <StatCard
+            label="交付时告警"
+            value={warnings === null ? "—" : `${formatNumber(warnings)} 条`}
+            tone={warnings !== null && warnings > 0 ? "warning" : "muted"}
+            hint={warnings === null ? "后端未返回" : "离开系统时仍未解决的告警"}
+          />
+        </div>
+
+        {quality?.metrics ? (
+          <section className="flex flex-col gap-1.5">
+            <h3 className="text-xs font-medium text-foreground">单 run 软指标</h3>
+            <MetricList metrics={quality.metrics} emptyText="后端没有返回质量指标明细。" />
+          </section>
+        ) : (
+          <p className="text-[11px] leading-5 text-muted-foreground">
+            没有质量指标明细{error ? `（${error}）` : "：后端这次没有随轨迹返回 quality，或这次 run 没有可评估的计划"}。
+          </p>
+        )}
+
+        <div>
+          <Button variant="outline" size="xs" onClick={() => onOpenTimeline(null, "硬校验")}>
+            在轨迹里看校验事件
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function IssuesCard({ data, timeline }: { data: AdminRunDetail; timeline: AdminTimeline | null }) {
+  const warnings = readWarningCount(data, timeline);
+  const errors = timeline?.summary.errors ?? null;
+  const fallbacks = timeline?.summary.fallbacks ?? null;
+  const runError = timeline?.run.error ?? data.progress.message ?? null;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex flex-wrap items-center gap-2">
+          <AlertTriangle
+            className={cn(
+              "size-4",
+              data.badcases.length > 0 || (warnings ?? 0) > 0 ? "text-warning" : "text-muted-foreground",
+            )}
+            aria-hidden
+          />
+          <span>哪里有问题</span>
+        </CardTitle>
+        <CardDescription>告警、Bad Case、Provider 失败与错误 / fallback 的汇总。</CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <StatCard
+            label="未解决告警"
+            value={warnings === null ? "—" : formatNumber(warnings)}
+            tone={warnings !== null && warnings > 0 ? "warning" : "muted"}
+          />
+          <StatCard
+            label="Bad Case"
+            value={formatNumber(data.badcases.length)}
+            tone={data.badcases.length > 0 ? "warning" : "muted"}
+          />
+          <StatCard
+            label="Provider 失败"
+            value={formatNumber(data.metrics.provider_failures)}
+            tone={data.metrics.provider_failures && data.metrics.provider_failures > 0 ? "warning" : "muted"}
+          />
+          <StatCard
+            label="错误 / fallback"
+            value={errors === null ? "—" : `${formatNumber(errors)} / ${formatNumber(fallbacks ?? 0)}`}
+            tone={errors !== null && errors > 0 ? "danger" : "muted"}
+            hint={errors === null ? "轨迹未加载" : "来自轨迹事件统计"}
+          />
+        </div>
+
+        {data.badcases.length > 0 ? (
+          <ul className="flex flex-col gap-1.5">
+            {data.badcases.slice(0, 4).map((badcase) => (
+              <li key={badcase.badcase_id} className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="font-medium text-foreground">{badcaseCategoryLabel(badcase.category)}</span>
+                <StatusBadge status={badcase.severity} />
+                <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                  {cleanBadcaseSymptom(badcase.symptom, badcase.category)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="text-[11px] text-muted-foreground">这次运行没有登记 Bad Case。</p>
+        )}
+
+        {runError ? (
+          <p className="rounded-lg border border-danger/25 bg-danger-subtle px-3 py-2 text-[11px] leading-5 break-words text-danger-subtle-foreground">
+            {runError}
+          </p>
+        ) : null}
+
+        <div className="flex flex-wrap gap-2">
+          <Button variant="outline" size="xs" nativeButton={false} render={<Link href="/admin/badcases" />}>
+            打开问题案例页
+          </Button>
+          <Button variant="outline" size="xs" nativeButton={false} render={<Link href="/admin/providers" />}>
+            Provider 健康
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -486,12 +1051,96 @@ function formatSubtotal(
 
 /* ------------------------------ 阶段 ------------------------------ */
 
+function stageAnchorId(stageId: string): string {
+  return `run-stage-${stageId}`;
+}
+
+function StageDetailCard({
+  stages,
+  stageRows,
+  runMetrics,
+  focus,
+  onOpenTimeline,
+}: {
+  stages: ReturnType<typeof useAdminResource<AdminStageDetail[]>>;
+  stageRows: AdminStageDetail[];
+  runMetrics: AdminRunDetail["metrics"];
+  focus: StageFocus;
+  onOpenTimeline: (stage: string | null, query?: string) => void;
+}) {
+  const appliedToken = useRef<number | null>(null);
+
+  // 从轨迹页跳过来时定位到目标阶段并短暂高亮；同一个 token 只做一次。
+  // 高亮直接操作 classList 而不是 state：这是「滚动完成后同步 DOM」，不需要额外一次渲染。
+  useEffect(() => {
+    if (appliedToken.current === focus.token) return;
+    appliedToken.current = focus.token;
+    if (!focus.stage) return;
+    const node = document.getElementById(stageAnchorId(focus.stage));
+    if (!node) return;
+    node.scrollIntoView({ behavior: "smooth", block: "center" });
+    node.classList.add("ring-2", "ring-primary/40");
+    const timer = window.setTimeout(() => node.classList.remove("ring-2", "ring-primary/40"), 2400);
+    return () => {
+      window.clearTimeout(timer);
+      node.classList.remove("ring-2", "ring-primary/40");
+    };
+  }, [focus]);
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>阶段</CardTitle>
+        <CardDescription>
+          workflow 的 {stageRows.length} 个阶段；点击任意阶段查看步骤、事实、工具 / 模型调用与 Token，
+          也可以用「在轨迹中定位」跳回轨迹页看这个阶段发生了什么。
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {stages.error ? (
+          <InlineError
+            title="阶段明细没能加载"
+            description="阶段端点可能尚未部署或暂时不可用；下面的阶段摘要来自运行详情，仍然可以查看。"
+            detail={(stages.error as AdminApiError).detail}
+            onRetry={stages.reload}
+            className="mb-3"
+          />
+        ) : null}
+        {stages.loading && !stages.data ? (
+          <SectionSkeleton rows={3} />
+        ) : stageRows.length === 0 ? (
+          <SectionEmpty
+            title="没有阶段进度"
+            description="这次运行没有写入阶段记录，因此看不到分步进度。Trace 里通常仍有更细的 span。"
+          />
+        ) : (
+          <ul className="flex flex-col gap-2.5">
+            {stageRows.map((stage) => (
+              <StageRow
+                key={stage.stage_id}
+                stage={stage}
+                runMetrics={runMetrics}
+                anchorId={stageAnchorId(stage.stage_id)}
+                onOpenTimeline={onOpenTimeline}
+              />
+            ))}
+          </ul>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 function StageRow({
   stage,
   runMetrics,
+  anchorId,
+  onOpenTimeline,
 }: {
   stage: AdminStageDetail;
   runMetrics: AdminRunDetail["metrics"];
+  anchorId?: string;
+  onOpenTimeline?: (stage: string | null, query?: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const duration = stage.duration_ms ?? durationBetween(stage.started_at, stage.finished_at);
@@ -501,7 +1150,7 @@ function StageRow({
   const llmCalls = stage.llm_calls ?? [];
 
   return (
-    <li>
+    <li id={anchorId} className="rounded-lg">
       <button
         type="button"
         onClick={() => setOpen(true)}
@@ -524,6 +1173,13 @@ function StageRow({
         title={stage.title || stage.stage_id}
         description={stage.stage_id}
         badge={<StatusBadge status={stage.status} />}
+        footer={
+          onOpenTimeline ? (
+            <Button variant="outline" size="sm" onClick={() => onOpenTimeline(stage.stage_id)}>
+              在轨迹中定位这个阶段
+            </Button>
+          ) : undefined
+        }
       >
         <KeyValueList
           entries={[
@@ -1270,8 +1926,203 @@ function formatPlaceCount(value: string[] | number | null | undefined): string {
   return value.length > 0 ? value.join("、") : "无";
 }
 
+/* ------------------------------ 首屏派生数据 ------------------------------ */
+
+/** 后端返回的 user_journey 里有几个字段还没进前端类型（画像 / 区域 / 候选池），按 unknown 读。 */
+function journeyRecord(journey: AdminUserJourney | null): AdminRecord {
+  return journey ? (journey as unknown as AdminRecord) : {};
+}
+
+interface IntentHighlights {
+  destination: string | null;
+  origin: string | null;
+  startDate: string | null;
+  days: number | null;
+  travelers: number | null;
+  budgetTotal: number | null;
+  preferences: string[];
+  pace: string | null;
+  hotelPriority: string | null;
+}
+
+/** TripIntent 只在轨迹的 USER 事件里（metadata.intent），运行详情本身没有计划。 */
+function readIntentHighlights(timeline: AdminTimeline | null): IntentHighlights | null {
+  const event = timeline?.events.find((item) => item.event_type === "USER");
+  const intent = event && isRecord(event.metadata.intent) ? event.metadata.intent : null;
+  if (!intent) return null;
+  return {
+    destination: readText(intent, "destination"),
+    origin: readText(intent, "origin"),
+    startDate: readText(intent, "start_date"),
+    days: readNumber(intent, "days"),
+    travelers: readNumber(intent, "travelers"),
+    budgetTotal: readNumber(intent, "budget_total"),
+    preferences: readStringArray(intent, "preferences"),
+    pace: readText(intent, "pace"),
+    hotelPriority: readText(intent, "hotel_priority"),
+  };
+}
+
+function readProfile(journey: AdminUserJourney | null): AdminRecord | null {
+  const profile = journeyRecord(journey).profile;
+  return isRecord(profile) ? profile : null;
+}
+
+interface AreaBrief {
+  name: string;
+  tags: string[];
+  fitScore: number | null;
+}
+
+function readHotelAreas(journey: AdminUserJourney | null): { selected: string | null; areas: AreaBrief[] } {
+  const record = journeyRecord(journey);
+  const raw = Array.isArray(record.hotel_areas) ? record.hotel_areas : [];
+  const areas: AreaBrief[] = raw.filter(isRecord).map((area) => ({
+    name: readString(area, "name") ?? readString(area, "key") ?? "未命名区域",
+    tags: readStringArray(area, "tags"),
+    fitScore: readNumber(area, "fit_score"),
+  }));
+  return { selected: readString(record, "hotel_area_selected"), areas };
+}
+
+/**
+ * 选中的酒店：计划本身不在运行详情里，只能读决策链里 `search_hotels` 的选定记录。
+ * 两种字段口径都要认（`agent_or_stage`/`status` 与原始落库的 `stage`/`decision`）。
+ */
+function readSelectedHotel(decisions: AdminDecision[]): { label: string; reason: string | null } | null {
+  for (const decision of decisions) {
+    const record = decision as unknown as AdminRecord;
+    const stage = readString(record, "agent_or_stage") ?? readString(record, "stage");
+    if (stage !== "search_hotels") continue;
+    const status = readString(record, "status") ?? readString(record, "decision");
+    if (status && !["SELECT", "ACCEPT"].includes(status.toUpperCase())) continue;
+    const label = readString(record, "entity_id");
+    if (!label) continue;
+    return { label, reason: readString(record, "reason_text") ?? readString(record, "reason") };
+  }
+  return null;
+}
+
+function readPoiPools(journey: AdminUserJourney | null): {
+  attraction: number | null;
+  food: number | null;
+  experience: number | null;
+} {
+  const pools = journeyRecord(journey).poi_pools;
+  if (!isRecord(pools)) return { attraction: null, food: null, experience: null };
+  return {
+    attraction: readArrayLength(pools, "attraction"),
+    food: readArrayLength(pools, "food"),
+    experience: readArrayLength(pools, "experience"),
+  };
+}
+
+interface TimelineQuality {
+  score: number | null;
+  grade: string | null;
+  metrics: AdminRecord | null;
+  error: string | null;
+}
+
+/**
+ * 质量画像。
+ *
+ * 后端 `/timeline` 已经返回 `quality`，但前端类型与归一化还没透出这个字段，
+ * 因此按 unknown 读：契约补上后这里会自动生效；在那之前退回运行记录的 quality_score。
+ */
+function readTimelineQuality(timeline: AdminTimeline | null): TimelineQuality | null {
+  if (!timeline) return null;
+  const quality = (timeline as unknown as AdminRecord).quality;
+  if (!isRecord(quality)) return null;
+  return {
+    score: readNumber(quality, "score"),
+    grade: readString(quality, "grade"),
+    metrics: isRecord(quality.metrics) ? quality.metrics : null,
+    error: readString(quality, "error"),
+  };
+}
+
+/** 未解决告警：优先运行记录字段，否则取轨迹里那条「交付时的行程告警」事件。 */
+function readWarningCount(data: AdminRunDetail, timeline: AdminTimeline | null): number | null {
+  if (typeof data.run.warnings === "number") return data.run.warnings;
+  const event = timeline?.events.find((item) => item.title === "交付时的行程告警");
+  if (!event) return null;
+  const unresolved = readNumber(event.metadata, "unresolved");
+  if (unresolved !== null) return unresolved;
+  const codes = event.metadata.codes;
+  if (isRecord(codes)) {
+    let total = 0;
+    for (const value of Object.values(codes)) {
+      if (typeof value === "number" && Number.isFinite(value)) total += value;
+    }
+    return total;
+  }
+  return null;
+}
+
+function placeSelectionText(journey: AdminUserJourney | null): string {
+  const selections = journey?.place_selections;
+  if (!selections) return "—";
+  return `${formatPlaceCount(selections.must)} / ${formatPlaceCount(selections.want)} / ${formatPlaceCount(selections.reject)}`;
+}
+
+const QUALITY_GRADE_TONES: Record<string, AdminTone> = {
+  GOOD: "success",
+  FAIR: "warning",
+  POOR: "danger",
+  UNKNOWN: "muted",
+};
+
+const QUALITY_GRADE_LABELS: Record<string, string> = {
+  GOOD: "好",
+  FAIR: "一般",
+  POOR: "差",
+  UNKNOWN: "未评级",
+};
+
+const PROFILE_GROUP_KEYS: { key: string; label: string }[] = [
+  { key: "hotel_area", label: "住宿区域权重" },
+  { key: "hotel", label: "酒店权重" },
+  { key: "attraction", label: "景点权重" },
+  { key: "food", label: "餐饮权重" },
+];
 
 /* ------------------------------ 工具函数 ------------------------------ */
+
+function isRecord(value: unknown): value is AdminRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readString(record: AdminRecord, key: string): string | null {
+  const value = record[key];
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function readNumber(record: AdminRecord, key: string): number | null {
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function readStringArray(record: AdminRecord, key: string): string[] {
+  const value = record[key];
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+/** TripIntent.destination 是数组（一次可以带多个目的地），其余大多是字符串。 */
+function readText(record: AdminRecord, key: string): string | null {
+  const value = record[key];
+  if (typeof value === "string" && value.trim().length > 0) return value;
+  if (Array.isArray(value)) {
+    const parts = value.filter((item): item is string => typeof item === "string");
+    return parts.length > 0 ? parts.join("、") : null;
+  }
+  return null;
+}
+
+function readArrayLength(record: AdminRecord, key: string): number | null {
+  const value = record[key];
+  return Array.isArray(value) ? value.length : null;
+}
 
 function ErrorText({ value }: { value: string | null | undefined }) {
   if (!value) return <span className="text-muted-foreground">未返回</span>;

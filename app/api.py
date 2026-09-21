@@ -38,6 +38,12 @@ from .db import describe_configured_backend
 from .store import TravelPlanStore
 from .workflow import DEFAULT_OUTPUT_DIR, WORKFLOW_NAME, new_run_id, plan_payload
 
+# 管理端的聚合视图（Dashboard / 质量 / 漏斗 / Bad Case 聚类 / 轨迹）各自成模块：
+# 它们只读既有数据、不改业务逻辑，放在这里会让本文件变成几千行的统计代码仓库。
+# 路由在文件末尾注册（见"管理端聚合视图"一节）。
+from .admin_analytics import build_admin_router, enrich_runs
+from .admin_timeline import build_timeline_router
+
 #: 只允许下载这些产物。白名单而不是拼接路径，避免 `../` 穿越。
 ARTIFACTS: dict[str, str] = {
     "plan.json": "application/json",
@@ -708,9 +714,14 @@ def admin_runs(
     ),
 ) -> dict[str, Any]:
     store = get_store()
+    # 列表只补"这次行程好不好、有几个问题"两列质量信息；token / LLM / 工具调用
+    # 这些技术指标下沉到详情页 —— 一屏 12 列没人扫得动（见 docs/TravelPlan_Admin_整体优化方案.md §6）。
     return {
-        "items": store.list_runs(
-            limit=limit, offset=offset, status=status, q=q, include_benchmark=include_benchmark
+        "items": enrich_runs(
+            store,
+            store.list_runs(
+                limit=limit, offset=offset, status=status, q=q, include_benchmark=include_benchmark
+            ),
         ),
         "limit": limit,
         "offset": offset,
@@ -1690,3 +1701,28 @@ def get_artifact(run_id: str, filename: str) -> FileResponse:
     if not path.is_file():
         raise HTTPException(status_code=404, detail=f"run_id={run_id} 的 {filename} 不存在")
     return FileResponse(path, media_type=media_type, filename=filename)
+
+
+# ======================================================================
+# 管理端聚合视图（Dashboard / 行程质量 / 漏斗 / Bad Case 聚类 / 轨迹）
+# ======================================================================
+
+# 注册动作放在文件末尾：上面全是"HTTP 形状 ↔ RunResult"的翻译，聚合统计各自成模块，
+# 这里只把它们的 router 挂上来。两个 router 都自带 require_admin 依赖，
+# 不依赖具体路由是不是忘了加 —— 新增端点默认就是受保护的。
+
+
+def _admin_store() -> TravelPlanStore:
+    """聚合 router 的取库入口。
+
+    为什么是这一层转发而不是把 `get_store` 函数对象直接传进去：测试用
+    ``monkeypatch.setattr(api_module, "get_store", ...)`` 换 store 替身，
+    传对象会让两个新页面绕过替换、直连真库。每次调用重新查一次模块全局，
+    替换才对它们同样生效。
+    """
+
+    return get_store()
+
+
+api.include_router(build_admin_router(_admin_store, require_admin))
+api.include_router(build_timeline_router(_admin_store, require_admin))

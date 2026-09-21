@@ -9,6 +9,8 @@ import {
   Bug,
   Compass,
   FlaskConical,
+  Filter,
+  Gauge,
   HeartPulse,
   LayoutDashboard,
   ListChecks,
@@ -74,19 +76,40 @@ interface AdminNavItem {
   exact?: boolean;
 }
 
+/**
+ * 导航信息架构（docs/TravelPlan_Admin_整体优化方案.md §2）。
+ *
+ * 分组的依据是**要回答的问题**，不是页面来源：
+ *   * 总览   —— 现在系统健康吗、最该修什么？
+ *   * 产品质量 —— 生成出来的行程好不好、用户在哪一步流失、哪类问题在变多？
+ *   * 运行观测 —— 具体某次跑成什么样？
+ *   * 评测优化 —— 修完有没有变好？
+ * 「产品质量」放在运行观测之前是刻意的：这个后台的首要身份是产品质量控制台，
+ * 而不是 Agent 调用监视器。
+ */
 const NAV_GROUPS: { label: string; items: AdminNavItem[] }[] = [
   {
-    label: "观测",
+    label: "总览",
+    items: [{ href: "/admin", label: "仪表盘", icon: LayoutDashboard, exact: true }],
+  },
+  {
+    label: "产品质量",
     items: [
-      { href: "/admin", label: "仪表盘", icon: LayoutDashboard, exact: true },
+      { href: "/admin/travel-quality", label: "行程质量", icon: Gauge },
+      { href: "/admin/funnel", label: "规划漏斗", icon: Filter },
+      { href: "/admin/badcases", label: "问题中心", icon: Bug },
+    ],
+  },
+  {
+    label: "运行观测",
+    items: [
       { href: "/admin/runs", label: "运行记录", icon: ListChecks },
       { href: "/admin/sessions", label: "引导式会话", icon: Compass },
-      { href: "/admin/badcases", label: "问题案例", icon: Bug },
       { href: "/admin/providers", label: "Provider 健康", icon: HeartPulse },
     ],
   },
   {
-    label: "质量闭环",
+    label: "评测优化",
     items: [
       { href: "/admin/benchmark", label: "Benchmark", icon: FlaskConical },
       { href: "/admin/evolution", label: "Evolution", icon: Activity },

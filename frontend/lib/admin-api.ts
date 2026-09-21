@@ -14,6 +14,7 @@
 
 import type {
   AdminBadcase,
+  AdminBadcaseGroups,
   AdminBadcaseList,
   AdminBadcasePatch,
   AdminBenchmarkDetail,
@@ -24,12 +25,19 @@ import type {
   AdminConfigOverride,
   AdminConfigPatch,
   AdminCostBreakdown,
+  AdminDashboard,
+  AdminDashboardProviderRow,
+  AdminDecisionProfile,
   AdminDiscoveryBlock,
   AdminDiscoveryStage,
   AdminEvolutionLaunchResult,
   AdminEvolutionOverview,
   AdminEvolutionRunDetail,
+  AdminFunnel,
+  AdminFunnelBreakdownRow,
+  AdminGrade,
   AdminJevHealth,
+  AdminKpi,
   AdminLlmCall,
   AdminOverview,
   AdminPlanningEvent,
@@ -48,6 +56,7 @@ import type {
   AdminPrefetchSummary,
   AdminPoiSelectionCounts,
   AdminPoiSelectionItem,
+  AdminQualityDimension,
   AdminRunLink,
   AdminProviderDetail,
   AdminProviderHealthCall,
@@ -61,11 +70,21 @@ import type {
   AdminRunList,
   AdminRunMetrics,
   AdminRunSummary,
+  AdminSessionDecision,
   AdminStageDetail,
   AdminStageProgress,
   AdminStageTokens,
+  AdminTimeline,
+  AdminTraceEvent,
   AdminTraceSpan,
+  AdminTravelQuality,
+  AdminTrendPoint,
+  AdminTrendSeries,
+  AdminWindowKey,
 } from "@/types/admin";
+// 默认时间窗是**值**（不是类型），单独取一次：它同时被归一层与页面复用，
+// 只在 types 里改一处，前端默认窗就跟着变。
+import { DEFAULT_ADMIN_WINDOW } from "@/types/admin";
 
 export const ADMIN_API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 
@@ -438,6 +457,14 @@ function normalizeRunSummary(value: AdminRecord): AdminRunSummary {
     cost: toNumberOrNull(value.cost),
     source: toStringOrNull(value.source),
     source_session_id: toStringOrNull(value.source_session_id),
+    // 列表补齐的行程质量：后端现算，可能因「没有计划」而整段为 null。
+    // 归一成 null 而不是 0，页面才能显示「—」并说明原因。
+    quality_score: toNumberOrNull(value.quality_score),
+    quality_grade: toStringOrNull(value.quality_grade) as AdminGrade | null,
+    quality_error: toStringOrNull(value.quality_error),
+    destination: toStringOrNull(value.destination),
+    warnings: toNumberOrNull(value.warnings),
+    issue_count: toNumberOrNull(value.issue_count),
   };
 }
 
@@ -770,6 +797,33 @@ function normalizePlanningSessionDetail(payload: unknown): AdminPlanningSessionD
     poi_selections: normalizePlanningPoiSelections(record.poi_selections),
     events,
     run_link: normalizePlanningRunLink(record.run_link, session.run_id ?? null),
+    // `decision` 刻意**原样透传**：它是引导式决策块（动态偏好画像 / 住宿区域候选 / 候选池），
+    // 字段还会随决策层演进。在这里逐字段归一等于每加一个信号就要改一次客户端；
+    // 展示层只需要「有没有这一块」和几个已知字段，按 AdminRecord 读更稳。
+    decision: normalizeSessionDecision(record.decision, session),
+  };
+}
+
+/** 会话决策块：顶层优先，缺失时回落到 session 块里的同名字段（两个端点的形状不完全一致）。 */
+function normalizeSessionDecision(value: unknown, session: AdminPlanningSessionBlock): AdminSessionDecision | null {
+  const source = isRecord(value) ? value : null;
+  const raw = session as unknown as AdminRecord;
+  const profile = source?.profile ?? raw.profile;
+  const hotelAreas = source?.hotel_areas ?? raw.hotel_areas;
+  const poiPools = source?.poi_pools ?? raw.poi_pools;
+  if (!isRecord(profile) && !isArray(hotelAreas) && !isRecord(poiPools)) return null;
+  return {
+    profile: isRecord(profile) ? (profile as AdminDecisionProfile) : null,
+    hotel_areas: toArray(hotelAreas)
+      .filter(isRecord)
+      .map((area) => ({
+        key: toStringOrNull(area.key),
+        name: toStringOrNull(area.name),
+        reason: toStringOrNull(area.reason),
+        tags: toArray(area.tags).map(String),
+        fit_score: toNumberOrNull(area.fit_score),
+      })),
+    poi_pools: isRecord(poiPools) ? poiPools : {},
   };
 }
 
@@ -1380,4 +1434,583 @@ export function launchAdminEvolution(limit?: number): Promise<AdminEvolutionLaun
     timeoutMs: ADMIN_LAUNCH_TIMEOUT_MS,
     validate: isEvolutionLaunchResult,
   });
+}
+
+/* ==================================================================
+ * 管理端聚合视图（Dashboard / 行程质量 / 漏斗 / Bad Case 聚类 / 轨迹）
+ *
+ * 这一节的守卫与归一化放在一起（而不是塞进上面的守卫区与端点区）：
+ * 它们只服务这五个端点，读的时候不必在 1400 行里来回跳。
+ * ================================================================== */
+
+function isWindowKey(value: string | undefined): value is AdminWindowKey {
+  return value === "1h" || value === "24h" || value === "7d" || value === "30d";
+}
+
+/** 归一化时间窗：非法值一律退回默认窗，而不是把 undefined 发给后端（会吃 422）。 */
+function normalizeWindow(value: string | undefined): AdminWindowKey {
+  return isWindowKey(value) ? value : DEFAULT_ADMIN_WINDOW;
+}
+
+function normalizeTrendPoints(value: unknown): AdminTrendPoint[] {
+  return toArray(value)
+    .filter(isRecord)
+    .map((point) => ({ t: String(point.t ?? ""), value: toNumberOrNull(point.value) }));
+}
+
+function normalizeTrendSeries(value: unknown): AdminTrendSeries | null {
+  if (!isRecord(value)) return null;
+  const summary = isRecord(value.summary) ? value.summary : {};
+  return {
+    key: String(value.key ?? ""),
+    label: String(value.label ?? value.key ?? ""),
+    unit: toStringOrNull(value.unit),
+    points: normalizeTrendPoints(value.points),
+    summary: {
+      latest: toNumberOrNull(summary.latest),
+      min: toNumberOrNull(summary.min),
+      max: toNumberOrNull(summary.max),
+      avg: toNumberOrNull(summary.avg),
+    },
+  };
+}
+
+function normalizeKpi(value: unknown): AdminKpi | null {
+  if (!isRecord(value)) return null;
+  const direction = String(value.direction ?? "flat");
+  return {
+    key: String(value.key ?? ""),
+    label: String(value.label ?? value.key ?? ""),
+    value: toNumberOrNull(value.value),
+    unit: toStringOrNull(value.unit),
+    previous: toNumberOrNull(value.previous),
+    delta: toNumberOrNull(value.delta),
+    direction: direction === "up" || direction === "down" ? direction : "flat",
+    higher_is_better: value.higher_is_better !== false,
+    better: typeof value.better === "boolean" ? value.better : null,
+    hint: toStringOrNull(value.hint),
+    detail: toStringOrNull(value.detail),
+  };
+}
+
+/** 只要求形状"至少能读"：kpis / trends / attention / volume 四个键在。 */
+function isDashboardPayload(value: unknown): value is AdminRecord {
+  return (
+    isRecord(value) &&
+    isArray(value.kpis) &&
+    isArray(value.trends) &&
+    isArray(value.attention) &&
+    isRecord(value.volume)
+  );
+}
+
+function normalizeDashboard(payload: unknown): AdminDashboard {
+  const record = isRecord(payload) ? payload : {};
+  const volume = isRecord(record.volume) ? record.volume : {};
+  const cost = isRecord(record.cost) ? record.cost : {};
+  const quality = isRecord(record.quality) ? record.quality : {};
+  const decision = isRecord(record.decision_health) ? record.decision_health : {};
+  const badcases = isRecord(record.badcases) ? record.badcases : {};
+  const providers = isRecord(record.providers) ? record.providers : {};
+  const benchmark = isRecord(record.benchmark) ? record.benchmark : {};
+  const evolution = isRecord(record.evolution) ? record.evolution : {};
+  return {
+    window: String(record.window ?? DEFAULT_ADMIN_WINDOW),
+    window_label: String(record.window_label ?? ""),
+    generated_at: String(record.generated_at ?? ""),
+    kpis: toArray(record.kpis).map(normalizeKpi).filter((item): item is AdminKpi => item !== null),
+    statuses: isRecord(record.statuses) ? record.statuses : {},
+    volume: {
+      runs: toNumberOrNull(volume.runs) ?? 0,
+      previous_runs: toNumberOrNull(volume.previous_runs) ?? 0,
+      finished: toNumberOrNull(volume.finished) ?? 0,
+      previous_finished: toNumberOrNull(volume.previous_finished) ?? 0,
+      running: toNumberOrNull(volume.running) ?? 0,
+    },
+    trends: toArray(record.trends)
+      .map(normalizeTrendSeries)
+      .filter((item): item is AdminTrendSeries => item !== null),
+    attention: toArray(record.attention)
+      .filter(isRecord)
+      .map((item) => ({
+        id: String(item.id ?? ""),
+        level: String(item.level ?? "low"),
+        title: String(item.title ?? ""),
+        detail: String(item.detail ?? ""),
+        action: isRecord(item.action) ? item.action : {},
+        metric: isRecord(item.metric) ? item.metric : {},
+      })),
+    cost: {
+      total: toNumberOrNull(cost.total),
+      avg_per_run: toNumberOrNull(cost.avg_per_run),
+      previous_avg_per_run: toNumberOrNull(cost.previous_avg_per_run),
+      currency: String(cost.currency ?? "CNY"),
+      price_configured: cost.price_configured === true,
+    },
+    quality: {
+      score: toNumberOrNull(quality.score),
+      grade: (toStringOrNull(quality.grade) ?? "UNKNOWN") as AdminGrade,
+      sampled_runs: toNumberOrNull(quality.sampled_runs) ?? 0,
+      sampled: quality.sampled === true,
+    },
+    decision_health: {
+      runs: toNumberOrNull(decision.runs) ?? 0,
+      guided_runs: toNumberOrNull(decision.guided_runs) ?? 0,
+      profile_llm: toNumberOrNull(decision.profile_llm) ?? 0,
+      profile_fallback: toNumberOrNull(decision.profile_fallback) ?? 0,
+      profile_missing: toNumberOrNull(decision.profile_missing) ?? 0,
+      profile_success_rate: toNumberOrNull(decision.profile_success_rate),
+      runs_with_hard_errors: toNumberOrNull(decision.runs_with_hard_errors) ?? 0,
+      runs_with_rejected_in_plan: toNumberOrNull(decision.runs_with_rejected_in_plan) ?? 0,
+      runs_missing_must: toNumberOrNull(decision.runs_missing_must) ?? 0,
+      note: String(decision.note ?? ""),
+    },
+    badcases: {
+      open: toNumberOrNull(badcases.open) ?? 0,
+      window: toNumberOrNull(badcases.window) ?? 0,
+      previous: toNumberOrNull(badcases.previous) ?? 0,
+      by_severity: isRecord(badcases.by_severity) ? badcases.by_severity : {},
+    },
+    providers: {
+      total: toNumberOrNull(providers.total) ?? 0,
+      unhealthy: toNumberOrNull(providers.unhealthy) ?? 0,
+      window_note: String(providers.window_note ?? ""),
+      items: toArray(providers.items)
+        .filter(isRecord)
+        .map((item) => ({
+          ...item,
+          provider: String(item.provider ?? ""),
+          calls: toNumberOrNull(item.calls) ?? 0,
+          failures: toNumberOrNull(item.failures) ?? 0,
+          timeouts: toNumberOrNull(item.timeouts) ?? 0,
+          fallback_count: toNumberOrNull(item.fallback_count) ?? 0,
+          state: String(item.state ?? "UNKNOWN"),
+          needs_attention: item.needs_attention === true,
+        })) as AdminDashboardProviderRow[],
+    },
+    benchmark: {
+      latest_run_id: toStringOrNull(benchmark.latest_run_id),
+      latest_pass_rate: toNumberOrNull(benchmark.latest_pass_rate),
+    },
+    evolution: {
+      enabled: evolution.enabled === true,
+      last_run_id: toStringOrNull(evolution.last_run_id),
+      last_decision: toStringOrNull(evolution.last_decision),
+    },
+    notes: toArray(record.notes).map(String),
+  };
+}
+
+function isTravelQualityPayload(value: unknown): value is AdminRecord {
+  return isRecord(value) && isArray(value.dimensions) && isArray(value.runs) && isRecord(value.overall);
+}
+
+function normalizeQualityDimension(value: unknown): AdminQualityDimension | null {
+  if (!isRecord(value)) return null;
+  return {
+    key: String(value.key ?? ""),
+    label: String(value.label ?? value.key ?? ""),
+    score: toNumberOrNull(value.score),
+    score_percent: toNumberOrNull(value.score_percent),
+    grade: (toStringOrNull(value.grade) ?? "UNKNOWN") as AdminGrade,
+    grade_label: String(value.grade_label ?? ""),
+    metrics: toArray(value.metrics)
+      .filter(isRecord)
+      .map((metric) => ({
+        key: String(metric.key ?? ""),
+        label: String(metric.label ?? metric.key ?? ""),
+        value: metric.value ?? null,
+        unit: toStringOrNull(metric.unit),
+        hint: toStringOrNull(metric.hint),
+      })),
+    findings: toArray(value.findings)
+      .filter(isRecord)
+      .map((finding) => ({ level: String(finding.level ?? "low"), text: String(finding.text ?? "") })),
+    offenders: toArray(value.offenders)
+      .filter(isRecord)
+      .map((offender) => ({
+        run_id: String(offender.run_id ?? ""),
+        detail: String(offender.detail ?? ""),
+        value: toNumberOrNull(offender.value),
+      })),
+    note: toStringOrNull(value.note),
+  };
+}
+
+function normalizeTravelQuality(payload: unknown): AdminTravelQuality {
+  const record = isRecord(payload) ? payload : {};
+  const scan = isRecord(record.scan) ? record.scan : {};
+  const overall = isRecord(record.overall) ? record.overall : {};
+  const trend = normalizeTrendSeries(record.quality_trend);
+  return {
+    window: String(record.window ?? "7d"),
+    window_label: String(record.window_label ?? ""),
+    generated_at: String(record.generated_at ?? ""),
+    scan: {
+      runs_in_window: toNumberOrNull(scan.runs_in_window) ?? 0,
+      finished: toNumberOrNull(scan.finished) ?? 0,
+      scored: toNumberOrNull(scan.scored) ?? 0,
+      unscored: toNumberOrNull(scan.unscored) ?? 0,
+    },
+    overall: {
+      score: toNumberOrNull(overall.score),
+      grade: (toStringOrNull(overall.grade) ?? "UNKNOWN") as AdminGrade,
+      grade_label: String(overall.grade_label ?? ""),
+      weights: isRecord(overall.weights) ? overall.weights : {},
+      note: String(overall.note ?? ""),
+    },
+    dimensions: toArray(record.dimensions)
+      .map(normalizeQualityDimension)
+      .filter((item): item is AdminQualityDimension => item !== null),
+    runs: toArray(record.runs)
+      .filter(isRecord)
+      .map((run) => ({
+        run_id: String(run.run_id ?? ""),
+        created_at: toStringOrNull(run.created_at),
+        status: String(run.status ?? "UNKNOWN"),
+        destination: toStringOrNull(run.destination),
+        days: toNumberOrNull(run.days),
+        score: toNumberOrNull(run.score),
+        grade: (toStringOrNull(run.grade) ?? "UNKNOWN") as AdminGrade,
+        profile_source: toStringOrNull(run.profile_source),
+        hotel_area: toStringOrNull(run.hotel_area),
+        preference_coverage: toNumberOrNull(run.preference_coverage),
+        warnings: toNumberOrNull(run.warnings),
+        errors: toNumberOrNull(run.errors),
+        route_verified_rate: toNumberOrNull(run.route_verified_rate),
+        cost: toNumberOrNull(run.cost),
+        duration_ms: toNumberOrNull(run.duration_ms),
+      })),
+    destinations: toArray(record.destinations)
+      .filter(isRecord)
+      .map((item) => ({
+        name: String(item.name ?? ""),
+        runs: toNumberOrNull(item.runs) ?? 0,
+        score: toNumberOrNull(item.score),
+        grade: (toStringOrNull(item.grade) ?? "UNKNOWN") as AdminGrade,
+        degraded: toNumberOrNull(item.degraded) ?? 0,
+        failed: toNumberOrNull(item.failed) ?? 0,
+      })),
+    quality_trend:
+      trend ??
+      {
+        key: "quality",
+        label: "质量分",
+        unit: "ratio",
+        points: [],
+        summary: { latest: null, min: null, max: null, avg: null },
+      },
+    notes: toArray(record.notes).map(String),
+  };
+}
+
+function isFunnelPayload(value: unknown): value is AdminRecord {
+  return isRecord(value) && isArray(value.stages) && isRecord(value.breakdown);
+}
+
+function normalizeFunnel(payload: unknown): AdminFunnel {
+  const record = isRecord(payload) ? payload : {};
+  const biggest = isRecord(record.biggest_drop) ? record.biggest_drop : null;
+  const breakdown: Record<string, AdminFunnelBreakdownRow[]> = {};
+  if (isRecord(record.breakdown)) {
+    for (const [key, rows] of Object.entries(record.breakdown)) {
+      breakdown[key] = toArray(rows)
+        .filter(isRecord)
+        .map((row) => ({
+          key: String(row.key ?? ""),
+          sessions: toNumberOrNull(row.sessions) ?? 0,
+          stages: toArray(row.stages).map((value) => toNumberOrNull(value) ?? 0),
+          plan_success: toNumberOrNull(row.plan_success) ?? 0,
+          conversion: toNumberOrNull(row.conversion),
+        }));
+    }
+  }
+  return {
+    window: String(record.window ?? "7d"),
+    window_label: String(record.window_label ?? ""),
+    generated_at: String(record.generated_at ?? ""),
+    stages: toArray(record.stages)
+      .filter(isRecord)
+      .map((stage) => ({
+        key: String(stage.key ?? ""),
+        label: String(stage.label ?? stage.key ?? ""),
+        count: toNumberOrNull(stage.count) ?? 0,
+        rate_of_total: toNumberOrNull(stage.rate_of_total),
+        dropped: toNumberOrNull(stage.dropped) ?? 0,
+        drop_rate: toNumberOrNull(stage.drop_rate),
+        previous_count: toNumberOrNull(stage.previous_count) ?? 0,
+        previous_dropped: toNumberOrNull(stage.previous_dropped) ?? 0,
+      })),
+    sessions: toNumberOrNull(record.sessions) ?? 0,
+    previous_sessions: toNumberOrNull(record.previous_sessions) ?? 0,
+    overall_conversion: toNumberOrNull(record.overall_conversion),
+    biggest_drop: biggest
+      ? {
+          from: String(biggest.from ?? ""),
+          to: String(biggest.to ?? ""),
+          from_key: String(biggest.from_key ?? ""),
+          to_key: String(biggest.to_key ?? ""),
+          drop_rate: toNumberOrNull(biggest.drop_rate) ?? 0,
+          dropped: toNumberOrNull(biggest.dropped) ?? 0,
+        }
+      : null,
+    destination_dimension: String(record.destination_dimension ?? "destination"),
+    breakdown,
+    dimension_options: toArray(record.dimension_options)
+      .filter(isRecord)
+      .map((option) => ({ key: String(option.key ?? ""), label: String(option.label ?? option.key ?? "") })),
+    notes: toArray(record.notes).map(String),
+  };
+}
+
+function isBadcaseGroupsPayload(value: unknown): value is AdminRecord {
+  return isRecord(value) && isArray(value.groups) && isRecord(value.totals);
+}
+
+function normalizeBadcaseGroups(payload: unknown): AdminBadcaseGroups {
+  const record = isRecord(payload) ? payload : {};
+  const totals = isRecord(record.totals) ? record.totals : {};
+  const facets = isRecord(record.facets) ? record.facets : {};
+  return {
+    window: String(record.window ?? "7d"),
+    window_label: String(record.window_label ?? ""),
+    generated_at: String(record.generated_at ?? ""),
+    totals: {
+      badcases: toNumberOrNull(totals.badcases) ?? 0,
+      previous_badcases: toNumberOrNull(totals.previous_badcases) ?? 0,
+      groups: toNumberOrNull(totals.groups) ?? 0,
+      affected_runs: toNumberOrNull(totals.affected_runs) ?? 0,
+      pending: toNumberOrNull(totals.pending) ?? 0,
+      open_total: toNumberOrNull(totals.open_total) ?? 0,
+    },
+    groups: toArray(record.groups)
+      .filter(isRecord)
+      .map((group) => ({
+        key: String(group.key ?? ""),
+        category: String(group.category ?? group.key ?? ""),
+        severity: String(group.severity ?? "medium"),
+        occurrence_count: toNumberOrNull(group.occurrence_count) ?? 0,
+        previous_count: toNumberOrNull(group.previous_count) ?? 0,
+        trend_pct: toNumberOrNull(group.trend_pct),
+        affected_runs: toNumberOrNull(group.affected_runs) ?? 0,
+        first_seen: toStringOrNull(group.first_seen),
+        last_seen: toStringOrNull(group.last_seen),
+        last_seen_ago_seconds: toNumberOrNull(group.last_seen_ago_seconds),
+        related_module: toStringOrNull(group.related_module),
+        related_providers: toArray(group.related_providers).map(String),
+        pending_analysis: toNumberOrNull(group.pending_analysis) ?? 0,
+        unfixed: toNumberOrNull(group.unfixed) ?? 0,
+        top_symptoms: toArray(group.top_symptoms)
+          .filter(isRecord)
+          .map((item) => ({ text: String(item.text ?? ""), count: toNumberOrNull(item.count) ?? 0 })),
+        sample_ids: toArray(group.sample_ids).map(String),
+        sample_runs: toArray(group.sample_runs).map(String),
+        sparkline: normalizeTrendPoints(group.sparkline),
+      })),
+    facets: {
+
+      category: isRecord(facets.category) ? facets.category : {},
+      severity: isRecord(facets.severity) ? facets.severity : {},
+      analysis_status: isRecord(facets.analysis_status) ? facets.analysis_status : {},
+    },
+    notes: toArray(record.notes).map(String),
+  };
+}
+
+function isTimelinePayload(value: unknown): value is AdminRecord {
+  return isRecord(value) && isArray(value.events) && isArray(value.tracks) && isRecord(value.summary);
+}
+
+function normalizeTimelineEvent(value: AdminRecord): AdminTraceEvent {
+  return {
+    event_id: String(value.event_id ?? ""),
+    run_id: String(value.run_id ?? ""),
+    round_index: toNumberOrNull(value.round_index),
+    event_type: String(value.event_type ?? "SYSTEM"),
+    event_type_label: String(value.event_type_label ?? value.event_type ?? ""),
+    stage: toStringOrNull(value.stage),
+    title: String(value.title ?? ""),
+    summary: toStringOrNull(value.summary),
+    input_preview: toStringOrNull(value.input_preview),
+    output_preview: toStringOrNull(value.output_preview),
+    status: toStringOrNull(value.status),
+    started_at: toStringOrNull(value.started_at),
+    finished_at: toStringOrNull(value.finished_at),
+    duration_ms: toNumberOrNull(value.duration_ms),
+    parent_event_id: toStringOrNull(value.parent_event_id),
+    model: toStringOrNull(value.model),
+    provider: toStringOrNull(value.provider),
+    tool: toStringOrNull(value.tool),
+    tokens_in: toNumberOrNull(value.tokens_in),
+    tokens_out: toNumberOrNull(value.tokens_out),
+    cost: toNumberOrNull(value.cost),
+    cache_hit: typeof value.cache_hit === "boolean" ? value.cache_hit : null,
+    prefetch_reused: typeof value.prefetch_reused === "boolean" ? value.prefetch_reused : null,
+    fallback: typeof value.fallback === "boolean" ? value.fallback : null,
+    metadata: isRecord(value.metadata) ? value.metadata : {},
+    notes: toArray(value.notes).map(String),
+    badcases: toArray(value.badcases)
+      .filter(isRecord)
+      .map((case_) => ({
+        badcase_id: String(case_.badcase_id ?? ""),
+        category: toStringOrNull(case_.category),
+        severity: toStringOrNull(case_.severity),
+        symptom: toStringOrNull(case_.symptom),
+        analysis_status: toStringOrNull(case_.analysis_status),
+      })),
+  };
+}
+
+function normalizeTimeline(payload: unknown): AdminTimeline {
+  const record = isRecord(payload) ? payload : {};
+  const run = isRecord(record.run) ? record.run : {};
+  const summary = isRecord(record.summary) ? record.summary : {};
+  return {
+    run_id: String(record.run_id ?? run.run_id ?? ""),
+    generated_at: String(record.generated_at ?? ""),
+    run: {
+      run_id: String(run.run_id ?? record.run_id ?? ""),
+      status: toStringOrNull(run.status),
+      source: toStringOrNull(run.source),
+      original_query: toStringOrNull(run.original_query),
+      created_at: toStringOrNull(run.created_at),
+      started_at: toStringOrNull(run.started_at),
+      finished_at: toStringOrNull(run.finished_at),
+      duration_ms: toNumberOrNull(run.duration_ms),
+      cost: toNumberOrNull(run.cost),
+      total_tokens: toNumberOrNull(run.total_tokens),
+      badcase_count: toNumberOrNull(run.badcase_count),
+      error: toStringOrNull(run.error),
+    },
+    summary: {
+      events: toNumberOrNull(summary.events) ?? 0,
+      by_type: isRecord(summary.by_type) ? summary.by_type : {},
+      errors: toNumberOrNull(summary.errors) ?? 0,
+      fallbacks: toNumberOrNull(summary.fallbacks) ?? 0,
+      badcases: toNumberOrNull(summary.badcases) ?? 0,
+      stages: toNumberOrNull(summary.stages) ?? 0,
+    },
+    stages: toArray(record.stages)
+      .filter(isRecord)
+      .map((stage) => ({
+        stage_id: String(stage.stage_id ?? ""),
+        title: String(stage.title ?? stage.stage_id ?? ""),
+        status: toStringOrNull(stage.status),
+        ordinal: toNumberOrNull(stage.ordinal) ?? 0,
+        started_at: toStringOrNull(stage.started_at),
+        finished_at: toStringOrNull(stage.finished_at),
+      })),
+    tracks: toArray(record.tracks)
+      .filter(isRecord)
+      .map((track) => ({
+        key: String(track.key ?? ""),
+        label: String(track.label ?? track.key ?? ""),
+        count: toNumberOrNull(track.count) ?? 0,
+        blocks: toArray(track.blocks)
+          .filter(isRecord)
+          .map((block) => ({
+            event_id: String(block.event_id ?? ""),
+            title: String(block.title ?? ""),
+            status: toStringOrNull(block.status),
+            stage: toStringOrNull(block.stage),
+            start_ms: toNumberOrNull(block.start_ms),
+            duration_ms: toNumberOrNull(block.duration_ms),
+            badcase_count: toNumberOrNull(block.badcase_count) ?? 0,
+          })),
+      })),
+    events: toArray(record.events).filter(isRecord).map(normalizeTimelineEvent),
+    badcases: toArray(record.badcases)
+      .filter(isRecord)
+      .map((case_) => ({
+        badcase_id: String(case_.badcase_id ?? ""),
+        category: toStringOrNull(case_.category),
+        severity: toStringOrNull(case_.severity),
+        symptom: toStringOrNull(case_.symptom),
+        analysis_status: toStringOrNull(case_.analysis_status),
+      })),
+    quality: normalizeTimelineQuality(record.quality),
+    type_options: toArray(record.type_options)
+      .filter(isRecord)
+      .map((option) => ({ key: String(option.key ?? ""), label: String(option.label ?? option.key ?? "") })),
+    notes: toArray(record.notes).map(String),
+  };
+}
+
+function normalizeTimelineQuality(value: unknown): AdminTimeline["quality"] {
+  const record = isRecord(value) ? value : {};
+  return {
+    score: toNumberOrNull(record.score),
+    grade: (toStringOrNull(record.grade) ?? "UNKNOWN") as AdminGrade,
+    metrics: isRecord(record.metrics) ? record.metrics : null,
+    error: toStringOrNull(record.error),
+  };
+}
+
+/** 首屏。`qualitySample` 控制现算质量的抽样条数：0 表示不算（只想要系统指标时用）。 */
+export function getAdminDashboard(
+  windowKey: AdminWindowKey = DEFAULT_ADMIN_WINDOW,
+  qualitySample?: number,
+): Promise<AdminDashboard> {
+  return adminRequest<AdminRecord>("/api/v1/admin/dashboard", {
+    method: "GET",
+    query: { window: normalizeWindow(windowKey), quality_sample: qualitySample },
+    validate: isDashboardPayload,
+  }).then(normalizeDashboard);
+}
+
+export interface AdminTravelQualityQuery {
+  window: AdminWindowKey;
+  /** 现算质量的运行条数上限（后端硬上限 100）。 */
+  limit?: number;
+  destination?: string;
+}
+
+export function getAdminTravelQuality(
+  query: AdminTravelQualityQuery,
+): Promise<AdminTravelQuality> {
+  return adminRequest<AdminRecord>("/api/v1/admin/travel-quality", {
+    method: "GET",
+    query: {
+      window: normalizeWindow(query.window),
+      limit: query.limit,
+      destination: query.destination,
+    },
+    validate: isTravelQualityPayload,
+  }).then(normalizeTravelQuality);
+}
+
+export interface AdminFunnelQuery {
+  window: AdminWindowKey;
+  /** 拆解维度；不传时后端默认按目的地拆。 */
+  dimension?: string;
+}
+
+export function getAdminFunnel(query: AdminFunnelQuery): Promise<AdminFunnel> {
+  return adminRequest<AdminRecord>("/api/v1/admin/funnel", {
+    method: "GET",
+    query: { window: normalizeWindow(query.window), dimension: query.dimension },
+    validate: isFunnelPayload,
+  }).then(normalizeFunnel);
+}
+
+export interface AdminBadcaseGroupsQuery {
+  window: AdminWindowKey;
+  limit?: number;
+}
+
+export function getAdminBadcaseGroups(
+  query: AdminBadcaseGroupsQuery,
+): Promise<AdminBadcaseGroups> {
+  return adminRequest<AdminRecord>("/api/v1/admin/badcase-groups", {
+    method: "GET",
+    query: { window: normalizeWindow(query.window), limit: query.limit },
+    validate: isBadcaseGroupsPayload,
+  }).then(normalizeBadcaseGroups);
+}
+
+export function getAdminRunTimeline(runId: string): Promise<AdminTimeline> {
+  return adminRequest<AdminRecord>(`/api/v1/admin/runs/${encodeURIComponent(runId)}/timeline`, {
+    method: "GET",
+    validate: isTimelinePayload,
+  }).then(normalizeTimeline);
 }

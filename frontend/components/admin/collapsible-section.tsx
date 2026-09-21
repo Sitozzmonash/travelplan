@@ -22,6 +22,7 @@ export function CollapsibleSection({
   icon: Icon,
   defaultOpen = false,
   actions,
+  onOpenChange,
   children,
   className,
 }: {
@@ -31,6 +32,8 @@ export function CollapsibleSection({
   icon?: LucideIcon;
   defaultOpen?: boolean;
   actions?: ReactNode;
+  /** 展开/折叠通知。给「展开后才去请求」的区块用，避免首屏为折叠内容白等一次请求。 */
+  onOpenChange?: (open: boolean) => void;
   children: ReactNode;
   className?: string;
 }) {
@@ -39,7 +42,11 @@ export function CollapsibleSection({
   return (
     <details
       open={open}
-      onToggle={(event) => setOpen(event.currentTarget.open)}
+      onToggle={(event) => {
+        const next = event.currentTarget.open;
+        setOpen(next);
+        onOpenChange?.(next);
+      }}
       className={cn("group/section rounded-xl bg-card ring-1 ring-foreground/10", className)}
     >
       <summary className="flex cursor-pointer list-none items-center gap-2 px-3.5 py-2.5 [&::-webkit-details-marker]:hidden">

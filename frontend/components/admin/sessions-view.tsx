@@ -11,7 +11,7 @@ import { ResourceView, SectionEmpty } from "@/components/admin/admin-states";
 import { AdminDetailDialog, JsonBlock } from "@/components/admin/detail-dialog";
 import { DescriptionList, PanelSection, type DetailItem } from "@/components/admin/metric-list";
 import { StatusBadge, ToneBadge } from "@/components/admin/status-badge";
-import { formatNumber } from "@/components/admin/format";
+import { formatMetricValue, formatNumber, formatRatio } from "@/components/admin/format";
 import { useAdminResource } from "@/components/admin/use-admin-resource";
 import { formatDateTime } from "@/lib/format";
 import { getAdminPlanningSession, getAdminPlanningSessions } from "@/lib/admin-api";
@@ -20,6 +20,7 @@ import type {
   AdminPlanningSessionDetail,
   AdminPlanningSessionList,
   AdminPlanningSessionSummary,
+  AdminRecord,
 } from "@/types/admin";
 
 const PAGE_SIZE = 20;
@@ -28,7 +29,8 @@ const SEARCH_DEBOUNCE_MS = 350;
 /**
  * Guided Session 列表。
  * 这一页是「从用户前置选择追溯到最终 Run」的入口：
- * 列表按 session_id / run_id 搜索，详情弹窗展示偏好、POI 选择统计、Discovery 事件与降级。
+ * 列表按 session_id / run_id 全库搜索（后端 q 覆盖整张表，不是当前页），
+ * 详情弹窗展示偏好、动态偏好画像、POI 选择统计、Discovery 事件与降级。
  */
 export function SessionsView() {
   // 支持从运行详情跳转过来时带上 `?q=<session_id>`。
@@ -46,10 +48,6 @@ export function SessionsView() {
     `admin-sessions:${q}:${offset}`,
     () => getAdminPlanningSessions({ limit: PAGE_SIZE, offset, q: q || undefined }),
   );
-
-  const items = resource.data?.items ?? [];
-  // 后端契约暂未声明 q 参数：这里再做一次客户端兜底过滤，保证搜索一定可用。
-  const filtered = q ? items.filter((item) => matchesQuery(item, q)) : items;
 
   const columns: AdminColumn<AdminPlanningSessionSummary>[] = [
     {
@@ -213,7 +211,7 @@ export function SessionsView() {
         </div>
         {q ? (
           <p className="text-[11px] leading-4 text-muted-foreground">
-            当前页内按关键字过滤；如果后端支持 q 参数，分页结果会由后端先行筛选。
+            搜索覆盖全库（session_id / run_id 子串匹配），命中结果由后端分页返回。
           </p>
         ) : null}
       </div>
@@ -221,11 +219,11 @@ export function SessionsView() {
       <ResourceView
         resource={resource}
         loadingRows={5}
-        isEmpty={(data) => (q ? filtered.length === 0 : data.items.length === 0)}
+        isEmpty={(data) => data.items.length === 0}
         emptyTitle="没有符合条件的引导式会话"
         emptyDescription={
           q
-            ? `没有匹配「${q}」的 session_id 或 run_id。可以换一个片段再试。`
+            ? `全库没有匹配「${q}」的 session_id 或 run_id。可以换一个片段再试。`
             : "后端返回了空集合。用户在引导式向导里创建会话后，这里会出现记录。"
         }
       >
@@ -238,7 +236,7 @@ export function SessionsView() {
               onPrevious={() => setOffset((value) => Math.max(0, value - PAGE_SIZE))}
               onNext={() => setOffset((value) => value + PAGE_SIZE)}
             />
-            <AdminTable columns={columns} rows={filtered} getRowKey={(session) => session.session_id} />
+            <AdminTable columns={columns} rows={data.items} getRowKey={(session) => session.session_id} />
             <Pagination
               total={data.total}
               offset={data.offset}
@@ -415,6 +413,7 @@ function SessionDetailBody({ data }: { data: AdminPlanningSessionDetail }) {
         labels={data.preference_labels}
         capabilities={data.session.capabilities}
       />
+      <DynamicProfileSection data={data} />
       <DiscoverySection discovery={data.discovery} />
       <PrefetchSection summary={data.prefetch_summary} raw={data} />
       <PoiSelectionsSection selections={data.poi_selections} />
@@ -581,6 +580,216 @@ function PreferenceSection({
       ) : null}
     </PanelSection>
   );
+}
+
+/* ------------- Dynamic Preference Profile（画像 / 住宿区域 / 候选池） ------------- */
+
+/**
+ * 画像权重分组：键与后端 PreferenceProfile 的同名字段一致。
+ * 顺序即阅读顺序（先决定住哪，再决定怎么玩），weight 之外的字段单独列。
+ */
+const PROFILE_GROUP_KEYS: { key: string; label: string }[] = [
+  { key: "hotel_area", label: "住宿区域权重" },
+  { key: "hotel", label: "酒店权重" },
+  { key: "attraction", label: "景点权重" },
+  { key: "food", label: "餐饮权重" },
+  { key: "pace", label: "节奏" },
+];
+
+/** 权重键 → 中文；未登记的键原样显示，后端新增权重不会因为漏配而消失。 */
+const PROFILE_WEIGHT_LABELS: Record<string, string> = {
+  food_density: "美食密度",
+  commercial_area: "商圈",
+  nightlife: "夜生活",
+  poi_centrality: "中心性",
+  evidence: "攻略推荐",
+  price: "价格",
+  rating: "评分",
+  location: "位置",
+  user_interest: "用户兴趣",
+  route_fit: "路线契合",
+  target_poi_per_day: "每天点数",
+  prefer_free_time: "偏好自由时间",
+};
+
+const POI_POOL_LABELS: { key: string; label: string }[] = [
+  { key: "attraction", label: "景点候选" },
+  { key: "food", label: "餐饮候选" },
+  { key: "experience", label: "体验候选" },
+];
+
+/**
+ * decision 块（动态偏好画像 / 住宿区域 / 候选池）还没进前端类型与归一化，按 unknown 读：
+ * 契约补上后这里自动生效；缺失时降级成「后端未返回」，不抛错也不留空块。
+ */
+function decisionBlock(data: AdminPlanningSessionDetail): AdminRecord {
+  const record = data as unknown as AdminRecord;
+  if (isRecord(record.decision)) return record.decision;
+  // 同一份数据在 user 端 session_view 里挂在 session 块上，旧形状也要能读。
+  return isRecord(record.session) ? record.session : {};
+}
+
+function DynamicProfileSection({ data }: { data: AdminPlanningSessionDetail }) {
+  const decision = decisionBlock(data);
+  const profile = isRecord(decision.profile) ? decision.profile : null;
+  const areas = readHotelAreas(decision.hotel_areas);
+  const pools = readPoiPools(decision.poi_pools);
+
+  return (
+    <PanelSection
+      title="Dynamic Preference Profile"
+      description="用户偏好被翻译成的动态权重，以及据此挑出的住宿区域与候选池；只影响软取舍，不碰硬规则。"
+    >
+      {profile ? (
+        <ProfileSummary profile={profile} />
+      ) : (
+        <SectionEmpty
+          title="后端未返回动态偏好画像"
+          description="decision.profile 缺失：这次会话可能没走到画像生成，或者后端版本还没有这个块。"
+        />
+      )}
+
+      <section className="flex flex-col gap-1.5">
+        <h4 className="text-[11px] font-medium text-foreground">住宿区域候选</h4>
+        {areas.length > 0 ? (
+          <ul className="flex flex-col gap-1.5">
+            {areas.map((area) => (
+              <li
+                key={area.key}
+                className="flex flex-col gap-1 rounded-lg border border-border px-3 py-2"
+              >
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs font-medium text-foreground">{area.name}</span>
+                  {area.fitScore === null ? null : (
+                    <span className="tabular text-[11px] text-muted-foreground">
+                      契合度 {formatRatio(area.fitScore)}
+                    </span>
+                  )}
+                  {area.tags.map((tag) => (
+                    <ToneBadge key={tag} tone="muted" className="text-[0.625rem]">
+                      {tag}
+                    </ToneBadge>
+                  ))}
+                </div>
+                {area.reason ? (
+                  <p className="text-[11px] leading-5 break-words text-muted-foreground">
+                    {area.reason}
+                  </p>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="text-xs text-muted-foreground">
+            后端未返回住宿区域候选（decision.hotel_areas 为空）；这次规划可能没走到区域选择。
+          </p>
+        )}
+      </section>
+
+      <section className="flex flex-col gap-1.5">
+        <h4 className="text-[11px] font-medium text-foreground">候选池</h4>
+        {pools ? (
+          <DescriptionList
+            items={pools.map((pool) => ({
+              label: pool.label,
+              value: pool.count === null ? "后端未返回" : `${formatNumber(pool.count)} 个`,
+            }))}
+          />
+        ) : (
+          <p className="text-xs text-muted-foreground">后端未返回候选池（decision.poi_pools 缺失）。</p>
+        )}
+      </section>
+    </PanelSection>
+  );
+}
+
+function ProfileSummary({ profile }: { profile: AdminRecord }) {
+  const source = readString(profile, "source");
+  const style = readString(profile, "travel_style");
+  const reason = readString(profile, "reason");
+  const groups = PROFILE_GROUP_KEYS.filter((group) => isRecord(profile[group.key]));
+  const sourceLabel =
+    source === "llm" ? "LLM 生成" : source === "fallback" ? "均衡基线（fallback）" : "来源未返回";
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <ToneBadge tone={source === "llm" ? "info" : "muted"}>{sourceLabel}</ToneBadge>
+        <ValueChip label="风格" value={style ?? "后端未返回"} />
+      </div>
+      {source === "fallback" ? (
+        <p className="text-[11px] leading-5 text-muted-foreground">
+          fallback 表示这一次 LLM 没有产出有效画像，系统退回均衡基线 —— 权重与「没有画像」时完全一致，
+          不代表用户偏好缺失。
+        </p>
+      ) : null}
+      {reason ? (
+        <p className="text-[11px] leading-5 break-words text-muted-foreground">{reason}</p>
+      ) : null}
+      {groups.length > 0 ? (
+        <div className="flex flex-col gap-3">
+          {groups.map((group) => (
+            <section key={group.key} className="flex flex-col gap-1.5">
+              <h4 className="text-[11px] font-medium text-foreground">{group.label}</h4>
+              <WeightList weights={profile[group.key] as AdminRecord} />
+            </section>
+          ))}
+        </div>
+      ) : (
+        <p className="text-[11px] text-muted-foreground">后端未返回权重分组，只能看到风格与来源。</p>
+      )}
+    </div>
+  );
+}
+
+/** 权重取值：数字按千分位，布尔翻成「是 / 否」（pace 组里有布尔项）。 */
+function WeightList({ weights }: { weights: AdminRecord }) {
+  const entries = Object.entries(weights);
+  if (entries.length === 0) {
+    return <p className="text-[11px] text-muted-foreground">这一组没有权重。</p>;
+  }
+  return (
+    <ul className="flex flex-wrap gap-1.5">
+      {entries.map(([key, value]) => (
+        <li key={key} className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
+          {PROFILE_WEIGHT_LABELS[key] ?? key}{" "}
+          <span className="tabular text-foreground">{formatMetricValue(value)}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+interface AreaBrief {
+  key: string;
+  name: string;
+  reason: string | null;
+  tags: string[];
+  fitScore: number | null;
+}
+
+/** 住宿区域候选：名称 + 契合度 + 理由（理由就是「为什么选它」的审计口径）。 */
+function readHotelAreas(raw: unknown): AreaBrief[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(isRecord).map((area, index) => {
+    const key = readString(area, "key") ?? readString(area, "name") ?? `area-${index}`;
+    return {
+      key,
+      name: readString(area, "name") ?? key,
+      reason: readString(area, "reason"),
+      tags: readStringArray(area, "tags"),
+      fitScore: readNumber(area, "fit_score"),
+    };
+  });
+}
+
+/** poi_pools 是 {池: [place_id]}；整块缺失时返回 null，页面才能写「后端未返回」而不是「0 个」。 */
+function readPoiPools(raw: unknown): { key: string; label: string; count: number | null }[] | null {
+  if (!isRecord(raw)) return null;
+  return POI_POOL_LABELS.map((pool) => {
+    const value = raw[pool.key];
+    return { key: pool.key, label: pool.label, count: Array.isArray(value) ? value.length : null };
+  });
 }
 
 function DiscoverySection({ discovery }: { discovery: AdminPlanningSessionDetail["discovery"] }) {
@@ -882,12 +1091,25 @@ function Pagination({
   );
 }
 
-function matchesQuery(session: AdminPlanningSessionSummary, q: string): boolean {
-  const needle = q.toLowerCase();
-  return (
-    session.session_id.toLowerCase().includes(needle) ||
-    (session.run_id ?? "").toLowerCase().includes(needle)
-  );
+/* ------------------------------ 防御性读取 ------------------------------ */
+
+function isRecord(value: unknown): value is AdminRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readString(record: AdminRecord, key: string): string | null {
+  const value = record[key];
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function readNumber(record: AdminRecord, key: string): number | null {
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function readStringArray(record: AdminRecord, key: string): string[] {
+  const value = record[key];
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
 function useDebouncedValue<T>(value: T, delayMs: number): T {

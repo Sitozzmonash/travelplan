@@ -9,17 +9,18 @@ import { FilterSelect, FILTER_ALL, type FilterOption } from "@/components/admin/
 import { AdminTable, type AdminColumn } from "@/components/admin/admin-table";
 import { PageHeader } from "@/components/admin/page-header";
 import { ResourceView } from "@/components/admin/admin-states";
-import { SourceTag, StatusBadge } from "@/components/admin/status-badge";
+import { SourceTag, StatusBadge, ToneBadge, type AdminTone } from "@/components/admin/status-badge";
 import {
   formatCost,
   formatDurationMs,
   formatNumber,
-  formatTokens,
+  formatRatio,
   statusLabel,
 } from "@/components/admin/format";
+import { formatStamp } from "@/lib/format";
 import { useAdminResource } from "@/components/admin/use-admin-resource";
 import { getAdminRuns } from "@/lib/admin-api";
-import type { AdminRunList, AdminRunSummary } from "@/types/admin";
+import { ADMIN_GRADE_LABELS, type AdminRunList, type AdminRunSummary } from "@/types/admin";
 
 /** 契约里没写 run 状态枚举，这里给已知集合，运行时再合并实际出现的状态。 */
 const KNOWN_STATUSES = ["RUNNING", "SUCCESS", "DEGRADED", "FAILED", "CANCELLED"];
@@ -30,14 +31,26 @@ const LIMIT_OPTIONS: FilterOption[] = [
   { value: "100", label: "每页 100 条" },
 ];
 
+/** 质量等级 → 色调：与后端 `_grade()` 的四档一一对应，UNKNOWN 保持中性灰。 */
+const GRADE_TONES: Record<string, AdminTone> = {
+  GOOD: "success",
+  FAIR: "warning",
+  POOR: "danger",
+  UNKNOWN: "muted",
+};
+
 /** 搜索防抖：run_id 是渐进的输入，每敲一个字都请求会把后端打满。 */
 const SEARCH_DEBOUNCE_MS = 350;
 
 export function RunsView() {
-  const [status, setStatus] = useState<string>(FILTER_ALL);
+  // 首屏筛选支持深链：Dashboard 的「当前需要关注」跳到 /admin/runs?status=FAILED（或 ?q=…）。
+  // 用惰性初始化读 window 而不是 useSearchParams（静态导出需要 Suspense 边界），
+  // 也不用 effect + setState（ESLint react-hooks/set-state-in-effect 视为错误）；
+  // 管理台外壳在 hydration 前只渲染骨架，因此这里首次求值时 window 一定可用。
+  const [status, setStatus] = useState<string>(() => readInitialParam("status") ?? FILTER_ALL);
   const [limit, setLimit] = useState<number>(20);
   const [offset, setOffset] = useState<number>(0);
-  const [queryDraft, setQueryDraft] = useState("");
+  const [queryDraft, setQueryDraft] = useState(() => readInitialParam("q") ?? "");
   const [includeBenchmark, setIncludeBenchmark] = useState(false);
   const q = useDebouncedValue(queryDraft.trim(), SEARCH_DEBOUNCE_MS);
 
@@ -48,13 +61,13 @@ export function RunsView() {
   );
 
   const items = resource.data?.items ?? [];
-  const statusOptions = buildStatusOptions(items);
+  const statusOptions = buildStatusOptions(items, status);
 
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
         title="运行记录"
-        description="每一次规划运行的用量、耗时与问题数量。可以按 run_id 搜索；Benchmark 用例运行默认不显示。点 Run 编号进入详情。"
+        description="每一次运行的行程质量与问题数量（Token / LLM / 工具等指标在运行详情里）。可以按 run_id 搜索；Benchmark 用例运行默认不显示。点运行编号进入详情。"
         actions={
           <Button variant="outline" size="sm" onClick={resource.reload}>
             <RefreshCw />
@@ -161,6 +174,9 @@ export function RunsView() {
               onPrevious={() => setOffset((value) => Math.max(0, value - limit))}
               onNext={() => setOffset((value) => value + limit)}
             />
+            <p className="text-[11px] text-muted-foreground">
+              技术指标（Token / LLM / 工具 / Provider 失败）已下沉到运行详情，列表只保留产品质量视角的 8 列。
+            </p>
             <AdminTable
               columns={RUN_COLUMNS}
               rows={data.items}
@@ -181,6 +197,13 @@ export function RunsView() {
   );
 }
 
+/** 读 URL 查询串里的首个筛选值；没有（或空串）时返回 null。 */
+function readInitialParam(key: string): string | null {
+  if (typeof window === "undefined") return null;
+  const value = new URLSearchParams(window.location.search).get(key);
+  return value && value.length > 0 ? value : null;
+}
+
 function useDebouncedValue<T>(value: T, delayMs: number): T {
   const [debounced, setDebounced] = useState(value);
   useEffect(() => {
@@ -190,55 +213,101 @@ function useDebouncedValue<T>(value: T, delayMs: number): T {
   return debounced;
 }
 
-function buildStatusOptions(items: AdminRunSummary[]): FilterOption[] {
-  const seen = new Set<string>();
+/**
+ * 状态下拉：已知枚举 + 本页出现的状态 + 深链带来的状态。
+ * 深链（?status=FAILED）必须出现在选项里，否则下拉会显示成「全部状态」而列表其实在筛选。
+ */
+function buildStatusOptions(items: AdminRunSummary[], current: string): FilterOption[] {
+  const seen = new Set<string>(KNOWN_STATUSES);
   for (const item of items) seen.add(item.status);
-  const extra = [...seen].filter((value) => !KNOWN_STATUSES.includes(value));
+  if (current !== FILTER_ALL) seen.add(current);
   return [
     { value: FILTER_ALL, label: "全部状态" },
-    ...KNOWN_STATUSES.map((value) => ({ value, label: statusLabel(value) })),
-    ...extra.map((value) => ({ value, label: statusLabel(value) })),
+    ...[...seen].map((value) => ({ value, label: statusLabel(value) })),
   ];
+}
+
+/** 质量：拿到分数才显示百分比；没有分数时把后端给的原因放进 title，绝不把 null 画成 0。 */
+function QualityCell({ run }: { run: AdminRunSummary }) {
+  if (run.quality_score === null || run.quality_score === undefined) {
+    return (
+      <span
+        className="text-xs text-muted-foreground"
+        title={run.quality_error ?? "后端没有返回质量分"}
+      >
+        —
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <span className="tabular text-xs">{formatRatio(run.quality_score)}</span>
+      {run.quality_grade ? (
+        <ToneBadge tone={GRADE_TONES[run.quality_grade] ?? "muted"} className="text-[0.625rem]">
+          {ADMIN_GRADE_LABELS[run.quality_grade] ?? run.quality_grade}
+        </ToneBadge>
+      ) : null}
+    </span>
+  );
+}
+
+/** 问题：Bad Case 与未解决告警合并成一列；两者都为 0 / 缺失时写「无」。 */
+function IssueCell({ run }: { run: AdminRunSummary }) {
+  const cases = run.issue_count ?? 0;
+  const warnings = run.warnings ?? 0;
+  if (cases === 0 && warnings === 0) {
+    return <span className="text-xs text-muted-foreground">无</span>;
+  }
+  return (
+    <Link
+      href={`/admin/runs/${encodeURIComponent(run.run_id)}`}
+      title="打开运行详情查看这些问题"
+      className="tabular text-xs whitespace-nowrap text-primary underline-offset-4 hover:underline"
+    >
+      {formatNumber(cases)} 案例 · {formatNumber(warnings)} 告警
+    </Link>
+  );
 }
 
 const RUN_COLUMNS: AdminColumn<AdminRunSummary>[] = [
   {
-    key: "run_id",
-    header: "Run",
+    key: "status",
+    header: "状态",
     primary: true,
-    className: "max-w-[16rem]",
     cell: (run) => (
-      <Link
-        href={`/admin/runs/${encodeURIComponent(run.run_id)}`}
-        title={run.run_id}
-        className="block max-w-[16rem] truncate font-mono text-xs text-primary underline-offset-4 hover:underline"
-      >
-        {run.run_id}
-      </Link>
+      <span className="flex flex-col gap-1">
+        <StatusBadge status={run.status} />
+        {/* Run 编号列已从列表移除：编号跟着状态放在首列，保证仍然点得进运行详情。 */}
+        <Link
+          href={`/admin/runs/${encodeURIComponent(run.run_id)}`}
+          title={run.run_id}
+          className="block max-w-[12rem] truncate font-mono text-[11px] text-primary underline-offset-4 hover:underline"
+        >
+          {run.run_id}
+        </Link>
+      </span>
     ),
   },
-  { key: "status", header: "状态", cell: (run) => <StatusBadge status={run.status} /> },
-  { key: "source", header: "来源", cell: (run) => <SourceTag source={run.source} /> },
   {
     key: "query",
-    header: "原始请求",
-    mobileHidden: true,
+    header: "用户请求 · 目的地",
+    className: "max-w-[24rem]",
     cell: (run) => (
-      <span className="line-clamp-2 block max-w-[24rem] text-xs text-muted-foreground">
-        {run.original_query || "后端没有记录原始请求文本"}
+      <span className="flex flex-col gap-1">
+        {run.destination ? (
+          <span className="flex flex-wrap items-center gap-1.5">
+            <ToneBadge tone="info" className="text-[0.625rem]">
+              {run.destination}
+            </ToneBadge>
+          </span>
+        ) : null}
+        <span className="line-clamp-2 text-xs leading-5 text-muted-foreground">
+          {run.original_query || "后端没有记录原始请求文本"}
+        </span>
       </span>
     ),
   },
-  {
-    key: "created_at",
-    header: "开始时间",
-    mobileHidden: true,
-    cell: (run) => (
-      <span className="font-mono text-[11px] whitespace-nowrap text-muted-foreground">
-        {run.created_at ?? "—"}
-      </span>
-    ),
-  },
+  { key: "source", header: "来源", cell: (run) => <SourceTag source={run.source} /> },
   {
     key: "duration",
     header: "耗时",
@@ -246,33 +315,16 @@ const RUN_COLUMNS: AdminColumn<AdminRunSummary>[] = [
     cell: (run) => <span className="tabular text-xs">{formatDurationMs(run.duration_ms)}</span>,
   },
   {
-    key: "tokens",
-    header: "Token",
+    key: "quality",
+    header: "质量",
     align: "right",
-    cell: (run) => <span className="tabular text-xs">{formatTokens(run.total_tokens)}</span>,
+    cell: (run) => <QualityCell run={run} />,
   },
   {
-    key: "calls",
-    header: "LLM / Jev / 工具",
+    key: "issues",
+    header: "问题",
     align: "right",
-    cell: (run) => (
-      <span className="tabular text-xs whitespace-nowrap">
-        {formatNumber(run.llm_calls)} / {formatNumber(run.jev_calls)} / {formatNumber(run.tool_calls)}
-      </span>
-    ),
-  },
-  {
-    key: "provider_failures",
-    header: "Provider 失败",
-    align: "right",
-    mobileHidden: true,
-    cell: (run) => <span className="tabular text-xs">{formatNumber(run.provider_failures)}</span>,
-  },
-  {
-    key: "badcase_count",
-    header: "Bad Case",
-    align: "right",
-    cell: (run) => <span className="tabular text-xs">{formatNumber(run.badcase_count)}</span>,
+    cell: (run) => <IssueCell run={run} />,
   },
   {
     key: "cost",
@@ -280,6 +332,19 @@ const RUN_COLUMNS: AdminColumn<AdminRunSummary>[] = [
     align: "right",
     mobileHidden: true,
     cell: (run) => <span className="tabular text-xs">{formatCost(run.cost)}</span>,
+  },
+  {
+    key: "started_at",
+    header: "开始时间",
+    mobileHidden: true,
+    cell: (run) => (
+      <span
+        className="font-mono text-[11px] whitespace-nowrap text-muted-foreground"
+        title={run.started_at ?? run.created_at ?? undefined}
+      >
+        {formatStamp(run.started_at ?? run.created_at)}
+      </span>
+    ),
   },
 ];
 

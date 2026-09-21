@@ -1,379 +1,508 @@
 "use client";
 
+import { useState } from "react";
 import Link from "next/link";
-import {
-  Activity,
-  Bug,
-  Coins,
-  Cpu,
-  FlaskConical,
-  Gauge,
-  RefreshCw,
-  Sparkles,
-  Wrench,
-} from "lucide-react";
+import { Activity, FlaskConical, Gauge, HeartPulse, RefreshCw, TriangleAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import { AdminTable, type AdminColumn } from "@/components/admin/admin-table";
-import { BooleanBadge, StatusBadge } from "@/components/admin/status-badge";
+import { AttentionPanel } from "@/components/admin/attention-panel";
 import { CollapsibleSection } from "@/components/admin/collapsible-section";
+import { PanelSection } from "@/components/admin/metric-list";
 import { PageHeader } from "@/components/admin/page-header";
 import { ResourceView, SectionEmpty } from "@/components/admin/admin-states";
-import { StatCard } from "@/components/admin/stat-card";
+import { StatCard, type StatCardTrend } from "@/components/admin/stat-card";
+import { StatusBadge, ToneBadge } from "@/components/admin/status-badge";
+import { Sparkline } from "@/components/admin/trend-sparkline";
+import { WindowSelect, windowLabel } from "@/components/admin/window-select";
 import {
   formatCost,
   formatDurationMs,
   formatNumber,
   formatPassRate,
-  formatMetricValue,
-  formatTokens,
+  formatRatio,
   statusLabel,
 } from "@/components/admin/format";
 import { useAdminResource } from "@/components/admin/use-admin-resource";
-import { describeAdminError, getAdminOverview, getAdminRuns } from "@/lib/admin-api";
-import type { AdminOverview, AdminRunList, AdminRunSummary } from "@/types/admin";
+import { getAdminDashboard, getAdminOverview } from "@/lib/admin-api";
+import {
+  DEFAULT_ADMIN_WINDOW,
+  type AdminDashboard,
+  type AdminKpi,
+  type AdminOverview,
+  type AdminTrendSeries,
+  type AdminWindowKey,
+} from "@/types/admin";
 
 /**
- * 仪表盘：默认只放汇总卡。
- * 逐条运行的用量明细放在「详细用量明细」里，且首屏折叠 ——
- * 操作员打开这一页通常只想确认"现在有没有出问题"，不需要 50 行明细。
+ * 仪表盘：一屏回答「现在系统健康吗、最该修什么」。
+ *
+ * 与旧版的区别（docs/TravelPlan_Admin_整体优化方案.md §3）：
+ *   * 首屏只留关键指标，且全部**带环比**与时间范围 —— 历史累计量（总 Token / 总工具调用）
+ *     不再占首屏，它们被收进页面底部的「累计用量（历史总量）」折叠区；
+ *   * 「当前需要关注」提到最显眼的位置，每条都带可点的入口；
+ *   * Jev 不再是核心健康指标（文档 §10 把它降为可选增强），相关明细与累计用量放在一起。
  */
 export function DashboardView() {
-  const overview = useAdminResource<AdminOverview>("admin-overview", getAdminOverview);
-  const runs = useAdminResource<AdminRunList>("admin-overview-usage", () =>
-    getAdminRuns({ limit: 50, offset: 0 }),
+  const [windowKey, setWindowKey] = useState<AdminWindowKey>(DEFAULT_ADMIN_WINDOW);
+  const dashboard = useAdminResource<AdminDashboard>(
+    `admin-dashboard:${windowKey}`,
+    () => getAdminDashboard(windowKey),
   );
 
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
         title="仪表盘"
-        description="运行总量、调用用量与质量闭环的当前状态。所有数字都来自后端聚合，管理台不做二次计算。"
+        description="按时间范围统计的关键指标、环比与当前需要关注的问题。所有数字都来自后端聚合，管理台不做二次计算。"
         actions={
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => {
-              overview.reload();
-              runs.reload();
-            }}
-          >
-            <RefreshCw />
-            刷新
-          </Button>
+          <div className="flex items-end gap-2">
+            <WindowSelect value={windowKey} onChange={setWindowKey} />
+            <Button variant="outline" size="sm" onClick={dashboard.reload}>
+              <RefreshCw />
+              刷新
+            </Button>
+          </div>
         }
       />
 
-      <ResourceView resource={overview} loadingRows={5}>
-        {(data) => <OverviewBody data={data} />}
+      <ResourceView resource={dashboard} loadingRows={6}>
+        {(data) => (
+          <div className="flex flex-col gap-4">
+            <p className="text-[11px] text-muted-foreground">
+              {windowLabel(data.window, data.window_label)} · 更新于 {data.generated_at} ·
+              环比对照的是等长上一周期。
+            </p>
+
+            <KpiGrid kpis={data.kpis} />
+
+            <AttentionPanel items={data.attention} />
+
+            <TrendGrid trends={data.trends} />
+
+            <div className="grid gap-3 lg:grid-cols-2">
+              <StatusDistribution data={data} />
+              <DecisionHealth data={data} />
+              <ProviderSnapshot data={data} />
+              <QualityClosure data={data} />
+            </div>
+
+            {data.notes.length > 0 ? (
+              <section className="rounded-xl border border-border bg-muted/30 p-3.5">
+                <p className="text-xs font-medium text-foreground">口径与数据缺口</p>
+                <ul className="mt-1.5 list-disc space-y-1 pl-4 text-[11px] leading-5 text-muted-foreground">
+                  {data.notes.map((note) => (
+                    <li key={note}>{note}</li>
+                  ))}
+                </ul>
+              </section>
+            ) : null}
+
+            <LifetimeUsage />
+          </div>
+        )}
       </ResourceView>
+    </div>
+  );
+}
 
-      <CollapsibleSection
-        title="详细用量明细"
-        description="按运行列出 Token、LLM / Jev / 工具调用次数"
-        count={runs.data ? runs.data.total : undefined}
-        icon={Coins}
-      >
-        <ResourceView
-          resource={runs}
-          loadingRows={4}
-          isEmpty={(data) => data.items.length === 0}
-          emptyTitle="还没有任何运行记录"
-          emptyDescription="后端 runs 存储为空。发起一次规划后，这里会出现逐条用量。"
+/* ------------------------------ 关键指标 ------------------------------ */
+
+/**
+ * 环比文案：delta 与指标**同单位**，所以格式必须跟着 unit 走。
+ * 比率类的 delta 是百分点差（0.021 → 2.1%），不是相对变化率 —— 这是后端定义的口径。
+ */
+function formatDelta(kpi: AdminKpi): string | null {
+  if (kpi.delta === null || kpi.direction === "flat") return null;
+  const absolute = Math.abs(kpi.delta);
+  const unit = kpi.unit ?? "";
+  if (unit === "ratio" || unit === "score") return formatRatio(absolute);
+  if (unit === "ms") return formatDurationMs(absolute);
+  if (unit === "cny") return formatCost(absolute);
+  return formatNumber(absolute);
+}
+
+function formatKpiValue(kpi: AdminKpi): string {
+  if (kpi.value === null) return "—";
+  // 质量分虽然按比率存（0~1），但页面上用「分」比用「%」更贴合它的含义。
+  if (kpi.key === "quality_score") return `${(kpi.value * 100).toFixed(0)} 分`;
+  const unit = kpi.unit ?? "";
+  if (unit === "ratio") return formatRatio(kpi.value);
+  if (unit === "ms") return formatDurationMs(kpi.value);
+  if (unit === "cny") return formatCost(kpi.value);
+  return formatNumber(kpi.value);
+}
+
+function kpiTone(kpi: AdminKpi): "muted" | "success" | "warning" | "danger" | "info" {
+  if (kpi.better === true) return "success";
+  if (kpi.better === false) return "danger";
+  return "muted";
+}
+
+function KpiGrid({ kpis }: { kpis: AdminKpi[] }) {
+  if (kpis.length === 0) {
+    return <SectionEmpty title="后端没有返回关键指标" description="这一屏靠 /admin/dashboard 聚合，返回空对象时不做本地兜底推算。" />;
+  }
+  return (
+    <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+      {kpis.map((kpi) => {
+        const delta = formatDelta(kpi);
+        const trend: StatCardTrend | null =
+          delta === null
+            ? null
+            : {
+                direction: kpi.direction === "flat" ? "flat" : kpi.direction === "up" ? "up" : "down",
+                label: delta,
+                better: kpi.better,
+              };
+        return (
+          <StatCard
+            key={kpi.key}
+            label={kpi.label}
+            value={formatKpiValue(kpi)}
+            hint={kpi.hint ?? undefined}
+            tone={kpiTone(kpi)}
+            trend={trend}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+/* ------------------------------ 趋势 ------------------------------ */
+
+function formatTrendValue(series: AdminTrendSeries, value: number | null): string {
+  if (value === null) return "—";
+  if (series.unit === "ratio") return formatRatio(value);
+  if (series.unit === "ms") return formatDurationMs(value);
+  if (series.unit === "cny") return formatCost(value);
+  return formatNumber(value);
+}
+
+function TrendGrid({ trends }: { trends: AdminTrendSeries[] }) {
+  if (trends.length === 0) return null;
+  return (
+    <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+      {trends.map((series) => (
+        <div
+          key={series.key}
+          className="flex flex-col gap-1 rounded-xl bg-card p-3.5 ring-1 ring-foreground/10"
         >
-          {(data) => <UsageTable data={data} />}
-        </ResourceView>
-      </CollapsibleSection>
-
-      {overview.error && overview.data ? (
-        <p className="text-[11px] text-muted-foreground">
-          上面的数字是上一次成功读取的结果，最近一次刷新失败（{describeAdminError(overview.error)}）
-        </p>
-      ) : null}
-    </div>
+          <div className="flex items-baseline justify-between gap-2">
+            <span className="text-xs text-muted-foreground">{series.label}</span>
+            <span className="tabular text-sm font-medium text-foreground">
+              {formatTrendValue(series, series.summary.latest)}
+            </span>
+          </div>
+          <Sparkline
+            points={series.points.map((point) => point.value)}
+            ariaLabel={`${series.label} 趋势`}
+            tone={series.key === "badcases" ? "warning" : "info"}
+            variant={series.key === "badcases" ? "bar" : "line"}
+          />
+          <span className="text-[10px] text-muted-foreground">
+            最低 {formatTrendValue(series, series.summary.min)} · 最高{" "}
+            {formatTrendValue(series, series.summary.max)} · 均值{" "}
+            {formatTrendValue(series, series.summary.avg)}
+          </span>
+        </div>
+      ))}
+    </section>
   );
 }
 
-function OverviewBody({ data }: { data: AdminOverview }) {
-  const statusEntries = Object.entries(data.statuses);
+/* ------------------------------ 次要卡片 ------------------------------ */
 
+function Card({
+  title,
+  description,
+  action,
+  children,
+}: {
+  title: string;
+  description?: string;
+  action?: React.ReactNode;
+  children: React.ReactNode;
+}) {
   return (
-    <div className="flex flex-col gap-4">
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-        <StatCard label="运行总数" value={formatNumber(data.run_count)} icon={Activity} />
-        <StatCard
-          label="运行中"
-          value={formatNumber(data.running_count)}
-          tone="info"
-          hint="仍在执行的运行"
-        />
-        <StatCard
-          label="降级完成"
-          value={formatNumber(data.degraded_count)}
-          tone="warning"
-          hint="有数据源失败但仍产出行程"
-        />
-        <StatCard
-          label="失败"
-          value={formatNumber(data.failed_count)}
-          tone={data.failed_count > 0 ? "danger" : "muted"}
-          hint="没有产出可用行程"
-        />
-        <StatCard label="总 Token" value={formatTokens(data.total_tokens)} icon={Coins} />
-        <StatCard label="LLM 调用" value={formatNumber(data.total_llm_calls)} icon={Cpu} />
-        <StatCard label="Jev 调用" value={formatNumber(data.total_jev_calls)} icon={Sparkles} />
-        <StatCard label="工具调用" value={formatNumber(data.total_tool_calls)} icon={Wrench} />
-        <StatCard
-          label="Provider 失败"
-          value={formatNumber(data.provider_failures)}
-          tone={data.provider_failures > 0 ? "warning" : "muted"}
-          hint="外部数据源返回失败"
-        />
-        <StatCard
-          label="未关闭 Bad Case"
-          value={`${formatNumber(data.badcase_open)} / ${formatNumber(data.badcase_total)}`}
-          tone={data.badcase_open > 0 ? "warning" : "success"}
-          icon={Bug}
-          hint="未关闭 / 总数"
-        />
-        <StatCard
-          label="最新 Benchmark 通过率"
-          value={formatPassRate(data.benchmark.latest_pass_rate)}
-          icon={FlaskConical}
-          hint={
-            data.benchmark.latest_run_id
-              ? `最近一次：${data.benchmark.latest_run_id}`
-              : "还没有跑过 Benchmark"
-          }
-        />
-        <StatCard
-          label="Evolution 待处理"
-          value={formatNumber(data.evolution.pending_badcases)}
-          tone={data.evolution.pending_badcases > 0 ? "warning" : "muted"}
-          icon={Gauge}
-          hint={data.evolution.enabled ? "Evolution 已启用" : "Evolution 未启用"}
-        />
+    <section className="flex flex-col gap-2 rounded-xl bg-card p-3.5 ring-1 ring-foreground/10">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <div className="flex flex-col">
+          <h2 className="text-sm font-medium text-foreground">{title}</h2>
+          {description ? (
+            <span className="text-[11px] leading-4 text-muted-foreground">{description}</span>
+          ) : null}
+        </div>
+        {action}
       </div>
-
-      <div className="grid gap-4 lg:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <CardTitle>运行状态分布</CardTitle>
-            <CardDescription>后端 run 状态枚举的原始计数，未做归并。</CardDescription>
-          </CardHeader>
-          <CardContent>
-            {statusEntries.length === 0 ? (
-              <p className="text-xs text-muted-foreground">后端没有返回任何状态计数。</p>
-            ) : (
-              <ul className="flex flex-col gap-2">
-                {statusEntries.map(([status, count]) => (
-                  <li key={status} className="flex items-center justify-between gap-2">
-                    <StatusBadge status={status} />
-                    <span className="tabular text-xs font-medium text-foreground">
-                      {formatMetricValue(count)}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>Jev 决策健康</CardTitle>
-            <CardDescription>Jev 是大模型决策层的降级开关，异常会直接体现为 fallback。</CardDescription>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-3">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-xs text-muted-foreground">启用</span>
-              <BooleanBadge value={data.jev.enabled} onLabel="已启用" offLabel="未启用" />
-              <span className="text-xs text-muted-foreground">配置</span>
-              <BooleanBadge
-                value={data.jev.configured}
-                onLabel="已配置密钥"
-                offLabel="缺少密钥"
-                onTone="success"
-                offTone="warning"
-              />
-            </div>
-            <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs sm:grid-cols-4">
-              <Metric label="调用" value={formatNumber(data.jev.calls)} />
-              <Metric label="fallback" value={formatNumber(data.jev.fallback)} />
-              <Metric label="超时" value={formatNumber(data.jev.timeout)} />
-              <Metric label="低置信度" value={formatNumber(data.jev.low_confidence)} />
-            </dl>
-            <Link
-              href="/admin/config"
-              className="text-xs text-primary underline-offset-4 hover:underline"
-            >
-              查看 Jev 实时健康与系统配置
-            </Link>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>最近一次 Benchmark</CardTitle>
-            <CardDescription>固定用例集上的通过情况，是「改动有没有变坏」的基线。</CardDescription>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-2 text-xs">
-            {data.benchmark.latest_run_id ? (
-              <>
-                <p className="font-mono break-all text-foreground">{data.benchmark.latest_run_id}</p>
-                <p className="text-muted-foreground">
-                  覆盖 suite：
-                  {data.benchmark.latest_suites.length > 0
-                    ? data.benchmark.latest_suites.join("、")
-                    : "未记录"}
-                </p>
-                <p className="text-muted-foreground">
-                  通过率：<span className="tabular font-medium text-foreground">{formatPassRate(data.benchmark.latest_pass_rate)}</span>
-                </p>
-                <Link
-                  href={`/admin/benchmark/${encodeURIComponent(data.benchmark.latest_run_id)}`}
-                  className="text-primary underline-offset-4 hover:underline"
-                >
-                  打开这次 Benchmark 详情
-                </Link>
-              </>
-            ) : (
-              <SectionEmpty
-                title="还没有 Benchmark 记录"
-                description="去 Benchmark 页面选择 suite 跑一次，就能得到通过率基线。"
-                hint="通过率是质量回归的第一道防线，建议在每次改动后运行。"
-              />
-            )}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>Evolution 状态</CardTitle>
-            <CardDescription>把 Bad Case 沉淀成可验证的经验，并决定采纳 / 拒绝 / 回滚。</CardDescription>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-2 text-xs">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-muted-foreground">开关</span>
-              <BooleanBadge value={data.evolution.enabled} onLabel="已启用" offLabel="未启用" />
-            </div>
-            <p className="text-muted-foreground">
-              待处理 Bad Case：
-              <span className="tabular font-medium text-foreground">
-                {formatNumber(data.evolution.pending_badcases)}
-              </span>
-            </p>
-            <p className="text-muted-foreground">
-              最近一次运行：{data.evolution.last_run_id ?? "还没有运行过"}
-            </p>
-            <p className="text-muted-foreground">
-              最近决定：{data.evolution.last_decision ? statusLabel(data.evolution.last_decision) : "—"}
-            </p>
-            <Link
-              href="/admin/evolution"
-              className="text-primary underline-offset-4 hover:underline"
-            >
-              打开 Evolution 页面
-            </Link>
-          </CardContent>
-        </Card>
-      </div>
-    </div>
+      {children}
+    </section>
   );
 }
 
-function Metric({ label, value }: { label: string; value: string }) {
+function StatusDistribution({ data }: { data: AdminDashboard }) {
+  // statuses 在契约里是 AdminRecord（值 unknown）：先收窄成数字再排序，
+  // 否则统计口径还没稳定时这里会拿字符串去做减法。
+  const entries = Object.entries(data.statuses)
+    .map(([status, count]) => ({ status, count: typeof count === "number" ? count : 0 }))
+    .sort((left, right) => right.count - left.count);
   return (
-    <div className="flex items-baseline justify-between gap-2 border-b border-border/60 pb-1">
-      <dt className="text-muted-foreground">{label}</dt>
-      <dd className="tabular font-medium text-foreground">{value}</dd>
-    </div>
-  );
-}
-
-function UsageTable({ data }: { data: AdminRunList }) {
-  const columns: AdminColumn<AdminRunSummary>[] = [
-    {
-      key: "run_id",
-      header: "Run",
-      primary: true,
-      cell: (run) => (
+    <Card
+      title="运行状态分布"
+      description={`${data.window_label}内 ${data.volume.runs} 次运行（上一周期 ${data.volume.previous_runs} 次）`}
+      action={
         <Link
-          href={`/admin/runs/${encodeURIComponent(run.run_id)}`}
-          className="font-mono text-xs text-primary underline-offset-4 hover:underline"
+          href="/admin/runs"
+          className="text-[11px] font-medium text-primary underline-offset-4 hover:underline"
         >
-          {run.run_id}
+          查看运行记录
         </Link>
-      ),
-    },
-    { key: "status", header: "状态", cell: (run) => <StatusBadge status={run.status} /> },
+      }
+    >
+      {entries.length === 0 ? (
+        <p className="text-xs text-muted-foreground">这个时间窗内没有运行。</p>
+      ) : (
+        <ul className="flex flex-wrap gap-2">
+          {entries.map((entry) => (
+            <li key={entry.status} className="flex items-center gap-1.5">
+              <StatusBadge status={entry.status} />
+              <span className="tabular text-xs text-foreground">{formatNumber(entry.count)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Card>
+  );
+}
+
+function DecisionHealth({ data }: { data: AdminDashboard }) {
+  const health = data.decision_health;
+  const items: { label: string; value: string; hint?: string }[] = [
     {
-      key: "tokens",
-      header: "Token",
-      align: "right",
-      cell: (run) => <span className="tabular text-xs">{formatTokens(run.total_tokens)}</span>,
+      label: "动态偏好画像成功率",
+      value: health.profile_success_rate === null ? "—" : formatRatio(health.profile_success_rate),
+      hint: `分母是 ${health.guided_runs} 个引导式运行（Quick 没有画像）`,
     },
-    {
-      key: "llm",
-      header: "LLM",
-      align: "right",
-      cell: (run) => <span className="tabular text-xs">{formatNumber(run.llm_calls)}</span>,
-    },
-    {
-      key: "jev",
-      header: "Jev",
-      align: "right",
-      cell: (run) => <span className="tabular text-xs">{formatNumber(run.jev_calls)}</span>,
-    },
-    {
-      key: "tool",
-      header: "工具",
-      align: "right",
-      cell: (run) => <span className="tabular text-xs">{formatNumber(run.tool_calls)}</span>,
-    },
-    {
-      key: "provider",
-      header: "Provider 失败",
-      align: "right",
-      mobileHidden: true,
-      cell: (run) => <span className="tabular text-xs">{formatNumber(run.provider_failures)}</span>,
-    },
-    {
-      key: "badcase",
-      header: "Bad Case",
-      align: "right",
-      cell: (run) => <span className="tabular text-xs">{formatNumber(run.badcase_count)}</span>,
-    },
-    {
-      key: "duration",
-      header: "耗时",
-      align: "right",
-      mobileHidden: true,
-      cell: (run) => (
-        <span className="tabular text-xs">{formatDurationMs(run.duration_ms)}</span>
-      ),
-    },
-    {
-      key: "cost",
-      header: "成本",
-      align: "right",
-      mobileHidden: true,
-      cell: (run) => <span className="tabular text-xs">{formatCost(run.cost)}</span>,
-    },
+    { label: "画像由 LLM 生成", value: formatNumber(health.profile_llm) },
+    { label: "画像走 fallback", value: formatNumber(health.profile_fallback) },
+    { label: "带硬错误的运行", value: formatNumber(health.runs_with_hard_errors) },
+    { label: "REJECT 进了计划", value: formatNumber(health.runs_with_rejected_in_plan) },
+    { label: "丢失 MUST 的运行", value: formatNumber(health.runs_missing_must) },
   ];
+  return (
+    <Card
+      title="决策健康"
+      description={health.note || "按抽样的运行统计"}
+      action={
+        <Link
+          href="/admin/travel-quality?focus=preference_match"
+          className="text-[11px] font-medium text-primary underline-offset-4 hover:underline"
+        >
+          打开质量页
+        </Link>
+      }
+    >
+      <dl className="grid grid-cols-2 gap-x-3 gap-y-1.5">
+        {items.map((item) => (
+          <div key={item.label} className="flex flex-col gap-0.5" title={item.hint}>
+            <dt className="text-[11px] text-muted-foreground">{item.label}</dt>
+            <dd className="tabular text-xs font-medium text-foreground">{item.value}</dd>
+          </div>
+        ))}
+      </dl>
+    </Card>
+  );
+}
+
+function ProviderSnapshot({ data }: { data: AdminDashboard }) {
+  const unhealthy = data.providers.items.filter((item) => item.needs_attention);
+  return (
+    <Card
+      title="Provider 健康"
+      description={data.providers.window_note || "按每个 Provider 最近的调用统计"}
+      action={
+        <Link
+          href="/admin/providers"
+          className="text-[11px] font-medium text-primary underline-offset-4 hover:underline"
+        >
+          查看详情
+        </Link>
+      }
+    >
+      {data.providers.total === 0 ? (
+        <p className="text-xs text-muted-foreground">还没有 Provider 调用记录。</p>
+      ) : (
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center gap-2">
+            <HeartPulse className="size-4 text-muted-foreground" aria-hidden />
+            <span className="text-xs text-foreground">
+              {data.providers.total} 个 Provider，{data.providers.unhealthy} 个需要关注
+            </span>
+          </div>
+          {unhealthy.length > 0 ? (
+            <ul className="flex flex-wrap gap-2">
+              {unhealthy.map((item) => (
+                <li key={item.provider} className="flex items-center gap-1.5">
+                  <ToneBadge tone={item.state === "UNAVAILABLE" ? "danger" : "warning"}>
+                    {item.state}
+                  </ToneBadge>
+                  <span className="text-xs text-foreground">{item.provider}</span>
+                  <span className="tabular text-[11px] text-muted-foreground">
+                    {item.failure_rate === null ? "—" : formatRatio(item.failure_rate)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-xs text-muted-foreground">没有处于降级/不可用的 Provider。</p>
+          )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function QualityClosure({ data }: { data: AdminDashboard }) {
+  return (
+    <Card title="质量闭环" description="质量问题、评测与自动优化的当前状态">
+      <ul className="flex flex-col gap-2 text-xs text-foreground">
+        <li className="flex items-center gap-2">
+          <TriangleAlert className="size-4 text-muted-foreground" aria-hidden />
+          <span>
+            未处理 Bad Case {formatNumber(data.badcases.open)} 条（{data.window_label}新增{" "}
+            {formatNumber(data.badcases.window)}，上一周期 {formatNumber(data.badcases.previous)}）
+          </span>
+          <Link
+            href="/admin/badcases"
+            className="ml-auto shrink-0 text-[11px] font-medium text-primary underline-offset-4 hover:underline"
+          >
+            问题中心
+          </Link>
+        </li>
+        <li className="flex items-center gap-2">
+          <FlaskConical className="size-4 text-muted-foreground" aria-hidden />
+          <span>
+            最新 Benchmark 通过率 {formatPassRate(data.benchmark.latest_pass_rate)}
+            {data.benchmark.latest_run_id ? `（${data.benchmark.latest_run_id}）` : "（还没有跑过）"}
+          </span>
+          <Link
+            href="/admin/benchmark"
+            className="ml-auto shrink-0 text-[11px] font-medium text-primary underline-offset-4 hover:underline"
+          >
+            查看
+          </Link>
+        </li>
+        <li className="flex items-center gap-2">
+          <Activity className="size-4 text-muted-foreground" aria-hidden />
+          <span>
+            Evolution {data.evolution.enabled ? "已启用" : "未启用"}
+            {data.evolution.last_decision ? ` · 最近决策 ${data.evolution.last_decision}` : ""}
+          </span>
+          <Link
+            href="/admin/evolution"
+            className="ml-auto shrink-0 text-[11px] font-medium text-primary underline-offset-4 hover:underline"
+          >
+            查看
+          </Link>
+        </li>
+        <li className="flex items-center gap-2">
+          <Gauge className="size-4 text-muted-foreground" aria-hidden />
+          <span>
+            行程质量分{" "}
+            {data.quality.score === null
+              ? "—"
+              : `${(data.quality.score * 100).toFixed(0)} 分（${data.quality.grade}）`}
+            {data.quality.sampled ? "（抽样）" : ""}
+          </span>
+          <Link
+            href="/admin/travel-quality"
+            className="ml-auto shrink-0 text-[11px] font-medium text-primary underline-offset-4 hover:underline"
+          >
+            质量页
+          </Link>
+        </li>
+      </ul>
+    </Card>
+  );
+}
+
+/* ------------------------------ 累计用量（下沉） ------------------------------ */
+
+/**
+ * 历史累计量与 Jev 明细。
+ *
+ * 为什么不放在首屏：`总 Token = 2,000,000`、`总工具调用 = 18,000` 这类数字**没法指导
+ * 下一步该修什么**（文档 §3.1）。但它们仍然有用（容量与成本核对），所以下沉到一个
+ * 按需加载的折叠区，而不是删掉。
+ */
+function LifetimeUsage() {
+  const [loaded, setLoaded] = useState(false);
+  const overview = useAdminResource<AdminOverview>("admin-overview", getAdminOverview, loaded);
 
   return (
-    <div className="flex flex-col gap-3">
-      <p className="text-[11px] text-muted-foreground">
-        展示最近 {data.items.length} 条（共 {formatNumber(data.total)} 条）。完整分页见「运行记录」。
-      </p>
-      <AdminTable columns={columns} rows={data.items} getRowKey={(run) => run.run_id} />
-    </div>
+    <CollapsibleSection
+      title="累计用量（历史总量）"
+      description="历史累计，不是当前时间窗的指标；打开时才请求 /admin/overview。"
+      onOpenChange={(open) => {
+        if (open) setLoaded(true);
+      }}
+    >
+      {!loaded ? (
+        <p className="text-xs text-muted-foreground">展开后加载。</p>
+      ) : (
+        <ResourceView resource={overview} loadingRows={3}>
+          {(data) => (
+            <div className="flex flex-col gap-3">
+              <dl className="grid grid-cols-2 gap-x-3 gap-y-1.5 md:grid-cols-4">
+                {(
+                  [
+                    ["运行总数", formatNumber(data.run_count)],
+                    ["总 Token", formatNumber(data.total_tokens)],
+                    ["LLM 调用", formatNumber(data.total_llm_calls)],
+                    ["工具调用", formatNumber(data.total_tool_calls)],
+                    ["Provider 失败", formatNumber(data.provider_failures)],
+                    ["运行中", formatNumber(data.running_count)],
+                    ["降级完成", formatNumber(data.degraded_count)],
+                    ["失败", formatNumber(data.failed_count)],
+                  ] as const
+                ).map(([label, value]) => (
+                  <div key={label} className="flex flex-col gap-0.5">
+                    <dt className="text-[11px] text-muted-foreground">{label}</dt>
+                    <dd className="tabular text-xs font-medium text-foreground">{value}</dd>
+                  </div>
+                ))}
+              </dl>
+              <PanelSection
+                title="Jev（可选增强）"
+                description="文档 §10 已把 Jev 降为可选增强，因此它只在累计用量里出现，不再是首屏核心指标。"
+              >
+                <dl className="grid grid-cols-2 gap-x-3 gap-y-1.5 md:grid-cols-4">
+                  {(
+                    [
+                      ["开关", data.jev.enabled ? "已启用" : "未启用"],
+                      ["密钥", data.jev.configured ? "已配置" : "未配置"],
+                      ["调用", formatNumber(data.jev.calls)],
+                      ["fallback", formatNumber(data.jev.fallback)],
+                      ["超时", formatNumber(data.jev.timeout)],
+                      ["低置信", formatNumber(data.jev.low_confidence)],
+                    ] as const
+                  ).map(([label, value]) => (
+                    <div key={label} className="flex flex-col gap-0.5">
+                      <dt className="text-[11px] text-muted-foreground">{label}</dt>
+                      <dd className="text-xs font-medium text-foreground">{value}</dd>
+                    </div>
+                  ))}
+                </dl>
+              </PanelSection>
+              <p className="text-[11px] text-muted-foreground">
+                状态枚举说明：当前累计里出现{" "}
+                {Object.keys(data.statuses)
+                  .map((status) => statusLabel(status))
+                  .join("、") || "无"}。
+              </p>
+            </div>
+          )}
+        </ResourceView>
+      )}
+    </CollapsibleSection>
   );
 }
