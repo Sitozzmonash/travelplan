@@ -1,12 +1,12 @@
 "use client";
 
-import { CircleAlert, ListChecks, Map as MapIcon, Route } from "lucide-react";
+import { CircleAlert, Coffee, ListChecks, Map as MapIcon, Route, Sparkles } from "lucide-react";
 import { useCallback, useMemo, useState } from "react";
 import type { ReviseRequest, ReviseResult } from "@/types/api";
-import type { Evidence, ItineraryItem, MapPoint, TripPlan } from "@/types/plan";
+import type { Evidence, ItineraryDay, ItineraryItem, MapPoint, TripPlan } from "@/types/plan";
 import { getEvidence, revisePlan } from "@/lib/api";
 import { buildSourceRecords, providerLabel, recordsForItem, sourceStatusLabel } from "@/lib/display";
-import { formatDuration } from "@/lib/format";
+import { formatCNY, formatDistance, formatDuration } from "@/lib/format";
 import { AuditDrawer } from "@/components/audit-drawer";
 import { BudgetCard } from "@/components/budget-card";
 import { DayTabs } from "@/components/day-tabs";
@@ -86,6 +86,15 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
       minutes: legs.reduce((sum, leg) => sum + Math.ceil((leg.duration_seconds ?? 0) / 60), 0),
     };
   }, [day]);
+
+  const mapHotel = useMemo(() => {
+    const hotel = plan.hotel?.selected;
+    return hotel && typeof hotel.lat === "number" && typeof hotel.lng === "number"
+      ? { name: hotel.name, lat: hotel.lat, lng: hotel.lng }
+      : null;
+  }, [plan.hotel]);
+
+  const foodStops = useMemo(() => (day?.items ?? []).filter((item) => item.type === "food"), [day]);
 
   const degradedProviders = useMemo(
     () =>
@@ -174,12 +183,35 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
 
       <div className="grid gap-5 lg:grid-cols-[minmax(0,1.7fr)_minmax(0,1fr)]">
         <div className="space-y-5" id="itinerary">
+          <div id="map">
+            <SectionCard
+              title={`${dayLabel} 路线总览`}
+              icon={MapIcon}
+              description="酒店、景点和餐饮都在同一张路线图里；切换日期会同步更新当天动线。"
+            >
+              <RouteBriefing day={day} totalMinutes={mapTotals.minutes} onSelect={setSelectedItemId} />
+              <div className="mt-4">
+                <TravelMap
+                  points={mapPoints}
+                  hotel={mapHotel}
+                  dayLabel={dayLabel}
+                  areaLabel={day?.area ?? ""}
+                  selectedId={selectedItemId}
+                  onSelect={setSelectedItemId}
+                  totalDistanceMeters={mapTotals.distance}
+                  totalMinutes={mapTotals.minutes}
+                />
+              </div>
+            </SectionCard>
+          </div>
+
           <SectionCard
             title={`${dayLabel} 行程`}
             icon={ListChecks}
-            description="按时间顺序排列，段间交通与停留时长都来自后端计算结果。"
+            description="按时间顺序走完这一天；点击地点可查看完整说明或调整安排。"
           >
             <DayTabs days={days} activeDayIndex={day?.day_index ?? activeDayIndex} onChange={setActiveDayIndex} />
+            <DayIntent day={day} totalMinutes={mapTotals.minutes} />
             <div className="mt-4">
               <ItineraryTimeline
                 day={day}
@@ -213,23 +245,6 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
             />
           </div>
 
-          <div id="map">
-            <SectionCard
-              title={`${dayLabel} 路线示意`}
-              icon={MapIcon}
-              description="示意地图：按后端返回的经纬度绘制，用于核对当天动线，不代表真实底图。"
-            >
-              <TravelMap
-                points={mapPoints}
-                dayLabel={dayLabel}
-                areaLabel={day?.area ?? ""}
-                selectedId={selectedItemId}
-                onSelect={setSelectedItemId}
-                totalDistanceMeters={mapTotals.distance}
-                totalMinutes={mapTotals.minutes}
-              />
-            </SectionCard>
-          </div>
         </div>
 
         <div className="space-y-5">
@@ -239,6 +254,8 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
             onOpenCompare={() => setHotelOpen(true)}
             onOpenSource={openSources}
           />
+
+          <FoodStops items={foodStops} onSelect={(item) => { setSelectedItemId(item.id); openDetail(item); }} />
 
           <SectionCard
             title="交通方案"
@@ -396,5 +413,88 @@ function TransportSummary({ plan }: { plan: TripPlan }) {
       })}
       <p className="text-xs leading-5 text-muted-foreground">{transport.selection_reason}</p>
     </div>
+  );
+}
+
+function RouteBriefing({
+  day,
+  totalMinutes,
+  onSelect,
+}: {
+  day: ItineraryDay | null;
+  totalMinutes: number;
+  onSelect: (itemId: string) => void;
+}) {
+  const places = day?.items.filter((item) => item.type !== "transport" && item.type !== "free_time") ?? [];
+  if (!places.length) return null;
+
+  return (
+    <div className="overflow-hidden rounded-xl border border-primary/15 bg-[linear-gradient(110deg,var(--color-accent),transparent)] px-3.5 py-3">
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-xs font-medium text-foreground">今天的动线</p>
+        {totalMinutes > 0 ? <span className="text-[11px] text-muted-foreground">路上约 {formatDuration(totalMinutes)}</span> : null}
+      </div>
+      <div className="mt-2.5 flex gap-1.5 overflow-x-auto pb-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+        {places.map((item, index) => (
+          <button
+            key={item.id}
+            type="button"
+            onClick={() => onSelect(item.id)}
+            className="group inline-flex shrink-0 items-center gap-1.5 text-left text-[11px] text-muted-foreground hover:text-foreground"
+          >
+            <span className="flex size-5 shrink-0 items-center justify-center rounded-full border border-primary/25 bg-card text-[10px] font-medium text-primary group-hover:bg-primary group-hover:text-primary-foreground">
+              {index + 1}
+            </span>
+            <span className="max-w-24 truncate">{item.name}</span>
+            {index < places.length - 1 ? <span className="text-border">→</span> : null}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function DayIntent({ day, totalMinutes }: { day: TripPlan["days"][number] | null; totalMinutes: number }) {
+  if (!day) return null;
+  const places = day.items.filter((item) => item.type === "attraction" || item.type === "activity").length;
+  const meals = day.items.filter((item) => item.type === "food").length;
+  return (
+    <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-lg border border-border/70 bg-muted/25 px-3 py-2.5 text-xs text-muted-foreground">
+      <Sparkles className="size-3.5 shrink-0 text-primary" aria-hidden />
+      <span>{day.area ? `今天以 ${day.area} 为主` : "今天按时间顺序安排活动"}</span>
+      <span>{places} 个游览安排</span>
+      {meals ? <span>{meals} 顿当地用餐</span> : null}
+      {totalMinutes > 0 ? <span>移动约 {formatDuration(totalMinutes)}</span> : null}
+    </div>
+  );
+}
+
+function FoodStops({ items, onSelect }: { items: ItineraryItem[]; onSelect: (item: ItineraryItem) => void }) {
+  if (!items.length) return null;
+
+  return (
+    <SectionCard title="今日美食" icon={Coffee} description="按当天位置和营业时间匹配；点开可查看推荐内容与来源。">
+      <div className="space-y-2.5">
+        {items.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            onClick={() => onSelect(item)}
+            className="w-full rounded-lg border border-border/80 bg-card px-3 py-3 text-left transition-colors hover:border-primary/35 hover:bg-accent/25"
+          >
+            <div className="flex items-baseline justify-between gap-3">
+              <span className="min-w-0 truncate text-sm font-medium text-foreground">{item.name}</span>
+              <span className="tabular shrink-0 text-[11px] text-muted-foreground">{item.start_time ?? "用餐时间待定"}</span>
+            </div>
+            <p className="mt-1.5 line-clamp-2 text-xs leading-5 text-muted-foreground">{item.reason || "已根据当天动线匹配。"}</p>
+            <div className="mt-2 flex flex-wrap gap-x-2.5 gap-y-1 text-[11px] text-muted-foreground">
+              {item.travel_from_previous?.distance_meters ? <span>距上一站 {formatDistance(item.travel_from_previous.distance_meters)}</span> : null}
+              {item.opening_hours ? <span>{item.opening_hours}</span> : null}
+              {typeof item.price === "number" ? <span>人均约 {formatCNY(item.price)}</span> : null}
+            </div>
+          </button>
+        ))}
+      </div>
+    </SectionCard>
   );
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { Info, MapPinned, Route } from "lucide-react";
+import { BedDouble, Info, MapPinned, Route } from "lucide-react";
 import type { MapPoint } from "@/types/plan";
 import { cn } from "@/lib/utils";
 import { formatDistance, formatDuration } from "@/lib/format";
@@ -11,6 +11,8 @@ interface TravelMapProps {
   areaLabel: string;
   selectedId?: string | null;
   onSelect?: (id: string) => void;
+  /** 住宿不属于当天的路线编号，但要作为动线的固定参照点显示。 */
+  hotel?: { name: string; lat: number; lng: number } | null;
   totalDistanceMeters?: number | null;
   totalMinutes?: number | null;
   heightClassName?: string;
@@ -30,12 +32,13 @@ export function TravelMap({
   areaLabel,
   selectedId,
   onSelect,
+  hotel,
   totalDistanceMeters,
   totalMinutes,
   heightClassName = "h-[280px] sm:h-[320px]",
   className,
 }: TravelMapProps) {
-  const layout = project(points);
+  const layout = project(points, hotel);
   const selected = points.find((point) => point.id === selectedId) ?? null;
 
   return (
@@ -71,6 +74,17 @@ export function TravelMap({
               strokeLinejoin="round"
               opacity={0.55}
             />
+          ) : null}
+
+          {layout.hotel ? (
+            <g transform={`translate(${layout.hotel.x} ${layout.hotel.y})`}>
+              <title>住宿中心：{layout.hotel.name}</title>
+              <circle r={4.8} fill="var(--color-card)" stroke="var(--color-primary)" strokeWidth={0.9} />
+              <path d="M-2.1 1.8V-1.2h4.2v3M-2.7 1.8h5.4M-1.2-1.2v1.5M1.2-1.2v1.5" fill="none" stroke="var(--color-primary)" strokeWidth={0.75} strokeLinecap="round" />
+              <text y={6.4} textAnchor="middle" fontSize={2.35} fill="var(--color-foreground)" opacity={0.82}>
+                住宿
+              </text>
+            </g>
           ) : null}
 
           {layout.points.map((point) => {
@@ -120,7 +134,7 @@ export function TravelMap({
           })}
         </svg>
 
-        {points.length === 0 ? (
+        {points.length === 0 && !hotel ? (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 px-6 text-center">
             <MapPinned className="size-5 text-muted-foreground" aria-hidden />
             <p className="text-sm font-medium text-foreground">这一天的安排没有可定位的地点</p>
@@ -150,6 +164,11 @@ export function TravelMap({
         </span>
         <span className="tabular">总距离 {formatDistance(totalDistanceMeters ?? null)}</span>
         <span className="tabular">{points.length} 个标记点</span>
+        {hotel ? (
+          <span className="inline-flex items-center gap-1 text-foreground/80">
+            <BedDouble className="size-3.5" aria-hidden /> 住宿中心
+          </span>
+        ) : null}
         {onSelect ? <span className="text-muted-foreground/70">点击编号可高亮对应安排</span> : null}
       </div>
     </div>
@@ -165,23 +184,31 @@ interface ProjectedPoint extends MapPoint {
   y: number;
 }
 
+interface ProjectedHotel {
+  name: string;
+  x: number;
+  y: number;
+}
+
 interface MapLayout {
   points: ProjectedPoint[];
   routePath: string;
+  hotel: ProjectedHotel | null;
 }
 
 const VIEW_W = 100;
 const VIEW_H = 62;
 const PADDING = 14;
 
-function project(points: MapPoint[]): MapLayout {
-  if (!points.length) return { points: [], routePath: "" };
+function project(points: MapPoint[], hotel?: TravelMapProps["hotel"]): MapLayout {
+  const coordinates = hotel ? [...points, { ...hotel }] : points;
+  if (!coordinates.length) return { points: [], routePath: "", hotel: null };
 
-  const midLat = points.reduce((sum, point) => sum + point.lat, 0) / points.length;
+  const midLat = coordinates.reduce((sum, point) => sum + point.lat, 0) / coordinates.length;
   const lonScale = Math.cos((midLat * Math.PI) / 180);
 
-  const xs = points.map((point) => point.lng * lonScale);
-  const ys = points.map((point) => point.lat);
+  const xs = coordinates.map((point) => point.lng * lonScale);
+  const ys = coordinates.map((point) => point.lat);
   const minX = Math.min(...xs);
   const maxX = Math.max(...xs);
   const minY = Math.min(...ys);
@@ -199,8 +226,18 @@ function project(points: MapPoint[]): MapLayout {
     return { ...point, x, y };
   });
 
+  const hotelIndex = hotel ? coordinates.length - 1 : -1;
+  const projectedHotel =
+    hotel && hotelIndex >= 0
+      ? {
+          name: hotel.name,
+          x: PADDING + ((xs[hotelIndex] - minX) / spanX) * usableW,
+          y: PADDING + (1 - (ys[hotelIndex] - minY) / spanY) * usableH,
+        }
+      : null;
+
   const routePath = projected.map((point) => `${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(" ");
-  return { points: projected, routePath };
+  return { points: projected, routePath, hotel: projectedHotel };
 }
 
 // ==================================================
