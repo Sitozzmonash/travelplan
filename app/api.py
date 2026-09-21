@@ -653,6 +653,33 @@ def start_planning_session(session_id: str) -> dict[str, Any]:
     return outcome
 
 
+@api.get("/api/v1/city-cache/{city}")
+def get_city_cache_candidates(city: str) -> dict[str, Any]:
+    """读取可公开展示的城市候选缓存；未命中时让客户端走正常会话 Discovery。"""
+
+    from app import city_cache
+
+    hit = city_cache.read_candidates(city, store=get_store())
+    if hit is None:
+        raise HTTPException(status_code=404, detail=f"城市 {city!r} 暂无有效缓存")
+    return hit.payload()
+
+
+@api.post("/api/v1/admin/city-cache/{city}/refresh", status_code=202, dependencies=[Depends(require_admin)])
+def refresh_city_cache_candidates(city: str) -> dict[str, Any]:
+    """管理员触发城市知识异步刷新；同城并发请求会合并，避免重复消耗 Provider 配额。"""
+
+    from app import city_cache
+
+    normalized = city_cache.normalize_city(city)
+    if not normalized:
+        raise HTTPException(status_code=422, detail="城市不能为空")
+    city_cache.refresh_in_background(
+        normalized, refresh=lambda cached_city: sessions.refresh_city_cache(get_store(), cached_city)
+    )
+    return {"city": normalized, "status": "refresh_queued"}
+
+
 @api.get("/api/v1/admin/runs", dependencies=[Depends(require_admin)])
 def admin_runs(
     limit: int = 50,

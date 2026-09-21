@@ -379,6 +379,30 @@ CREATE TABLE IF NOT EXISTS planning_sessions (
 
 CREATE INDEX IF NOT EXISTS idx_planning_sessions_updated ON planning_sessions(updated_at);
 
+-- 跨会话复用的城市知识。它与 run 级 ``places`` 完全分开：后者是审计快照，
+-- 这里是按城市更新的攻略/POI 基础信息，绝不能共享 run_id 主键。
+CREATE TABLE IF NOT EXISTS city_pois (
+    city TEXT NOT NULL, place_id TEXT NOT NULL,
+    name, normalized_name, category, lng REAL, lat REAL,
+    address, business_area, district, opening_hours, phone, rating REAL,
+    amap_verified INTEGER NOT NULL DEFAULT 0,
+    trust_score REAL, ad_risk REAL,
+    evidence_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(city, place_id)
+);
+
+CREATE TABLE IF NOT EXISTS city_poi_mentions (
+    city TEXT NOT NULL, place_id TEXT NOT NULL,
+    raw_name TEXT NOT NULL, source_type TEXT NOT NULL,
+    provider TEXT, source_url TEXT, snippet TEXT,
+    tone TEXT, published_at TEXT, updated_at TEXT NOT NULL,
+    PRIMARY KEY(city, source_url, raw_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_city_pois_updated ON city_pois(city, updated_at);
+CREATE INDEX IF NOT EXISTS idx_city_poi_mentions_updated ON city_poi_mentions(city, place_id, updated_at);
+
 -- Provider 调用账本（观测用）。
 -- 与 sources 的分工：sources 是"这次 run 用了什么证据"；provider_calls 是"谁在什么时候
 -- 调了哪个数据源、成不成、多快" —— 后者要能记录还没有 run 的 Discovery 调用。
@@ -908,6 +932,85 @@ class TravelPlanStore:
                 " VALUES (?, ?, ?)",
                 (run_id, place_id, evidence_id),
             )
+
+    # ------------------------------------------------------------------
+    # city cache
+    # ------------------------------------------------------------------
+
+    def upsert_city_pois(self, city: str, rows: Iterable[dict[str, Any]]) -> int:
+        """写入城市 POI 基础信息；旧刷新绝不覆盖较新的结果。"""
+
+        values = [
+            (
+                city,
+                str(row["place_id"]),
+                row.get("name"), row.get("normalized_name"), row.get("category"),
+                row.get("lng"), row.get("lat"), row.get("address"), row.get("business_area"),
+                row.get("district"), row.get("opening_hours"), row.get("phone"), row.get("rating"),
+                1 if row.get("amap_verified") else 0, row.get("trust_score"), row.get("ad_risk"),
+                int(row.get("evidence_count") or 0), row.get("updated_at") or utcnow().isoformat(),
+            )
+            for row in rows if row.get("place_id")
+        ]
+        if not values:
+            return 0
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO city_pois"
+                " (city, place_id, name, normalized_name, category, lng, lat, address, business_area,"
+                "  district, opening_hours, phone, rating, amap_verified, trust_score, ad_risk,"
+                "  evidence_count, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(city, place_id) DO UPDATE SET"
+                " name=excluded.name, normalized_name=excluded.normalized_name, category=excluded.category,"
+                " lng=excluded.lng, lat=excluded.lat, address=excluded.address,"
+                " business_area=excluded.business_area, district=excluded.district,"
+                " opening_hours=excluded.opening_hours, phone=excluded.phone, rating=excluded.rating,"
+                " amap_verified=excluded.amap_verified, trust_score=excluded.trust_score,"
+                " ad_risk=excluded.ad_risk, evidence_count=excluded.evidence_count, updated_at=excluded.updated_at"
+                " WHERE excluded.updated_at >= city_pois.updated_at",
+                values,
+            )
+        return len(values)
+
+    def upsert_city_poi_mentions(self, city: str, rows: Iterable[dict[str, Any]]) -> int:
+        """写入攻略提及；将空 URL 规范成空串以让复合主键真正去重。"""
+
+        values = [
+            (
+                city, str(row["place_id"]), str(row["raw_name"]), str(row.get("source_type") or "social"),
+                row.get("provider"), str(row.get("source_url") or ""), row.get("snippet"), row.get("tone"),
+                row.get("published_at"), row.get("updated_at") or utcnow().isoformat(),
+            )
+            for row in rows if row.get("place_id") and row.get("raw_name")
+        ]
+        if not values:
+            return 0
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO city_poi_mentions"
+                " (city, place_id, raw_name, source_type, provider, source_url, snippet, tone, published_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(city, source_url, raw_name) DO UPDATE SET"
+                " place_id=excluded.place_id, source_type=excluded.source_type, provider=excluded.provider,"
+                " snippet=excluded.snippet, tone=excluded.tone, published_at=excluded.published_at,"
+                " updated_at=excluded.updated_at"
+                " WHERE excluded.updated_at >= city_poi_mentions.updated_at",
+                values,
+            )
+        return len(values)
+
+    def get_city_cache_rows(self, city: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """读取单个城市的缓存原始行，时间有效性由 city_cache 统一判断。"""
+
+        with self._connect() as conn:
+            pois = conn.execute(
+                "SELECT * FROM city_pois WHERE city=? ORDER BY updated_at DESC, name", (city,)
+            ).fetchall()
+            mentions = conn.execute(
+                "SELECT * FROM city_poi_mentions WHERE city=? ORDER BY updated_at DESC, raw_name", (city,)
+            ).fetchall()
+        return [dict(row) for row in pois], [dict(row) for row in mentions]
 
     # ------------------------------------------------------------------
     # decision

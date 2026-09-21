@@ -19,9 +19,10 @@ from __future__ import annotations
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Sequence
 
-from app import discovery
+from app import city_cache, discovery
 from app.config import current_config
 from app.workflow import DEFAULT_OUTPUT_DIR
 from app.models import TripIntent, coerce_float, coerce_str, coerce_str_list
@@ -298,7 +299,6 @@ def run_discovery(
             hub = hub_factory(session_id)
         else:
             hub = ProviderHub(run_id=session_id, store=None, mcp_servers=default_mcp_servers())
-        llm = llm_factory() if llm_factory is not None else LLM.from_env()
         config = current_config()
         events = list(session.get("events") or [])
         for stage, name in (
@@ -310,6 +310,11 @@ def run_discovery(
             events.append(_event(f"{name}_started", stage))
         session["events"] = events
         started = _now()
+
+        # 城市攻略/POI 跨会话复用；交通和酒店仍然走本会话的实时 Provider 查询。
+        # allow_stale 实现 stale-while-revalidate：旧候选能立刻展示，后台再补一次城市知识。
+        destination = (intent.destination or [""])[0]
+        cached = city_cache.read_candidates(destination, store=store, allow_stale=True)
 
         # 每完成一条线就落一次盘：用户在 Discovery 还没跑完时点「开始规划」，
         # 读到的必须是"已经查好的那部分"，而不是空 —— 这是之前真丢数据的根因
@@ -331,15 +336,33 @@ def run_discovery(
             except Exception:  # noqa: BLE001 —— 增量落盘失败不该让 Discovery 挂掉
                 return
 
-        result = discovery.prefetch(
-            hub,
-            llm,
-            intent,
-            hotel_pages=max(1, config.discovery_hotel_pages),
-            workers=max(1, config.discovery_workers),
-            on_partial=persist_partial,
-        )
-        bundle = _bundle_from(session_id, intent, result, hub)
+        if cached is not None:
+            result, bundle = _prefetch_with_city_cache(
+                session_id, intent, hub, config.discovery_hotel_pages, cached
+            )
+            if cached.stale:
+                city_cache.refresh_in_background(
+                    cached.city,
+                    refresh=lambda city: refresh_city_cache(store, city),
+                )
+        else:
+            # 命中城市缓存不需要攻略检索/地点抽取模型；延迟初始化也让只读缓存不依赖 LLM 凭据。
+            llm = llm_factory() if llm_factory is not None else LLM.from_env()
+            result = discovery.prefetch(
+                hub,
+                llm,
+                intent,
+                hotel_pages=max(1, config.discovery_hotel_pages),
+                workers=max(1, config.discovery_workers),
+                on_partial=persist_partial,
+            )
+            bundle = _bundle_from(session_id, intent, result, hub)
+            # 缓存落库只是加速层，失败不能把一次 live Discovery 变成失败。
+            try:
+                city_cache.write_candidates(destination, bundle.places, bundle.evidences, store=store)
+            except Exception:  # noqa: BLE001
+                bundle.degradations.append("城市缓存写入失败，本次仍使用实时结果")
+            bundle.city_cache = {"source": "live", "updated_at": _now().isoformat(), "stale": False}
         stages = result.get("stages") or {}
         # 调用账本落库：Discovery 的调用发生在会话里，没有 run_id。
         # Provider Health 要能区分"Discovery 阶段大量超时"与"正式 Run 正常"，
@@ -406,6 +429,90 @@ def run_discovery(
                 pass
     session["updated_at"] = _now().isoformat()
     store.save_planning_session(session)
+
+
+def _prefetch_with_city_cache(
+    session_id: str,
+    intent: TripIntent,
+    hub: Any,
+    hotel_pages: int,
+    cached: city_cache.CityCacheHit,
+) -> tuple[dict[str, Any], discovery.PrefetchBundle]:
+    """把缓存的攻略/POI 与实时机酒装进既有 PrefetchBundle。"""
+
+    started = _now()
+    errors: dict[str, str] = {}
+    try:
+        transport = discovery.fetch_transport_candidates(hub, intent)
+    except Exception as exc:  # noqa: BLE001
+        transport = SimpleNamespace(outbound=[], inbound=[], degradations=[str(exc)])
+        errors["transport"] = f"{type(exc).__name__}: {exc}"
+    try:
+        hotels = discovery.fetch_hotel_candidates(hub, intent, pages=max(1, hotel_pages))
+    except Exception as exc:  # noqa: BLE001
+        hotels = SimpleNamespace(items=[], degradations=[str(exc)])
+        errors["hotels"] = f"{type(exc).__name__}: {exc}"
+    social = SimpleNamespace(evidences=[], queries=[], served_queries=[], degradations=[])
+    places = SimpleNamespace(places=cached.places, degradations=[])
+    elapsed = round((_now() - started).total_seconds() * 1000)
+    stages = {
+        "transport": _cached_stage(transport, "all_options", errors.get("transport"), elapsed),
+        "hotels": _cached_stage(hotels, "items", errors.get("hotels"), elapsed),
+        "social": {
+            "status": "STALE_CACHE" if cached.stale else "CACHE",
+            "result_count": len(cached.mentions), "duration_ms": 0, "degraded": cached.stale,
+            "error": None, "updated_at": cached.updated_at,
+        },
+        "places": {
+            "status": "STALE_CACHE" if cached.stale else "CACHE",
+            "result_count": len(cached.places), "duration_ms": 0, "degraded": cached.stale,
+            "error": None, "updated_at": cached.updated_at,
+        },
+    }
+    result = {"transport": transport, "hotels": hotels, "social": social, "places": places,
+              "errors": errors, "stages": stages, "ledger": {"city_cache_hits": 1}}
+    bundle = _bundle_from(session_id, intent, result, hub)
+    bundle.city_cache = {
+        "source": "city_cache", "updated_at": cached.updated_at, "stale": cached.stale,
+    }
+    if cached.stale:
+        bundle.degradations.append("城市攻略缓存已过期，已在后台刷新；当前先展示最近可用结果")
+    return result, bundle
+
+
+def _cached_stage(value: Any, count_attr: str, error: str | None, elapsed: int) -> dict[str, Any]:
+    candidates = getattr(value, count_attr, []) or []
+    return {
+        "status": "FAILED" if error else ("OK" if candidates else "EMPTY"),
+        "result_count": len(candidates), "duration_ms": elapsed, "degraded": bool(getattr(value, "degradations", [])),
+        "error": error,
+    }
+
+
+def refresh_city_cache(store: TravelPlanStore, city: str) -> None:
+    """只刷新可复用的城市攻略/POI；没有出发地和日期时机酒函数会自然跳过。"""
+
+    normalized = city_cache.normalize_city(city)
+    if not normalized:
+        return
+    from app.llm import LLM
+    from app.providers import ProviderHub, default_mcp_servers
+
+    hub = ProviderHub(run_id=f"city-cache:{normalized}", store=None, mcp_servers=default_mcp_servers())
+    try:
+        intent = TripIntent(destination=[normalized], days=1, source="city_cache_refresh")
+        config = current_config()
+        result = discovery.prefetch(
+            hub, LLM.from_env(), intent,
+            hotel_pages=1, workers=max(1, config.discovery_workers),
+        )
+        bundle = _bundle_from(f"city-cache:{normalized}", intent, result, hub)
+        city_cache.write_candidates(normalized, bundle.places, bundle.evidences, store=store)
+    finally:
+        try:
+            hub.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _record_provider_calls(store: TravelPlanStore, calls: Sequence[Mapping[str, Any]], *, session_id: str) -> int:
@@ -491,6 +598,10 @@ def _bundle_from(session_id: str, intent: TripIntent, result: Mapping[str, Any],
         # Discovery 的复用/降级计数（Part C）：正式 run 的 perf 摘要要用它回答
         # "Prefetch 到底省了多少次重复查询"。
         ledger=dict(result.get("ledger") or {}),
+        # B 的聚合产物必须随 prefetch_json 一起落盘；不能因 A 的会话搬运而丢失。
+        hotel_areas=list(result.get("hotel_areas") or []),
+        poi_pools=dict(result.get("poi_pools") or {}),
+        profile=dict(result.get("profile") or {}),
         discovery_status=DISCOVERY_READY,
     )
 
@@ -592,12 +703,16 @@ def session_view(session: Mapping[str, Any]) -> dict[str, Any]:
         key = str(card.get("category") or "other")
         categories[key] = categories.get(key, 0) + 1
     selections = dict(session.get("poi_selections") or {})
+    prefetch = dict(session.get("prefetch") or {})
+    freshness = dict(prefetch.get("city_cache") or {})
     return {
         "session_id": session["session_id"],
         "status": session["status"],
         "discovery_status": session["discovery_status"],
         "created_at": session.get("created_at"),
-        "updated_at": session.get("updated_at"),
+        # 缓存命中时展示的是源数据时间，不用会话 PATCH 的时间冒充"数据刚更新"。
+        "updated_at": freshness.get("updated_at") or session.get("updated_at"),
+        "source": freshness.get("source"),
         "expires_at": session.get("expires_at"),
         "run_id": session.get("run_id"),
         "error": session.get("error"),
@@ -622,6 +737,10 @@ def session_view(session: Mapping[str, Any]) -> dict[str, Any]:
             for key, count in sorted(categories.items(), key=lambda item: -item[1])
         ],
         "evidence_summary": session.get("evidence_summary") or {},
+        # B 的候选池/用户画像作为会话 JSON 一起过户；空值也保留稳定形状给 C。
+        "hotel_areas": prefetch.get("hotel_areas") or [],
+        "poi_pools": prefetch.get("poi_pools") or {},
+        "profile": prefetch.get("profile") or {},
         "degradations": session.get("degradations") or [],
         "events": session.get("events") or [],
         # 能力声明：途牛目前不返回星级字段，前端据此把「最低星级」置灰并说明原因，

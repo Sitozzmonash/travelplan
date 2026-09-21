@@ -990,6 +990,14 @@ class PrefetchBundle:
     ledger: dict[str, int] = field(default_factory=dict)
     #: 开始规划时为等 Discovery 而实际等待的毫秒数（0 = 没有在跑，直接开始）
     grace_waited_ms: int = 0
+    # B 的跨步骤产物。Prefetch 是跨版本 JSON，字段必须显式保留，不能在 load/dump 期间丢失。
+    hotel_areas: list[dict[str, Any]] = field(default_factory=list)
+    poi_pools: dict[str, list[Any]] = field(default_factory=dict)
+    profile: dict[str, Any] = field(default_factory=dict)
+    #: A 的城市缓存新鲜度（不等同于会话的 updated_at）。
+    city_cache: dict[str, Any] = field(default_factory=dict)
+    #: 前向兼容：未来角色新增的 Prefetch JSON 字段原样过户给正式 run。
+    extras: dict[str, Any] = field(default_factory=dict)
 
     @property
     def reused(self) -> bool:
@@ -1009,7 +1017,8 @@ class PrefetchBundle:
         return [query for query in _dedupe_queries(needed) if _normalize_query(query) not in served]
 
     def dump(self) -> dict[str, Any]:
-        return {
+        payload = dict(self.extras)
+        payload.update({
             "session_id": self.session_id,
             "basic_intent": self.basic_intent,
             "outbound": [_dump_model(item) for item in self.outbound],
@@ -1025,13 +1034,24 @@ class PrefetchBundle:
             "discovery": dict(self.discovery),
             "ledger": dict(self.ledger),
             "grace_waited_ms": self.grace_waited_ms,
-        }
+            "hotel_areas": list(self.hotel_areas),
+            "poi_pools": dict(self.poi_pools),
+            "profile": dict(self.profile),
+            "city_cache": dict(self.city_cache),
+        })
+        return payload
 
     @classmethod
     def load(cls, payload: Mapping[str, Any] | None) -> "PrefetchBundle":
         """从会话 JSON 还原；任何一块坏了都只丢那一块，不让整次规划失败。"""
 
         data = dict(payload or {})
+        known = {
+            "session_id", "basic_intent", "outbound", "inbound", "hotels", "evidences", "places",
+            "social_queries", "social_served_queries", "provider_calls", "degradations",
+            "discovery_status", "discovery", "ledger", "grace_waited_ms", "hotel_areas",
+            "poi_pools", "profile", "city_cache",
+        }
         return cls(
             session_id=coerce_str(data.get("session_id")) or None,
             basic_intent=dict(data.get("basic_intent") or {}),
@@ -1056,6 +1076,14 @@ class PrefetchBundle:
                 if isinstance(value, (int, float)) and not isinstance(value, bool)
             },
             grace_waited_ms=int(data.get("grace_waited_ms") or 0),
+            hotel_areas=[item for item in (data.get("hotel_areas") or []) if isinstance(item, Mapping)],
+            poi_pools={
+                str(key): list(value) for key, value in (data.get("poi_pools") or {}).items()
+                if isinstance(value, list)
+            },
+            profile=dict(data.get("profile") or {}),
+            city_cache=dict(data.get("city_cache") or {}),
+            extras={key: value for key, value in data.items() if key not in known},
         )
 
 

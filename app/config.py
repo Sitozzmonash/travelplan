@@ -197,6 +197,11 @@ class TravelPlanConfig:
     #: 但**绝不能久等** —— 等到就带上已完成的部分开始，没完成的部分由正式流程自己补查。
     discovery_grace_seconds: float = 3.0
 
+    # --- 跨会话城市知识缓存（A）---
+    # 攻略文本变化快，POI 基础信息稳定得多；分开过期，避免为了地址重查而频繁刷新攻略。
+    city_cache_guide_ttl_days: int = 7
+    city_cache_poi_ttl_days: int = 15
+
     @classmethod
     def from_env(cls) -> "TravelPlanConfig":
         """读取显式环境覆盖；无效值回退默认值而不让服务启动失败。"""
@@ -384,6 +389,12 @@ class TravelPlanConfig:
             )
             if decimal("DISCOVERY_GRACE_SECONDS", defaults.discovery_grace_seconds) is not None
             else defaults.discovery_grace_seconds,
+            city_cache_guide_ttl_days=max(
+                1, integer("CITY_CACHE_GUIDE_TTL_DAYS", defaults.city_cache_guide_ttl_days) or 1
+            ),
+            city_cache_poi_ttl_days=max(
+                1, integer("CITY_CACHE_POI_TTL_DAYS", defaults.city_cache_poi_ttl_days) or 1
+            ),
         )
 
     def public_dict(self) -> dict[str, Any]:
@@ -439,6 +450,8 @@ EDITABLE_KEYS: dict[str, tuple[str, float | None, float | None]] = {
     "DISCOVERY_PLACE_PER_CATEGORY": ("int", 1, 20),
     "DISCOVERY_HOTEL_PAGES": ("int", 1, 10),
     "PLANNING_SESSION_TTL_MINUTES": ("int", 5, 1440),
+    "CITY_CACHE_GUIDE_TTL_DAYS": ("int", 1, 90),
+    "CITY_CACHE_POI_TTL_DAYS": ("int", 1, 180),
     # 性能：受控并发（Part A / L）。上限给到 16 是有意的护栏 ——
     # 再往上就不是"调参"而是拿 Provider 的限流去赌一次 run 能不能跑完。
     "PROVIDER_MAX_CONCURRENCY": ("int", 1, 16),
