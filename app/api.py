@@ -246,7 +246,7 @@ def health() -> dict[str, Any]:
     `postgresql://***@host/db`（绝不回显用户名/密码）。连库失败时也要如实报
     "配置目标是哪个后端"，而不是假装一切正常。
 
-    顶层另有两个**契约字段**（PRD §14 字面要求，供部署/监控直接消费，不必再解析
+    顶层另有两个**契约字段**（部署契约，见 `docs/09_部署说明.md` §2.4；供部署/监控直接消费，不必再解析
     `store` 嵌套结构）：`database_backend = sqlite|postgres`、
     `database_connected = true|false`。`database_connected` 表示"这次真的把库连上了"
     （一次 `SELECT 1` 走通；建表在 store 构造时已经做过，探针里不重复跑 DDL）；
@@ -290,7 +290,7 @@ def health() -> dict[str, Any]:
         "status": "ok" if store_ok else "degraded",
         "workflow": WORKFLOW_NAME,
         "project_id": PROJECT_ID,
-        # 部署契约字段（PRD §14）：后端类型固定二选一，连接状态来自"真的连上并建表"。
+        # 部署契约字段（docs/09_部署说明.md §2.4）：后端类型固定二选一，连接状态来自"真的连上并建表"。
         "database_backend": store_info.get("backend") or "unknown",
         "database_connected": store_ok,
         "store": store_info,
@@ -443,7 +443,12 @@ def _jev_calls_from_spans(spans: list[dict]) -> list[dict]:
 
 
 def _llm_calls_from_spans(spans: list[dict]) -> list[dict]:
-    """component=llm 的 span → 管理端的 "LLM 调用" 列表。"""
+    """component=llm 的 span → 管理端的 "LLM 调用" 列表。
+
+    预览与 token 直接取 span 属性（``app/llm.py`` 写下的脱敏截断值）；早期版本记录的
+    run 没有这些属性，此时一律回 None —— 不回 0/空串，管理端才不会把"没记"显示成
+    "模型没消耗 token"。
+    """
 
     calls: list[dict] = []
     for span in spans:
@@ -459,13 +464,32 @@ def _llm_calls_from_spans(spans: list[dict]) -> list[dict]:
                 "chars": attributes.get("chars"),
                 "error": span.get("error"),
                 "started_at": span.get("started_at"),
+                "finished_at": span.get("finished_at"),
+                "input_tokens": attributes.get("input_tokens"),
+                "output_tokens": attributes.get("output_tokens"),
+                "cached_tokens": attributes.get("cached_tokens"),
+                "total_tokens": attributes.get("total_tokens"),
+                "system_preview": attributes.get("system_preview"),
+                "user_preview": attributes.get("user_preview"),
+                "context_preview": attributes.get("context_preview"),
+                "assistant_preview": attributes.get("assistant_preview"),
+                "prompt_version": attributes.get("prompt_version"),
+                "prompt_hash": attributes.get("prompt_hash"),
             }
         )
     return calls
 
 
 @api.get("/api/v1/admin/overview", dependencies=[Depends(require_admin)])
-def admin_overview() -> dict[str, Any]:
+def admin_overview(include_tokens: bool = True) -> dict[str, Any]:
+    """历史累计量。``total_tokens`` 是**累计口径**（所有 run 的 run_metrics 之和），
+    与 Dashboard 那个"平均每个规划的 token"（窗口 + 只看有快照的 run）不是一回事，
+    两个口径各有自己的标签，不要互相引用。
+
+    ``include_tokens`` 默认 True 保持既有契约；不需要累计用量的消费方传 false 即可，
+    这样以后再往这里加明细也不会让首屏响应跟着长。
+    """
+
     store = get_store()
     runs = store.list_runs(limit=200)
     statuses: dict[str, int] = {}
@@ -478,17 +502,16 @@ def admin_overview() -> dict[str, Any]:
     evolves = store.list_evolution_runs(limit=1)
     benchmarks = store.list_benchmark_runs(limit=1)
 
-    return {
+    payload = {
         "run_count": store.count_runs(),
         "statuses": statuses,
         "degraded_count": statuses.get("DEGRADED", 0),
         "failed_count": statuses.get("FAILED", 0),
         "running_count": statuses.get("RUNNING", 0),
-        "total_tokens": sum(int(run["total_tokens"] or 0) for run in runs),
-        "total_llm_calls": sum(int(run["llm_calls"] or 0) for run in runs),
-        "total_jev_calls": sum(int(run["jev_calls"] or 0) for run in runs),
-        "total_tool_calls": sum(int(run["tool_calls"] or 0) for run in runs),
-        "provider_failures": sum(int(run["provider_failures"] or 0) for run in runs),
+        "total_llm_calls": sum(int(run.get("llm_calls") or 0) for run in runs),
+        "total_jev_calls": sum(int(run.get("jev_calls") or 0) for run in runs),
+        "total_tool_calls": sum(int(run.get("tool_calls") or 0) for run in runs),
+        "provider_failures": sum(int(run.get("provider_failures") or 0) for run in runs),
         "badcase_open": badcase_open,
         "badcase_total": badcase_total,
         "jev": _jev_health(store, runs),
@@ -506,6 +529,13 @@ def admin_overview() -> dict[str, Any]:
             "last_decision": evolves[0]["decision"] if evolves else None,
         },
     }
+    if include_tokens:
+        # 累计口径：没有 token 快照的 run 贡献 0（它本来就没被计入），所以这里是下界而不是 0。
+        payload["total_tokens"] = sum(int(run.get("total_tokens") or 0) for run in runs)
+        payload["total_tokens_runs"] = sum(
+            1 for run in runs if run.get("total_tokens") is not None
+        )
+    return payload
 
 
 def _pass_rate(benchmark_run: dict) -> float | None:
@@ -676,14 +706,18 @@ def start_planning_session(session_id: str) -> dict[str, Any]:
 
 @api.get("/api/v1/city-cache/{city}")
 def get_city_cache_candidates(city: str) -> dict[str, Any]:
-    """读取可公开展示的城市候选缓存；未命中时让客户端走正常会话 Discovery。"""
+    """读取可公开展示的城市候选缓存；未命中时让客户端走正常会话 Discovery。
+
+    这个接口**不需要鉴权**，所以只返回候选与攻略的元信息，**不外发攻略正文**
+    （第三方内容 + 单城市可达数百 KB）；正文只在会话 Discovery 与正式 run 内部使用。
+    """
 
     from app import city_cache
 
     hit = city_cache.read_candidates(city, store=get_store())
     if hit is None:
         raise HTTPException(status_code=404, detail=f"城市 {city!r} 暂无有效缓存")
-    return hit.payload()
+    return hit.payload(include_evidence_text=False)
 
 
 @api.post("/api/v1/admin/city-cache/{city}/refresh", status_code=202, dependencies=[Depends(require_admin)])
@@ -699,6 +733,68 @@ def refresh_city_cache_candidates(city: str) -> dict[str, Any]:
         normalized, refresh=lambda cached_city: sessions.refresh_city_cache(get_store(), cached_city)
     )
     return {"city": normalized, "status": "refresh_queued"}
+
+
+@api.get("/api/v1/admin/city-cache/{city}/entities", dependencies=[Depends(require_admin)])
+def admin_city_entities(city: str, limit: int = 200) -> dict[str, Any]:
+    """这座城市的 Canonical Place 实体底座（只读）。
+
+    为什么需要它：候选列表只给"用户能选的地点"，而"同一个现实地点为什么只有一个身份"
+    要看实体层本身 —— 实体、别名、Provider 引用、主点子点关系、查询缓存各自的规模。
+    这些数字是判断"实体层到底建起来了没有"的唯一依据，不该只存在于库里。
+    """
+
+    from app import city_cache
+
+    store = get_store()
+    normalized = city_cache.normalize_city(city)
+    if not normalized:
+        raise HTTPException(status_code=422, detail="城市不能为空")
+    cap = max(1, min(int(limit), 1000))
+    entities = store.get_canonical_places(normalized)
+    kinds: dict[str, int] = {}
+    for row in entities:
+        key = str(row.get("kind") or "place")
+        kinds[key] = kinds.get(key, 0) + 1
+    return {
+        "city": normalized,
+        "counts": {
+            "entities": len(entities),
+            "places": kinds.get("place", 0),
+            "facilities": kinds.get("facility", 0),
+            "aliases": len(store.get_place_aliases(normalized)),
+            "provider_refs": len(store.get_place_provider_refs(normalized)),
+            "relations": len(store.get_place_relations(normalized)),
+            "evidence_links": len(store.get_place_evidence_links(normalized)),
+            "query_cache": len(store.get_poi_query_cache_rows(normalized)),
+        },
+        "kinds": kinds,
+        "entities": entities[:cap],
+    }
+
+
+@api.get("/api/v1/admin/places/resolver-traces", dependencies=[Depends(require_admin)])
+def admin_place_resolver_traces(
+    run_id: str | None = None,
+    session_id: str | None = None,
+    city: str | None = None,
+    action: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """地点实体解析器的留痕（方案 §21）。
+
+    每条回答一件事：这个地点被**复用 / 新建 / 合并 / 折叠 / 丢弃**了，依据是什么。
+    "这次为什么没有重新查高德"这类问题只能从这里回答 —— 只看得见结果、看不见判断过程，
+    错并或漏并就永远无法复盘。
+    """
+
+    store = get_store()
+    if not any([run_id, session_id, city]):
+        raise HTTPException(status_code=422, detail="至少给一个过滤条件（run_id / session_id / city）")
+    rows = store.list_place_resolver_traces(
+        run_id=run_id, session_id=session_id, city=city, action=action, limit=limit
+    )
+    return {"count": len(rows), "filter": {"run_id": run_id, "session_id": session_id, "city": city, "action": action}, "traces": rows}
 
 
 @api.get("/api/v1/admin/runs", dependencies=[Depends(require_admin)])
@@ -1572,13 +1668,17 @@ def _stage_details(store: TravelPlanStore, run_id: str) -> list[dict[str, Any]]:
                     for span in related
                     if span.get("component") in ("tool", "provider", "mcp")
                 ],
-                "llm_calls": [_span_attributes(span) for span in related if span.get("component") == "llm"],
+                # 与顶层的 llm_calls 用同一个还原函数：阶段视图与调用列表的形状必须一致，
+                # 前端才不用为"这一行有没有 started_at"分两套渲染。多出来的也只是 span 的
+                # 起止时刻（attributes 里没有这两列），原有的属性一个不少。
+                "llm_calls": _llm_calls_from_spans(related),
                 "tokens": {
                     "input_tokens": run_metrics.get("input_tokens"),
                     "output_tokens": run_metrics.get("output_tokens"),
                     "cached_tokens": run_metrics.get("cached_tokens"),
                     "total_tokens": run_metrics.get("total_tokens"),
-                    "note": "token 只能按整次 run 统计：Provider 不按阶段回报用量",
+                    "note": "这四项是整次 run 的合计（run_metrics）；每个阶段/每次调用的用量在"
+                    " llm_calls 里逐条给出（模型回报的 usage，取不到的为 null 而不是 0）",
                 },
             }
         )

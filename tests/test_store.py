@@ -435,3 +435,50 @@ class TestHotelAndTransportRowsAreNotStored:
         assert saved["hotel"]["selected"]["name"] == "成都某酒店"
         assert saved["hotel"]["selected"]["price_note"] == "420 起价/晚"
         assert saved["hotel"]["selected"]["provider"] == "tuniu"
+
+
+class TestCanonicalLayerMigration:
+    """老库缺列时的迁移：`CREATE TABLE IF NOT EXISTS` 对已存在的表什么都不做。
+
+    线上真实踩过：canonical_places 由先上线的代码建出来（没有 opening_hours），
+    后加的列只写进了 SCHEMA 的 CREATE TABLE —— 结果整座城市预热 0 候选。
+    """
+
+    def test_missing_column_is_added_to_existing_table(self, tmp_path):
+        import sqlite3
+
+        path = tmp_path / "legacy.db"
+        conn = sqlite3.connect(path)
+        # 老版本的完整建表语句（就是少了后来加的 opening_hours）。
+        conn.execute(
+            "CREATE TABLE canonical_places ("
+            " canonical_place_id TEXT PRIMARY KEY, canonical_name TEXT NOT NULL,"
+            " normalized_name TEXT NOT NULL, city TEXT NOT NULL, district TEXT,"
+            " business_area TEXT, lng REAL, lat REAL, address TEXT,"
+            " category TEXT NOT NULL DEFAULT 'other', kind TEXT NOT NULL DEFAULT 'place',"
+            " parent_place_id TEXT, confidence REAL NOT NULL DEFAULT 0,"
+            " evidence_count INTEGER NOT NULL DEFAULT 0,"
+            " created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        conn.commit()
+        conn.close()
+
+        store = TravelPlanStore(path)
+        with store._connect() as live:  # noqa: SLF001 —— 只读列信息
+            columns = store._backend.table_columns(live, "canonical_places")  # noqa: SLF001
+        assert "opening_hours" in columns
+        # 迁移必须幂等：再构造一次不该报错、也不该改坏已有列。
+        TravelPlanStore(path)
+        assert store.upsert_canonical_places(
+            [
+                {
+                    "canonical_place_id": "place_canonical_x",
+                    "canonical_name": "宽窄巷子",
+                    "normalized_name": "宽窄巷子",
+                    "city": "成都",
+                    "opening_hours": "全天",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                }
+            ]
+        ) == 1
+        assert store.get_canonical_places("成都")[0]["opening_hours"] == "全天"

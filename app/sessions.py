@@ -355,6 +355,7 @@ def run_discovery(
                 hotel_pages=max(1, config.discovery_hotel_pages),
                 workers=max(1, config.discovery_workers),
                 on_partial=persist_partial,
+                store=store,
             )
             bundle = _bundle_from(session_id, intent, result, hub)
             # 缓存落库只是加速层，失败不能把一次 live Discovery 变成失败。
@@ -535,6 +536,7 @@ def refresh_city_cache(store: TravelPlanStore, city: str) -> dict[str, Any]:
         result = discovery.prefetch(
             hub, LLM.from_env(), intent,
             hotel_pages=1, workers=max(1, config.discovery_workers),
+            store=store,
         )
         bundle = _bundle_from(f"city-cache:{normalized}", intent, result, hub)
         written = city_cache.write_candidates(

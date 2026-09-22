@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+from app import places
 from app.config import PlannerTuning, current_tuning
 from app.models import Decision, DecisionStatus, Evidence, Place, TripIntent, coerce_float, coerce_str
 
@@ -473,29 +474,44 @@ PLACE_CATEGORY_LABELS: dict[str, str] = {
 }
 
 _CATEGORY_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("food", ("火锅", "小吃", "面", "餐", "美食", "夜市", "串", "烧烤", "咖啡", "茶馆", "甜", "饭", "食")),
-    ("nightview", ("夜", "灯光", "观景", "塔", "江", "livehouse", "酒吧")),
-    ("shopping", ("商圈", "步行街", "购物", "太古里", "春熙", "百货", "市集", "market")),
+    ("food", ("火锅", "小吃", "美食", "夜市", "烧烤", "咖啡", "茶馆", "餐厅", "饭店", "菜馆", "面馆", "酒馆")),
+    ("nightview", ("夜景", "灯光秀", "观景", "酒吧", "livehouse")),
+    ("shopping", ("商圈", "步行街", "购物", "太古里", "春熙路", "百货", "市集", "market", "商业街")),
     ("photo", ("拍照", "机位", "出片", "网红", "打卡", "摄影")),
-    ("nature", ("公园", "山", "湖", "湿地", "森林", "自然", "江", "河", "草")),
-    ("history", ("博物", "古迹", "古镇", "祠", "寺", "遗址", "故居", "塔", "宫", "陵")),
-    ("family", ("亲子", "动物", "乐园", "科技馆", "海洋", "熊猫")),
+    ("nature", ("公园", "湿地", "森林", "自然保护区", "植物园", "动物园", "湖泊", "湿地公园")),
+    ("history", ("博物馆", "古迹", "古镇", "祠堂", "寺庙", "遗址", "故居", "宫殿", "陵园", "文化馆")),
+    ("family", ("亲子", "乐园", "科技馆", "海洋馆", "熊猫", "动物园")),
     ("experience", ("体验", "演出", "剧场", "手作", "温泉", "游船", "滑雪", "演艺")),
+    ("attraction", ("景区", "风景", "名胜", "旅游区", "景点")),
 )
 
 
 def place_category(place: Place) -> str:
-    """把地点的类型/名字映射到用户的分类（确定性关键词匹配，不调模型）。"""
+    """把地点的类型/名字映射到用户的分类（确定性匹配，不调模型）。
 
+    判定顺序：**结构化 type 优先** → 关键词兜底 → ``other``。三点各自对应一次线上事故：
+
+    1. 地铁站 / 停车场 / 售票处 / 服务中心 / 酒店按高德 type 直接判为"其它"。
+       type 是平台给的结构化分类，比按名字猜可靠得多 —— "杜甫草堂(地铁站)" 的类型明明
+       写着"交通设施服务;地铁站"，却因为名字含"草"被归成了自然类，于是进了景点池。
+    2. 关键词表里不再有单字（见 `_CATEGORY_KEYWORDS` 上方说明）。
+    3. 兜底不再是 ``attraction``：分类失败却伪装成"这是个景点"，正是用户看到一堆停车场 /
+       酒店的根因。判不出来就如实说"其它"。
+    """
+
+    facility = places.facility_kind(place.name, place.type)
+    if facility is not None and facility != "uncategorized":
+        return "other"
+    structured = places.category_from_type(place.type)
+    if structured:
+        return structured
     haystack = " ".join(
         filter(None, [place.name, place.type or "", place.business_area or "", place.district or ""])
     )
     for category, keywords in _CATEGORY_KEYWORDS:
         if any(keyword in haystack for keyword in keywords):
             return category
-    if place.type and any(term in place.type for term in ("餐饮", "美食", "restaurant")):
-        return "food"
-    return "attraction"
+    return "other"
 
 
 def place_reason(

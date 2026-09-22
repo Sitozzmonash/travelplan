@@ -136,6 +136,109 @@ class TestAdminPlanningSessions:
         assert detail["run"]["source_session_id"] == session_id
 
 
+class TestRunTimelineLlmPreview:
+    """Run Trace 的 ASSISTANT 事件要能回答"模型收到了什么 / 回了什么 / 花了多少 token"。
+
+    两条路径都必须诚实：老 span 没有预览字段 → 说"这条 span 没写预览"，而不是笼统宣称
+    "从来没持久化过"；新 span 有就照实给出，且 token 取不到时留 None（不是 0）。
+    """
+
+    @staticmethod
+    def _run_with_llm_span(store: TravelPlanStore, run_id: str, attributes: dict) -> None:
+        store.create_run(run_id, original_query="北京→成都")
+        store.finish_run(run_id, "completed")
+        store.save_trace_span(
+            run_id,
+            f"{run_id}:llm:final_answer",
+            component="llm",
+            name="final_answer",
+            status="SUCCESS",
+            started_at="2026-09-20T10:00:00+00:00",
+            finished_at="2026-09-20T10:00:03+00:00",
+            attributes=attributes,
+        )
+
+    def test_legacy_span_says_the_preview_was_not_recorded(self, client, store):
+        self._run_with_llm_span(
+            store,
+            "tp-legacy",
+            {"tag": "final_answer", "model": "fake", "status": "OK", "duration_ms": 3000, "chars": 12},
+        )
+        body = client.get("/api/v1/admin/runs/tp-legacy/timeline", headers=AUTH).json()
+        event = next(item for item in body["events"] if item["event_type"] == "ASSISTANT")
+
+        assert event["input_preview"] is None and event["output_preview"] is None
+        assert event["tokens_in"] is None and event["tokens_out"] is None
+        # 降级必须在 payload 里看得见，而不是静默留空。
+        assert any("没有 Prompt 预览" in note for note in event["notes"])
+        assert any("没有 token 用量" in note for note in event["notes"])
+        assert set(event["metadata"]) >= {
+            "system_preview", "user_preview", "context_preview", "assistant_preview",
+            "prompt_version", "prompt_hash",
+            "input_tokens", "output_tokens", "cached_tokens", "total_tokens",
+        }
+        assert event["metadata"]["total_tokens"] is None
+        # 顶层说明不能再宣称"正文从未被持久化"。
+        assert any("早期版本记录的 run 的 span 里没有预览字段" in note for note in body["notes"])
+
+    def test_span_with_previews_and_usage_is_surfaced(self, client, store):
+        self._run_with_llm_span(
+            store,
+            "tp-preview",
+            {
+                "tag": "extract_places",
+                "model": "kimi",
+                "status": "OK",
+                "duration_ms": 1200,
+                "chars": 9,
+                "system_preview": "SYS",
+                "user_preview": "USER",
+                "context_preview": "CTX",
+                "assistant_preview": "ASSISTANT 正文",
+                "prompt_version": "deadbee",
+                "prompt_hash": "abc123abc123",
+                "input_tokens": 12,
+                "output_tokens": 34,
+                "cached_tokens": 0,
+                "total_tokens": 46,
+            },
+        )
+        body = client.get("/api/v1/admin/runs/tp-preview/timeline", headers=AUTH).json()
+        event = next(item for item in body["events"] if item["event_type"] == "ASSISTANT")
+
+        assert event["input_preview"] == "[system]\nSYS\n\n[user]\nUSER\n\n[context]\nCTX"
+        assert event["output_preview"] == "ASSISTANT 正文"
+        assert (event["tokens_in"], event["tokens_out"]) == (12, 34)
+        assert event["metadata"]["total_tokens"] == 46
+        # 0 是模型真的回了 cached=0，与"没回这个字段"（None）不是一回事。
+        assert event["metadata"]["cached_tokens"] == 0
+        assert event["metadata"]["prompt_version"] == "deadbee"
+        assert event["metadata"]["prompt_hash"] == "abc123abc123"
+        assert event["notes"] == []
+        assert "46 tokens" in event["summary"]
+
+    def test_previews_are_scrubbed_on_the_way_out(self, client, store, monkeypatch):
+        """span 可能是别的进程/旧版本写进来的：出口再过一次脱敏，明文 Key 不许出现。"""
+        monkeypatch.setenv("AMAP_API_KEY", "amap-live-123456")
+        self._run_with_llm_span(
+            store,
+            "tp-raw",
+            {
+                "tag": "critic",
+                "status": "OK",
+                "system_preview": "key=amap-live-123456",
+                "user_preview": "api_key: amap-live-123456",
+                "assistant_preview": "ok",
+                "input_tokens": 1,
+                "output_tokens": 2,
+                "total_tokens": 3,
+            },
+        )
+        response = client.get("/api/v1/admin/runs/tp-raw/timeline", headers=AUTH)
+        assert response.status_code == 200
+        assert "amap-live-123456" not in response.text
+
+
 class TestProviderHealth:
     def test_no_history_is_unknown_not_failure(self, client, store):
         body = client.get("/api/v1/admin/providers", headers=AUTH).json()

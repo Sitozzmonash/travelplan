@@ -18,10 +18,11 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from threading import Lock
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from app.config import current_config
 from app.models import Evidence, Place, basic_name_key, coerce_datetime, utcnow
+from app.planner import normalize_place_name
 from app.store import TravelPlanStore
 
 
@@ -178,12 +179,20 @@ def write_candidates(
     evidence_list = list(evidences)
     poi_rows = [_poi_row(place, timestamp) for place in place_list if place.place_id]
     cache_store.upsert_city_pois(normalized, poi_rows)
-    cache_store.upsert_city_poi_mentions(
-        normalized, _mention_rows(place_list, evidence_list, timestamp)
-    )
+    mention_rows = _mention_rows(place_list, evidence_list, timestamp)
+    cache_store.upsert_city_poi_mentions(normalized, mention_rows)
     cache_store.upsert_city_evidences(
         normalized, _evidence_rows(evidence_list, timestamp)
     )
+    # Evidence → 实体挂载：失败不该让整个缓存写入失败（它只是索引，候选与正文才是主体）。
+    try:
+        cache_store.upsert_place_evidence_links(
+            _link_evidence_rows(
+                mention_rows, city=normalized, store=cache_store, timestamp=timestamp
+            )
+        )
+    except Exception:  # noqa: BLE001
+        pass
     queries = [str(query) for query in (social_queries or []) if str(query).strip()]
     served = [str(query) for query in (social_served_queries or []) if str(query).strip()]
     if queries or served:
@@ -281,21 +290,37 @@ def _place_from_row(row: Mapping[str, Any], city: str) -> Place:
 def _mention_rows(
     places: list[Place], evidences: Iterable[Evidence], timestamp: str
 ) -> list[dict[str, Any]]:
-    by_name = {
-        basic_name_key(place.name): place
-        for place in places
-        if basic_name_key(place.name)
-    }
+    """攻略提及 → 城市级索引行。
+
+    A5 的根因有两半，这里修的是第二半：**匹配不能用字符串相等**。
+    攻略里写的是"杜甫草堂"，而高德返回并入库的是"成都杜甫草堂博物馆" —— 归一化之后
+    两者都是"杜甫草堂"，但 `basic_name_key` 的字符串相等判不出这一点，于是即便抽出的
+    地名已经写回 `evidence.place_mentions`，这里仍然匹配不上、`city_poi_mentions` 还是空的。
+
+    所以匹配键用 `normalize_place_name`（与 run 内去重、实体层同一套），并把地点的
+    **别名**（含被收敛进来的子设施名）一起放进索引 —— 用户写"熊猫基地南门"、
+    实体叫"成都大熊猫繁育研究基地"时也要能对上。
+    """
+
+    by_key: dict[str, Place] = {}
+    for place in places:
+        for name in (place.name, *place.aliases):
+            key = normalize_place_name(name, city=place.city) or basic_name_key(name)
+            if key:
+                by_key.setdefault(key, place)
     rows: list[dict[str, Any]] = []
     for evidence in evidences:
         for raw_name in evidence.place_mentions or []:
-            place = by_name.get(basic_name_key(raw_name))
+            key = normalize_place_name(raw_name, city=None) or basic_name_key(raw_name)
+            place = by_key.get(key)
             if place is None:
                 continue
             rows.append(
                 {
                     "place_id": place.place_id,
                     "raw_name": raw_name,
+                    # 只给 _link_evidence_rows 用来挂证据链，不会写进 city_poi_mentions。
+                    "evidence_key": _evidence_key(evidence),
                     "source_type": evidence.source_type,
                     "provider": evidence.provider,
                     "source_url": evidence.source_url,
@@ -304,6 +329,43 @@ def _mention_rows(
                     "updated_at": timestamp,
                 }
             )
+    return rows
+
+
+def _link_evidence_rows(
+    mention_rows: Sequence[Mapping[str, Any]], *, city: str, store: TravelPlanStore, timestamp: str
+) -> list[dict[str, Any]]:
+    """Evidence → Canonical Place 的挂载（方案 P1-11）。
+
+    用的是 `_mention_rows` 已经算出来的 (证据, 地点, 提及文本) 三元组 —— 那里已经做过
+    归一化与别名匹配，再算一遍只会多一处会漂移的规则。缺的只是"这个 place_id 属于哪个
+    canonical 实体"，从 `place_provider_refs` 反查即可。
+    """
+
+    pairs = [("amap", str(row["place_id"])) for row in mention_rows if row.get("place_id")]
+    if not pairs:
+        return []
+    canonical_by_ref = {
+        (str(ref.get("provider")), str(ref.get("provider_place_id"))): str(ref.get("canonical_place_id"))
+        for ref in store.get_place_provider_refs(city, keys=pairs)
+    }
+    rows: list[dict[str, Any]] = []
+    for row in mention_rows:
+        canonical_id = canonical_by_ref.get(("amap", str(row.get("place_id") or "")))
+        if not canonical_id:
+            # 没有 canonical 映射说明这批 POI 是更早版本写进去的（实体层还没建）。
+            # 不猜、不新建：等下一次预热重建时自然补上。
+            continue
+        rows.append(
+            {
+                "canonical_place_id": canonical_id,
+                "city": city,
+                "evidence_key": row.get("evidence_key"),
+                "mention_text": str(row.get("raw_name") or ""),
+                "confidence": None,
+                "updated_at": timestamp,
+            }
+        )
     return rows
 
 

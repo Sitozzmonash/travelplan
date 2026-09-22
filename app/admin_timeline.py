@@ -17,16 +17,16 @@
 三条硬约定
 ----------
 1. **同一份事实只读一次**：不新增埋点、不新建日志表。所有输入都来自既有 store 读接口。
-2. **拿不到就写拿不到**：模型输入/输出正文**没有**被持久化（trace 只记 tag / 模型 /
-   字符数 / 耗时），因此事件里 ``input_preview`` 只能是 ``None``，并在 ``notes`` 里
-   说明原因 —— 不拿摘要冒充原文。
+2. **拿不到就写拿不到**：模型调用现在会把 prompt / 输出以**脱敏 + 截断**的预览随 llm span
+   一起持久化（见 ``app/llm.py::LLMResult.to_audit``），所以 ASSISTANT 事件能给出
+   ``input_preview`` / ``output_preview``；早期版本记下的 run 没有这些字段，那时给
+   ``None`` 并在 ``notes`` 里说明"这条 span 没写预览"，而不是拿摘要冒充原文。
 3. **预览必须脱敏 + 截断**：Tool 参数与返回来自第三方，可能带 Key 或几百 KB 正文。
 """
 
 from __future__ import annotations
 
 import json
-import re
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -35,7 +35,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from .models import TripPlan
 from .observability import now_iso
-from .providers import _scrub_secrets
+from .redact import clip, scrub
 from .store import TravelPlanStore
 from .workflow import LLM_STAGE_MAP, PROVIDER_STAGE_MAP
 
@@ -76,26 +76,17 @@ _PREVIEW_LIMIT = 400
 #: 单次返回的事件上限：超长 run 只截断展示，不静默丢数据。
 _MAX_EVENTS = 800
 
-_SECRET_PATTERN = re.compile(
-    r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|token|authorization|secret|password|cookie)"
-    r"(\"?\s*[:=]\s*\"?)([A-Za-z0-9_\-./+]{6,})"
-)
-_BEARER_PATTERN = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_\-./+=]{6,}")
-
 #: 状态里算"这里出过问题"的那些。
 _PROBLEM_STATUSES = ("FAILED", "TIMEOUT", "ERROR", "AUTH_ERROR", "RATE_LIMITED", "INVALID")
 
 
 def _scrub(text: str) -> str:
-    """兜底脱敏：环境变量里的 Key + 常见凭据字样。
+    """兜底脱敏：实现只有一份，在 ``app/redact.py``（环境变量里的 Key + 常见凭据字样）。
 
-    复用 ``providers._scrub_secrets`` 而不是再写一份：那是全仓唯一一份"当前进程里
-    各个 Key 长什么样"的清单，各写一份必然会漏掉新加的 Key。
+    保留这个函数只是为了不改变本模块已有的调用点；新增脱敏一律走 `app.redact`。
     """
 
-    text = _scrub_secrets(text)
-    text = _BEARER_PATTERN.sub("Bearer ***", text)
-    return _SECRET_PATTERN.sub(lambda match: f"{match.group(1)}{match.group(2)}***", text)
+    return scrub(text)
 
 
 def _preview(value: Any, *, limit: int = _PREVIEW_LIMIT) -> str | None:
@@ -113,9 +104,31 @@ def _preview(value: Any, *, limit: int = _PREVIEW_LIMIT) -> str | None:
     text = _scrub(text.strip())
     if not text:
         return None
-    if len(text) > limit:
-        return f"{text[:limit]}…（已截断，原文 {len(text)} 字符）"
-    return text
+    return clip(text, limit=limit) or None
+
+
+def _int_or_none(value: Any) -> int | None:
+    """span 属性里的整数：取不到（或根本不是数字）就给 ``None``。
+
+    0 与"没有"必须分得开：0 会被读成"确实一次都没有"，而 None 才表示"这次没回报"。
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def _scrub_opt(text: Any) -> str | None:
+    """预览字段一律在**读出来的时候**再过一次脱敏。
+
+    写这些字段的进程可能不是当前进程（早期版本、别的部署），也可能环境里的 Key 换过；
+    不能假定落库时已经擦干净 —— 页面是最后一道出口，泄出去就收不回来了。
+    非字符串一律给 None：宁可少显示，也不把不确定类型的东西塞进预览。
+    """
+
+    if not isinstance(text, str) or not text:
+        return None
+    return _scrub(text) or None
 
 
 def _parse_ts(value: Any) -> datetime | None:
@@ -491,7 +504,11 @@ def _assistant_events(
     为什么**不**把 decisions 表铺进来：那是逐实体（每个 POI / 酒店 / 方案）的取舍记录，
     一次 run 有一两百条，铺进时间轴会把真正的执行过程淹没。决策链在运行详情页
     已有独立区块（``/admin/runs/{run_id}`` 的 ``decisions``），这里只回答"模型在哪一刻
-    被调用、花了多久"。
+    被调用、花了多久、收到与回了什么"。
+
+    正文与 token 都来自 llm span 上由 ``app/llm.py`` 写下的字段（脱敏 + 截断后的预览、
+    模型回报的 usage）。span 上没有这些字段时（早期版本记录的 run）如实留 None 并
+    在 ``notes`` 里说明"这条 span 没写"，而不是笼统宣称"从来没持久化过"。
     """
 
     events: list[dict[str, Any]] = []
@@ -502,6 +519,35 @@ def _assistant_events(
         stage = stages.of_span(span)
         tag = str(attributes.get("tag") or span.get("name") or "llm")
         duration = _span_duration(span)
+        system_preview = _scrub_opt(attributes.get("system_preview"))
+        user_preview = _scrub_opt(attributes.get("user_preview"))
+        context_preview = _scrub_opt(attributes.get("context_preview"))
+        assistant_preview = _scrub_opt(attributes.get("assistant_preview"))
+        tokens_in = _int_or_none(attributes.get("input_tokens"))
+        tokens_out = _int_or_none(attributes.get("output_tokens"))
+        cached_tokens = _int_or_none(attributes.get("cached_tokens"))
+        total_tokens = _int_or_none(attributes.get("total_tokens"))
+        # input_preview 用已有的字段承载"模型收到了什么"：逐段标注来源，
+        # 否则三段拼在一起没人分得清哪段是需求、哪段是带进来的上下文。
+        # 这里不再按 _PREVIEW_LIMIT 二次截断：各段已带自己的截断尾注，再截一次会把
+        # "原文 N 字符"写成一段预览的长度，读的人会误以为模型只收到 400 字符。
+        sections = [
+            f"[{label}]\n{value}"
+            for label, value in (
+                ("system", system_preview),
+                ("user", user_preview),
+                ("context", context_preview),
+            )
+            if value
+        ]
+        notes: list[str] = []
+        if not any((system_preview, user_preview, context_preview, assistant_preview)):
+            notes.append(
+                "这条 span 没有 Prompt 预览：该 run 由早期版本记录（span 不写预览字段），"
+                "或预览脱敏后为空；不是被隐藏"
+            )
+        if total_tokens is None:
+            notes.append("这次调用没有 token 用量：模型未回报 usage，字段留白而不是 0")
         events.append(
             _event(
                 event_id=str(span.get("span_id")),
@@ -510,7 +556,8 @@ def _assistant_events(
                 title=f"模型调用 · {tag}",
                 summary=f"{attributes.get('status') or span.get('status') or 'OK'}"
                 + (f"，{round(duration / 1000, 1)}s" if duration else "")
-                + (f"，输出 {attributes.get('chars')} 字符" if attributes.get("chars") else ""),
+                + (f"，输出 {attributes.get('chars')} 字符" if attributes.get("chars") else "")
+                + (f"，{total_tokens} tokens" if total_tokens is not None else ""),
                 stage=stage,
                 round_index=stages.ordinal(stage),
                 status=str(attributes.get("status") or span.get("status") or "OK"),
@@ -519,12 +566,25 @@ def _assistant_events(
                 duration_ms=duration,
                 parent_event_id=span.get("parent_span_id"),
                 model=str(attributes.get("model") or "") or None,
-                metadata={"tag": tag, "chars": attributes.get("chars")},
-                notes=[
-                    "模型输入/输出正文未持久化（trace 只记 tag / 模型 / 字符数 / 耗时），"
-                    "因此这里没有 Prompt 预览",
-                    "token 只能按整次 run 统计：Provider 不按调用回报用量",
-                ],
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                input_preview="\n\n".join(sections) or None,
+                output_preview=assistant_preview or None,
+                metadata={
+                    "tag": tag,
+                    "chars": attributes.get("chars"),
+                    "system_preview": system_preview,
+                    "user_preview": user_preview,
+                    "context_preview": context_preview,
+                    "assistant_preview": assistant_preview,
+                    "prompt_version": attributes.get("prompt_version"),
+                    "prompt_hash": attributes.get("prompt_hash"),
+                    "input_tokens": tokens_in,
+                    "output_tokens": tokens_out,
+                    "cached_tokens": cached_tokens,
+                    "total_tokens": total_tokens,
+                },
+                notes=notes,
                 badcases=badcase_by_ref.get(str(span.get("span_id")), []),
             )
         )
@@ -920,9 +980,11 @@ def run_timeline(store: TravelPlanStore, run_id: str) -> dict[str, Any]:
     fallbacks = [event for event in events if event.get("fallback")]
     errors = [event for event in events if event["event_type"] == "ERROR"]
     notes = [
-        "模型输入/输出正文与 System Prompt 未持久化，事件里只保留 tag / 模型 / 字符数 / 耗时",
+        "ASSISTANT 事件的 Prompt/输出正文是**脱敏 + 截断**后的预览（单段上限 2000 字符）；"
+        "早期版本记录的 run 的 span 里没有预览字段，此时预览为空并在该事件上标注",
+        "逐次调用的 token 来自模型回报的 usage（取不到留白，不是 0）；成本仍按整次 run 统计"
+        "（单价是用户填的估计值）",
         "逐条决策（选了什么 / 为什么）不在这条时间轴上：见运行详情页的决策链区块",
-        "token 与成本按整次 run 统计：Provider 不按调用回报用量，因此事件级 tokens/cost 为空",
     ]
     if truncated_events:
         notes.append(f"事件数超过 {_MAX_EVENTS} 条，仅返回前 {_MAX_EVENTS} 条")

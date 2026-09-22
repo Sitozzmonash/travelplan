@@ -159,14 +159,15 @@ def test_degraded_reason_is_human_readable_and_empty_on_success() -> None:
     assert ok.degraded_reason == ""
 
 
-def test_audit_entries_never_contain_prompts_or_secrets() -> None:
-    """审计条目只记元数据（tag/model/status/耗时/字数/起止时刻），不含 prompt 全文与任何 Key。"""
+def test_audit_entries_are_redacted_previews_not_raw_prompts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """审计条目带 prompt/输出的**预览**：只放脱敏 + 截断后的文本，绝不放 Key。"""
+    monkeypatch.setenv("MODEL_API_KEY", "sk-live-abcdef123456")
     llm = LLM(model=_OkModel("x" * 200))
-    llm.invoke("system-prompt-with-secret-skb-123", "user", tag="t")
+    llm.invoke("system-prompt-with-secret sk-live-abcdef123456", "user", tag="t")
 
     entry = llm.audit_entries()[0]
     # started_at / finished_at 是为了让 Trace 能画出真实的先后（缺了它们，所有模型调用
-    # 都会挤在 run 结尾），它们同样只放时刻、不放内容。
+    # 都会挤在 run 结尾）；token 与预览是为了回答"它收到了什么、回了什么、花了多少"。
     assert set(entry) == {
         "tag",
         "model",
@@ -176,9 +177,118 @@ def test_audit_entries_never_contain_prompts_or_secrets() -> None:
         "chars",
         "started_at",
         "finished_at",
+        "input_tokens",
+        "output_tokens",
+        "cached_tokens",
+        "total_tokens",
+        "system_preview",
+        "user_preview",
+        "context_preview",
+        "assistant_preview",
+        "prompt_version",
+        "prompt_hash",
     }
     assert entry["chars"] == 200
-    assert "skb-123" not in str(entry)
+    # 进程里配置的 Key 值不允许出现在审计里（预览里也不行）。
+    assert "sk-live-abcdef123456" not in str(entry)
+    assert "***" in entry["system_preview"]
+    assert entry["user_preview"] == "user"
+    assert entry["assistant_preview"] == "x" * 200
+    # 这次没传 context：字段留 None，而不是空串（空串会被读成"确实没有上下文"）。
+    assert entry["context_preview"] is None
+
+
+def test_preview_is_truncated_with_a_visible_tail_note() -> None:
+    """预览有上限，且截断必须留痕 —— 否则读者会把半截输出当成完整的输出。"""
+    import app.llm as llm_module
+
+    llm = LLM(model=_OkModel("y" * (llm_module._PREVIEW_CHARS + 500)))
+    entry = llm.invoke("sys", "user", tag="t").to_audit()
+
+    assert entry["assistant_preview"].startswith("y" * 100)
+    assert "已截断" in entry["assistant_preview"]
+    assert str(llm_module._PREVIEW_CHARS + 500) in entry["assistant_preview"]
+    assert entry["chars"] == llm_module._PREVIEW_CHARS + 500  # chars 仍是真实长度
+
+
+def test_context_is_a_third_input_segment() -> None:
+    """`context` 与"调用方自己拼进 user"语义等价，只是审计能把三段分开。"""
+    model = _OkModel("好")
+    llm = LLM(model=model)
+    llm.invoke("SYS", "USER", tag="t", context="CTX")
+
+    assert [message.content for message in model.seen[0]] == ["SYS", "USER\n\nCTX"]
+    entry = llm.audit_entries()[0]
+    assert entry["system_preview"] == "SYS"
+    assert entry["user_preview"] == "USER"
+    assert entry["context_preview"] == "CTX"
+
+    # 不传 context 时消息列表与以前完全一致（老调用点不受影响）。
+    plain = _OkModel("好")
+    LLM(model=plain).invoke("SYS", "USER", tag="t")
+    assert [message.content for message in plain.seen[0]] == ["SYS", "USER"]
+
+
+def test_invoke_json_passes_context_through() -> None:
+    """批量抽取这类调用走 invoke_json，context 必须原样透传，否则证据正文进不了审计。"""
+    model = _OkModel('{"places": []}')
+    llm = LLM(model=model)
+    llm.invoke_json("SYS", "USER", tag="extract_places", context="CTX")
+
+    assert [message.content for message in model.seen[0]] == ["SYS", "USER\n\nCTX"]
+    assert llm.audit_entries()[0]["context_preview"] == "CTX"
+
+
+def test_audit_tokens_stay_empty_when_there_is_no_usage() -> None:
+    """token 口径与 run_metrics 一致：没有数据就是 None，有数据就是 input+output。"""
+    entry = LLM(model=_OkModel("好")).invoke("s", "u", tag="t").to_audit()
+    assert (
+        entry["input_tokens"],
+        entry["output_tokens"],
+        entry["cached_tokens"],
+        entry["total_tokens"],
+    ) == (None, None, None, None)
+
+    # 空 dict 与 None 一样都是"取不到"：不能读成 0。
+    assert LLMResult(usage={}).to_audit()["total_tokens"] is None
+
+    with_cache = LLMResult(
+        usage={"input_tokens": 10, "output_tokens": 5, "cached_tokens": 4}
+    ).to_audit()
+    assert (
+        with_cache["input_tokens"],
+        with_cache["output_tokens"],
+        with_cache["cached_tokens"],
+        with_cache["total_tokens"],
+    ) == (10, 5, 4, 15)
+
+    # Provider 没回 cached 字段时留白：写 0 会被读成"这次没有缓存命中"。
+    assert LLMResult(usage={"input_tokens": 10, "output_tokens": 5}).to_audit()["cached_tokens"] is None
+
+
+def test_prompt_hash_tells_whether_two_calls_got_identical_input() -> None:
+    llm = LLM(model=_OkModel("好"))
+    llm.invoke("SYS", "USER", tag="a")
+    llm.invoke("SYS", "USER", tag="b")
+    llm.invoke("SYS", "USER", tag="c", context="CTX")
+
+    same_a, same_b, other = (call.to_audit() for call in llm.calls)
+    assert same_a["prompt_hash"] == same_b["prompt_hash"]
+    # 多带一段 context 就是另一份输入，指纹必须不同。
+    assert same_a["prompt_hash"] != other["prompt_hash"]
+    # 输入原文没记下来时（旧账本 / 直接构造的结果）算不出指纹，就给 None。
+    assert LLMResult().to_audit()["prompt_hash"] is None
+
+
+def test_prompt_version_is_the_code_version_or_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """prompt_version 标的是**代码**版本（prompt 跟着代码发版），取不到就留空。"""
+    monkeypatch.setenv("TRAVELPLAN_COMMIT", "deadbee")
+    assert LLMResult().to_audit()["prompt_version"] == "deadbee"
+
+    import app.version as version_module
+
+    monkeypatch.setattr(version_module, "travelplan_commit", lambda: None)
+    assert LLMResult().to_audit()["prompt_version"] is None
 
 
 def test_default_timeout_is_generous_but_bounded() -> None:

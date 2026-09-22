@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from app import models
-from app import planner
+from app import places
 from app.config import current_config
 from app.llm import LLM, degraded_note, invoke_json_in_batches
 from app.models import (
@@ -136,6 +136,23 @@ class PlaceCandidates:
     amap_status: str = "OK"
     extracted_from_evidence: int = 0
     keyword_hits: int = 0
+    #: 实体层这次做了什么（复用 / 新建 / 合并 / 丢弃 / 折叠）。管理端与 run 详情用它回答
+    #: "这次为什么（没）重新查高德"，详见 `places.PlaceResolver.traces`。
+    resolver: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class PlaceResolution:
+    """一次"搜索结果 → canonical 候选"的产物。"""
+
+    places: list[Place] = field(default_factory=list)
+    outcome: Any = None  # places.IngestOutcome
+    traces: list[dict[str, Any]] = field(default_factory=list)
+    summary: dict[str, Any] = field(default_factory=dict)
+    degradations: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    searched_terms: list[str] = field(default_factory=list)
+    reused_terms: list[str] = field(default_factory=list)
 
 
 # ======================================================================
@@ -563,6 +580,121 @@ def extract_places_from_evidences(
     return extracted, degradations
 
 
+def open_resolver(
+    *,
+    store: Any | None,
+    destination: str,
+    run_id: str | None = None,
+    session_id: str | None = None,
+) -> "places.PlaceResolver":
+    """建一个绑定到目的地城市的实体解析器（`store=None` 时退化成纯内存）。"""
+
+    return places.PlaceResolver(
+        store, city=destination, run_id=run_id, session_id=session_id
+    )
+
+
+def resolve_pois(
+    *,
+    resolver: "places.PlaceResolver",
+    results: Mapping[str, Any],
+    terms: Sequence[str],
+    extra_places: Sequence[Place] = (),
+) -> PlaceResolution:
+    """把"检索词 → Provider 结果"收敛成 canonical 候选（A3 / A4 / A6 / A8）。
+
+    这是**唯一**一处把高德返回变成候选的地方：Discovery 与正式 run 都走它，所以
+    "地理围栏、子设施收敛、连锁分店保护、实体复用"只有一份实现。
+
+    `terms` 是**真正打过 Provider 的词**（命中别名 / 查询缓存的词不该出现在这里，
+    它们的候选从 `extra_places` 传进来），顺序即候选顺序。
+
+    绝不空榜：收敛后一个都不剩而原始候选非空时，退回原始候选并如实记降级 ——
+    候选里混着子设施也比让用户面对空列表好，但必须说清这份列表是没收敛过的。
+    """
+
+    record_order = 0
+    records: list[places.PoiRecord] = []
+    searched: list[str] = []
+    raw_places: list[Place] = []
+    seen_ids: set[str] = set()
+    for term in terms:
+        result = results.get(term)
+        searched.append(term)
+        provider_ids: list[str] = []
+        for place in getattr(result, "items", None) or []:
+            if not place.place_id or place.place_id in seen_ids:
+                continue
+            seen_ids.add(place.place_id)
+            raw_places.append(place)
+            provider_ids.append(place.place_id)
+            records.append(places.PoiRecord.from_place(place, source_query=term, order=record_order))
+            record_order += 1
+        resolver.record_query(term, provider_result_ids=provider_ids)
+    for place in extra_places:
+        if not place.place_id or place.place_id in seen_ids:
+            continue
+        seen_ids.add(place.place_id)
+        raw_places.append(place)
+        records.append(places.PoiRecord.from_place(place, order=record_order))
+        record_order += 1
+
+    outcome = resolver.ingest(records)
+    resolution = PlaceResolution(
+        places=outcome.places,
+        outcome=outcome,
+        degradations=list(outcome.degradations),
+        notes=list(outcome.notes),
+        searched_terms=searched,
+    )
+    if outcome.dropped:
+        out_of_city = [item for item in outcome.dropped if item["reason"] == "out_of_city"]
+        skipped = [item for item in outcome.dropped if item["reason"] != "out_of_city"]
+        if out_of_city:
+            resolution.notes.append(
+                f"地理围栏剔除 {len(out_of_city)} 条不属于目的地的 POI（"
+                + "、".join(f"{item['name']}（{item.get('detail', '')}）" for item in out_of_city[:3])
+                + "）"
+            )
+        if skipped:
+            resolution.notes.append(
+                f"{len(skipped)} 条不适合当候选的 POI 没有进候选（附属设施 / 地址桩 / 住宅等）："
+                + "、".join(str(item["name"]) for item in skipped[:5])
+            )
+    if outcome.folded:
+        resolution.notes.append(
+            f"{len(outcome.folded)} 个子设施挂到了母体上（不再并列成候选）："
+            + "、".join(f"{item['name']}→{item['parent_name']}" for item in outcome.folded[:4])
+        )
+    if outcome.merged:
+        resolution.notes.append(f"实体层合并了 {outcome.merged} 条同实体的重复记录")
+    if not outcome.places and raw_places:
+        # 兜底分两级，先要"仍然干净"，再退到"可能脏但至少不空"：
+        #   ① 过完围栏、且不是附属设施 / 地址桩的原始候选（保住"不给用户看停车场"这条）；
+        #   ② 实在连一个都没有，才退回真正未过滤的原始候选，并如实说明它没收敛。
+        dropped_ids = {str(item.get("place_id") or "") for item in outcome.dropped}
+        clean = [
+            place
+            for place in raw_places
+            if str(place.place_id) not in dropped_ids
+            and places.facility_kind(place.name, place.type) is None
+            and places.non_destination_reason(place.type) is None
+        ]
+        if clean:
+            resolution.places = clean
+            resolution.degradations.append(
+                f"实体层没有收敛出可选地点（候选全是附属设施 / 地址桩），"
+                f"已退回 {len(clean)} 条原始候选（已剔除设施，但未经实体合并）"
+            )
+        else:
+            resolution.places = raw_places
+            resolution.degradations.append(
+                f"实体收敛后没有剩下可选地点，已退回 {len(raw_places)} 条**未经收敛**的原始候选；"
+                "这份列表可能包含附属设施"
+            )
+    return resolution
+
+
 def extract_place_candidates(
     hub: ProviderHub,
     llm: LLM,
@@ -573,11 +705,15 @@ def extract_place_candidates(
     verify_limit: int | None = None,
     poi_limit: int | None = None,
     ledger: CallLedger | None = None,
+    store: Any | None = None,
 ) -> PlaceCandidates:
     """从攻略提到的地方 + 关键词，去高德查成真实 POI 候选。
 
     关键设计：**攻略里的地名只当搜索关键词用**。候选地点必须能被高德查到，
     所以坐标、行政区、营业时间全部有出处；查不到就不进候选，绝不用模型编一个地点。
+
+    查之前必须过一遍 `PlaceResolver`（A3）：别名或查询缓存命中就不打高德 ——
+    "Agent 可以决定要查什么，但不能决定绕过缓存重新查"。
 
     Discovery 阶段只做到这里：不两两算路线、不逐个查门票 —— 那要等用户选完之后做。
     ``ledger`` 让同一次 Discovery 内的重复关键词只查一次高德（Part C）。
@@ -593,6 +729,9 @@ def extract_place_candidates(
     extracted, extract_degradations = extract_places_from_evidences(llm, evidences)
     result.degradations.extend(extract_degradations)
     result.extracted_from_evidence = len(extracted)
+    # A5：抽出来的地名必须写回证据，否则 city_poi_mentions 永远是空表
+    # （它按 evidence.place_mentions 建行，而模型抽出的地名此前从不落回这里）。
+    apply_extracted_mentions(evidences, extracted)
 
     if not evidences:
         result.notes.append("没有可用的攻略证据，地点候选只能来自关键词搜索")
@@ -615,6 +754,23 @@ def extract_place_candidates(
             raw_names.append(cleaned)
     search_terms = _dedupe_queries([*raw_names[: cfg.discovery_max_places], *keywords])
 
+    resolver = open_resolver(
+        store=store if store is not None else getattr(hub, "store", None),
+        destination=destination,
+        run_id=getattr(hub, "run_id", None) or None,
+    )
+    # A3 / A4：先问实体层"这些词还值得查吗"。命中别名或查询缓存的词一次高德都不打。
+    to_search, hits = resolver.plan_queries(search_terms)
+    reused_places: list[Place] = []
+    for hit in hits:
+        reused_places.extend(hit.places)
+    if hits:
+        result.notes.append(
+            f"{len(hits)} 个检索词命中已有实体 / 查询缓存，未重复调用高德："
+            + "、".join(f"{hit.term}（{hit.reason}）" for hit in hits[:4])
+            + ("……" if len(hits) > 4 else "")
+        )
+
     # 关键词 POI 搜索互不依赖 → 受控并发；合并仍按关键词顺序（first-wins 的字段因此稳定）。
     outcomes = parallel_map(
         [
@@ -627,39 +783,62 @@ def extract_place_candidates(
                     detail=f"高德 POI「{term}」",
                 )[0]
             )
-            for term in search_terms
+            for term in to_search
         ],
         max_workers=cfg.provider_max_concurrency,
         thread_prefix="tp-disc-poi",
     )
 
+    results: dict[str, Any] = {}
     poi_status = "OK"
-    places: list[Place] = []
-    seen_ids: set[str] = set()
-    searched = 0
-    for term, outcome in zip(search_terms, outcomes):
-        searched += 1
+    for term, outcome in zip(to_search, outcomes):
         if not outcome.ok or outcome.value is None:
             result.degradations.append(f"高德 POI 查询「{term}」失败：{outcome.error}")
+            results[term] = None
             continue
-        poi = outcome.value
-        poi_status = poi_status if poi_status != "OK" else poi.status
-        for place in poi.items:
-            if place.place_id in seen_ids:
-                continue
-            seen_ids.add(place.place_id)
-            places.append(place)
+        results[term] = outcome.value
+        poi_status = poi_status if poi_status != "OK" else outcome.value.status
 
-    result.keyword_hits = searched
-    if not places and destination:
+    resolution = resolve_pois(
+        resolver=resolver,
+        results=results,
+        terms=to_search,
+        extra_places=reused_places,
+    )
+    result.degradations.extend(resolution.degradations)
+    result.notes.extend(resolution.notes)
+    result.resolver = {
+        **(resolver.flush()),
+        "reused_terms": [hit.term for hit in hits],
+        "reused_actions": {hit.term: hit.action for hit in hits},
+        "searched_terms": resolution.searched_terms,
+        "folded": list(getattr(resolution.outcome, "folded", []) or []),
+        "dropped": list(getattr(resolution.outcome, "dropped", []) or []),
+        "traces": resolution.traces,
+    }
+    result.keyword_hits = len(to_search)
+
+    deduped = resolution.places
+    if not deduped and destination:
         result.degradations.append(
             f"高德 POI 查询没有返回任何地点（{poi_status}），本次没有可选地点；"
             "没有用模型生成的地点填补"
         )
     result.amap_status = poi_status
 
-    deduped, dedupe_decisions = planner.dedupe_places(places)
-    result.decisions.extend(dedupe_decisions)
+    for entry in resolution.traces:
+        if str(entry.get("action")) != "folded":
+            continue
+        result.decisions.append(
+            Decision(
+                entity_id=str(entry.get("canonical_place_id") or ""),
+                status=DecisionStatus.KEEP,
+                agent_or_stage="place_resolver",
+                reason_codes=["folded_facility", str(entry.get("relation_type") or "child")],
+                reason_text=str(entry.get("reason") or "子设施并入母体"),
+                scores={"confidence": entry.get("confidence")},
+            )
+        )
 
     # 用户可见候选上限（用户旅程 §8：12~20 个，不要一次丢 50 个）。为什么在这里截：
     # 用户是在这一步做 MUST/WANT/REJECT 的，清单太长等于让他做无意义的筛选；
@@ -673,8 +852,16 @@ def extract_place_candidates(
 
     # Discovery 只对前 N 个做 POI 详情核实（营业时间/地址），控制成本；
     # 正式 run 的 ⑥ 步会对"真正可能排进行程"的点做深度验证（Part D）。
+    # A4 的 Cache First：实体层已经有地址 + 营业时间的不再打一次高德。
     verify = max(0, int(verify_limit if verify_limit is not None else cfg.discovery_poi_verify_limit))
-    detail_targets = deduped[:verify]
+    detail_targets = [
+        place for place in deduped[:verify] if resolver.needs_detail(place.place_id)
+    ]
+    skipped_details = len(deduped[:verify]) - len(detail_targets)
+    if skipped_details:
+        result.notes.append(
+            f"{skipped_details} 个候选的详情（地址 / 营业时间）已在实体层里，未重复查高德"
+        )
     detail_outcomes = parallel_map(
         [
             (
@@ -694,8 +881,37 @@ def extract_place_candidates(
             continue
         detail = outcome.value
         _apply_poi_detail(place, detail.items[0] if detail.items else {})
+
     result.places = deduped
     return result
+
+
+def apply_extracted_mentions(
+    evidences: Sequence[Evidence], extracted: Sequence[Mapping[str, Any]]
+) -> int:
+    """把模型抽出的地名写回 `evidence.place_mentions`，返回写入条数。
+
+    A5 的根因就在这一步缺失：`city_poi_mentions` 是按 `evidence.place_mentions` 建行的，
+    而模型抽出的地名此前只进 `extracted` 列表、从不回到证据对象上 —— 于是不管抽到多少
+    地点，那张表恒为 0 行（线上 0/213 有值）。
+
+    写回而不是另存一份映射：`place_mentions` 的语义本来就是"这篇攻略提到了哪些地点"，
+    数据源自带的提及与模型抽出的提及在这里没有区别；分开存只会让下游两个来源各写一遍。
+    只追加不覆盖，并按原顺序去重（同一篇里同一地名出现两次不该记两行）。
+    """
+
+    by_id = {evidence.id: evidence for evidence in evidences}
+    written = 0
+    for item in extracted:
+        owner = by_id.get(coerce_str(item.get("evidence_id")).strip())
+        name = coerce_str(item.get("name")).strip()
+        if owner is None or not name:
+            continue
+        if name in owner.place_mentions:
+            continue
+        owner.place_mentions.append(name)
+        written += 1
+    return written
 
 
 def _keyword_candidates(intent: TripIntent, queries: list[str]) -> list[str]:
@@ -741,18 +957,8 @@ def _apply_poi_detail(place: Place, detail: dict[str, Any]) -> None:
 
 #: 类别 → 候选池。景点/历史/自然/亲子/拍照归"游玩"，美食归"美食"，其余归"体验"。
 #: contract 2 的三个 key 固定，前端按三张卡片列渲染；顺序也固定（attraction 在前）。
-_POOL_BY_CATEGORY: dict[str, str] = {
-    "attraction": "attraction",
-    "history": "attraction",
-    "nature": "attraction",
-    "family": "attraction",
-    "photo": "attraction",
-    "food": "food",
-    "experience": "experience",
-    "nightview": "experience",
-    "shopping": "experience",
-    "other": "experience",
-}
+#: 映射本体住在 `places`（实体层判定"两条 POI 是不是同一类地方"要用它），这里只做引用。
+_POOL_BY_CATEGORY: dict[str, str] = places.POOL_BY_CATEGORY
 
 POOL_KEYS = ("attraction", "food", "experience")
 
@@ -947,6 +1153,7 @@ def prefetch(
     workers: int = 4,
     on_partial: Any | None = None,
     ledger: CallLedger | None = None,
+    store: Any | None = None,
 ) -> dict[str, Any]:
     """四条线并行取数，返回给 Planning Session 存草稿的原始结果。
 
@@ -958,6 +1165,9 @@ def prefetch(
 
     ``ledger`` 是这一次 Discovery 的查询键账本（Part C）：四条线共用一个，
     所以"交通查过的键""social 查过的关键词"彼此之间也不会重复请求。
+
+    ``store`` 让地点实体层（`app/places.py`）能把这次的结果沉淀成跨会话可复用的
+    canonical 实体；不传就只能在本进程内收敛，下次去同一座城市仍要从零判断。
     """
 
     from concurrent.futures import ThreadPoolExecutor
@@ -1101,10 +1311,18 @@ def prefetch(
         if social.evidences:
             try:
                 places = extract_place_candidates(
-                    hub, llm, intent, social.evidences, queries=social.queries, ledger=books
+                    hub, llm, intent, social.evidences, queries=social.queries,
+                    ledger=books, store=store,
                 )
             except Exception as exc:  # noqa: BLE001
                 errors["places"] = f"{type(exc).__name__}: {exc}"
+                # 如实记进**候选自身的**降级说明，而不只是 `errors`：`errors` 只进 stages
+                # 快照，用户与正式 run 看到的是 `PlaceCandidates.degradations`。两者不一致时
+                # 就会出现"一个地点都没有，但没人说得清为什么"（线上真实发生过一次：
+                # 实体层建表少了一列，全城预热 0 候选，而所有降级字段都是空的）。
+                places.degradations.append(
+                    f"地点候选生成失败（{type(exc).__name__}: {exc}），本次没有可选地点"
+                )
         outcomes["places"] = places
         started_at["places"] = places_started
         report("places")
@@ -1126,6 +1344,10 @@ def prefetch(
     transport: TransportCandidates | None = outcomes.get("transport")
     hotels: HotelCandidates | None = outcomes.get("hotels")
     stages = {name: dict(info) for name, info in timings.items()}
+    # 地点实体层这次做了什么（复用 / 新建 / 合并 / 丢弃 / 折叠）跟着 places 阶段一起走：
+    # 它进 `PrefetchBundle.discovery` → 会话的 discovery_json → 管理端，
+    # 于是"这次为什么（没有）重新查高德"在事后能被回答（方案 §21）。
+    stages.setdefault("places", {})["resolver"] = places.resolver
     return {
         "transport": transport,
         "hotels": hotels,

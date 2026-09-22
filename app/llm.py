@@ -13,11 +13,17 @@
 3. **调用留痕**：每次调用（含失败）都进 `self.calls`，最后写进 audit_report.json。
    审计要能回答"这次模型到底被调了几次、都让它干什么了、返回了什么"。
 
-Secret 只从环境变量读，且**不写入日志/输出文件**：`calls` 里只记 model 名与耗时。
+Secret 只从环境变量读，且**不写入日志/输出文件**：`calls` 里只记 model 名、耗时、
+token 用量与**脱敏截断后**的输入输出预览（见 `to_audit`）。
+
+为什么要记预览而不是全文：审计要能回答"这次模型到底收到了什么、又回了什么"，
+但 trace 与 audit_report 是要长期留在库里的文本，所以一律过 `app.redact` 做脱敏 +
+截断，原文本身不落盘。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -29,6 +35,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from app.models import coerce_str, parse_envelope
+from app.redact import clip, scrub
 
 try:  # 事件名只从 SuperHarness 取，不在本地抄一份字符串（抄了迟早会跟上游漂移）
     from superharness.observability import EventType
@@ -50,6 +57,11 @@ DEFAULT_TIMEOUT_SECONDS = 180.0
 #: 覆盖单次模型调用超时的环境变量名（秒）。做成可调是因为"多慢算慢"取决于模型：
 #: 推理模型的思考 token 不算在首 token 延迟里，同一条 prompt 在不同模型上能差好几倍。
 TIMEOUT_ENV_VAR = "TRAVELPLAN_LLM_TIMEOUT_SECONDS"
+
+#: 单条预览（system / user / context / assistant）的字符上限。四个字段都会进
+#: audit_report.json 与 llm span 的 attributes，一次 run 有 5–20 次调用，
+#: 不设上限时单条 run 的 trace 会被正文撑到几 MB。
+_PREVIEW_CHARS = 2000
 
 #: 状态语义与 providers.PROVIDER_STATUSES 对齐，前端不需要学第二套词表。
 STATUS_OK = "OK"
@@ -76,6 +88,13 @@ class LLMResult:
     finished_at: str | None = None
     #: 模型侧回报的 token 用量。取不到就是 None —— 宁可让上游不显示，也不填 0 冒充。
     usage: dict[str, Any] | None = None
+    #: 这次调用实际发出去的输入原文（system / user / 可选的 context）。
+    #: 只在 `invoke` 的收口点赋值：`_invoke` 有 5 个 return 分支，逐个分支写一定会漏一个，
+    #: 而漏掉的那次在审计里就变成"模型没收到输入"。None 表示这条账不是走 `invoke` 记的
+    #: （例如测试替身直接构造的 LLMResult），此时预览如实留白。
+    prompt_system: str | None = None
+    prompt_user: str | None = None
+    prompt_context: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -89,7 +108,21 @@ class LLMResult:
         return f"模型调用 {self.tag or '未命名'} 未成功（{self.status}{'：' + self.error if self.error else ''}）"
 
     def to_audit(self) -> dict[str, Any]:
-        """audit_report.json 的 llm_calls 条目。刻意不含 prompt 全文与任何 Secret。"""
+        """audit_report.json 的 llm_calls 条目：正文只给脱敏截断后的预览，不给全文。"""
+
+        usage = self.usage if isinstance(self.usage, dict) and self.usage else None
+        if usage is None:
+            # "取不到"≠"0"：Provider 没回报用量时四个字段一律留白（铁律，口径同
+            # workflow.persist_metrics —— 写 0 会被读成"模型没消耗 token"）。
+            input_tokens = output_tokens = cached_tokens = total_tokens = None
+        else:
+            input_tokens = int(usage.get("input_tokens") or 0)
+            output_tokens = int(usage.get("output_tokens") or 0)
+            # cached 只认 Provider 真的带了这个字段：缺字段时写 0 会被读成"没有缓存命中"。
+            cached_tokens = int(usage["cached_tokens"] or 0) if "cached_tokens" in usage else None
+            # 与 run_metrics 的 total_tokens 同口径（input + output），两级数字才对得上。
+            total_tokens = input_tokens + output_tokens
+
         return {
             "tag": self.tag,
             "model": self.model,
@@ -99,7 +132,53 @@ class LLMResult:
             "finished_at": self.finished_at,
             "error": self.error,
             "chars": len(self.text or ""),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cached_tokens": cached_tokens,
+            "total_tokens": total_tokens,
+            "system_preview": _preview_of(self.prompt_system),
+            "user_preview": _preview_of(self.prompt_user),
+            "context_preview": _preview_of(self.prompt_context),
+            "assistant_preview": _preview_of(self.text),
+            "prompt_version": _prompt_version(),
+            "prompt_hash": _prompt_hash(self.prompt_system, self.prompt_user, self.prompt_context),
         }
+
+
+def _preview_of(text: str | None) -> str | None:
+    """把一段原文压成可安全展示的预览：脱敏 → 截断。空值给 None 而不是空串。"""
+
+    if not text or not text.strip():
+        return None
+    return clip(scrub(text.strip()), limit=_PREVIEW_CHARS) or None
+
+
+def _prompt_hash(system: str | None, user: str | None, context: str | None) -> str | None:
+    """这次调用的输入指纹：用来判断两处调用拿到的是不是**完全相同**的输入。
+
+    输入一段都没记下来（旧账本）就返回 None —— 算不出来的指纹不能编一个假的出来。
+    """
+
+    if system is None and user is None and context is None:
+        return None
+    joined = "\x00".join((system or "", context or "", user or ""))
+    return hashlib.sha1(joined.encode("utf-8")).hexdigest()[:12]
+
+
+def _prompt_version() -> str | None:
+    """这次调用属于哪一版**代码**（不是 prompt 的第几版）。
+
+    为什么用代码版本：prompt 常量就写在 ``app/prompts.py`` 里，跟着代码一起发版，
+    没有独立的 revision 号；拿 commit 当版本号至少能回答"这份审计是哪个构建产出的"。
+    取不到（部署环境没有 .git 也没有 TRAVELPLAN_COMMIT）就返回 None，不编版本号。
+    """
+
+    try:
+        from app.version import travelplan_commit
+
+        return travelplan_commit()
+    except Exception:  # noqa: BLE001 —— 版本信息拿不到只是审计少一列，不该影响调用
+        return None
 
 
 def _usage_of(response: Any) -> dict[str, Any] | None:
@@ -294,8 +373,16 @@ class LLM:
         response = self._model.invoke(messages)
         return _as_text(getattr(response, "content", response)), _usage_of(response)
 
-    def invoke(self, system: str, user: str, *, tag: str = "") -> LLMResult:
+    def invoke(
+        self, system: str, user: str, *, tag: str = "", context: str | None = None
+    ) -> LLMResult:
         """发一次对话；永远不抛异常。失败时 status != OK 且 error 有值。
+
+        ``context`` 是可选的第 3 段输入（例如检索到的证据正文）。给定时真正发出去的消息
+        列表是 ``[SystemMessage(system), HumanMessage(user + "\\n\\n" + context)]`` ——
+        与调用方自己拼好再当作 ``user`` 传进来**语义等价**，区别只是审计能分清
+        "哪一段是用户需求、哪一段是带进来的上下文"（预览才拆得开）。
+        不传（None 或空串）时行为与以前完全一致。
 
         这里只做观测上报，真正的调用在 `_invoke` —— 上报要有统一的收口点，
         否则 4 个 return 分支里漏一个就会出现「有 started 没有 finished」的残迹。
@@ -307,9 +394,13 @@ class LLM:
         # 起止时刻在**唯一收口点**盖上：`_invoke` 有 4 个 return 分支，
         # 逐个分支写时间戳一定会漏一个。
         started_at = datetime.now(timezone.utc).isoformat()
-        result = self._invoke(system, user, tag=tag)
+        result = self._invoke(system, user, tag=tag, context=context)
         result.started_at = started_at
         result.finished_at = datetime.now(timezone.utc).isoformat()
+        # 输入原文同理只在收口点盖：漏一次，审计里那次调用就变成"模型没收到输入"。
+        result.prompt_system = system
+        result.prompt_user = user
+        result.prompt_context = context
         self._emit(
             EventType.LLM_FINISHED,
             {
@@ -324,7 +415,9 @@ class LLM:
         )
         return result
 
-    def _invoke(self, system: str, user: str, *, tag: str = "") -> LLMResult:
+    def _invoke(
+        self, system: str, user: str, *, tag: str = "", context: str | None = None
+    ) -> LLMResult:
         """发一次对话；永远不抛异常。失败时 status != OK 且 error 有值。
 
         超时必须由我们自己兜：模型句柄是外部注入的，langchain 的 timeout 只在构造期
@@ -346,7 +439,11 @@ class LLM:
         try:
             from langchain_core.messages import HumanMessage, SystemMessage
 
-            messages: list[Any] = [SystemMessage(content=system), HumanMessage(content=user)]
+            # context 只是"多带一段输入"，与调用方自己拼成 user 完全等价（见 invoke 文档）。
+            messages: list[Any] = [
+                SystemMessage(content=system),
+                HumanMessage(content=f"{user}\n\n{context}" if context else user),
+            ]
         except Exception as exc:  # noqa: BLE001 —— 缺依赖也只是一个降级状态
             result = LLMResult(
                 status=STATUS_UNAVAILABLE,
@@ -415,13 +512,15 @@ class LLM:
         self.calls.append(result)
         return result
 
-    def invoke_json(self, system: str, user: str, *, tag: str = "") -> LLMResult:
+    def invoke_json(
+        self, system: str, user: str, *, tag: str = "", context: str | None = None
+    ) -> LLMResult:
         """发一次"只输出 JSON"的对话，并把返回解析进 `result.value`。
 
         解析失败时 status=INVALID_RESPONSE，但 `text` 仍然保留 —— 审计需要看到
-        "模型到底回了什么"，而不是只知道它没解析成功。
+        "模型到底回了什么"，而不是只知道它没解析成功。``context`` 原样透传给 `invoke`。
         """
-        result = self.invoke(system, user, tag=tag)
+        result = self.invoke(system, user, tag=tag, context=context)
         if not result.ok:
             return result
 

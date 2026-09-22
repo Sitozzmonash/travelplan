@@ -382,17 +382,32 @@ def run_contexts(store: TravelPlanStore, runs: Sequence[Mapping[str, Any]]) -> l
     为什么必须并发：每条 run 至少要一次 `get_plan`（有些还要一次会话读），
     而经 Neon 的每次往返约 1 秒 —— 30 条 run 串行就是半分钟，页面早就转圈转到放弃了。
     `plan_snapshot` 自带进程内缓存与锁，store 也是线程安全的，所以这里可以安全并发。
+
+    会话按 session_id 去重：同一个会话可以产出多条 run（同一份需求重跑一次就是这样），
+    一个会话读 N 次是纯粹的重复往返。去重只在**同一次调用内**生效，不跨请求缓存 ——
+    放进来的会话可能是刚被改过的新状态，跨请求缓存会让页面看到旧的选择。
     """
+
+    sessions: dict[str, Mapping[str, Any] | None] = {}
+    sessions_lock = threading.Lock()
 
     def load(run: Mapping[str, Any]) -> RunContext:
         snapshot = plan_snapshot(store, str(run.get("run_id")))
         session: Mapping[str, Any] | None = None
         session_id = run.get("source_session_id")
         if session_id:
-            try:
-                session = store.get_planning_session(str(session_id))
-            except Exception:  # noqa: BLE001 —— 会话读不到不影响计划本身的质量
-                session = None
+            key = str(session_id)
+            with sessions_lock:
+                known = key in sessions
+                session = sessions.get(key)
+            if not known:
+                try:
+                    session = store.get_planning_session(key)
+                except Exception:  # noqa: BLE001 —— 会话读不到不影响计划本身的质量
+                    session = None
+                # 读之前不持锁：并发闸门要留给真正的等待，不能被这把锁串行化。
+                with sessions_lock:
+                    sessions[key] = session
         return RunContext(run=run, snapshot=snapshot, session=session)
 
     if not runs:
@@ -541,6 +556,15 @@ def _run_stats(runs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         for run in finished
         if isinstance(run.get("cost"), (int, float)) and not isinstance(run.get("cost"), bool)
     ]
+    # token 口径与 cost 刻意不同：**只看有快照的 run**（不看 status）。run_metrics 是
+    # 失败/降级也会写的（一次失败的规划照样烧了 token），把它们排除掉会让"平均每个规划
+    # 多少 token"偏低。NULL 表示"这次没记"，既不进分子也不进分母 —— 记成 0 才是错的。
+    snapshot_tokens = [
+        int(run["total_tokens"])
+        for run in runs
+        if isinstance(run.get("total_tokens"), (int, float))
+        and not isinstance(run.get("total_tokens"), bool)
+    ]
     return {
         "runs": len(runs),
         "finished": len(finished),
@@ -558,6 +582,9 @@ def _run_stats(runs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "avg_cost": _mean(costs),
         "total_cost": round(sum(costs), 4) if costs else None,
         "cost_known_runs": len(costs),
+        "avg_tokens_per_run": _mean(snapshot_tokens),
+        "total_tokens": sum(snapshot_tokens) if snapshot_tokens else None,
+        "token_known_runs": len(snapshot_tokens),
         "slow_runs": [
             run
             for run in finished
@@ -767,8 +794,83 @@ def _attention(
     return items
 
 
+# ======================================================================
+# 首屏缓存
+# ======================================================================
+
+#: 首屏聚合结果的存活时间。为什么是"几十秒"而不是更长：窗口内的成功率/失败率是
+#: 运维盯着做决定的数字，滞后太久会让人对着过期的红点排查。
+_DASHBOARD_TTL_SECONDS = 45.0
+
+
+@dataclass(slots=True)
+class _DashboardEntry:
+    """缓存里的一屏：算好的时刻 + 整份 payload。"""
+
+    computed_at: str
+    payload: dict[str, Any]
+
+
+class _DashboardCache:
+    """按 (窗口, 抽样量) 缓存整份首屏。
+
+    为什么要缓存**整份 payload**：首屏的耗时不在某一条 SQL，而在"翻页扫窗口 +
+    每个抽样 run 解一份 100–220KB 的 plan_json + Provider 逐个聚合"这三件事叠加，
+    单点缓存其中任何一条都救不了"连打开几次就开始转圈"。
+    缓存与 _PLANS 一样只在进程内存里，重启即失效；命中时必须让消费方知道看到的是
+    哪一刻算的（payload 的 `cache` 字段与 notes），否则"刚跑完的 run 没出现"会被当成 Bug。
+    """
+
+    def __init__(self, *, ttl_seconds: float, max_entries: int = 8) -> None:
+        self._ttl = ttl_seconds
+        self._max = max_entries
+        self._lock = threading.Lock()
+        self._items: dict[str, tuple[float, _DashboardEntry]] = {}
+
+    def get(self, key: str) -> _DashboardEntry | None:
+        with self._lock:
+            stored = self._items.get(key)
+            if stored is None:
+                return None
+            stored_at, entry = stored
+            if time.monotonic() - stored_at > self._ttl:
+                self._items.pop(key, None)
+                return None
+            return entry
+
+    def put(self, key: str, entry: _DashboardEntry) -> None:
+        with self._lock:
+            # 窗口只有 4 档、抽样量也就几个，条目本来就少；淘汰只做兜底。
+            if len(self._items) >= self._max:
+                oldest = min(self._items, key=lambda item: self._items[item][0])
+                self._items.pop(oldest, None)
+            self._items[key] = (time.monotonic(), entry)
+
+
+_DASHBOARDS = _DashboardCache(ttl_seconds=_DASHBOARD_TTL_SECONDS)
+
+
 def dashboard(store: TravelPlanStore, *, window: Window, quality_sample: int = 10) -> dict[str, Any]:
-    """Dashboard 首屏：关键指标 + 环比 + 趋势 + 当前需要关注。"""
+    """Dashboard 首屏：关键指标 + 环比 + 趋势 + 当前需要关注。
+
+    结果按 (窗口, 抽样量) 缓存 ``_DASHBOARD_TTL_SECONDS`` 秒：命中时直接回同一份，
+    并在 `cache` 字段与 ``notes`` 里写明"这是哪一刻算的、最多滞后多久"。
+    """
+
+    cache_key = f"{window.key}|q{quality_sample}"
+    cached = _DASHBOARDS.get(cache_key)
+    if cached is not None:
+        payload = dict(cached.payload)
+        payload["notes"] = list(cached.payload.get("notes") or []) + [
+            f"本页为缓存结果（计算于 {cached.computed_at}，TTL {_DASHBOARD_TTL_SECONDS:g}s）："
+            "窗口内新产生的数据最多滞后这么久才出现",
+        ]
+        payload["cache"] = {
+            "hit": True,
+            "computed_at": cached.computed_at,
+            "ttl_seconds": _DASHBOARD_TTL_SECONDS,
+        }
+        return payload
 
     notes: list[str] = []
 
@@ -886,6 +988,17 @@ def dashboard(store: TravelPlanStore, *, window: Window, quality_sample: int = 1
             hint=f"{stats['cost_known_runs']} 个运行有成本快照" if stats["cost_known_runs"] else "未配置单价",
         ),
         _kpi(
+            "avg_tokens_per_run",
+            "平均每个规划的 token",
+            stats["avg_tokens_per_run"],
+            unit="count",
+            previous=previous_stats["avg_tokens_per_run"],
+            higher_is_better=False,
+            hint=f"{stats['token_known_runs']} 个运行有 token 快照"
+            if stats["token_known_runs"]
+            else "窗口内没有带 token 快照的运行",
+        ),
+        _kpi(
             "badcase_open",
             "未处理 Bad Case",
             badcase_open,
@@ -984,7 +1097,7 @@ def dashboard(store: TravelPlanStore, *, window: Window, quality_sample: int = 1
     benchmarks = gathered["benchmarks"] or []
     evolves = gathered["evolves"] or []
 
-    return {
+    payload = {
         "window": window.key,
         "window_label": window.label,
         "generated_at": now_iso(),
@@ -1017,6 +1130,14 @@ def dashboard(store: TravelPlanStore, *, window: Window, quality_sample: int = 1
             "currency": "USD",
             "price_configured": _cost_configured(),
         },
+        # token 单独一块，与 cost 一样只覆盖**本窗口**：历史累计用量在 /admin/overview，
+        # 两处口径不同，字段名也不许看起来像同一个东西。
+        "tokens": {
+            "avg_per_run": stats["avg_tokens_per_run"],
+            "previous_avg_per_run": previous_stats["avg_tokens_per_run"],
+            "known_runs": stats["token_known_runs"],
+            "window_total": stats["total_tokens"],
+        },
         "quality": {
             "score": quality_score,
             "grade": grade(quality_score),
@@ -1048,6 +1169,13 @@ def dashboard(store: TravelPlanStore, *, window: Window, quality_sample: int = 1
         },
         "notes": notes,
     }
+    payload["cache"] = {
+        "hit": False,
+        "computed_at": payload["generated_at"],
+        "ttl_seconds": _DASHBOARD_TTL_SECONDS,
+    }
+    _DASHBOARDS.put(cache_key, _DashboardEntry(computed_at=payload["generated_at"], payload=payload))
+    return payload
 
 
 def _pass_rate(benchmark_run: Mapping[str, Any]) -> float | None:

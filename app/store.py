@@ -436,6 +436,166 @@ CREATE INDEX IF NOT EXISTS idx_city_pois_updated ON city_pois(city, updated_at);
 CREATE INDEX IF NOT EXISTS idx_city_poi_mentions_updated ON city_poi_mentions(city, place_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_city_evidences_updated ON city_evidences(city, updated_at);
 
+-- ======================================================================
+-- Canonical Place 实体层（"同一个现实地点只有一个身份"）
+-- ======================================================================
+-- 与 run 级 ``places`` 的关系：那是**某一次 run 的证据快照**（主键带 run_id，永不跨 run
+-- 复用），这里是**跨 run / 跨会话的现实实体**。两者必须分开：把 canonical 身份塞进
+-- places 就等于让一次 run 的去重结论改写所有历史 run 的证据链。
+--
+-- 表名刻意叫 canonical_places 而不是方案里写的 places，也是同一个原因：``places``
+-- 已经被 run 级快照占用，同名会让"读到的到底是快照还是实体"变成靠猜。
+CREATE TABLE IF NOT EXISTS canonical_places (
+    canonical_place_id TEXT PRIMARY KEY,
+    canonical_name     TEXT NOT NULL,
+    normalized_name    TEXT NOT NULL,
+    city               TEXT NOT NULL,
+    district           TEXT,
+    business_area      TEXT,
+    lng                REAL,
+    lat                REAL,
+    address            TEXT,
+    opening_hours      TEXT,
+    category           TEXT NOT NULL DEFAULT 'other',
+    -- place = 用户真正想去的地点；facility = 它的子设施（入口/停车场/售票处/游客中心…）。
+    -- 子设施保留自己的身份（它可能有真实用途，例如"从这里进"），但不该和母体并列成候选。
+    kind               TEXT NOT NULL DEFAULT 'place',
+    -- 子设施指回母体；母体自己为 NULL。
+    parent_place_id    TEXT,
+    confidence         REAL NOT NULL DEFAULT 0,
+    evidence_count     INTEGER NOT NULL DEFAULT 0,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_canonical_places_city_name
+    ON canonical_places(city, normalized_name);
+CREATE INDEX IF NOT EXISTS idx_canonical_places_parent
+    ON canonical_places(parent_place_id);
+
+-- 别名索引：解析一个名字时**先查这里**，命中就完全不必打 Provider。
+-- 主键是 (city, normalized_alias) 而不是 (canonical_place_id, alias)：同一座城市里
+-- 一个归一化别名只能指向一个实体。否则 alias 表既能表达"一个名字属于两个地点"，
+-- 又会在解析时被迫在两者之间随便选一个 —— 那是错并的温床，不如让写入时就冲突。
+CREATE TABLE IF NOT EXISTS place_aliases (
+    city               TEXT NOT NULL,
+    normalized_alias   TEXT NOT NULL,
+    alias              TEXT NOT NULL,
+    canonical_place_id TEXT NOT NULL,
+    source             TEXT NOT NULL DEFAULT 'derived',
+    confidence         REAL,
+    updated_at         TEXT NOT NULL,
+    PRIMARY KEY(city, normalized_alias)
+);
+
+CREATE INDEX IF NOT EXISTS idx_place_aliases_place
+    ON place_aliases(canonical_place_id);
+
+-- Provider 引用：高德 poi_id 只是**证据**，不是身份。
+-- 主键 (provider, provider_place_id)：一个 Provider 的一个 ID 只能映射到一个 canonical
+-- 实体（这是"同一个 POI 第二次出现时不必再判断"的根据）；反过来一个 canonical 实体
+-- 可以挂多个 Provider ID（景区主 POI + 子 POI + 旧 ID + 换 Provider）。
+CREATE TABLE IF NOT EXISTS place_provider_refs (
+    provider           TEXT NOT NULL,
+    provider_place_id  TEXT NOT NULL,
+    canonical_place_id TEXT NOT NULL,
+    -- 冗余存一份 city：按城市批量装载引用时不必 join canonical_places（那是一次全表扫）。
+    city               TEXT NOT NULL DEFAULT '',
+    provider_name      TEXT,
+    -- Provider 给的原始类型串（高德形如"交通设施服务;地铁站;地铁站"）。必须留：它是
+    -- "这个 POI 是不是子设施"最可靠的结构化依据，而缓存命中时我们不会再打 Provider。
+    provider_type      TEXT,
+    lng                REAL,
+    lat                REAL,
+    address            TEXT,
+    district           TEXT,
+    business_area      TEXT,
+    opening_hours      TEXT,
+    fetched_at         TEXT,
+    updated_at         TEXT NOT NULL,
+    PRIMARY KEY(provider, provider_place_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_place_provider_refs_place
+    ON place_provider_refs(canonical_place_id);
+CREATE INDEX IF NOT EXISTS idx_place_provider_refs_city
+    ON place_provider_refs(city);
+
+-- Evidence → Canonical Place 的挂载。表名带 _links 是为了**不和 run 级 place_evidence
+-- 撞名**：后者是 (run_id, place_id, evidence_id) 的 run 内证据链，语义完全不同。
+-- evidence_key 用城市级内容键（与 city_evidences 同源），跨会话稳定。
+CREATE TABLE IF NOT EXISTS place_evidence_links (
+    canonical_place_id TEXT NOT NULL,
+    city               TEXT NOT NULL,
+    evidence_key       TEXT NOT NULL,
+    mention_text       TEXT NOT NULL DEFAULT '',
+    confidence         REAL,
+    updated_at         TEXT NOT NULL,
+    PRIMARY KEY(canonical_place_id, evidence_key, mention_text)
+);
+
+CREATE INDEX IF NOT EXISTS idx_place_evidence_links_city
+    ON place_evidence_links(city, evidence_key);
+
+-- 主点 / 子点关系。方案 §10：熊猫基地与"熊猫基地南门"是两个实体 + 一条父子边，
+-- 而不是粗暴合成一个 Place。
+CREATE TABLE IF NOT EXISTS place_relations (
+    parent_place_id TEXT NOT NULL,
+    child_place_id  TEXT NOT NULL,
+    relation_type   TEXT NOT NULL DEFAULT 'child',
+    -- 同 place_provider_refs：按城市批量装载时省掉一次 join。
+    city            TEXT NOT NULL DEFAULT '',
+    confidence      REAL,
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY(parent_place_id, child_place_id, relation_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_place_relations_child
+    ON place_relations(child_place_id);
+CREATE INDEX IF NOT EXISTS idx_place_relations_city
+    ON place_relations(city);
+
+-- 跨会话 / 跨 run 的查询缓存。回答的是"以前这个 query 查到了什么"，**不回答**
+-- "这个 query 对应的实体是谁" —— 那必须再过一次 Entity Resolver（方案 §14）。
+CREATE TABLE IF NOT EXISTS poi_query_cache (
+    city             TEXT NOT NULL,
+    query_type       TEXT NOT NULL,
+    normalized_query TEXT NOT NULL,
+    provider         TEXT,
+    matched_place_ids_json   TEXT NOT NULL DEFAULT '[]',
+    provider_result_ids_json TEXT NOT NULL DEFAULT '[]',
+    result_count     INTEGER NOT NULL DEFAULT 0,
+    hit_count        INTEGER NOT NULL DEFAULT 0,
+    fetched_at       TEXT NOT NULL,
+    expires_at       TEXT,
+    updated_at       TEXT NOT NULL,
+    PRIMARY KEY(city, query_type, normalized_query)
+);
+
+-- Resolver 留痕（方案 §21）：每次"复用了谁 / 并了谁 / 丢了谁 / 为什么没查 Provider"
+-- 都要能回答。不写它，管理端就只能看到结果、看不到判断过程。
+CREATE TABLE IF NOT EXISTS place_resolver_traces (
+    trace_id           TEXT PRIMARY KEY,
+    run_id             TEXT,
+    session_id         TEXT,
+    city               TEXT,
+    operation          TEXT NOT NULL,
+    action             TEXT NOT NULL,
+    query              TEXT,
+    canonical_place_id TEXT,
+    parent_place_id    TEXT,
+    relation_type      TEXT,
+    confidence         REAL,
+    reason             TEXT,
+    signals_json       TEXT NOT NULL DEFAULT '{}',
+    created_at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_place_resolver_traces_run
+    ON place_resolver_traces(run_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_place_resolver_traces_city
+    ON place_resolver_traces(city, created_at);
+
 -- Provider 调用账本（观测用）。
 -- 与 sources 的分工：sources 是"这次 run 用了什么证据"；provider_calls 是"谁在什么时候
 -- 调了哪个数据源、成不成、多快" —— 后者要能记录还没有 run 的 Discovery 调用。
@@ -469,9 +629,22 @@ CREATE TABLE IF NOT EXISTS runtime_config (
 """
 
 
+#: canonical 实体层各表**后加的列**：`ALTER TABLE ADD COLUMN` 用的 DDL。
+#: 空元组的表表示当前没有待补的列 —— 新增列时一律在这里登记，不要只改 SCHEMA 里的
+#: CREATE TABLE：那份 DDL 对已存在的表不生效（见 `_migrate_canonical_layer`）。
+_CANONICAL_LAYER_COLUMNS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    ("canonical_places", (("opening_hours", "TEXT"),)),
+    ("place_provider_refs", (("city", "TEXT NOT NULL DEFAULT ''"), ("provider_type", "TEXT"))),
+    ("place_relations", (("city", "TEXT NOT NULL DEFAULT ''"),)),
+    ("place_aliases", ()),
+    ("place_evidence_links", ()),
+    ("poi_query_cache", ()),
+    ("place_resolver_traces", ()),
+)
+
+
 class TravelPlanStore:
     """按 run 归档业务证据的封装（SQLite 默认，PostgreSQL/Neon 可选）。
-
     后端选择（见 ``app/db.resolve_backend``）：
       - 显式传入 ``db_path`` → **一律 SQLite**（测试/Benchmark 传临时库，绝不会写到线上）；
       - 未传 ``db_path`` 且环境变量 ``DATABASE_URL`` 非空 → Postgres（Neon）；
@@ -563,11 +736,32 @@ class TravelPlanStore:
         """建表（幂等）。构造函数里就调用，调用方不必记得先 migrate。"""
         with self._connect() as conn:
             self._migrate_places_scope(conn)
+            # 补列必须在 `executescript(SCHEMA)` **之前**：那份脚本里有
+            # `CREATE INDEX IF NOT EXISTS ... ON canonical_places(parent_place_id)`，
+            # 老表缺这一列时索引语句会先炸掉，迁移根本没机会跑。
+            self._migrate_canonical_layer(conn)
             # 同一份 SCHEMA 字符串给两种方言用：DDL 只用两边都支持的子集
             # （IF NOT EXISTS / 复合主键 / 复合外键 / 普通类型），方言细节由 backend 翻译。
             conn.executescript(self._backend.schema_ddl(SCHEMA))
             self._migrate_run_source(conn)
             self._migrate_session_prefetch(conn)
+
+    def _migrate_canonical_layer(self, conn: Any) -> None:
+        """给 canonical 实体层的表补齐后加的列。
+
+        为什么需要：`CREATE TABLE IF NOT EXISTS` 对**已存在**的表什么都不做，而这张表是
+        先上线的代码建出来的、`opening_hours` 是后加的 —— 老库拿到的是没有这一列的版本，
+        写入时直接 `UndefinedColumn`。线上已经真实发生过一次（重启后预热全城 0 候选）。
+        空列表表示"这张表当前没有待补的列"，留着是为了让新增列时有个明确的落点。
+        """
+
+        for table, columns in _CANONICAL_LAYER_COLUMNS:
+            existing = self._backend.table_columns(conn, table)
+            if not existing:
+                continue  # 表还不存在：交给 SCHEMA 里的 CREATE TABLE
+            for column, ddl in columns:
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def _migrate_run_source(self, conn: Any) -> None:
         """给 `runs` 补 `source` / `source_session_id`（`CREATE TABLE IF NOT EXISTS` 不会改老表）。
@@ -1156,6 +1350,446 @@ class TravelPlanStore:
                     f"DELETE FROM {table} WHERE city=? AND {column} < ?", (city, threshold)
                 )
                 removed += int(cursor.rowcount or 0)
+        return removed
+
+    # ------------------------------------------------------------------
+    # canonical place 实体层
+    # ------------------------------------------------------------------
+
+    def upsert_canonical_places(self, rows: Iterable[dict[str, Any]]) -> int:
+        """写入 Canonical Place 实体；旧写入不覆盖较新的。
+
+        `created_at` 只在首次插入时写，后续更新不动它 —— 否则"这个实体是什么时候
+        第一次被认识的"会随每次刷新往前漂。
+        """
+
+        timestamp = utcnow().isoformat()
+        values = [
+            (
+                str(row["canonical_place_id"]),
+                str(row.get("canonical_name") or ""),
+                str(row.get("normalized_name") or ""),
+                str(row.get("city") or ""),
+                row.get("district"), row.get("business_area"),
+                row.get("lng"), row.get("lat"), row.get("address"),
+                row.get("opening_hours"),
+                str(row.get("category") or "other"),
+                str(row.get("kind") or "place"),
+                row.get("parent_place_id"),
+                float(row.get("confidence") or 0.0),
+                int(row.get("evidence_count") or 0),
+                row.get("created_at") or timestamp,
+                row.get("updated_at") or timestamp,
+            )
+            for row in rows if row.get("canonical_place_id")
+        ]
+        if not values:
+            return 0
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO canonical_places"
+                " (canonical_place_id, canonical_name, normalized_name, city, district,"
+                "  business_area, lng, lat, address, opening_hours, category, kind, parent_place_id,"
+                "  confidence, evidence_count, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(canonical_place_id) DO UPDATE SET"
+                " canonical_name=excluded.canonical_name, normalized_name=excluded.normalized_name,"
+                " city=excluded.city, district=excluded.district, business_area=excluded.business_area,"
+                " lng=excluded.lng, lat=excluded.lat, address=excluded.address,"
+                " opening_hours=excluded.opening_hours,"
+                " category=excluded.category, kind=excluded.kind, parent_place_id=excluded.parent_place_id,"
+                " confidence=excluded.confidence, evidence_count=excluded.evidence_count,"
+                " updated_at=excluded.updated_at"
+                " WHERE excluded.updated_at >= canonical_places.updated_at",
+                values,
+            )
+        return len(values)
+
+    def get_canonical_places(
+        self, city: str, *, canonical_ids: Sequence[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """按城市读取实体（可选只取指定的几个 id）。"""
+
+        sql = "SELECT * FROM canonical_places WHERE city=?"
+        params: list[Any] = [city]
+        if canonical_ids is not None:
+            ids = [str(item) for item in canonical_ids if str(item)]
+            if not ids:
+                return []
+            sql += f" AND canonical_place_id IN ({','.join('?' * len(ids))})"
+            params.extend(ids)
+        with self._connect() as conn:
+            rows = conn.execute(sql + " ORDER BY canonical_name", params).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_canonical_places(self, city: str | None = None) -> int:
+        """实体总数（管理端只用它报"这座城市的实体底座建了多少"）。"""
+
+        with self._connect() as conn:
+            if city:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n FROM canonical_places WHERE city=?", (city,)
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT COUNT(*) AS n FROM canonical_places").fetchone()
+        return int(row["n"] if row is not None else 0)
+
+    def upsert_place_aliases(self, rows: Iterable[dict[str, Any]]) -> int:
+        """写入别名索引。
+
+        冲突时**不改 canonical_place_id**：主键 (city, normalized_alias) 的语义是
+        "这个别名属于谁"，让后来者顶掉它等于允许一次错误的写入改写已有身份。
+        只更新置信度与来源，身份冲突由 Entity Resolver 在写入前解决（它能看到两边）。
+        """
+
+        timestamp = utcnow().isoformat()
+        values = [
+            (
+                str(row.get("city") or ""),
+                str(row["normalized_alias"]),
+                str(row.get("alias") or ""),
+                str(row["canonical_place_id"]),
+                str(row.get("source") or "derived"),
+                row.get("confidence"),
+                row.get("updated_at") or timestamp,
+            )
+            for row in rows
+            if row.get("normalized_alias") and row.get("canonical_place_id")
+        ]
+        if not values:
+            return 0
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO place_aliases"
+                " (city, normalized_alias, alias, canonical_place_id, source, confidence, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(city, normalized_alias) DO UPDATE SET"
+                " alias=excluded.alias, source=excluded.source, confidence=excluded.confidence,"
+                " updated_at=excluded.updated_at"
+                " WHERE excluded.updated_at >= place_aliases.updated_at"
+                "   AND place_aliases.canonical_place_id = excluded.canonical_place_id",
+                values,
+            )
+        return len(values)
+
+    def get_place_aliases(
+        self, city: str, *, normalized_aliases: Sequence[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """按城市读取别名（可选只取指定的几个归一化别名）。"""
+
+        sql = "SELECT * FROM place_aliases WHERE city=?"
+        params: list[Any] = [city]
+        if normalized_aliases is not None:
+            keys = [str(item) for item in normalized_aliases if str(item)]
+            if not keys:
+                return []
+            sql += f" AND normalized_alias IN ({','.join('?' * len(keys))})"
+            params.extend(keys)
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_place_provider_refs(self, rows: Iterable[dict[str, Any]]) -> int:
+        """写入 Provider 引用（高德 poi_id → canonical 实体）。"""
+
+        timestamp = utcnow().isoformat()
+        values = [
+            (
+                str(row.get("provider") or ""),
+                str(row["provider_place_id"]),
+                str(row["canonical_place_id"]),
+                str(row.get("city") or ""),
+                row.get("provider_name"), row.get("provider_type"),
+                row.get("lng"), row.get("lat"),
+                row.get("address"), row.get("district"), row.get("business_area"),
+                row.get("opening_hours"), row.get("fetched_at"),
+                row.get("updated_at") or timestamp,
+            )
+            for row in rows
+            if row.get("provider_place_id") and row.get("canonical_place_id")
+        ]
+        if not values:
+            return 0
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO place_provider_refs"
+                " (provider, provider_place_id, canonical_place_id, city, provider_name, provider_type,"
+                "  lng, lat, address, district, business_area, opening_hours, fetched_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(provider, provider_place_id) DO UPDATE SET"
+                " canonical_place_id=excluded.canonical_place_id, city=excluded.city,"
+                " provider_name=excluded.provider_name, provider_type=excluded.provider_type,"
+                " lng=excluded.lng, lat=excluded.lat,"
+                " address=excluded.address, district=excluded.district,"
+                " business_area=excluded.business_area, opening_hours=excluded.opening_hours,"
+                " fetched_at=excluded.fetched_at, updated_at=excluded.updated_at"
+                " WHERE excluded.updated_at >= place_provider_refs.updated_at",
+                values,
+            )
+        return len(values)
+
+    def get_place_provider_refs(
+        self,
+        city: str | None = None,
+        *,
+        keys: Sequence[tuple[str, str]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """按 (provider, provider_place_id) 或按城市读取 Provider 引用。
+
+        `keys` 的用法是"这批高德 POI 我以前见过吗"：一次查完，别在循环里逐条查。
+        """
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if city:
+            clauses.append("city=?")
+            params.append(city)
+        if keys is not None:
+            pairs = [(str(p), str(i)) for p, i in keys if p and i]
+            if not pairs:
+                return []
+            clauses.append(
+                "(" + " OR ".join("(provider=? AND provider_place_id=?)" for _ in pairs) + ")"
+            )
+            for provider, provider_id in pairs:
+                params.extend([provider, provider_id])
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM place_provider_refs" + where
+                # 顺序必须稳定：调用方按顺序决定"哪条引用是主引用"，而它决定复用回来的
+                # 候选带哪个 Provider ID。不排序时同一个实体两次会话可能带不同的 ID。
+                + " ORDER BY provider, provider_place_id",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_place_evidence_links(self, rows: Iterable[dict[str, Any]]) -> int:
+        """把攻略证据挂到 canonical 实体上。"""
+
+        timestamp = utcnow().isoformat()
+        values = [
+            (
+                str(row["canonical_place_id"]),
+                str(row.get("city") or ""),
+                str(row["evidence_key"]),
+                str(row.get("mention_text") or ""),
+                row.get("confidence"),
+                row.get("updated_at") or timestamp,
+            )
+            for row in rows
+            if row.get("canonical_place_id") and row.get("evidence_key")
+        ]
+        if not values:
+            return 0
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO place_evidence_links"
+                " (canonical_place_id, city, evidence_key, mention_text, confidence, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(canonical_place_id, evidence_key, mention_text) DO UPDATE SET"
+                " confidence=excluded.confidence, updated_at=excluded.updated_at"
+                " WHERE excluded.updated_at >= place_evidence_links.updated_at",
+                values,
+            )
+        return len(values)
+
+    def get_place_evidence_links(self, city: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM place_evidence_links WHERE city=?", (city,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_place_relations(self, rows: Iterable[dict[str, Any]]) -> int:
+        """写入主点 / 子点关系。"""
+
+        timestamp = utcnow().isoformat()
+        values = [
+            (
+                str(row["parent_place_id"]),
+                str(row["child_place_id"]),
+                str(row.get("relation_type") or "child"),
+                str(row.get("city") or ""),
+                row.get("confidence"),
+                row.get("updated_at") or timestamp,
+            )
+            for row in rows
+            if row.get("parent_place_id") and row.get("child_place_id")
+            and str(row.get("parent_place_id")) != str(row.get("child_place_id"))
+        ]
+        if not values:
+            return 0
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO place_relations"
+                " (parent_place_id, child_place_id, relation_type, city, confidence, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(parent_place_id, child_place_id, relation_type) DO UPDATE SET"
+                " city=excluded.city, confidence=excluded.confidence, updated_at=excluded.updated_at"
+                " WHERE excluded.updated_at >= place_relations.updated_at",
+                values,
+            )
+        return len(values)
+
+    def get_place_relations(self, city: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM place_relations WHERE city=?", (city,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_poi_query_cache(self, city: str, rows: Iterable[dict[str, Any]]) -> int:
+        """写入跨会话查询缓存。
+
+        `hit_count` 用**累加**而不是覆盖：它是"这条缓存被复用了几次"的计数器，
+        与 `matched_place_ids` 这类会被最新一次刷新改写的结果字段语义不同。
+        """
+
+        timestamp = utcnow().isoformat()
+        values = [
+            (
+                city,
+                str(row.get("query_type") or "search_poi"),
+                str(row["normalized_query"]),
+                row.get("provider"),
+                _json(list(row.get("matched_place_ids") or [])),
+                _json(list(row.get("provider_result_ids") or [])),
+                int(row.get("result_count") or 0),
+                int(row.get("hit_count") or 0),
+                row.get("fetched_at") or timestamp,
+                row.get("expires_at"),
+                row.get("updated_at") or timestamp,
+            )
+            for row in rows if row.get("normalized_query")
+        ]
+        if not values:
+            return 0
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO poi_query_cache"
+                " (city, query_type, normalized_query, provider, matched_place_ids_json,"
+                "  provider_result_ids_json, result_count, hit_count, fetched_at, expires_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(city, query_type, normalized_query) DO UPDATE SET"
+                " provider=excluded.provider,"
+                " matched_place_ids_json=excluded.matched_place_ids_json,"
+                " provider_result_ids_json=excluded.provider_result_ids_json,"
+                " result_count=excluded.result_count,"
+                " hit_count=poi_query_cache.hit_count + excluded.hit_count,"
+                " fetched_at=excluded.fetched_at, expires_at=excluded.expires_at,"
+                " updated_at=excluded.updated_at",
+                values,
+            )
+        return len(values)
+
+    def get_poi_query_cache_rows(self, city: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM poi_query_cache WHERE city=? ORDER BY normalized_query", (city,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_poi_query_cache(
+        self, city: str, *, query_type: str, normalized_query: str
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM poi_query_cache WHERE city=? AND query_type=? AND normalized_query=?",
+                (city, query_type, normalized_query),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def save_place_resolver_traces(self, rows: Iterable[dict[str, Any]]) -> int:
+        """写入 Resolver 留痕（谁被复用 / 并进谁 / 为什么没查 Provider）。"""
+
+        timestamp = utcnow().isoformat()
+        values = [
+            (
+                str(row["trace_id"]),
+                row.get("run_id"), row.get("session_id"), row.get("city"),
+                str(row.get("operation") or "resolve"),
+                str(row.get("action") or "unknown"),
+                row.get("query"), row.get("canonical_place_id"),
+                row.get("parent_place_id"), row.get("relation_type"),
+                row.get("confidence"), row.get("reason"),
+                _json(dict(row.get("signals") or {})),
+                row.get("created_at") or timestamp,
+            )
+            for row in rows if row.get("trace_id")
+        ]
+        if not values:
+            return 0
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO place_resolver_traces"
+                " (trace_id, run_id, session_id, city, operation, action, query, canonical_place_id,"
+                "  parent_place_id, relation_type, confidence, reason, signals_json, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                values,
+            )
+        return len(values)
+
+    def list_place_resolver_traces(
+        self,
+        *,
+        run_id: str | None = None,
+        session_id: str | None = None,
+        city: str | None = None,
+        action: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if run_id:
+            clauses.append("run_id=?")
+            params.append(run_id)
+        if session_id:
+            clauses.append("session_id=?")
+            params.append(session_id)
+        if city:
+            clauses.append("city=?")
+            params.append(city)
+        if action:
+            clauses.append("action=?")
+            params.append(action)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM place_resolver_traces" + where + " ORDER BY created_at DESC LIMIT ?",
+                [*params, max(1, min(int(limit), 1000))],
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def purge_city_cache(self, city: str, *, include_canonical: bool = True) -> dict[str, int]:
+        """**整城删除**城市缓存（不是按 TTL 清过期行）。
+
+        与 `prune_city_cache` 的分工：后者只删各自 TTL 之外的行，清不掉"还新鲜但内容是
+        错的"那些 —— 而错数据不会因为时间过去而变对（去重键是 (city, place_id)，一次新的
+        预热只会再加一批子设施、顶不掉旧的）。重建那条路必须先整体清空，见
+        `scripts/rebuild_city_cache.py`。
+
+        `include_canonical=True` 时连 canonical 实体层一起清：实体层的输入就是这批脏 POI，
+        留着它等于让重建读回旧身份，重建出来的还是同一份东西。
+        **run 级 `places` / `place_evidence` 一律不动** —— 那是历史 run 的证据链。
+        """
+
+        removed: dict[str, int] = {}
+        with self._connect() as conn:
+            for table in ("city_pois", "city_poi_mentions", "city_evidences", "city_cache_meta"):
+                cursor = conn.execute(f"DELETE FROM {table} WHERE city=?", (city,))
+                removed[table] = int(cursor.rowcount or 0)
+            if include_canonical:
+                for table in (
+                    "canonical_places",
+                    "place_aliases",
+                    "place_provider_refs",
+                    "place_evidence_links",
+                    "place_relations",
+                    "poi_query_cache",
+                ):
+                    cursor = conn.execute(f"DELETE FROM {table} WHERE city=?", (city,))
+                    removed[table] = int(cursor.rowcount or 0)
         return removed
 
     # ------------------------------------------------------------------

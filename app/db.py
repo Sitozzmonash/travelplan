@@ -105,6 +105,7 @@ INSERT_OR_REPLACE_PK: dict[str, tuple[str, ...]] = {
     "planning_sessions": ("session_id",),
     "provider_calls": ("call_id",),
     "runtime_config": ("key",),
+    "place_resolver_traces": ("trace_id",),
 }
 
 _INSERT_OR_RE = re.compile(

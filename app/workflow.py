@@ -2444,6 +2444,9 @@ def node_extract_places(state: TravelState) -> dict:
     if not reused_extraction:
         extracted, extract_degradations = discovery.extract_places_from_evidences(llm, llm_targets)
         degradations.extend(extract_degradations)
+        # A5：抽出的地名写回证据（`city_poi_mentions` 按 place_mentions 建行）。不写回的话
+        # 城市缓存里那张表永远是空的，攻略↔地点的索引也就永远建不起来。
+        discovery.apply_extracted_mentions(state.get("evidences", []), extracted)
 
     if reused_extraction:
         _ledger(state).mark("extract_places", MARK_PREFETCH_REUSED, "地点抽取复用 Discovery 结论（未重复调用模型）")
@@ -2515,7 +2518,6 @@ def node_extract_places(state: TravelState) -> dict:
     # --- 2) 高德 POI 搜索（受控并发，Part A）---
     keywords = _keyword_candidates(intent, state.get("queries") or _fallback_queries(intent))
     places: list[Place] = []
-    seen_ids: set[str] = set()
     poi_status = "OK"
 
     # 关键词表：攻略里提到的地名 / 模型抽出的地名 / 兜底关键词。
@@ -2539,26 +2541,44 @@ def node_extract_places(state: TravelState) -> dict:
         cleaned = coerce_str(term).strip()
         if cleaned and cleaned not in search_terms:
             search_terms.append(cleaned)
-    searched = len(search_terms)
+
+    # A3 / A4：正式 run 这条路径同样必须先过实体层 —— 别名或查询缓存命中的词一次高德都不打，
+    # 拿到的高德结果也一律经过地理围栏 / 子设施收敛 / 连锁分店保护，而不是"全收 + 按 id 去重"。
+    resolver = discovery.open_resolver(
+        store=store, destination=destination, run_id=run_id
+    )
+    to_search, reuse_hits = resolver.plan_queries(search_terms)
+    reused_places: list[Place] = [place for hit in reuse_hits for place in hit.places]
+    if reuse_hits:
+        steps_note = (
+            f"{len(reuse_hits)} 个检索词命中已有实体 / 查询缓存，未重复调用高德："
+            + "、".join(hit.term for hit in reuse_hits[:5])
+        )
+    else:
+        steps_note = ""
+    searched = len(to_search)
 
     def search_one(term: str) -> Any:
         return hub.search_poi(term, destination, page_size=cfg.poi_page_size, type_hint="attraction")
 
     results = _run_parallel(
-        [(term, (lambda term=term: search_one(term))) for term in search_terms],
+        [(term, (lambda term=term: search_one(term))) for term in to_search],
         limit=cfg.provider_max_concurrency,
         thread_prefix="tp-poi",
     )
-    # 去重必须按**任务定义顺序**做，不能用完成顺序：同一份攻略在两路并发下
-    # 先返回哪个是不确定的，按完成顺序去重会让 first-wins 的字段在不同 run 里抖动。
-    for term in search_terms:
-        result = results[term]
-        for place in result.items:
-            if place.place_id in seen_ids:
-                continue
-            seen_ids.add(place.place_id)
-            places.append(place)
     poi_status = _first_bad_status(results)
+    resolution = discovery.resolve_pois(
+        resolver=resolver, results=results, terms=to_search, extra_places=reused_places
+    )
+    places = list(resolution.places)
+    degradations.extend(resolution.degradations)
+    # 落库：不 flush 的话这次解析只活在内存里 —— 跨会话复用与 Resolver 留痕都无从发生
+    # （正式 run 的这条路径与 Discovery 那条共用同一份实体层，两边都必须落）。
+    resolver_summary = resolver.flush()
+    if resolution.notes:
+        steps_notes = list(resolution.notes)
+    else:
+        steps_notes = []
 
     if not places and destination:
         # 高德确实没返回任何 POI：如实降级，不用模型编地点。
@@ -2567,8 +2587,23 @@ def node_extract_places(state: TravelState) -> dict:
             "没有用模型生成的地点填补"
         )
 
-    # --- 3) 去重（PRD §20）---
-    deduped, dedupe_decisions = planner.dedupe_places(places)
+    # --- 3) 去重 ---
+    # 收敛已经由实体层（`places.resolve_pois`）做完了：它比 `planner.dedupe_places` 多管
+    # 子设施收敛、连锁分店保护与跨会话复用，**再跑一遍 run 内去重只会把它刻意拆开的分店
+    # 重新合并**。所以这里只把实体层的判断翻译成 run 的决策链，不再二次去重。
+    deduped = places
+    dedupe_decisions = [
+        Decision(
+            entity_id=str(entry.get("canonical_place_id") or ""),
+            status=DecisionStatus.KEEP,
+            agent_or_stage="place_resolver",
+            reason_codes=["folded_facility", str(entry.get("relation_type") or "child")],
+            reason_text=str(entry.get("reason") or "子设施并入母体"),
+            scores={"confidence": entry.get("confidence")},
+        )
+        for entry in (resolution.traces or [])
+        if str(entry.get("action")) == "folded"
+    ]
     decisions.extend(dedupe_decisions)
 
     # --- 4) 持久化 + 建证据链 ---
@@ -2583,17 +2618,29 @@ def node_extract_places(state: TravelState) -> dict:
     with_evidence = sum(1 for place in deduped if linked.get(place.place_id))
     steps = [
         f"高德 POI 查询 {searched} 次（攻略抽取 {len(extracted)} 个地名 + 关键词 {len(keywords)} 个）",
-        f"POI 原始候选 {len(places)} 个 → 去重后 {len(deduped)} 个",
+        f"POI 候选 {len(places)} 个（实体层已收敛：合并重复、折叠子设施、剔除越界）",
         f"其中 {with_evidence} 个有攻略证据支撑，{len(deduped) - with_evidence} 个只有高德 POI 信息",
         extraction_note,
+        # 实体层这次做了什么：回答"为什么没重新查高德"，也是判断复用是否真的生效的唯一依据。
+        "地点实体层：Provider 引用复用 {refs} 个，合并 {merged} 个，新建实体 {created} 个，"
+        "查询缓存命中 {hits} 个词，落库 {persisted}".format(
+            refs=int(getattr(resolution.outcome, "reused_refs", 0) or 0),
+            merged=int(getattr(resolution.outcome, "merged", 0) or 0),
+            created=int(getattr(resolution.outcome, "created", 0) or 0),
+            hits=len(reuse_hits),
+            persisted="成功" if resolver_summary.get("persisted") else "跳过（只读实例）",
+        ),
     ]
+    if steps_note:
+        steps.append(steps_note)
+    steps.extend(steps_notes)
     for item in extracted[:6]:
         steps.append(
             f"攻略抽取：{coerce_str(item.get('name'))}"
             f"（{coerce_str(item.get('category')) or '未分类'}，{coerce_str(item.get('tone')) or 'neutral'}，来自 {item.get('evidence_id')}）"
         )
 
-    summary = f"{len(places)} 个 POI 候选 → 去重后 {len(deduped)} 个，其中 {with_evidence} 个有攻略证据"
+    summary = f"{len(places)} 个 POI 候选（实体层已收敛），其中 {with_evidence} 个有攻略证据"
     return {
         "places": deduped,
         "decisions": decisions,
@@ -5069,6 +5116,15 @@ def _emit_run_spans(state: TravelState, *, llm: Any) -> None:
                 "duration_ms": entry.get("duration_ms"),
                 "chars": entry.get("chars"),
                 "error": entry.get("error"),
+                # A12 / A13：每次调用的 token 用量与**脱敏 + 截断**的 prompt / 输出预览，
+                # 整条目透传而不是逐字段点名 —— `LLMResult.to_audit()` 以后再加字段
+                # （例如 cached_tokens）不必回来改这里，也不需要两处名字保持一致。
+                # 预览在 `app/llm.py` 里就已经脱敏，这里不做二次处理。
+                **{
+                    key: value
+                    for key, value in entry.items()
+                    if key not in {"tag", "model", "status", "duration_ms", "chars", "error"}
+                },
             },
             parent_span_id=parent_for(_llm_stage_for(tag)),
             error=entry.get("error"),

@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from app.store import TravelPlanStore
 from app.workflow import execute_travel_run
-from tests.fakes import QUERY, FakeHub, FakeJev, FakeLLM
+from tests.fakes import QUERY, FakeHub, FakeJev, FakeLLM, make_store
 
 RUN_ID = "tp-admin-fixture"
 TOKEN = "admin-test-token"
@@ -143,6 +143,231 @@ class TestRuns:
 
     def test_detail_404(self, client):
         assert client.get("/api/v1/admin/runs/tp-nope", headers=AUTH).status_code == 404
+
+
+@pytest.fixture()
+def llm_detail_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    """一个只有 llm span 的最小库：验证 Run Detail 里"模型收到了什么"的形状。"""
+
+    from app import api as api_module
+
+    store = make_store(tmp_path / "llm-detail.db")
+    store.create_run("tp-llm", original_query="北京→成都")
+    store.finish_run("tp-llm", "completed")
+    store.save_run_metrics(
+        "tp-llm", {"duration_ms": 4000, "input_tokens": 12, "output_tokens": 34, "total_tokens": 46}
+    )
+    store.update_stage(
+        "tp-llm", "finalize", "SUCCESS", started_at="2026-09-20T10:00:00+00:00",
+        finished_at="2026-09-20T10:00:04+00:00",
+    )
+    store.save_trace_span(
+        "tp-llm",
+        "tp-llm:llm:final_answer",
+        component="llm",
+        name="final_answer",
+        status="SUCCESS",
+        started_at="2026-09-20T10:00:00+00:00",
+        finished_at="2026-09-20T10:00:01+00:00",
+        attributes={"tag": "final_answer", "model": "fake", "status": "OK", "duration_ms": 1000, "chars": 5},
+    )
+    store.save_trace_span(
+        "tp-llm",
+        "tp-llm:llm:critic",
+        component="llm",
+        name="critic",
+        status="SUCCESS",
+        started_at="2026-09-20T10:00:02+00:00",
+        finished_at="2026-09-20T10:00:04+00:00",
+        attributes={
+            "tag": "critic",
+            "model": "kimi",
+            "status": "OK",
+            "duration_ms": 2000,
+            "chars": 9,
+            "system_preview": "SYS",
+            "user_preview": "USER",
+            "assistant_preview": "模型输出",
+            "prompt_version": "deadbee",
+            "prompt_hash": "h1234567890",
+            "input_tokens": 12,
+            "output_tokens": 34,
+            "cached_tokens": 7,
+            "total_tokens": 46,
+        },
+    )
+    monkeypatch.setenv("TRAVELPLAN_ADMIN_TOKEN", TOKEN)
+    monkeypatch.setattr(api_module, "get_store", lambda: store)
+    monkeypatch.setattr(api_module, "_output_dir", lambda: tmp_path / "outputs")
+    return TestClient(api_module.api)
+
+
+class TestRunDetailLlmCalls:
+    """Run Detail 的 LLM 调用列表要能同时喂 Workflow View 与 Conversation View。"""
+
+    def test_calls_expose_previews_tokens_and_prompt_identity(self, llm_detail_client):
+        body = llm_detail_client.get("/api/v1/admin/runs/tp-llm", headers=AUTH).json()
+        calls = {call["tag"]: call for call in body["llm_calls"]}
+
+        legacy = calls["final_answer"]
+        # 老 run 的 span 没有这些字段：回 None，不回 0 / 空串（否则页面会把"没记"画成"没有"）。
+        assert legacy["input_tokens"] is None and legacy["total_tokens"] is None
+        assert legacy["system_preview"] is None and legacy["prompt_version"] is None
+        assert legacy["finished_at"] == "2026-09-20T10:00:01+00:00"
+
+        rich = calls["critic"]
+        assert (rich["system_preview"], rich["user_preview"], rich["assistant_preview"]) == (
+            "SYS", "USER", "模型输出",
+        )
+        assert rich["context_preview"] is None
+        assert (rich["input_tokens"], rich["output_tokens"], rich["cached_tokens"], rich["total_tokens"]) == (
+            12, 34, 7, 46,
+        )
+        assert rich["prompt_version"] == "deadbee"
+        assert rich["prompt_hash"] == "h1234567890"
+        assert rich["finished_at"] == "2026-09-20T10:00:04+00:00"
+
+    def test_stage_token_note_no_longer_claims_usage_is_run_level_only(self, llm_detail_client):
+        body = llm_detail_client.get("/api/v1/admin/runs/tp-llm", headers=AUTH).json()
+        stage = next(row for row in body["stages"] if row["stage_id"] == "finalize")
+
+        # run 级合计仍然来自 run_metrics（口径没变）……
+        assert stage["tokens"]["total_tokens"] == 46
+        # ……但说明必须改成事实：逐次用量在 llm_calls 里是有的。
+        assert "整次 run 的合计" in stage["tokens"]["note"]
+        assert "Provider 不按阶段回报用量" not in stage["tokens"]["note"]
+
+    def test_overview_keeps_the_cumulative_token_counter(self, llm_detail_client):
+        body = llm_detail_client.get("/api/v1/admin/overview", headers=AUTH).json()
+        assert body["total_tokens"] == 46
+        assert body["total_tokens_runs"] == 1
+        # 显式关掉时不再计算：这个字段是 opt-in 的（默认开，保证既有契约不破）。
+        assert "total_tokens" not in llm_detail_client.get(
+            "/api/v1/admin/overview", params={"include_tokens": "false"}, headers=AUTH
+        ).json()
+
+
+@pytest.fixture()
+def dashboard_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """计数版的库替身：验证 Dashboard 的第二次请求真的没再打一遍聚合。"""
+
+    from app import admin_analytics
+    from app import api as api_module
+
+    store = make_store(tmp_path / "dashboard.db")
+    for index, tokens in enumerate((100, 300, None)):
+        run_id = f"tp-dash-{index}"
+        store.create_run(run_id, original_query="北京→成都")
+        store.finish_run(run_id, "completed")
+        metrics = {"duration_ms": 1000 + index}
+        if tokens is not None:
+            metrics["total_tokens"] = tokens
+        store.save_run_metrics(run_id, metrics)
+
+    counts = {"list_runs": 0}
+
+    class _CountingStore:
+        """只统计 list_runs：Dashboard 的往返大头就是它（翻页扫窗口）。"""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            value = getattr(self._inner, name)
+            if name != "list_runs":
+                return value
+
+            def counted(*args, **kwargs):
+                counts["list_runs"] += 1
+                return value(*args, **kwargs)
+
+            return counted
+
+    monkeypatch.setenv("TRAVELPLAN_ADMIN_TOKEN", TOKEN)
+    monkeypatch.setattr(api_module, "get_store", lambda: _CountingStore(store))
+    # 每个用例一份全新的缓存，避免与其它用例共享状态。
+    monkeypatch.setattr(admin_analytics, "_DASHBOARDS", admin_analytics._DashboardCache(ttl_seconds=45.0))
+    return TestClient(api_module.api), counts
+
+
+class TestDashboardTokens:
+    def test_avg_tokens_per_run_only_counts_runs_with_a_snapshot(self, dashboard_client):
+        client, _ = dashboard_client
+        body = client.get("/api/v1/admin/dashboard", headers=AUTH).json()
+
+        kpi = next(item for item in body["kpis"] if item["key"] == "avg_tokens_per_run")
+        assert kpi["label"] == "平均每个规划的 token"
+        assert kpi["unit"] == "count"
+        # (100 + 300) / 2：没有快照的那条既不进分子也不进分母，更不当成 0。
+        assert kpi["value"] == 200
+        assert kpi["higher_is_better"] is False
+        assert kpi["hint"] == "2 个运行有 token 快照"
+        # 两个窗口指标挨在一起（都是"每个 run"口径）。
+        keys = [item["key"] for item in body["kpis"]]
+        assert keys.index("avg_tokens_per_run") == keys.index("avg_cost") + 1
+
+        assert body["tokens"] == {
+            "avg_per_run": 200,
+            "previous_avg_per_run": None,
+            "known_runs": 2,
+            "window_total": 400,
+        }
+
+    def test_without_snapshots_the_kpi_is_none_not_zero(self, tmp_path, monkeypatch):
+        from app import admin_analytics
+        from app import api as api_module
+
+        store = make_store(tmp_path / "empty.db")
+        store.create_run("tp-empty", original_query="北京→成都")
+        store.finish_run("tp-empty", "completed")
+        store.save_run_metrics("tp-empty", {"duration_ms": 10})
+
+        monkeypatch.setenv("TRAVELPLAN_ADMIN_TOKEN", TOKEN)
+        monkeypatch.setattr(api_module, "get_store", lambda: store)
+        monkeypatch.setattr(admin_analytics, "_DASHBOARDS", admin_analytics._DashboardCache(ttl_seconds=45.0))
+
+        body = TestClient(api_module.api).get("/api/v1/admin/dashboard", headers=AUTH).json()
+        kpi = next(item for item in body["kpis"] if item["key"] == "avg_tokens_per_run")
+        assert kpi["value"] is None
+        assert "没有带 token 快照" in kpi["hint"]
+        assert body["tokens"]["window_total"] is None
+        assert body["tokens"]["known_runs"] == 0
+
+
+class TestDashboardCache:
+    def test_second_request_is_served_from_cache_and_says_so(self, dashboard_client):
+        client, counts = dashboard_client
+
+        first = client.get("/api/v1/admin/dashboard", headers=AUTH).json()
+        assert first["cache"]["hit"] is False
+        assert first["cache"]["computed_at"] == first["generated_at"]
+        calls_after_first = counts["list_runs"]
+        assert calls_after_first >= 1
+
+        second = client.get("/api/v1/admin/dashboard", headers=AUTH).json()
+        assert second["cache"]["hit"] is True
+        assert counts["list_runs"] == calls_after_first, "缓存没有生效，又打了一遍库"
+        # 命中缓存必须自证：哪一刻算的、最多滞后多久。
+        assert second["cache"]["computed_at"] == first["cache"]["computed_at"]
+        assert second["cache"]["ttl_seconds"] == 45.0
+        assert any("缓存结果" in note for note in second["notes"])
+        # 业务数字仍然是同一份，不是重新算出一个不同的值。
+        assert second["kpis"] == first["kpis"]
+
+    def test_expired_cache_recomputes(self, dashboard_client, monkeypatch):
+        from app import admin_analytics
+
+        client, counts = dashboard_client
+        # 负 TTL = 永远过期：走的是与自然过期完全相同的那条分支，又不依赖时钟精度
+        # （Windows 上 time.monotonic 的粒度约 15ms，TTL=0 可能"还没过期"）。
+        monkeypatch.setattr(admin_analytics, "_DASHBOARDS", admin_analytics._DashboardCache(ttl_seconds=-1.0))
+
+        first = client.get("/api/v1/admin/dashboard", headers=AUTH).json()
+        calls_after_first = counts["list_runs"]
+        second = client.get("/api/v1/admin/dashboard", headers=AUTH).json()
+
+        assert first["cache"]["hit"] is False and second["cache"]["hit"] is False
+        assert counts["list_runs"] > calls_after_first
 
 
 class TestBadcases:
