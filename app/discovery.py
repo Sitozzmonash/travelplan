@@ -609,8 +609,8 @@ def resolve_pois(
     `terms` 是**真正打过 Provider 的词**（命中别名 / 查询缓存的词不该出现在这里，
     它们的候选从 `extra_places` 传进来），顺序即候选顺序。
 
-    绝不空榜：收敛后一个都不剩而原始候选非空时，退回原始候选并如实记降级 ——
-    候选里混着子设施也比让用户面对空列表好，但必须说清这份列表是没收敛过的。
+    收敛为空时只允许退回未被硬过滤的干净候选；全被围栏 / 非目的地 / 附属设施规则
+    拒绝时保持空集并如实说明，不能为了不空榜复活已拒绝的 POI。
     """
 
     record_order = 0
@@ -669,9 +669,7 @@ def resolve_pois(
     if outcome.merged:
         resolution.notes.append(f"实体层合并了 {outcome.merged} 条同实体的重复记录")
     if not outcome.places and raw_places:
-        # 兜底分两级，先要"仍然干净"，再退到"可能脏但至少不空"：
-        #   ① 过完围栏、且不是附属设施 / 地址桩的原始候选（保住"不给用户看停车场"这条）；
-        #   ② 实在连一个都没有，才退回真正未过滤的原始候选，并如实说明它没收敛。
+        # 兜底不能绕过硬过滤：只保留未被拒绝、且不是附属设施 / 地址桩的原始候选。
         dropped_ids = {str(item.get("place_id") or "") for item in outcome.dropped}
         clean = [
             place
@@ -683,14 +681,13 @@ def resolve_pois(
         if clean:
             resolution.places = clean
             resolution.degradations.append(
-                f"实体层没有收敛出可选地点（候选全是附属设施 / 地址桩），"
-                f"已退回 {len(clean)} 条原始候选（已剔除设施，但未经实体合并）"
+                "实体层没有收敛出可选地点，"
+                f"已退回 {len(clean)} 条原始候选（已通过硬过滤，但未经实体合并）"
             )
         else:
-            resolution.places = raw_places
             resolution.degradations.append(
-                f"实体收敛后没有剩下可选地点，已退回 {len(raw_places)} 条**未经收敛**的原始候选；"
-                "这份列表可能包含附属设施"
+                "实体收敛后没有剩下可选地点，原始候选均被硬过滤（异地 / 非目的地 / 附属设施）；"
+                "本次返回空候选，不恢复已拒绝的 POI"
             )
     return resolution
 
@@ -1108,22 +1105,38 @@ def _area_tags(categories: Mapping[str, int]) -> list[str]:
     return tags[:3]
 
 
+def aggregate_candidate_metadata(
+    intent: TripIntent,
+    evidences: Sequence[Evidence],
+    places: Sequence[Place],
+    *,
+    profile: PreferenceProfile | None = None,
+) -> dict[str, Any]:
+    """实时 / 缓存路径共用的确定性聚合，不发起 Provider 或 LLM 调用。
+
+    返回 JSON 形状的 ``profile / hotel_areas / poi_pools``；省略 profile 时明确采用
+    均衡基线。单项聚合失败只降级该项，不能丢掉其它已经可用的结果。
+    """
+
+    profile_obj = profile if profile is not None else PreferenceProfile.default_profile()
+    try:
+        hotel_areas = extract_hotel_areas(intent, evidences, places, profile=profile_obj)
+    except Exception:  # noqa: BLE001 —— 聚合失败不影响候选交接
+        hotel_areas = []
+    try:
+        poi_pools = split_poi_pools(places)
+    except Exception:  # noqa: BLE001
+        poi_pools = {key: [] for key in POOL_KEYS}
+    return {
+        "profile": profile_obj.model_dump(mode="json"),
+        "hotel_areas": hotel_areas,
+        "poi_pools": poi_pools,
+    }
+
+
 # ======================================================================
 # 组合入口
 # ======================================================================
-
-
-def _run_stage(run: Any, name: str, func: Any, args: tuple, report: Any) -> None:
-    """跑一条 Discovery 线，无论成功失败都在结束时上报一次。
-
-    为什么要单独包一层：并行线是"谁先完成谁先可用"，只有每条线结束时立刻上报，
-    用户在等待期间点「开始规划」才能拿到已经完成的那部分（否则要等全部跑完）。
-    """
-
-    try:
-        run(name, func, args)
-    finally:
-        report(name)
 
 
 def _destination(intent: TripIntent) -> str | None:
@@ -1155,10 +1168,10 @@ def prefetch(
     ledger: CallLedger | None = None,
     store: Any | None = None,
 ) -> dict[str, Any]:
-    """四条线并行取数，返回给 Planning Session 存草稿的原始结果。
+    """交通、酒店、social→places 依赖链并行，返回给 Planning Session 的原始结果。
 
-    为什么并行：用户在选交通/酒店/节奏的这几十秒里，后台应该已经在查了。
-    串行会让"Prefetch 提前开始"这件事失去意义。
+    画像只依赖 intent，独立启动；地点只等 social 结束（包括空结果或失败），
+    不等待交通、酒店或画像。已完成阶段按最新累积快照串行发布，供中途开始规划复用。
 
     单条线失败不影响其它线（`TransportCandidates` 等各自带 degradations），
     这也满足验收标准里"social / hotel / transport 失败仍可继续"。
@@ -1171,33 +1184,20 @@ def prefetch(
     """
 
     from concurrent.futures import ThreadPoolExecutor
-
-    books = ledger or CallLedger(scope="discovery")
-    destinations = {
-        "transport": (fetch_transport_candidates, (hub, intent)),
-        "hotels": (fetch_hotel_candidates, (hub, intent)),
-        "social": (discover_social_evidence, (hub, llm, intent)),
-    }
-    outcomes: dict[str, Any] = {}
-    errors: dict[str, str] = {}
-
-    def run(name: str, func: Any, args: tuple) -> None:
-        try:
-            if name == "hotels":
-                outcomes[name] = func(*args, pages=hotel_pages)
-            elif name == "social":
-                outcomes[name] = func(*args, ledger=books)
-            else:
-                outcomes[name] = func(*args)
-        except Exception as exc:  # noqa: BLE001 —— 一条线崩了不能带走整个 Discovery
-            errors[name] = f"{type(exc).__name__}: {exc}"
-
+    from copy import deepcopy
     import threading
     import time as _time
 
-    # 每条线单独计时：管理端要回答"Discovery 卡在哪一步"，只有总耗时是答不出来的。
-    # 未完成的线在这里用 status=RUNNING 表示 —— 用户中途点「开始规划」时，
-    # 正式 run 要能区分"这条线查过了但没数据"和"这条线还没查完"。
+    from app.decision.profile import generate_preference_profile
+
+    books = ledger or CallLedger(scope="discovery")
+    outcomes: dict[str, Any] = {}
+    errors: dict[str, str] = {}
+    profile_obj: PreferenceProfile | None = None
+    lock = threading.Lock()
+    callback_lock = threading.Lock()
+
+    # RUNNING 保留既有交接契约；started_at 在任务真正开始时更新，排队不算执行耗时。
     timings: dict[str, dict[str, Any]] = {
         name: {
             "started_at": _iso(),
@@ -1208,161 +1208,118 @@ def prefetch(
             "degraded": False,
             "error": None,
         }
-        for name in (*destinations, "places")
+        for name in ("transport", "hotels", "social", "places")
     }
-    started_at = {name: _time.perf_counter() for name in destinations}
-    lock = threading.Lock()
-
-    def finish(name: str, *, status: str, count: int, degraded: bool, error: str | None = None) -> None:
-        """收尾一条线并通知调用方（增量落盘用）。"""
-
-        with lock:
-            timings[name].update(
-                {
-                    "finished_at": _iso(),
-                    "duration_ms": round((_time.perf_counter() - started_at.get(name, _time.perf_counter())) * 1000)
-                    if name in started_at
-                    else None,
-                    "status": status,
-                    "result_count": count,
-                    "degraded": degraded,
-                    "error": error,
-                }
-            )
-        if on_partial is not None:
-            try:
-                on_partial(snapshot())
-            except Exception:  # noqa: BLE001 —— 落盘失败不该毁掉 Discovery
-                pass
 
     def snapshot() -> dict[str, Any]:
         with lock:
-            return {
+            social = outcomes.get("social") or SocialEvidence()
+            candidates = outcomes.get("places") or PlaceCandidates()
+            stages = {name: dict(info) for name, info in timings.items()}
+            if "places" in outcomes:
+                stages["places"]["resolver"] = candidates.resolver
+            # 回调持有自己的数据：后续抽取补写 evidence.place_mentions 或调用方修改
+            # 快照，都不能让已发布结果和正在写入的状态互相污染。
+            return deepcopy({
                 "transport": outcomes.get("transport"),
                 "hotels": outcomes.get("hotels"),
-                "social": outcomes.get("social"),
-                "places": outcomes.get("places") or PlaceCandidates(),
+                "social": social,
+                "places": candidates,
                 "errors": dict(errors),
-                "stages": {name: dict(info) for name, info in timings.items()},
-            }
+                "stages": stages,
+                "ledger": books.summary(),
+                **aggregate_candidate_metadata(
+                    intent, social.evidences, candidates.places, profile=profile_obj,
+                ),
+            })
 
-    def report(name: str) -> None:
-        """一条线跑完 → 定状态并通知调用方（顺序无关，谁先完成谁先上报）。"""
+    def publish() -> None:
+        if on_partial is not None:
+            # 必须先取得回调锁再取最新快照：只锁回调却预先取快照仍会旧结果后到。
+            # 状态写入不持有回调锁，慢落盘不阻止其它线完成。
+            with callback_lock:
+                try:
+                    on_partial(snapshot())
+                except Exception:  # noqa: BLE001 —— 落盘失败不该毁掉 Discovery
+                    pass
 
-        if name == "transport":
-            transport = outcomes.get("transport")
-            finish(
-                name,
-                status="FAILED" if name in errors else ("EMPTY" if not (transport and transport.all_options) else "OK"),
-                count=len(transport.all_options) if transport else 0,
-                degraded=bool(transport and transport.degradations),
-                error=errors.get(name),
-            )
-        elif name == "hotels":
-            hotels = outcomes.get("hotels")
-            finish(
-                name,
-                status="FAILED" if name in errors else ("EMPTY" if not (hotels and hotels.items) else "OK"),
-                count=len(hotels.items) if hotels else 0,
-                degraded=bool(hotels and hotels.degradations),
-                error=errors.get(name),
-            )
-        elif name == "social":
-            social = outcomes.get("social") or SocialEvidence()
-            finish(
-                name,
-                status="FAILED" if name in errors else ("EMPTY" if not social.evidences else "OK"),
-                count=len(social.evidences),
-                degraded=bool(social.degradations),
-                error=errors.get(name),
-            )
-        elif name == "places":
-            places_stage = outcomes.get("places") or PlaceCandidates()
-            finish(
-                name,
-                status="FAILED" if name in errors else ("EMPTY" if not places_stage.places else "OK"),
-                count=len(places_stage.places),
-                degraded=bool(places_stage.degradations),
-                error=errors.get(name),
-            )
-
-    with ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="tp-discovery") as pool:
-        futures = {
-            name: pool.submit(_run_stage, run, name, func, args, report)
-            for name, (func, args) in destinations.items()
-        }
-        for future in futures.values():
-            future.result()
-
-    social: SocialEvidence = outcomes.get("social") or SocialEvidence()
-
-    # --- E1/E3/E4：动态偏好画像 + 住宿区域 + 候选池（角色 B 产物，contract 2 字段来源）---
-    # 画像只依赖 intent，和"抽取地点"这条最慢的线**并行**跑，因此不为 Discovery 增加墙钟。
-    # 区域与池是从已查好的地点/攻略**聚合**，确定性计算，不再打 Provider。
-    # 失败一律退回均衡基线/空集，绝不影响 Discovery 本身。A 透传（prefetch_json 拆分）时
-    # 必须原样带走 `profile` / `hotel_areas` / `poi_pools` 这三个键。
-    from app.decision.profile import generate_preference_profile
-
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="tp-disc-profile") as profile_pool:
-        profile_future = profile_pool.submit(generate_preference_profile, intent, llm)
-
-        places = PlaceCandidates()
-        places_started = _time.perf_counter()
-        if social.evidences:
-            try:
-                places = extract_place_candidates(
-                    hub, llm, intent, social.evidences, queries=social.queries,
-                    ledger=books, store=store,
-                )
-            except Exception as exc:  # noqa: BLE001
-                errors["places"] = f"{type(exc).__name__}: {exc}"
-                # 如实记进**候选自身的**降级说明，而不只是 `errors`：`errors` 只进 stages
-                # 快照，用户与正式 run 看到的是 `PlaceCandidates.degradations`。两者不一致时
-                # 就会出现"一个地点都没有，但没人说得清为什么"（线上真实发生过一次：
-                # 实体层建表少了一列，全城预热 0 候选，而所有降级字段都是空的）。
-                places.degradations.append(
-                    f"地点候选生成失败（{type(exc).__name__}: {exc}），本次没有可选地点"
-                )
-        outcomes["places"] = places
-        started_at["places"] = places_started
-        report("places")
-
+    def run(name: str, func: Any, *args: Any, **kwargs: Any) -> Any:
+        started = _time.perf_counter()
+        with lock:
+            timings[name]["started_at"] = _iso()
+        value = None
+        error = None
         try:
-            profile_obj: PreferenceProfile = profile_future.result()
-        except Exception:  # noqa: BLE001 —— 画像失败不该影响 Discovery
-            profile_obj = PreferenceProfile.default_profile()
+            value = func(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 —— 一条线崩了不能带走整个 Discovery
+            error = f"{type(exc).__name__}: {exc}"
+            if name == "places":
+                # 用户与正式 run 读取候选自身的降级说明，而不只是 errors。
+                value = PlaceCandidates(degradations=[
+                    f"地点候选生成失败（{error}），本次没有可选地点"
+                ])
+        items = getattr(value, {
+            "transport": "all_options", "hotels": "items",
+            "social": "evidences", "places": "places",
+        }[name], [])
+        # 结果、错误、终态一次提交；任何快照都不会看见「完成但没结果」的中间态。
+        with lock:
+            if value is not None:
+                outcomes[name] = value
+            if error is not None:
+                errors[name] = error
+            timings[name].update({
+                "finished_at": _iso(),
+                "duration_ms": round((_time.perf_counter() - started) * 1000),
+                "status": "FAILED" if error else ("OK" if items else "EMPTY"),
+                "result_count": len(items),
+                "degraded": bool(getattr(value, "degradations", [])),
+                "error": error,
+            })
+        publish()
+        return value
 
-    hotel_areas: list[dict[str, Any]] = []
-    poi_pools: dict[str, list[str]] = {key: [] for key in POOL_KEYS}
-    try:
-        hotel_areas = extract_hotel_areas(intent, social.evidences, places.places, profile=profile_obj)
-        poi_pools = split_poi_pools(places.places)
-    except Exception:  # noqa: BLE001 —— 区域/池聚合失败不该让 Discovery 挂掉
-        hotel_areas = []
-        poi_pools = {key: [] for key in POOL_KEYS}
+    def social_then_places() -> None:
+        social = run("social", discover_social_evidence, hub, llm, intent, ledger=books)
+        # 抽取会补写证据的地点提及。使用私有副本，完成后在状态锁内一并交接。
+        social = deepcopy(social) if social is not None else SocialEvidence()
 
-    transport: TransportCandidates | None = outcomes.get("transport")
-    hotels: HotelCandidates | None = outcomes.get("hotels")
-    stages = {name: dict(info) for name, info in timings.items()}
-    # 地点实体层这次做了什么（复用 / 新建 / 合并 / 丢弃 / 折叠）跟着 places 阶段一起走：
-    # 它进 `PrefetchBundle.discovery` → 会话的 discovery_json → 管理端，
-    # 于是"这次为什么（没有）重新查高德"在事后能被回答（方案 §21）。
-    stages.setdefault("places", {})["resolver"] = places.resolver
-    return {
-        "transport": transport,
-        "hotels": hotels,
-        "social": social,
-        "places": places,
-        "errors": errors,
-        "stages": stages,
-        # 本次 Discovery 的缓存/复用/降级计数（Part C）：写进会话，正式 run 与
-        # 管理端因此能回答"Prefetch 阶段省了多少重复查询"。
-        "ledger": books.summary(),
-        # 角色 B 的决策产物（contract 2）：画像 / 住宿区域 / 候选池。
-        "profile": profile_obj.model_dump(mode="json"),
-        "hotel_areas": hotel_areas,
-        "poi_pools": poi_pools,
-    }
+        def extract() -> PlaceCandidates:
+            candidates = extract_place_candidates(
+                hub, llm, intent, social.evidences, queries=social.queries,
+                ledger=books, store=store,
+            )
+            with lock:
+                outcomes["social"] = social
+            return candidates
+
+        # 成功、空结果、抛错都到这里：关键词搜索不依赖攻略非空。
+        run("places", extract)
+
+    def generate_profile() -> None:
+        nonlocal profile_obj
+        try:
+            value = generate_preference_profile(intent, llm)
+        except Exception:  # noqa: BLE001 —— 画像失败只回退均衡基线
+            value = PreferenceProfile.default_profile()
+        with lock:
+            profile_obj = value
+
+    # 画像只依赖 intent，从预取开始就独立运行。social→places 在同一个任务内串接，
+    # 不让 worker 等待本池 future；即使 workers=1，也能完成整条依赖链且各执行一次。
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="tp-disc-profile") as profile_pool:
+        profile_future = profile_pool.submit(generate_profile)
+        with ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="tp-discovery") as pool:
+            futures = [
+                pool.submit(social_then_places),
+                pool.submit(run, "transport", fetch_transport_candidates, hub, intent),
+                pool.submit(run, "hotels", fetch_hotel_candidates, hub, intent, pages=hotel_pages),
+            ]
+            for future in futures:
+                future.result()
+        profile_future.result()
+
+    return snapshot()
 
 
 def _iso() -> str:

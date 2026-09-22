@@ -148,12 +148,13 @@ def create_session(
         "events": [_event("session_created", f"{basic.get('origin') or '?'} → {basic.get('destination') or '?'}")],
         "run_id": None,
     }
-    store.save_planning_session(session)
-    if config.discovery_enabled and submit is not None and basic.get("destination"):
+    queued = config.discovery_enabled and submit is not None and bool(basic.get("destination"))
+    if queued:
         session["status"] = SESSION_DISCOVERING
         session["discovery_status"] = DISCOVERY_RUNNING
         session["events"].append(_event("discovery_queued", "已提交后台 Discovery"))
-        store.save_planning_session(session)
+    store.save_planning_session(session)
+    if queued:
         submit(run_discovery, store, session["session_id"])
     return session
 
@@ -162,16 +163,12 @@ def get_session(store: TravelPlanStore, session_id: str, *, expire: bool = True)
     """读会话。读取时顺手做一次过期判定 —— 不依赖后台定时任务。"""
 
     if expire:
-        expired = store.expire_planning_sessions(now=_now().isoformat())
-        if expired:
-            # 补一条 session_expired 事件：状态变了但时间线上没有痕迹，运维会以为是别的原因。
-            for session in store.list_planning_sessions(limit=expired)[0]:
-                session["events"] = [
-                    *(session.get("events") or []),
-                    _event("session_expired", f"超过 TTL 未开始规划（{session.get('expires_at')}）"),
-                ]
-                store.save_planning_session(session)
-    return store.get_planning_session(session_id)
+        store.expire_planning_sessions(now=_now().isoformat())
+    session = store.get_planning_session(session_id)
+    if expire and session is not None and session["status"] == SESSION_EXPIRED:
+        # 只补当前真正过期的行，不能按 updated_at 猜测刚才过期的是谁。
+        session = store.update_planning_session(session_id, lambda current: None)
+    return session
 
 
 def patch_session(
@@ -189,14 +186,8 @@ def patch_session(
     （用户旅程落地任务 §16）。前端要改基础信息就重新 POST 一个 session。
     """
 
-    session = get_session(store, session_id)
-    if session is None:
-        return None
-    if session["status"] in (SESSION_CANCELLED, SESSION_EXPIRED):
-        return session
-
-    preferences = dict(session.get("preferences") or {})
-    changed: list[str] = []
+    # 先做纯归一化，事务中只合并本请求包含的键，避免并发 PATCH 互相覆盖。
+    normalized: dict[str, Any] = {}
     for key in PATCHABLE_FIELDS:
         if key not in payload:
             continue
@@ -222,44 +213,44 @@ def patch_session(
                 value = coerce_str(value) or None
         else:
             value = coerce_str(value) or None
-        if preferences.get(key) != value:
-            preferences[key] = value
-            changed.append(key)
-    if "budget_total" in payload:
-        budget = coerce_float(payload["budget_total"])
-        basic = dict(session.get("basic_intent") or {})
-        if basic.get("budget_total") != budget:
-            basic["budget_total"] = budget
-            session["basic_intent"] = basic
-            changed.append("budget_total")
+        normalized[key] = value
 
-    if "poi_selections" in payload:
-        selections = normalize_place_selections(payload["poi_selections"])
-        if selections != (session.get("poi_selections") or {}):
-            session["poi_selections"] = selections
-            changed.append("poi_selections")
+    def apply(session: dict[str, Any]) -> None:
+        if session["status"] in (SESSION_CANCELLED, SESSION_EXPIRED, SESSION_STARTING):
+            return
+        preferences = session["preferences"]
+        changed: list[str] = []
+        for key, value in normalized.items():
+            if preferences.get(key) != value:
+                preferences[key] = value
+                changed.append(key)
+        if "budget_total" in payload:
+            budget = coerce_float(payload["budget_total"])
+            if session["basic_intent"].get("budget_total") != budget:
+                session["basic_intent"]["budget_total"] = budget
+                if "budget_total" not in changed:
+                    changed.append("budget_total")
+        if "poi_selections" in payload:
+            selections = normalize_place_selections(payload["poi_selections"])
+            if selections != session["poi_selections"]:
+                session["poi_selections"] = selections
+                changed.append("poi_selections")
+        if changed:
+            session["events"].append(_event("user_preferences_updated", "、".join(changed)))
 
-    if changed:
-        session["preferences"] = preferences
-        session["updated_at"] = _now().isoformat()
-        session["events"] = [
-            *(session.get("events") or []),
-            _event("user_preferences_updated", "、".join(changed)),
-        ]
-        # 偏好只影响排序，不影响原始数据 —— 所以不重跑 Discovery（§15）。
-        store.save_planning_session(session)
-    return session
+    # 偏好只影响排序，不重跑 Discovery；STARTING 后冻结已确认的输入。
+    return store.update_planning_session(session_id, apply)
 
 
 def cancel_session(store: TravelPlanStore, session_id: str) -> dict[str, Any] | None:
-    session = get_session(store, session_id)
-    if session is None:
-        return None
-    session["status"] = SESSION_CANCELLED
-    session["updated_at"] = _now().isoformat()
-    session["events"] = [*(session.get("events") or []), _event("session_cancelled", "用户取消")]
-    store.save_planning_session(session)
-    return session
+    def cancel(session: dict[str, Any]) -> None:
+        # 已创建的正式 Run 不属于取消草稿接口，不能把它伪装成已取消。
+        if session["status"] in (SESSION_STARTING, SESSION_CANCELLED, SESSION_EXPIRED):
+            return
+        session["status"] = SESSION_CANCELLED
+        session["events"].append(_event("session_cancelled", "用户取消"))
+
+    return store.update_planning_session(session_id, cancel)
 
 
 # ======================================================================
@@ -280,10 +271,12 @@ def run_discovery(
     用户旅程验收标准里明确要求"社交/酒店/交通失败仍可继续"。
     """
 
-    session = get_session(store, session_id, expire=False)
+    session = get_session(store, session_id)
     if session is None or session["status"] in (SESSION_CANCELLED, SESSION_EXPIRED, SESSION_STARTING):
         return
     intent = intent_from_basic(session.get("basic_intent") or {}, session.get("preferences") or {})
+    # 这里只积累 Discovery 自己的新事件，最后追加到锁内读到的最新事件列表。
+    session["events"] = []
 
     hub = None
     llm = None
@@ -323,22 +316,23 @@ def run_discovery(
             try:
                 partial = _bundle_from(session_id, intent, snapshot, hub)
                 payload = partial.dump()
-                session["transport_candidates"] = payload["outbound"] + payload["inbound"]
-                session["hotel_candidates"] = payload["hotels"]
-                session["place_candidates"] = _candidate_cards(
-                    partial.places, session.get("poi_selections") or {}
-                )
-                session["evidence_summary"] = _evidence_summary_of(partial)
-                session["discovery"] = dict(snapshot.get("stages") or {})
-                session["prefetch"] = payload
-                session["updated_at"] = _now().isoformat()
-                store.save_planning_session(session)
+                def publish(current: dict[str, Any]) -> None:
+                    if current["status"] in (SESSION_CANCELLED, SESSION_EXPIRED, SESSION_STARTING):
+                        return
+                    current["transport_candidates"] = payload["outbound"] + payload["inbound"]
+                    current["hotel_candidates"] = payload["hotels"]
+                    current["place_candidates"] = _candidate_cards(partial.places, current["poi_selections"])
+                    current["evidence_summary"] = _evidence_summary_of(partial)
+                    current["discovery"] = dict(snapshot.get("stages") or {})
+                    current["prefetch"] = payload
+                store.update_planning_session(session_id, publish)
             except Exception:  # noqa: BLE001 —— 增量落盘失败不该让 Discovery 挂掉
                 return
 
         if cached is not None:
             result, bundle = _prefetch_with_city_cache(
-                session_id, intent, hub, config.discovery_hotel_pages, cached
+                session_id, intent, hub, config.discovery_hotel_pages, cached,
+                on_partial=persist_partial,
             )
             if cached.stale:
                 city_cache.refresh_in_background(
@@ -435,8 +429,18 @@ def run_discovery(
                 hub.close()
             except Exception:  # noqa: BLE001
                 pass
-    session["updated_at"] = _now().isoformat()
-    store.save_planning_session(session)
+    def publish_finished(current: dict[str, Any]) -> None:
+        if current["status"] in (SESSION_CANCELLED, SESSION_EXPIRED, SESSION_STARTING):
+            return
+        # 最终失败也不能用启动时的空快照抹掉已经发布的分支。
+        fields = ("status", "discovery_status", "degradations")
+        if session["discovery_status"] != DISCOVERY_FAILED:
+            fields += ("transport_candidates", "hotel_candidates", "evidence_summary", "discovery", "prefetch")
+            current["place_candidates"] = _candidate_cards(bundle.places, current["poi_selections"])
+        for field in fields:
+            current[field] = session[field]
+        current["events"].extend(session["events"])
+    store.update_planning_session(session_id, publish_finished)
 
 
 def _prefetch_with_city_cache(
@@ -445,61 +449,84 @@ def _prefetch_with_city_cache(
     hub: Any,
     hotel_pages: int,
     cached: city_cache.CityCacheHit,
+    *,
+    on_partial: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, Any], discovery.PrefetchBundle]:
-    """把缓存的攻略/POI 与实时机酒装进既有 PrefetchBundle。"""
+    """先发布静态缓存，再并发补实时机酒；缓存命中不新增模型调用。"""
 
-    started = _now()
-    errors: dict[str, str] = {}
-    try:
-        transport = discovery.fetch_transport_candidates(hub, intent)
-    except Exception as exc:  # noqa: BLE001
-        transport = SimpleNamespace(outbound=[], inbound=[], degradations=[str(exc)])
-        errors["transport"] = f"{type(exc).__name__}: {exc}"
-    try:
-        hotels = discovery.fetch_hotel_candidates(hub, intent, pages=max(1, hotel_pages))
-    except Exception as exc:  # noqa: BLE001
-        hotels = SimpleNamespace(items=[], degradations=[str(exc)])
-        errors["hotels"] = f"{type(exc).__name__}: {exc}"
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from app.models import PreferenceProfile
+
+    profile = PreferenceProfile.default_profile()
+    profile.reason = "城市缓存路径采用均衡基线；正式规划按用户最终偏好生成画像"
     social = SimpleNamespace(
-        # 攻略正文与检索词也来自城市知识库：没有这两样，正式 run 会把社媒检索与
-        # 模型抽取全价重付一遍（这是"命中缓存却还是慢"的根因）。
-        evidences=list(cached.evidences),
-        queries=list(cached.social_queries),
-        served_queries=list(cached.social_served_queries),
-        degradations=[],
+        evidences=list(cached.evidences), queries=list(cached.social_queries),
+        served_queries=list(cached.social_served_queries), degradations=[],
     )
     places = SimpleNamespace(places=cached.places, degradations=[])
-    elapsed = round((_now() - started).total_seconds() * 1000)
     stages = {
-        "transport": _cached_stage(transport, "all_options", errors.get("transport"), elapsed),
-        "hotels": _cached_stage(hotels, "items", errors.get("hotels"), elapsed),
-        "social": {
-            "status": "STALE_CACHE" if cached.stale else "CACHE",
-            "result_count": len(cached.evidences), "duration_ms": 0, "degraded": cached.stale,
-            "error": None, "updated_at": cached.updated_at,
-            "mention_count": len(cached.mentions),
-        },
-        "places": {
-            "status": "STALE_CACHE" if cached.stale else "CACHE",
-            "result_count": len(cached.places), "duration_ms": 0, "degraded": cached.stale,
-            "error": None, "updated_at": cached.updated_at,
-        },
+        name: {"status": "RUNNING", "result_count": 0, "duration_ms": None,
+               "degraded": False, "error": None}
+        for name in ("transport", "hotels")
     }
-    result = {"transport": transport, "hotels": hotels, "social": social, "places": places,
-              "errors": errors, "stages": stages, "ledger": {"city_cache_hits": 1}}
-    bundle = _bundle_from(session_id, intent, result, hub)
-    bundle.city_cache = {
-        "source": "city_cache",
-        "updated_at": cached.updated_at,
-        "stale": cached.stale,
-        # 让会话视图能如实说"攻略正文也来自缓存，N 条、M 条检索词"。
-        "evidences": len(cached.evidences),
-        "mentions": len(cached.mentions),
-        "social_queries": len(cached.social_queries),
+    for name, count in (("social", len(cached.evidences)), ("places", len(cached.places))):
+        stages[name] = {
+            "status": "STALE_CACHE" if cached.stale else "CACHE",
+            "result_count": count, "duration_ms": 0, "degraded": cached.stale,
+            "error": None, "updated_at": cached.updated_at,
+        }
+    stages["social"]["mention_count"] = len(cached.mentions)
+    result: dict[str, Any] = {
+        "transport": None, "hotels": None, "social": social, "places": places,
+        "errors": {}, "stages": stages, "ledger": {"city_cache_hits": 1},
+        **discovery.aggregate_candidate_metadata(intent, cached.evidences, cached.places, profile=profile),
+        "city_cache": {
+            "source": "city_cache", "updated_at": cached.updated_at, "stale": cached.stale,
+            "evidences": len(cached.evidences), "mentions": len(cached.mentions),
+            "social_queries": len(cached.social_queries),
+        },
+        "degradations": ["城市攻略缓存已过期；当前先展示最近可用结果"] if cached.stale else [],
     }
-    if cached.stale:
-        bundle.degradations.append("城市攻略缓存已过期，已在后台刷新；当前先展示最近可用结果")
-    return result, bundle
+    def publish() -> None:
+        if on_partial is not None:
+            try:
+                on_partial({**result, "errors": dict(result["errors"]),
+                            "stages": {key: dict(value) for key, value in stages.items()}})
+            except Exception:  # noqa: BLE001
+                pass
+
+    publish()  # 必须在发起任何实时查询之前，让静态候选立刻可读。
+
+    def fetch(name: str) -> tuple[Any, dict[str, Any]]:
+        started = time.perf_counter()
+        began = _now().isoformat()
+        error = None
+        try:
+            value = (
+                discovery.fetch_transport_candidates(hub, intent) if name == "transport"
+                else discovery.fetch_hotel_candidates(hub, intent, pages=max(1, hotel_pages))
+            )
+        except Exception as exc:  # noqa: BLE001
+            error = f"{type(exc).__name__}: {exc}"
+            value = discovery.TransportCandidates() if name == "transport" else discovery.HotelCandidates()
+            value.degradations.append(error)
+        info = _cached_stage(value, "all_options" if name == "transport" else "items", error,
+                             round((time.perf_counter() - started) * 1000))
+        info.update(started_at=began, finished_at=_now().isoformat())
+        return value, info
+
+    # 只有协调线程写 result/发布，杜绝分支回调乱序覆盖已完成的候选。
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="tp-cache-live") as pool:
+        futures = {pool.submit(fetch, name): name for name in ("transport", "hotels")}
+        for future in as_completed(futures):
+            name = futures[future]
+            value, info = future.result()
+            result[name] = value
+            stages[name] = info
+            if info["error"]:
+                result["errors"][name] = info["error"]
+            publish()
+    return result, _bundle_from(session_id, intent, result, hub)
 
 
 def _cached_stage(value: Any, count_attr: str, error: str | None, elapsed: int) -> dict[str, Any]:
@@ -633,7 +660,7 @@ def _bundle_from(session_id: str, intent: TripIntent, result: Mapping[str, Any],
     hotels = result.get("hotels")
     social = result.get("social")
     places = result.get("places")
-    degradations: list[str] = []
+    degradations: list[str] = list(result.get("degradations") or [])
     for part in (transport, hotels, social, places):
         degradations.extend(getattr(part, "degradations", []) or [])
     return discovery.PrefetchBundle(
@@ -667,6 +694,7 @@ def _bundle_from(session_id: str, intent: TripIntent, result: Mapping[str, Any],
         hotel_areas=list(result.get("hotel_areas") or []),
         poi_pools=dict(result.get("poi_pools") or {}),
         profile=dict(result.get("profile") or {}),
+        city_cache=dict(result.get("city_cache") or {}),
         discovery_status=DISCOVERY_READY,
     )
 
@@ -858,29 +886,44 @@ def start_run(
 
     # Discovery 还在跑时给一个很短的 grace period：期间完成的结果继续合并进来。
     # 到点仍没完成的线不再阻塞用户 —— 正式流程会对缺失的部分自己补查。
-    session, grace_waited_ms = _await_discovery(store, session_id)
-    intent = intent_from_basic(session.get("basic_intent") or {}, session.get("preferences") or {})
-    if session.get("poi_selections"):
-        intent.place_selections = normalize_place_selections(session["poi_selections"])
-    bundle = discovery.PrefetchBundle.load(session.get("prefetch"))
-    bundle.session_id = session_id
-    bundle.basic_intent = dict(session.get("basic_intent") or {})
-    bundle.grace_waited_ms = grace_waited_ms
-
-    query = _compose_query(session)
+    _, grace_waited_ms = _await_discovery(store, session_id)
     run_id = _new_run_id()
-    store.create_run(run_id, original_query=query, source="guided", source_session_id=session_id)
-    session["status"] = SESSION_STARTING
-    session["run_id"] = run_id
-    session["updated_at"] = _now().isoformat()
-    session["events"] = [
-        *(session.get("events") or []),
-        _event("session_confirmed", f"用户确认并开始规划（{query}）"),
-        _event("run_started", run_id),
-    ]
-    store.save_planning_session(session)
+    prepared: dict[str, Any] = {}
 
-    submit(_start_job, store, run_id, query, intent, bundle, output_dir, session_id)
+    def confirm(current: dict[str, Any]) -> str:
+        # 锁内读取最终用户输入和已发布预取，只做纯构造，不等模型/Provider。
+        intent = intent_from_basic(current["basic_intent"], current["preferences"])
+        intent.place_selections = normalize_place_selections(current["poi_selections"])
+        bundle = discovery.PrefetchBundle.load(current.get("prefetch"))
+        bundle.session_id = session_id
+        bundle.basic_intent = dict(current["basic_intent"])
+        bundle.grace_waited_ms = grace_waited_ms
+        query = _compose_query(current)
+        prepared.update(intent=intent, bundle=bundle, query=query)
+        if grace_waited_ms:
+            current["events"].append(_event(
+                "discovery_grace_waited", f"等待 {grace_waited_ms}ms 后带着已完成的部分开始"
+            ))
+        current["events"].extend([
+            _event("session_confirmed", f"用户确认并开始规划（{query}）"),
+            _event("run_started", run_id),
+        ])
+        return query
+
+    session, created = store.start_planning_session_run(session_id, run_id, confirm)
+    if session is None:
+        return {"error": "not_found"}
+    if session["status"] in (SESSION_CANCELLED, SESSION_EXPIRED):
+        return {"error": "session_closed"}
+    if not created:
+        return {"run_id": session["run_id"], "status": "RUNNING"}
+    try:
+        submit(_start_job, store, run_id, prepared["query"], prepared["intent"],
+               prepared["bundle"], output_dir, session_id)
+    except Exception as exc:
+        # 接纳失败至少如实结束 run，不留下一个永远等待工作线程的 RUNNING。
+        store.finish_run(run_id, "failed", error=f"任务提交失败：{type(exc).__name__}: {exc}")
+        raise
     return {"run_id": run_id, "status": "RUNNING"}
 
 
@@ -938,26 +981,17 @@ def _await_discovery(
     started = time.perf_counter()
     while (
         session.get("discovery_status") in (DISCOVERY_RUNNING, DISCOVERY_PENDING)
+        and session.get("status") not in (SESSION_STARTING, SESSION_CANCELLED, SESSION_EXPIRED)
         and (time.perf_counter() - started) < budget
     ):
         time.sleep(min(0.2, max(0.02, budget / 10)))
         refreshed = get_session(store, session_id, expire=False)
         if refreshed is None:
+            session = {}
             break
         session = refreshed
     waited = int((time.perf_counter() - started) * 1000)
-    if waited:
-        session["events"] = [
-            *(session.get("events") or []),
-            _event(
-                "discovery_grace_waited",
-                f"开始规划时 Discovery 仍在进行，等待 {waited}ms 后带着已完成的部分开始",
-            ),
-        ]
-        try:
-            store.save_planning_session(session)
-        except Exception:  # noqa: BLE001
-            pass
+    # 等待只读；确认事件由获得启动权的事务写入，不能再整行回写旧快照。
     return session, waited
 
 

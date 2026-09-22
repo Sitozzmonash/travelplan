@@ -26,6 +26,7 @@ import type { Pace, PoiSelection, SessionPatchInput, SessionView } from "@/types
 import {
   basicIssues,
   createEmptyDraft,
+  fullDraftPatch,
   hasAnyPreference,
   preferenceReplayPatch,
   stepPatch,
@@ -47,6 +48,19 @@ const POLL_INTERVAL_MS = 2500;
 const POLL_MAX_ATTEMPTS = 144;
 const POLL_MAX_FAILURES = 4;
 const POI_SYNC_DEBOUNCE_MS = 700;
+
+/** 对象身份隔离每一代会话；action 在 await / React 重渲染前同步上锁。 */
+interface SessionSync {
+  id: string | null;
+  tail: Promise<boolean>;
+  action: "create" | "sync" | "finish" | null;
+  confirmed: boolean;
+  runId: string | null;
+}
+
+function newSessionSync(): SessionSync {
+  return { id: null, tail: Promise.resolve(true), action: null, confirmed: false, runId: null };
+}
 
 /**
  * Guided 向导（§17）唯一的状态机。
@@ -87,11 +101,12 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
     if (fromUrl.budgetMode) basic.budgetMode = fromUrl.budgetMode;
     return { ...empty, basic };
   });
+  const draftRef = useRef(draft);
+  const sessionSync = useRef<SessionSync>(newSessionSync());
   const [session, setSession] = useState<SessionView | null>(null);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
-  const [pendingPatch, setPendingPatch] = useState<SessionPatchInput | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
@@ -110,22 +125,24 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
   const missingBasic = basicIssues(draft.basic);
 
   useEffect(() => {
-    if (!sessionId || settled || unusable || pollStalled) return;
+    if (!sessionId || settled || unusable || pollStalled || starting) return;
+    const scope = sessionSync.current;
+    if (scope.id !== sessionId) return;
     let active = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let attempts = 0;
     let failures = 0;
 
     async function tick() {
-      if (!active || !sessionId) return;
+      if (!active || scope !== sessionSync.current || scope.confirmed || !sessionId) return;
       try {
         const view = await getPlanningSession(sessionId);
-        if (!active) return;
+        if (!active || scope !== sessionSync.current || scope.confirmed) return;
         setSession(view);
         failures = 0;
         if (isDiscoverySettled(view) || isSessionUnusable(view)) return;
       } catch {
-        if (!active) return;
+        if (!active || scope !== sessionSync.current || scope.confirmed) return;
         failures += 1;
         attempts += 1;
         if (failures >= POLL_MAX_FAILURES || attempts >= POLL_MAX_ATTEMPTS) {
@@ -152,7 +169,7 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
       active = false;
       if (timer) clearTimeout(timer);
     };
-  }, [sessionId, settled, unusable, pollStalled, pollNonce]);
+  }, [sessionId, settled, unusable, pollStalled, pollNonce, starting]);
 
   useEffect(() => {
     return () => {
@@ -178,20 +195,28 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  function updateDraft(update: (current: GuidedDraft) => GuidedDraft): void {
+    // 最终确认锁定控件；ref guard 同时挡住重渲染前已经排入的点击。
+    if (sessionSync.current.action === "finish" || sessionSync.current.confirmed) return;
+    const next = update(draftRef.current);
+    draftRef.current = next;
+    setDraft(next);
+  }
+
   function patchTransport(patch: Partial<GuidedDraft["transport"]>) {
-    setDraft((current) => ({ ...current, transport: { ...current.transport, ...patch } }));
+    updateDraft((current) => ({ ...current, transport: { ...current.transport, ...patch } }));
   }
 
   function patchHotel(patch: Partial<GuidedDraft["hotel"]>) {
-    setDraft((current) => ({ ...current, hotel: { ...current.hotel, ...patch } }));
+    updateDraft((current) => ({ ...current, hotel: { ...current.hotel, ...patch } }));
   }
 
   function patchPace(next: Pace) {
-    setDraft((current) => ({ ...current, pace: next }));
+    updateDraft((current) => ({ ...current, pace: next }));
   }
 
   function patchPoiExpanded(key: string) {
-    setDraft((current) => ({
+    updateDraft((current) => ({
       ...current,
       poi: {
         ...current.poi,
@@ -202,35 +227,35 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
     }));
   }
 
-  /** 清空 POI 选择：重建会话后必须走这里，否则界面还留着没写进新会话的旧勾选。 */
+  /** 重建开始时清空旧 POI，不能等新会话异步补写完后再清掉新选择。 */
   function clearPoi(): void {
-    setDraft((current) => ({ ...current, poi: { selections: {}, bulk: null, expanded: [] } }));
+    updateDraft((current) => ({ ...current, poi: { selections: {}, bulk: null, expanded: [] } }));
   }
 
-  function schedulePoiSync(selections: Record<string, PoiSelection>): void {
-    const id = sessionId;
-    if (!id) return;
+  function cancelPoiSync(): void {
     if (poiTimer.current) clearTimeout(poiTimer.current);
+    poiTimer.current = null;
+  }
+
+  function schedulePoiSync(): void {
+    const scope = sessionSync.current;
+    if (!scope.id || scope.action === "finish" || scope.confirmed) return;
+    cancelPoiSync();
     poiTimer.current = setTimeout(() => {
-      void patchPlanningSession(id, { poi_selections: selections })
-        .then((view) => {
-          setSession(view);
-          setSyncError(null);
-          setPendingPatch(null);
-        })
-        .catch((cause) => {
-          setSyncError(describeSessionError(cause));
-          setPendingPatch({ poi_selections: selections });
-        });
+      poiTimer.current = null;
+      if (scope !== sessionSync.current || scope.action === "finish" || scope.confirmed) return;
+      void syncNow(() => stepPatch(0, draftRef.current), scope);
     }, POI_SYNC_DEBOUNCE_MS);
   }
 
   function selectPoi(placeId: string, state: PoiSelection | null): void {
-    const selections = { ...draft.poi.selections };
-    if (state) selections[placeId] = state;
-    else delete selections[placeId];
-    setDraft((current) => ({ ...current, poi: { ...current.poi, selections, bulk: null } }));
-    schedulePoiSync(selections);
+    updateDraft((current) => {
+      const selections = { ...current.poi.selections };
+      if (state) selections[placeId] = state;
+      else delete selections[placeId];
+      return { ...current, poi: { ...current.poi, selections, bulk: null } };
+    });
+    schedulePoiSync();
   }
 
   /**
@@ -240,142 +265,163 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
    */
   function selectBulk(mode: PoiBulkMode): void {
     const selections: Record<string, PoiSelection> = mode === "auto" ? {} : bestValueSelections(session);
-    setDraft((current) => ({ ...current, poi: { ...current.poi, selections, bulk: mode } }));
-    schedulePoiSync(selections);
+    updateDraft((current) => ({ ...current, poi: { ...current.poi, selections, bulk: mode } }));
+    schedulePoiSync();
   }
 
-  /** 创建（或重建）会话：取消旧会话 + 取消待发送的 POI 同步，避免打到已作废的 session。 */
+  /** 创建（或重建）会话：先换代，使旧 PATCH / 轮询响应立刻失效。 */
   async function rebuildSession(): Promise<boolean> {
-    const previous = sessionId;
-    if (previous) void cancelPlanningSession(previous);
-    if (poiTimer.current) {
-      clearTimeout(poiTimer.current);
-      poiTimer.current = null;
-    }
+    const previous = sessionSync.current;
+    if (previous.action === "create" || previous.action === "finish" || previous.confirmed) return false;
+    const scope = newSessionSync();
+    scope.action = "create";
+    sessionSync.current = scope;
+    cancelPoiSync();
+    if (previous.id) void cancelPlanningSession(previous.id);
+    clearPoi();
+    setSession(null);
     setCreating(true);
+    setSyncing(false);
     setCreateError(null);
+    setSyncError(null);
+    setStartError(null);
     try {
-      const created = await createPlanningSession(toCreateInput(draft.basic));
+      const created = await createPlanningSession(toCreateInput(draftRef.current.basic));
+      if (scope !== sessionSync.current) return false;
+      scope.id = created.session_id;
       setSession(created);
       setPollStalled(false);
-      setSyncError(null);
-      setPendingPatch(null);
-      setStartError(null);
-      if (hasAnyPreference(draft)) {
-        try {
-          const replayed = await patchPlanningSession(created.session_id, preferenceReplayPatch(draft));
-          setSession(replayed);
-        } catch {
-          // 偏好补写失败不阻塞：用户继续往下走时还会再写一次。
-        }
+      if (hasAnyPreference(draftRef.current)) {
+        // 补写也走同一队列；失败不阻塞浏览，但最终确认必须重新提交完整草稿。
+        await syncNow(() => preferenceReplayPatch(draftRef.current), scope);
       }
-      return true;
+      return scope === sessionSync.current;
     } catch (cause) {
-      setCreateError(describeSessionError(cause));
+      if (scope === sessionSync.current) setCreateError(describeSessionError(cause));
       return false;
     } finally {
-      setCreating(false);
+      if (scope === sessionSync.current) {
+        scope.action = null;
+        setCreating(false);
+      }
     }
   }
 
-  async function syncNow(patch: SessionPatchInput, advanceTo: number): Promise<void> {
-    const id = sessionId;
-    if (!id || Object.keys(patch).length === 0) {
-      setStep(advanceTo);
-      return;
-    }
-    // 这次要发的就是最新的 POI 选择时，取消还在等待的防抖同步，避免重复 PATCH。
-    if (patch.poi_selections && poiTimer.current) {
-      clearTimeout(poiTimer.current);
-      poiTimer.current = null;
-    }
+  /** 所有 PATCH 的唯一出口：串行执行，真正发出时才读取草稿，失败显式返回 false。 */
+  function syncNow(patch: () => SessionPatchInput, scope: SessionSync): Promise<boolean> {
+    const id = scope.id;
+    if (!id || scope !== sessionSync.current || scope.confirmed) return Promise.resolve(false);
+    const result = scope.tail.then(async () => {
+      if (scope !== sessionSync.current || scope.confirmed) return false;
+      try {
+        const view = await patchPlanningSession(id, patch());
+        if (scope !== sessionSync.current) return false;
+        setSession(view);
+        if (view.status === "STARTING" && view.run_id) scope.runId = view.run_id;
+        if (isSessionUnusable(view) || view.status === "STARTING") {
+          setSyncError("会话已关闭或已经开始规划，无法写回偏好。请检查会话状态。");
+          return false;
+        }
+        setSyncError(null);
+        return true;
+      } catch (cause) {
+        if (scope === sessionSync.current) setSyncError(describeSessionError(cause));
+        return false;
+      }
+    });
+    // 失败也让链正常结算，下一次重试不会被旧 rejection 阻断。
+    scope.tail = result;
+    return result;
+  }
+
+  async function syncStep(advanceTo: number, full = false): Promise<void> {
+    const scope = sessionSync.current;
+    if (!scope.id || scope.action || scope.confirmed) return;
+    scope.action = "sync";
+    cancelPoiSync();
     setSyncing(true);
     try {
-      const view = await patchPlanningSession(id, patch);
-      setSession(view);
-      setSyncError(null);
-      setPendingPatch(null);
-    } catch (cause) {
-      // 写不回后端也不拦住用户：明确告知 + 提供重试，而不是把人卡在这一步。
-      setSyncError(describeSessionError(cause));
-      setPendingPatch(patch);
+      await syncNow(() => full ? fullDraftPatch(draftRef.current) : stepPatch(step, draftRef.current), scope);
     } finally {
-      setSyncing(false);
-      setStep(advanceTo);
+      if (scope === sessionSync.current) {
+        scope.action = null;
+        setSyncing(false);
+        // 中途同步失败仍可浏览下一步；只有最终确认必须成功才允许 START。
+        setStep(advanceTo);
+      }
     }
   }
 
   async function handleContinue(): Promise<void> {
-    if (!sessionId) {
-      // 还没建好会话（创建失败，或挂载时那次创建还在飞）：这一页勾的 POI 没有落点，
-      // 所以此刻这颗按钮就是「重新创建会话」，绝不静默跳到下一屏。
+    const scope = sessionSync.current;
+    if (scope.action || scope.confirmed) return;
+    if (!scope.id) {
+      // 创建失败时不静默进入下一屏，先给这一页的选择建立会话。
       await rebuildSession();
       return;
     }
-    await syncNow(stepPatch(step, draft), step + 1);
+    await syncStep(step + 1);
   }
 
-  /**
-   * 最后一页的「开始规划」：先把这一页改过的偏好写回，再开跑。
-   * 顺序不能反 —— 用户可能在偏好页直接点开始、从没点过「继续」，
-   * 那些交通 / 酒店 / 节奏就还没进过 PATCH。
-   * 写回失败时不静默开跑：`syncNow` 会把 patch 存进 `pendingPatch`，
-   * `handleStart` 随后会重试并在仍失败时明确报错，而不是制造"已确认"的假象。
-   */
+  /** 锁定选择 → 排空已发 / 已排 PATCH → 最新完整草稿 → 成功后才 START。 */
   async function handleFinish(): Promise<void> {
-    await syncNow(stepPatch(step, draft), step);
-    await handleStart();
-  }
-
-  async function handleStart(): Promise<void> {
-    if (!sessionId) {
+    const scope = sessionSync.current;
+    if (scope.action || scope.confirmed) return;
+    if (!scope.id) {
       setStartError("会话还没创建成功，无法开始规划。请先重新创建会话。");
       return;
     }
+    scope.action = "finish";
+    cancelPoiSync();
     setStarting(true);
     setStartError(null);
     try {
-      // syncNow 在网络失败时允许用户继续浏览下一步，但正式 Run 不能静默带着旧偏好启动。
-      // 这里先补写最后一份失败的 PATCH；仍失败就明确留在确认页，而不是制造“已确认”的假象。
-      if (pendingPatch) {
-        try {
-          const view = await patchPlanningSession(sessionId, pendingPatch);
-          setSession(view);
-          setSyncError(null);
-          setPendingPatch(null);
-        } catch (cause) {
-          const message = describeSessionError(cause);
-          setSyncError(message);
-          setStartError("部分偏好尚未写回会话，请先重试同步后再开始规划。");
-          setStarting(false);
+      const ok = await syncNow(() => fullDraftPatch(draftRef.current), scope);
+      if (scope !== sessionSync.current) return;
+      if (!ok) {
+        // 上次 START 可能已被服务器接收，只是响应丢失。只恢复已确认的 Run，
+        // 不重复启动，也不把被冻结的偏好冒充成本次修改已成功。
+        if (scope.runId) {
+          scope.confirmed = true;
+          router.push(`/plan/${encodeURIComponent(scope.runId)}`);
           return;
         }
+        setStartError("部分偏好尚未写回会话，请先重试同步后再开始规划。");
+        return;
       }
-      const result = await startPlanningSession(sessionId);
+      // 此后禁止任何 POI / 重试 PATCH 插入，直到 START 失败并由用户重新确认。
+      scope.confirmed = true;
+      const result = await startPlanningSession(scope.id);
+      if (scope !== sessionSync.current) return;
       router.push(`/plan/${encodeURIComponent(result.run_id)}`);
     } catch (cause) {
-      setStartError(describeSessionError(cause));
-      setStarting(false);
+      if (scope === sessionSync.current) {
+        scope.confirmed = false;
+        setStartError(describeSessionError(cause));
+      }
+    } finally {
+      if (scope === sessionSync.current && !scope.confirmed) {
+        scope.action = null;
+        setStarting(false);
+      }
     }
   }
 
   /** 会话过期 / 被取消后的重建入口：按 URL 带来的基础信息重开，偏好原样补写回去。 */
   async function handleRestart(): Promise<void> {
+    const scope = sessionSync.current;
+    if (scope.action === "create" || scope.action === "finish" || scope.confirmed) return;
     const ok = await rebuildSession();
     if (!ok) {
       setStep(0);
       return;
     }
-    clearPoi();
     setPollNonce((value) => value + 1);
   }
 
   function retrySync(): void {
-    // 重试时留在当前步骤：偏好没写回去也要让用户能继续，而不是把人卡在这一步。
-    // 两步流程里「当前页自己的字段」就是 stepPatch(step)：第 0 页是 POI，
-    // 最后一页是交通 / 酒店 / 节奏，不需要像旧的三步流程那样回退一页。
-    const patch = pendingPatch ?? stepPatch(step, draft);
-    void syncNow(patch, step);
+    // 不保存失败 PATCH：每次重试覆盖为最新完整草稿，包含已取消的选择。
+    void syncStep(step, true);
   }
 
   function retryDiscovery(): void {
@@ -462,7 +508,7 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
                   <span>这一步的偏好没能写回后端：{syncError}</span>
                 </p>
                 <div className="flex justify-end">
-                  <Button variant="outline" size="sm" onClick={retrySync} disabled={syncing}>
+                  <Button variant="outline" size="sm" onClick={retrySync} disabled={busy}>
                     <RefreshCw />
                     重试同步
                   </Button>
@@ -509,29 +555,31 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
             action={session ? <SessionStatusChip session={session} poiStep={step === 0} /> : null}
             className="mt-3 shadow-sm"
           >
-            {step === 0 ? (
-              <StepPoi
-                session={session}
-                settled={settled}
-                unusable={unusable}
-                pollStalled={pollStalled}
-                selections={draft.poi.selections}
-                expanded={draft.poi.expanded}
-                bulk={draft.poi.bulk}
-                onSelect={selectPoi}
-                onBulk={selectBulk}
-                onToggleExpand={patchPoiExpanded}
-                onRetryDiscovery={retryDiscovery}
-              />
-            ) : null}
-            {isLast ? (
-              <StepPreferences
-                draft={draft}
-                onTransport={patchTransport}
-                onHotel={patchHotel}
-                onPace={patchPace}
-              />
-            ) : null}
+            <fieldset disabled={starting} className="m-0 min-w-0 border-0 p-0">
+              {step === 0 ? (
+                <StepPoi
+                  session={session}
+                  settled={settled}
+                  unusable={unusable}
+                  pollStalled={pollStalled}
+                  selections={draft.poi.selections}
+                  expanded={draft.poi.expanded}
+                  bulk={draft.poi.bulk}
+                  onSelect={selectPoi}
+                  onBulk={selectBulk}
+                  onToggleExpand={patchPoiExpanded}
+                  onRetryDiscovery={retryDiscovery}
+                />
+              ) : null}
+              {isLast ? (
+                <StepPreferences
+                  draft={draft}
+                  onTransport={patchTransport}
+                  onHotel={patchHotel}
+                  onPace={patchPace}
+                />
+              ) : null}
+            </fieldset>
           </SectionCard>
 
           <div className="sticky bottom-0 z-20 mt-4 flex items-center justify-between gap-3 border-t border-border/70 bg-background/95 py-3 backdrop-blur-sm sm:static sm:bg-transparent sm:py-0 sm:pt-4">

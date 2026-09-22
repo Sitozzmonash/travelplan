@@ -17,8 +17,9 @@ sources / evidence / plans 的结构由 Provider 决定，随时可能多一个�
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 # 方言差异（占位符 / INSERT OR REPLACE / PRAGMA / 连接池）**全部**在 app/db.py 里，
 # 本模块的方法体继续只写 SQLite 原生 SQL —— 想看"两种库差在哪"，只需要读 app/db.py。
@@ -2339,10 +2340,9 @@ class TravelPlanStore:
     # ------------------------------------------------------------------
 
     def save_planning_session(self, session: dict[str, Any]) -> str:
-        """整行写入。
+        """写入初始/导入快照；运行中的会话必须走 update_planning_session。
 
-        会话是短生命周期草稿，逐字段 UPDATE 只会让代码更难读；而它每次变化都由
-        `app/sessions.py` 统一构造完整快照，所以整行替换反而是最不容易出错的做法。
+        不能用读到的旧快照替换正在被用户、Discovery 和启动请求共同修改的行。
         """
 
         session_id = str(session["session_id"])
@@ -2377,6 +2377,100 @@ class TravelPlanStore:
                 ),
             )
         return session_id
+
+    @contextmanager
+    def _planning_session_transaction(self, session_id: str) -> Iterator[tuple[dict | None, Any]]:
+        """锁定后读取最新草稿，仅保存变化字段；事务内禁止 Provider/等待操作。
+
+        首条 no-op UPDATE 在 SQLite 获取写锁，在 Postgres 获取行锁，所以后续
+        读改写跨线程/进程都串行，不依赖进程内锁或 SQLite 专属 BEGIN IMMEDIATE。
+        """
+
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE planning_sessions SET session_id=session_id WHERE session_id=?",
+                    (session_id,),
+                )
+                row = conn.execute(
+                    "SELECT * FROM planning_sessions WHERE session_id=?", (session_id,)
+                ).fetchone()
+                if row is None:
+                    yield None, conn
+                    return
+                session = self._session_row(row)
+                stamp = utcnow().isoformat()
+                if session["status"] not in ("STARTING", "CANCELLED", "EXPIRED") and session["expires_at"] < stamp:
+                    session["status"] = "EXPIRED"
+                if session["status"] == "EXPIRED" and not any(
+                    event.get("event") == "session_expired" for event in session["events"]
+                ):
+                    session["events"].append({
+                        "event": "session_expired", "at": stamp,
+                        "detail": f"超过 TTL 未开始规划（{session['expires_at']}）",
+                    })
+                yield session, conn
+                # 列名固定映射，调用方不能把任意 payload key 拼进 SQL。
+                json_columns = {
+                    "basic_intent": "basic_intent_json", "preferences": "preferences_json",
+                    "poi_selections": "poi_selections_json", "transport_candidates": "transport_json",
+                    "hotel_candidates": "hotels_json", "place_candidates": "places_json",
+                    "evidence_summary": "evidence_summary_json", "degradations": "degradations_json",
+                    "events": "events_json", "discovery": "discovery_json", "prefetch": "prefetch_json",
+                }
+                values = {column: _json(session[key]) for key, column in json_columns.items()}
+                values.update({key: session.get(key) for key in ("status", "discovery_status", "error", "run_id")})
+                changed = {key: value for key, value in values.items() if value != row[key]}
+                if changed:
+                    session["updated_at"] = utcnow().isoformat()
+                    changed["updated_at"] = session["updated_at"]
+                    conn.execute(
+                        "UPDATE planning_sessions SET " + ", ".join(f"{key}=?" for key in changed)
+                        + " WHERE session_id=?", (*changed.values(), session_id),
+                    )
+        finally:
+            # Postgres 上下文已归还池；原生 SQLite 上下文只 commit，不会 close。
+            if isinstance(self._backend, SqliteBackend):
+                conn.close()
+
+    def update_planning_session(
+        self, session_id: str, update: Callable[[dict[str, Any]], None]
+    ) -> dict[str, Any] | None:
+        """update 只修改锁内读到的最新行；异常将回滚，不得嵌套访问 store。"""
+
+        with self._planning_session_transaction(session_id) as (session, _conn):
+            if session is not None:
+                update(session)
+        return session
+
+    def start_planning_session_run(
+        self, session_id: str, run_id: str, confirm: Callable[[dict[str, Any]], str]
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """占用草稿、创建 Run 和进度在同一事务；仅赢家可提交后台任务。"""
+
+        created = False
+        with self._planning_session_transaction(session_id) as (session, conn):
+            if session is not None and not session.get("run_id") and session["status"] in (
+                "COLLECTING", "DISCOVERING", "READY"
+            ):
+                query = confirm(session)
+                stamp = utcnow().isoformat()
+                conn.execute(
+                    "INSERT INTO runs (run_id, user_id, created_at, status, original_query, source, source_session_id)"
+                    " VALUES (?, NULL, ?, 'running', ?, 'guided', ?)",
+                    (run_id, stamp, query, session_id),
+                )
+                conn.execute(
+                    "INSERT INTO run_progress"
+                    " (run_id, status, current_stage, message, started_at, updated_at, finished_at, error)"
+                    " VALUES (?, 'RUNNING', NULL, ?, ?, ?, NULL, NULL)",
+                    (run_id, "规划任务已创建", stamp, stamp),
+                )
+                session["status"] = "STARTING"
+                session["run_id"] = run_id
+                created = True
+        return session, created
 
     @staticmethod
     def _session_row(row: Any) -> dict[str, Any]:

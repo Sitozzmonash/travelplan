@@ -2,8 +2,8 @@
  * Guided 向导的本地草稿模型与「草稿 → 后端请求体」的转换。
  *
  * 设计原则：
- * 1. 用户没表态（null）≠「不限」≠「不确定」≠「帮我选」，四者在提交时必须可区分；
- *    只是没表态的字段会从 PATCH 里省略，让后端自己的默认策略生效。
+ * 1. 草稿保留没表态（null）与「不限 / 不确定 / 帮我选」的区别；
+ *    清空补充条件时显式提交 null，不能省略 PATCH 字段而留下旧值。
  * 2. 任何一步都能用「随便 / 帮我选」走完：未表态时按文档默认（都可以 + 帮我选）提交，
  *    不阻塞、也不在前端假装后端已经知道。
  */
@@ -191,21 +191,21 @@ export function transportPatch(draft: GuidedDraft): SessionPatchInput {
   };
 }
 
-function maxPriceValue(hotel: HotelDraft): NumericPreference | undefined {
+function maxPriceValue(hotel: HotelDraft): NumericPreference {
   if (hotel.maxPriceSentinel) return hotel.maxPriceSentinel;
   const text = hotel.maxPriceText.trim();
-  if (!text) return undefined;
+  if (!text) return null;
   const parsed = Number(text);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
-/** 酒店偏好：未表态的补充项直接省略，把决定权留给后端的稳定默认策略。 */
+/** 后端按字段是否出现更新；null 才会清除旧价格 / 房型，省略意味着保留。 */
 export function hotelPatch(draft: GuidedDraft): SessionPatchInput {
-  const patch: SessionPatchInput = { hotel_priority: draft.hotel.priority ?? "auto" };
-  const maxPrice = maxPriceValue(draft.hotel);
-  if (maxPrice !== undefined) patch.hotel_max_price_per_night = maxPrice;
-  if (draft.hotel.roomType !== null) patch.hotel_room_type = draft.hotel.roomType;
-  return patch;
+  return {
+    hotel_priority: draft.hotel.priority ?? "auto",
+    hotel_max_price_per_night: maxPriceValue(draft.hotel),
+    hotel_room_type: draft.hotel.roomType,
+  };
 }
 
 /** POI 选择：永远提交完整的显式映射，空对象 = 都交给系统安排。 */
@@ -277,6 +277,11 @@ export function preferenceReplayPatch(draft: GuidedDraft): SessionPatchInput {
     ...hotelPatch(draft),
     ...pacePatch(draft),
   };
+}
+
+/** 最终确认 / 错误重试提交完整现状，不重放历史失败的局部 PATCH。 */
+export function fullDraftPatch(draft: GuidedDraft): SessionPatchInput {
+  return { ...preferenceReplayPatch(draft), ...poiPatch(draft) };
 }
 
 export interface PoiNameGroup {
