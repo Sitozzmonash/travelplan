@@ -2,10 +2,10 @@
 
 为什么需要它
 ------------
-城市知识库的**读路径**已经做完（`docs/15_城市知识库攻略正文复用.md`）：命中之后
+城市知识库的**读路径**已经做完（`docs/architecture/DATA_REUSE_ENTITY.md`）：命中之后
 一个社媒 Provider 都不打、一次地点抽取都不调。但**填充**仍然只能"等第一个用户来踩"——
 那位用户要把最贵的社媒检索 + 模型抽取全价付掉，而且一路压在 512Mi 的单实例上
-（`docs/09_部署说明.md` §7 记过 OOM 与健康检查超时）。
+（`docs/operations/DEPLOYMENT.md` §7 记过 OOM 与健康检查超时）。
 
 预热就是把这段挪到离线：提前把行写进 `city_pois` / `city_poi_mentions` /
 `city_evidences` / `city_cache_meta`，之后所有去同一座城市的会话都走命中路径。
@@ -34,13 +34,26 @@
 
 用法
 ----
-    python scripts/preheat_cities.py                    # 默认 20 个城市；只补空/过期的
+    python scripts/preheat_cities.py                    # 默认 53 个城市；只补空/过期的
+    python scripts/preheat_cities.py --daily            # 定时模式：每天最多 15 座，按天轮转起点
+    python scripts/preheat_cities.py --daily --limit 30
     python scripts/preheat_cities.py --cities 成都 重庆
     python scripts/preheat_cities.py --retry-degraded   # 社媒恢复后，把无社媒的城市补回来
     python scripts/preheat_cities.py --force            # 全部重跑
     python scripts/preheat_cities.py --list             # 只看现状，不跑
 
-退出码：0 = 全部成功（降级不算失败，但会打印警告）；1 = 有城市失败 / 未落库。
+定时模式（--daily）
+------------------
+由定时任务（每天凌晨 3 点，见 `.github/workflows/preheat-daily.yml`）调用：
+
+* 每天最多**真正尝试**预热 `--limit` 座城市（默认 15），到额度就停 —— 不会一次烧光配额；
+* 起点按当天是一年中的第几天轮转（`day_of_year % len(cities)`），失败/卡住的城市
+  不会天天排在队首挡住后面的城市，隔几天自然把每座城都轮一遍；
+* 因"新鲜 / 未过期"跳过的城市**不占**额度，只有真的调了 `refresh_city_cache` 才算；
+* 与 `--force` 互斥：定时任务不该强制重跑全部城市，两个一起给会直接报错。
+
+退出码：0 = 全部成功 / daily 正常截断到额度（降级不算失败，但会打印警告）；
+1 = 有城市失败 / 未落库。
 """
 
 from __future__ import annotations
@@ -48,6 +61,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -59,17 +73,29 @@ from app.store import TravelPlanStore  # noqa: E402
 #: `.env` 的位置。**不在 import 时加载** —— 见 `main()` 里的说明。
 _ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 
-#: 默认预热清单（20 个）。按"被搜得多 + 覆盖不同地域"挑，命中率比覆盖面重要。
-#: 除了常规热门，刻意放了几个中小城市（钦州 / 婺源 / 黄山 / 泉州），用来证明
+#: 默认预热清单（53 个）。覆盖全国热门 + 各地域，按"被搜得多"排序，命中率比覆盖面重要。
+#: 除了常规热门，刻意放了几个中小城市（泉州 / 景德镇 / 开封 / 邯郸），用来证明
 #: 这条预热链路不是只对一线城市有效。
 DEFAULT_CITIES = (
-    # 第一轮（2026-09-21 上午）
-    "成都", "重庆", "西安", "北京", "上海", "杭州",
-    # 第二轮：福建 / 安徽 / 广西 + 其它热门与中小城市
-    "厦门", "泉州", "福州",
-    "黄山", "合肥", "钦州",
-    "桂林", "长沙", "武汉", "青岛", "洛阳",
-    "婺源", "大理", "三亚",
+    # 第一梯队：一线 + 顶级流量（被搜得最多）
+    "北京", "上海", "广州", "深圳",
+    "成都", "重庆", "西安", "杭州",
+    # 长三角
+    "南京", "苏州", "无锡", "宁波", "温州",
+    # 京津冀 / 华北 / 山东半岛
+    "天津", "青岛", "烟台", "威海", "济南", "郑州",
+    # 东北
+    "沈阳", "大连", "哈尔滨", "长春",
+    # 华中
+    "武汉", "长沙", "南昌", "合肥",
+    # 广西 / 云贵：桂林山水、民族风情与高原游
+    "桂林", "南宁", "柳州", "贵阳", "昆明", "丽江", "大理", "西双版纳",
+    # 西北 / 西部边疆
+    "兰州", "敦煌", "西宁", "银川", "乌鲁木齐", "拉萨", "呼和浩特",
+    # 东南沿海
+    "厦门", "福州", "泉州", "珠海",
+    # 文化古城（含中小城市）
+    "黄山", "景德镇", "洛阳", "开封", "邯郸", "太原", "石家庄",
 )
 
 
@@ -125,7 +151,20 @@ def _skip_reason(info: dict[str, object], *, force: bool, retry_degraded: bool) 
     return "缓存新鲜且社媒证据齐全"
 
 
-def main() -> int:
+def _rotate_daily(cities: list[str]) -> list[str]:
+    """`--daily`：按当天在一年中的第几天轮转起点。
+
+    失败/卡住的城市如果天天排在队首，会一直挡着后面的城市。每天从不同起点开始、
+    走到今天的额度就停，隔几天自然把每座城都轮一遍。非 daily 模式不调用本函数。
+    """
+
+    if not cities:
+        return cities
+    start = int(date.today().strftime("%j")) % len(cities)
+    return cities[start:] + cities[:start]
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="为热门城市预热城市知识库")
     parser.add_argument("--cities", nargs="*", default=list(DEFAULT_CITIES), help="要预热的城市")
     parser.add_argument("--force", action="store_true", help="已新鲜的城市也重跑")
@@ -134,19 +173,41 @@ def main() -> int:
         action="store_true",
         help="额外重跑「新鲜但没有社媒证据」的城市（社媒恢复后用这个补）",
     )
+    parser.add_argument(
+        "--daily",
+        action="store_true",
+        help="定时模式：每天最多 --limit 座城市，起点按天轮转（与 --force 互斥）",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=15,
+        help="每天最多尝试预热的城市数（仅 --daily 生效，默认 15）",
+    )
     parser.add_argument("--list", action="store_true", help="只报告现状，不跑 Provider")
     parser.add_argument(
         "--allow-sqlite",
         action="store_true",
         help="允许写到本地 SQLite（默认拒绝：预热的意义是写共享库）",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # `.env` 只在这里加载，不在 import 时加载：这个模块会被测试 import（`tests/test_preheat_cities.py`），
     # 而 `load_dotenv()` 会往 `os.environ` 里灌值 —— 那样同一进程里**后面跑的其它测试**会
     # 悄悄读到 .env 的配置（实测会把 `tests/test_workflow.py` 的"模型只有 6 个调用点"断言打破）。
     # 副作用只该发生在真正执行的时候。
     load_dotenv(_ENV_PATH)
+
+    if args.daily and args.force:
+        print(
+            "--force 与 --daily 互斥：定时任务不该强制重跑全部城市。\n"
+            "去掉 --force（--daily 每天只跑 --limit 座城市）。",
+            file=sys.stderr,
+        )
+        return 1
+    if args.daily and args.limit < 1:
+        print("--limit 至少要为 1", file=sys.stderr)
+        return 1
 
     store = TravelPlanStore()
     if store.backend_name != "postgres" and not args.allow_sqlite:
@@ -162,6 +223,9 @@ def main() -> int:
     if not cities:
         print("没有要预热城市", file=sys.stderr)
         return 1
+    if args.daily:
+        cities = _rotate_daily(cities)
+        print(f"定时模式：起点按 day-of-year 轮转，最多尝试 {args.limit} 座。")
 
     print(f"库：{store.describe()}")
     print(f"预热 {len(cities)} 座城市：{'、'.join(cities)}")
@@ -175,13 +239,21 @@ def main() -> int:
     print()
     failed: list[str] = []
     degraded: list[str] = []
+    attempted = 0
+    limit = args.limit if args.daily else len(cities)
     started = time.perf_counter()
     for index, city in enumerate(cities, start=1):
+        if attempted >= limit:
+            # 只有 --daily 会把 limit 设成小于城市总数；到额度就停，正常截断不算失败。
+            if args.daily:
+                print(f"    已达今日额度 {limit} 座，停止（其余留到后续轮次）。", flush=True)
+            break
         before = _row(city, store=store)
         skip = _skip_reason(before, force=args.force, retry_degraded=args.retry_degraded)
         if skip is not None:
             print(f"[{index}/{len(cities)}] {city}：跳过（{skip}）")
             continue
+        attempted += 1
         print(f"[{index}/{len(cities)}] {city}：开始预热……", flush=True)
         began = time.perf_counter()
         try:

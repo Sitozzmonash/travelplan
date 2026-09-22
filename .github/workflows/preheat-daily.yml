@@ -1,0 +1,47 @@
+name: Preheat city knowledge (daily)
+
+on:
+  schedule:
+    # UTC 19:00 = 北京时间 / 马来西亚时间次日 03:00（用户要求"每天凌晨 3 点"）。
+    # GitHub Actions 的 schedule 可能延迟数分钟，不影响"凌晨低峰跑离线预热"的语义。
+    - cron: '0 19 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preheat:
+    name: Daily preheat (--daily)
+    runs-on: ubuntu-latest
+    # 单城约 2.5 分钟，15 城约 40 分钟；90 分钟留足慢速 Provider 时的余量。
+    timeout-minutes: 90
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          # requirements.txt 里是 `-e ./super_harness[mcp]`，必须先检出子模块才能装依赖。
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily preheat
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          AMAP_API_KEY: ${{ secrets.AMAP_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          TIKHUB_API_TOKEN: ${{ secrets.TIKHUB_API_TOKEN }}
+          MODEL_NAME: ${{ secrets.MODEL_NAME }}
+          MODEL_BASE_URL: ${{ secrets.MODEL_BASE_URL }}
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+          JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
+          # 可选：仓库 Variable PREHEAT_DAILY_LIMIT（默认 15），控制每天最多预热多少座城。
+          PREHEAT_DAILY_LIMIT: ${{ vars.PREHEAT_DAILY_LIMIT || '15' }}
+        # 退出码：0=成功/降级落库/正常截断；1=有城市失败 → 步骤失败、job 失败（不接外部通知）。
+        run: python scripts/preheat_cities.py --daily --limit "$PREHEAT_DAILY_LIMIT"

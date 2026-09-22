@@ -1,13 +1,16 @@
-"""预热脚本的跳过判定（`scripts/preheat_cities.py::_skip_reason`）。
+"""预热脚本的跳过判定与 `--daily` 定时模式（`scripts/preheat_cities.py`）。
 
-为什么单独测这几行：它是"要不要再花 2~3 分钟 + 一份 Provider 配额重跑一座城市"的唯一判据。
-判反了两个方向都很糟 ——
+两块内容：
 
-* 该跑的不跑：空的城市永远填不上、降级的城市永远停在降级；
-* 每次都重跑：白烧配额与时间（这正是限流本身的一部分原因）。
+* 跳过判定（`_skip_reason`）：它是"要不要再花 2~3 分钟 + 一份 Provider 配额重跑一座
+  城市"的唯一判据，判反两个方向都很糟 —— 该跑的不跑（空城永远填不上、降级永远停在
+  降级）、每次都重跑（白烧配额，这正是限流本身的一部分原因）。接口约定容易写反
+  （返回**跳过理由**、返回 `None` 表示执行），所以四种组合都钉住。
 
-而它的接口约定本身就容易写反（返回**跳过理由**、返回 `None` 表示执行），所以这里
-把四种组合都钉住，而不是只测一条。
+* `--daily` 定时模式：每天最多真正尝试 `--limit` 座城市（默认 15）、起点按
+  day-of-year 轮转、跳过的城市不占额度、与 `--force` 互斥。这些用例全部用替身跑
+  `main()` —— monkeypatch 掉 `load_dotenv` / `TravelPlanStore` / `_row` /
+  `sessions.refresh_city_cache`，不真连库、不真调 Provider。
 """
 
 from __future__ import annotations
@@ -63,3 +66,162 @@ def test_degraded_city_is_skipped_by_default(preheat):
     reason = preheat._skip_reason(_city("新鲜", social=0), force=False, retry_degraded=False)
     assert reason, "默认不该重跑降级城市"
     assert "--retry-degraded" in reason, "跳过时要告诉用户怎么补社媒"
+
+
+# ---------------------------------------------------------------- --daily 替身设施
+
+class _FakeStore:
+    """只被 `store.describe()` / `store.backend_name` 用到；`_row` 已被替身化。"""
+
+    backend_name = "postgres"
+
+    def describe(self) -> str:
+        return "postgres:测试替身"
+
+
+def _fixed_date(doy: int):
+    """让 `date.today().strftime("%j")` 固定返回 doy（1~366）。"""
+
+    class _FakeDate:
+        @classmethod
+        def today(cls):
+            return _FakeDate()
+
+        def strftime(self, fmt: str) -> str:
+            assert fmt == "%j"
+            return f"{doy:03d}"
+
+    return _FakeDate
+
+
+def _run_main(preheat, monkeypatch, argv, *, states: dict[str, str], call_log: list[str]) -> int:
+    """替身化跑 `main()`：不连库、不调 Provider，只记录 refresh 调用序列。
+
+    `states` 决定每座城市 `_row` 返回的 state（缺省"空"= 会真跑）；`call_log` 按序记录
+    真正调了 `sessions.refresh_city_cache` 的城市。
+    """
+
+    monkeypatch.setattr(preheat, "load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr(preheat, "TravelPlanStore", _FakeStore)
+    monkeypatch.setattr(
+        preheat,
+        "_row",
+        lambda city, *, store: {
+            "city": city,
+            "state": states.get(city, "空"),
+            "places": 20,
+            "evidences": 10,
+            "social": 5,
+            "queries": 3,
+            "age": "-",
+        },
+    )
+    monkeypatch.setattr(
+        preheat.sessions,
+        "refresh_city_cache",
+        lambda store, city: (
+            call_log.append(city),
+            {
+                "city": city,
+                "places": 5,
+                "evidences": 3,
+                "social_evidences": 2,
+                "queries": 1,
+                "notes": [],
+            },
+        )[1],
+    )
+    return preheat.main(argv)
+
+
+# ------------------------------------------------------------ --daily 定时模式用例
+
+def test_daily_rotation_and_truncation(preheat, monkeypatch):
+    """day-of-year 决定轮转起点；串行、达到 limit 即停；跳过的城市不占额度。"""
+
+    call_log: list[str] = []
+    monkeypatch.setattr(preheat, "date", _fixed_date(2))  # doy=2 → 2 % 5 = 2
+    cities = ["北京", "上海", "广州", "深圳", "成都"]
+    states = {"深圳": "新鲜"}  # 只有深圳新鲜（跳过），其余是空城（会真跑）
+    rc = _run_main(
+        preheat, monkeypatch,
+        ["--daily", "--limit", "2", "--cities", *cities],
+        states=states, call_log=call_log,
+    )
+    # 轮转后顺序：广州、深圳、成都、北京、上海
+    # 广州跑(1) → 深圳跳过(不占额度) → 成都跑(2，达额度) → 北京停
+    assert call_log == ["广州", "成都"], f"调用序列应为轮转后前 2 个真跑的，实际 {call_log}"
+    assert len(call_log) == 2
+    assert rc == 0, "daily 正常截断到额度算成功"
+
+
+def test_daily_rotation_start_depends_on_day_of_year(preheat, monkeypatch):
+    """`start = day_of_year % len(cities)`：不同日期轮转起点不同，整数倍回原点。"""
+
+    cities = ["a", "b", "c", "d", "e"]
+    monkeypatch.setattr(preheat, "date", _fixed_date(2))  # 2 % 5 = 2
+    assert preheat._rotate_daily(cities) == ["c", "d", "e", "a", "b"]
+    monkeypatch.setattr(preheat, "date", _fixed_date(5))  # 5 % 5 = 0 → 保持原顺序
+    assert preheat._rotate_daily(cities) == ["a", "b", "c", "d", "e"]
+
+
+def test_skipped_cities_do_not_count_toward_limit(preheat, monkeypatch):
+    """跳过的不占额度：6 座里 3 座新鲜被跳过，limit=3 时 3 个真跑的都被跑完。"""
+
+    call_log: list[str] = []
+    monkeypatch.setattr(preheat, "date", _fixed_date(1))  # 1 % 6 = 1 → 从第 2 座开始
+    cities = ["A", "B", "C", "D", "E", "F"]
+    states = {"B": "新鲜", "D": "新鲜", "F": "新鲜"}
+    rc = _run_main(
+        preheat, monkeypatch,
+        ["--daily", "--limit", "3", "--cities", *cities],
+        states=states, call_log=call_log,
+    )
+    # 轮转后：B, C, D, E, F, A
+    # B 跳过、C 跑(1)、D 跳过、E 跑(2)、F 跳过、A 跑(3) → 达额度
+    assert call_log == ["C", "E", "A"], f"跳过的城市不该占额度，实际 {call_log}"
+    assert rc == 0
+
+
+def test_non_daily_keeps_original_order_and_runs_all(preheat, monkeypatch):
+    """非 daily 模式：不轮转、不截断，保持原顺序全部跑完（回归保护）。"""
+
+    call_log: list[str] = []
+    cities = ["a", "b", "c"]
+    rc = _run_main(
+        preheat, monkeypatch,
+        ["--cities", *cities],
+        states={}, call_log=call_log,
+    )
+    assert call_log == ["a", "b", "c"]
+    assert rc == 0
+
+
+def test_force_and_daily_are_mutually_exclusive(preheat, monkeypatch, capsys):
+    """`--force` 与 `--daily` 互斥：同时给直接报错返回 1，一座都不跑。"""
+
+    call_log: list[str] = []
+    rc = _run_main(
+        preheat, monkeypatch,
+        ["--daily", "--force", "--cities", "北京"],
+        states={}, call_log=call_log,
+    )
+    assert rc == 1
+    assert call_log == [], "互斥报错时不该真的跑任何城市"
+    assert "互斥" in capsys.readouterr().err, "报错信息要说明互斥"
+
+
+# ------------------------------------------------------------ 默认城市清单
+
+def test_default_cities_cover_regions_without_duplicates(preheat):
+    """清单扩到 45 个左右：长度 ≥ 40、无重复、关键城市与地域都要在。"""
+
+    cities = preheat.DEFAULT_CITIES
+    assert len(cities) >= 40, f"默认清单要扩到 45 个左右，实际 {len(cities)}"
+    assert len(set(cities)) == len(cities), "默认清单不能有重复城市"
+    for name in (
+        "北京", "上海", "广州", "深圳", "成都", "重庆", "西安", "杭州",  # 一线 + 顶级流量
+        "南京", "苏州", "武汉", "哈尔滨", "昆明", "厦门",               # 各地域代表
+        "乌鲁木齐", "拉萨", "呼和浩特",                                  # 西部边疆
+    ):
+        assert name in cities, f"默认清单缺城市：{name}"
