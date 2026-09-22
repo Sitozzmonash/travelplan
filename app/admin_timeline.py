@@ -22,13 +22,31 @@
    ``input_preview`` / ``output_preview``；早期版本记下的 run 没有这些字段，那时给
    ``None`` 并在 ``notes`` 里说明"这条 span 没写预览"，而不是拿摘要冒充原文。
 3. **预览必须脱敏 + 截断**：Tool 参数与返回来自第三方，可能带 Key 或几百 KB 正文。
+
+Agent Loop 这一路（主路径已换成它）
+----------------------------------
+`app/agent_runner.py::execute_agent_run` 里 Agent 自己调工具出计划，落进 trace 的事实是：
+
+* 工具 span（component=``tool``，``name`` = 工具名）—— 每次调用一条，attributes 带
+  ``tool / status / duration_ms / seq / stage_key / query / note``；
+* 模型 span（component=``llm``）—— 每次调用一条，attributes 带
+  ``input_tokens / output_tokens / cached_tokens / total_tokens / cumulative_*``；
+* ``run_stages`` 的 ``stage_id`` 就是**中文展示名**（「在查酒店」），逐次调用的完整事实
+  在 span 上（同名工具多次调用共享同一行 stage，后写覆盖先写）。
+
+所以本模块除了逐条事件，还会给出一份 ``agent`` 块：``steps``（按真实发生顺序排好的
+工具 / 模型步骤，带每步 token）、``tokens``（run_metrics 的整 run 汇总）、``meta``
+（prompt 版本 / 交卷方式 / truncation 与上限）。**固定 12 步的那些阶段码在这一路里不存在**，
+事件与步骤一律按新口径归属，旧 run 走原来的三条规则（见 ``_StageIndex``）。
 """
 
 from __future__ import annotations
 
 import json
+import os
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -37,7 +55,18 @@ from .models import TripPlan
 from .observability import now_iso
 from .redact import clip, scrub
 from .store import TravelPlanStore
-from .workflow import LLM_STAGE_MAP, PROVIDER_STAGE_MAP
+from .workflow import DEFAULT_OUTPUT_DIR, LLM_STAGE_MAP, PROVIDER_STAGE_MAP
+
+#: Agent 交卷工具名。与 `app/agent_runner.py::SUBMIT_TOOL_NAME` 必须一致（有一处单测守着）。
+#: 刻意不 import agent_runner：那个模块会拉起 langchain / superharness，而这个模块是
+#: 只读聚合，不该因为写一个新实现而多背一份重依赖。
+SUBMIT_TOOL_NAME = "submit_final_plan"
+
+#: `audit["agent"]["plan_origin"]` → 人话（管理端直接把这句话显示出来）。
+PLAN_ORIGIN_LABELS: dict[str, str] = {
+    SUBMIT_TOOL_NAME: "Agent 调用 submit_final_plan 交卷",
+    "message_json": "Agent 未交卷，行程由最后一条回复里的 JSON 解析（message_json 兜底）",
+}
 
 #: 八类事件。前端按它做筛选与配色，因此词表只在这里定义一次。
 EVENT_TYPES: tuple[str, ...] = (
@@ -194,13 +223,28 @@ def _stage_for_tool(tool: str) -> str | None:
 # ======================================================================
 
 
+def _base_stage_key(key: str) -> str:
+    """``tool:search_hotels:2`` → ``tool:search_hotels``；``llm:gpt-4o`` 原样返回。
+
+    同一个工具的第 N 次调用共享同一行 stage（后写覆盖先写），facts 里只留下最后那次的
+    ``stage_key``；去掉尾部的调用序号，前几次才能挂回同一行。
+    """
+
+    head, separator, tail = key.rpartition(":")
+    if separator and tail.isdigit():
+        return head
+    return key
+
+
 class _StageIndex:
     """把 span / 工具 / 模型调用归到 workflow 阶段。
 
-    归属规则有三条，优先用最可靠的那条：
-      1. 父 span 以 ``:{stage_id}`` 结尾 —— trace 自己写下的父子关系；
-      2. 工具名 → 阶段（``PROVIDER_STAGE_MAP``）—— 静态映射，来自 workflow；
-      3. 模型 tag → 阶段（``LLM_STAGE_MAP``），按前缀匹配（tag 带序号）。
+    归属规则按可靠性排序，先用前面那条：
+      1. **Agent Loop 的步骤身份**：span 属性里的 ``stage_key``（``tool:search_hotels:2``）、
+         工具名、模型名与 ``run_stages.facts`` 对上 —— 中文展示名就是 stage_id 本身；
+      2. 父 span 以 ``:{stage_id}`` 结尾 —— trace 自己写下的父子关系；
+      3. 工具名 → 阶段（``PROVIDER_STAGE_MAP``）/ 模型 tag → 阶段（``LLM_STAGE_MAP``）
+         —— 固定 12 步流程的静态映射，只在旧 run 上有意义。
     三条都命不中就不挂阶段（前端显示"未归属"），而不是随便猜一个。
     """
 
@@ -208,6 +252,13 @@ class _StageIndex:
         self.order: list[str] = []
         self.titles: dict[str, str] = {}
         self.status: dict[str, Any] = {}
+        #: Agent Loop 的三个反查表：stage_key / 工具名 / 模型名 → stage_id。
+        self._by_key: dict[str, str] = {}
+        self._by_tool: dict[str, str] = {}
+        self._by_model: dict[str, str] = {}
+        #: 模型名 → facts 里的 stage_key。模型调用的 span 不写 stage_key（工具 span 才写），
+        #: 而所有模型调用共享「在思考行程」这一行，它对每次模型调用都是同一个值，可以安全回填。
+        self._key_by_model: dict[str, str] = {}
         for stage in stages:
             stage_id = str(stage.get("stage_id") or "")
             if not stage_id:
@@ -216,18 +267,68 @@ class _StageIndex:
                 self.order.append(stage_id)
             self.titles[stage_id] = str(stage.get("message") or stage_id) or stage_id
             self.status[stage_id] = stage.get("status")
+            facts = stage.get("facts")
+            facts = facts if isinstance(facts, Mapping) else {}
+            stage_key = str(facts.get("stage_key") or "")
+            if stage_key:
+                self._by_key.setdefault(stage_key, stage_id)
+                base = _base_stage_key(stage_key)
+                if base != stage_key:
+                    self._by_key.setdefault(base, stage_id)
+            tool = str(facts.get("tool") or "")
+            if tool:
+                self._by_tool.setdefault(tool, stage_id)
+            model = str(facts.get("model") or "")
+            if model:
+                self._by_model.setdefault(model, stage_id)
+                if stage_key:
+                    self._key_by_model.setdefault(model, stage_key)
         self._index = {stage_id: position for position, stage_id in enumerate(self.order)}
         self._run_id = run_id
 
+    @staticmethod
+    def _suffix_lookup(index: Mapping[str, str], name: str) -> str | None:
+        """带 Provider 前缀的工具名（``tuniu_search_hotels``）按后缀挂回它的阶段。"""
+
+        if not name:
+            return None
+        for known, stage_id in index.items():
+            if name.endswith(known):
+                return stage_id
+        return None
+
+    def key_for_model(self, model: str) -> str:
+        """模型名 → 那行 stage 的 ``facts.stage_key``（拿不到就给空串）。"""
+
+        return self._key_by_model.get(model) or ""
+
     def of_span(self, span: Mapping[str, Any]) -> str | None:
+        attributes = span.get("attributes") or {}
+        component = str(span.get("component") or "")
+        # 1) Agent Loop：span 上带着 run_stages 里那份步骤身份。
+        stage_key = str(attributes.get("stage_key") or "")
+        if stage_key:
+            mapped = self._by_key.get(stage_key) or self._by_key.get(_base_stage_key(stage_key))
+            if mapped:
+                return mapped
+        if component in ("tool", "mcp"):
+            tool = str(attributes.get("tool") or span.get("name") or "")
+            mapped = self._by_tool.get(tool) or self._suffix_lookup(self._by_tool, tool)
+            if mapped:
+                return mapped
+        if component == "llm":
+            name = str(attributes.get("model") or attributes.get("tag") or span.get("name") or "")
+            mapped = self._by_model.get(name) or self._suffix_lookup(self._by_model, name)
+            if mapped:
+                return mapped
+        # 2) 父 span 写下的父子关系（固定 12 步流程）。
         parent = str(span.get("parent_span_id") or "")
         prefix = f"{self._run_id}:"
         if parent.startswith(prefix):
             tail = parent[len(prefix) :].split(":", 1)[0]
             if tail in self._index:
                 return tail
-        attributes = span.get("attributes") or {}
-        component = str(span.get("component") or "")
+        # 3) 静态映射（旧 run 的工具名 / 模型 tag）。
         if component in ("tool", "provider", "mcp"):
             tool = str(attributes.get("tool") or span.get("name") or "")
             mapped = _stage_for_tool(tool)
@@ -331,28 +432,38 @@ def _tool_events(
     *,
     run_id: str,
     spans: Sequence[Mapping[str, Any]],
-    sources: Sequence[Mapping[str, Any]],
+    sources_by_span: Mapping[str, Mapping[str, Any]],
     stages: _StageIndex,
     badcase_by_ref: Mapping[str, list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
-    """工具调用事件：span 给"发生了什么"，source 给"参数与返回"。"""
+    """工具调用事件：span 给"发生了什么"，source 给"参数与返回"。
 
-    sources_by_id = {str(source.get("source_id")): source for source in sources}
+    ``sources_by_span`` 由 ``_match_sources_to_spans`` 算好（显式 source_id 优先，其次按
+    时间窗口对齐）—— Agent 路径的 tool span 不带 source_id，只能靠时间窗口找回 Provider
+    与返回条数。
+    """
+
     events: list[dict[str, Any]] = []
-    matched: set[str] = set()
     for span in spans:
         if str(span.get("component")) not in ("tool", "mcp"):
             continue
         attributes = span.get("attributes") or {}
-        source_id = str(attributes.get("source_id") or "")
-        source = sources_by_id.get(source_id)
-        if source:
-            matched.add(source_id)
+        source = sources_by_span.get(str(span.get("span_id") or ""))
         tool = str(attributes.get("tool") or span.get("name") or "tool")
-        provider = str(attributes.get("provider") or "") or None
+        # Provider 优先用 span 自己写的（固定流程）；没有就用对齐上的账本行 —— Agent 路径的
+        # tool span 不带 provider，不补的话每一行都只能显示工具名。
+        provider = (
+            str(attributes.get("provider") or "")
+            or (str(source.get("provider") or "") if source else "")
+            or None
+        )
         stage = stages.of_span(span)
         status = str(attributes.get("status") or span.get("status") or "UNKNOWN")
         returned = attributes.get("returned")
+        if returned is None and source is not None:
+            normalized = source.get("normalized")
+            if isinstance(normalized, Mapping) and isinstance(normalized.get("count"), int):
+                returned = normalized["count"]
         duration = _span_duration(span)
         notes: list[str] = []
         if str(attributes.get("hedge_discarded") or "").lower() in ("true", "1"):
@@ -361,6 +472,11 @@ def _tool_events(
             notes.append("结果来自 Discovery 阶段，本次 run 没有再打一次 Provider")
         if source and source.get("source_type") == "discovery":
             notes.append("该调用属于 Discovery 阶段，本次 run 复用其结果")
+        if source is not None and not attributes.get("source_id"):
+            notes.append(
+                "Provider 与返回条数按**时间窗口**对齐到这次工具调用"
+                "（Agent 路径的 tool span 不写 source_id；窗口内唯一命中才认）"
+            )
 
         events.append(
             _event(
@@ -398,12 +514,15 @@ def _tool_events(
                     or returned
                 ),
                 metadata={
-                    "source_id": source_id or None,
+                    "source_id": str((source or {}).get("source_id") or "") or None,
                     "source_url": (source or {}).get("source_url"),
                     "returned": returned,
                     "timeout": attributes.get("timeout"),
                     "provider_called": attributes.get("provider_called"),
                     "marker": attributes.get("marker"),
+                    "stage_key": attributes.get("stage_key"),
+                    "seq": attributes.get("seq"),
+                    "output_chars": attributes.get("output_chars"),
                 },
                 notes=notes,
                 badcases=badcase_by_ref.get(str(span.get("span_id")), []),
@@ -419,6 +538,7 @@ def _provider_events(
     sources: Sequence[Mapping[str, Any]],
     matched_source_ids: set[str],
     stages: _StageIndex,
+    agent_run: bool = False,
 ) -> list[dict[str, Any]]:
     """底层数据源事件：分组 span 给"这家 Provider 调了几次"，
     未被任何 tool span 覆盖的 source 行按"复用 Discovery / 未落 span"单独列出来。"""
@@ -485,7 +605,14 @@ def _provider_events(
                 output_preview=_preview(
                     (source.get("normalized") or {}).get("items") or source.get("raw")
                 ),
-                notes=["这条调用没有对应的 tool span（多为 Discovery 复用或早期版本记录）"],
+                notes=[
+                    (
+                        "Agent 路径的 tool span 不带 source_id，这条账本行按时间窗口也没能唯一"
+                        "对齐到某次工具调用（多为预取复用、并发对冲或没有对应 span 的调用）"
+                        if agent_run
+                        else "这条调用没有对应的 tool span（多为 Discovery 复用或早期版本记录）"
+                    )
+                ],
                 metadata={"source_type": source.get("source_type"), "source_url": source.get("source_url")},
             )
         )
@@ -746,6 +873,339 @@ def _error_events(
 
 
 # ======================================================================
+# Agent Loop：步骤流 / token / 元信息
+# ======================================================================
+
+#: 没有开始时刻的事件排到最后（而不是排到 1970 年去）。
+_SORT_MAX = datetime.max.replace(tzinfo=timezone.utc)
+
+
+def _output_dir() -> Path:
+    """run 级产物的目录（与 `app/api.py::_output_dir` 同一份口径：环境变量优先）。"""
+
+    return Path(os.environ.get("TRAVELPLAN_OUTPUT_DIR", str(DEFAULT_OUTPUT_DIR)))
+
+
+def _run_audit(run_id: str) -> dict[str, Any]:
+    """读回该 run 的 `audit_report.json`（读不到就给空 dict，绝不因此让轨迹打不开）。
+
+    为什么这里要读文件：`audit["agent"]` 里的 ``plan_origin`` / ``truncation`` /
+    ``max_steps`` / ``timeout_seconds`` **没有对应的库表列**（run_metrics 表结构固定，
+    `store.save_run_metrics` 只落那几个汇总数字；这几项当时只写进了内存里的 metrics 与
+    审计文件）。库侧能拿到的只有 run_metrics 汇总与 trace，所以这一块要么读文件、
+    要么留空 —— 这里选择读文件并把"读不到"如实标注（见 payload 的 notes）。
+    """
+
+    path = _output_dir() / run_id / "audit_report.json"
+    try:
+        if not path.is_file():
+            return {}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _is_agent_run(spans: Sequence[Mapping[str, Any]], prompt_span: Mapping[str, Any] | None) -> bool:
+    """这次 run 是不是 Agent Loop 出的计划。
+
+    两条证据任一成立即可：`_record_prompt_version` 写下的 workflow span 上标了
+    ``agent=superharness``；或者有 tool span 带 ``stage_key``（StepReporter 只有这一路用）。
+    旧 run 两条都命不中 —— 于是它们继续走固定 12 步的展示口径。
+    """
+
+    attributes = (prompt_span or {}).get("attributes") or {}
+    if str(attributes.get("agent") or "") == "superharness":
+        return True
+    return any(
+        str(span.get("component")) in ("tool", "mcp") and (span.get("attributes") or {}).get("stage_key")
+        for span in spans
+    )
+
+
+def _prompt_span(spans: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+    for span in spans:
+        if str(span.get("component")) == "workflow" and str(span.get("name")) == "prompt_version":
+            return span
+    return None
+
+
+def _match_sources_to_spans(
+    spans: Sequence[Mapping[str, Any]], sources: Sequence[Mapping[str, Any]]
+) -> tuple[dict[str, Mapping[str, Any]], set[str]]:
+    """把 Provider 账本的行对齐到工具调用 span，返回 `(span_id → source, 已认领的 source_id)`。
+
+    两条规则，都可以回溯：
+      1. span 自己写着 ``source_id``（固定流程的 tool span 就是这么记的）—— 显式引用，最可靠；
+      2. 退一步按**时间窗口**：账本行的 ``fetched_at`` 落在某个工具 span 的起止之间。
+         Agent 路径的 tool span 不带 source_id，只有这条能把"这次工具调用背后是谁返回的、
+         返回几条"挂回来。窗口内落进多条就都不认 —— 宁可留白，也不把 A 次调用的返回
+         挂到 B 次调用上。
+    """
+
+    sources_by_id = {str(source.get("source_id") or ""): source for source in sources}
+    claimed: dict[str, Mapping[str, Any]] = {}
+    matched: set[str] = set()
+    windows: list[tuple[str, datetime, datetime]] = []
+    for span in spans:
+        if str(span.get("component")) not in ("tool", "mcp"):
+            continue
+        span_key = str(span.get("span_id") or "")
+        attributes = span.get("attributes") or {}
+        explicit = str(attributes.get("source_id") or "")
+        if explicit and explicit in sources_by_id:
+            claimed[span_key] = sources_by_id[explicit]
+            matched.add(explicit)
+            continue
+        started = _parse_ts(span.get("started_at"))
+        finished = _parse_ts(span.get("finished_at")) or started
+        if started is None or finished is None:
+            continue
+        windows.append((span_key, started, finished))
+    if not windows:
+        return claimed, matched
+
+    taken: set[str] = set()
+    for source in sources:
+        source_id = str(source.get("source_id") or "")
+        if source_id in matched:
+            continue
+        stamp = _parse_ts(source.get("fetched_at"))
+        if stamp is None:
+            continue
+        fits = [
+            span_key
+            for span_key, started, finished in windows
+            if started <= stamp <= finished and span_key not in taken
+        ]
+        if len(fits) != 1:
+            continue
+        claimed[fits[0]] = source
+        taken.add(fits[0])
+        matched.add(source_id)
+    return claimed, matched
+
+
+def _span_tokens(attributes: Mapping[str, Any]) -> dict[str, int | None] | None:
+    """一次模型调用的 token 四项（取不到就给 None，绝不写 0 冒充）。
+
+    ``total_tokens`` 优先用 span 上写好的（StepReporter 按 input + output 算过，
+    cached 已含在 input 内）；只有早期 span 缺 total 时才自己加。
+    """
+
+    tokens_in = _int_or_none(attributes.get("input_tokens"))
+    tokens_out = _int_or_none(attributes.get("output_tokens"))
+    cached = _int_or_none(attributes.get("cached_tokens"))
+    total = _int_or_none(attributes.get("total_tokens"))
+    if total is None and (tokens_in is not None or tokens_out is not None):
+        total = int(tokens_in or 0) + int(tokens_out or 0)
+    if tokens_in is None and tokens_out is None and cached is None and total is None:
+        return None
+    return {"input": tokens_in, "output": tokens_out, "cached": cached, "total": total}
+
+
+def _agent_steps(
+    *,
+    spans: Sequence[Mapping[str, Any]],
+    stages: _StageIndex,
+    sources_by_span: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Agent 的步骤流：一行 = 一次真实调用（tool span 或 llm span）。
+
+    为什么不直接拿 ``run_stages`` 当步骤流：它的 ``stage_id`` 是中文展示名，同名工具的
+    第 N 次调用共享同一行（后写覆盖先写），逐次事实只在 span 上。这里按 span 归拢，
+    ``stage`` 仍回到那行展示名，于是"工具中文名 + 状态 + 耗时 + 这一步的 token"一次给全。
+
+    顺序按 ``started_at``（真实发生顺序）；同一时刻再用 span 上的 ``seq`` 与 span_id 兜底
+    —— 工具 span 的 ``seq`` 是"该工具的第几次调用"，它排不了跨工具 / 跨模型的先后。
+    """
+
+    rows: list[dict[str, Any]] = []
+    for span in spans:
+        component = str(span.get("component") or "")
+        if component not in ("tool", "mcp", "llm"):
+            continue
+        attributes = span.get("attributes") or {}
+        kind = "model" if component == "llm" else "tool"
+        stage = stages.of_span(span)
+        source = sources_by_span.get(str(span.get("span_id") or "")) if kind == "tool" else None
+        model_name = str(attributes.get("model") or span.get("name") or "") if kind == "model" else ""
+        # 步骤身份：工具 span 自己写着 stage_key；模型 span 不写，用「在思考行程」那行 facts 里的
+        # key 回填（它按模型名记录，对每一次模型调用都是同一个值，不是逐次推断出来的）。
+        step_key = str(attributes.get("stage_key") or "") or (
+            stages.key_for_model(model_name) if kind == "model" else ""
+        )
+        returned = attributes.get("returned")
+        if returned is None and source is not None:
+            normalized = source.get("normalized")
+            if isinstance(normalized, Mapping) and isinstance(normalized.get("count"), int):
+                returned = normalized["count"]
+        rows.append(
+            {
+                "order": 0,  # 排完序统一编号
+                "kind": kind,
+                "seq": _int_or_none(attributes.get("seq")),
+                "span_id": str(span.get("span_id") or ""),
+                "event_id": str(span.get("span_id") or ""),
+                "stage": stage,
+                "stage_title": stages.titles.get(stage) if stage else None,
+                "step_key": step_key or None,
+                "tool": str(attributes.get("tool") or span.get("name") or "") or None
+                if kind == "tool"
+                else None,
+                "model": model_name or None,
+                "provider": str(attributes.get("provider") or "")
+                or (str(source.get("provider") or "") if source else "")
+                or None,
+                "status": str(attributes.get("status") or span.get("status") or "") or None,
+                "started_at": _iso_or_none(span.get("started_at")),
+                "finished_at": _iso_or_none(span.get("finished_at")),
+                "duration_ms": _span_duration(span),
+                "query": _preview((source or {}).get("query") or attributes.get("query")),
+                "note": _preview(attributes.get("note"))
+                or _preview((source or {}).get("normalized")),
+                "returned": returned,
+                "error": _scrub_opt(span.get("error")),
+                "tokens": _span_tokens(attributes) if kind == "model" else None,
+                "cumulative_total_tokens": _int_or_none(attributes.get("cumulative_total_tokens")),
+            }
+        )
+    rows.sort(
+        key=lambda row: (
+            _parse_ts(row["started_at"]) or _SORT_MAX,
+            row["seq"] or 0,
+            row["span_id"],
+        )
+    )
+    for index, row in enumerate(rows, start=1):
+        row["order"] = index
+    return rows
+
+
+def _agent_block(
+    *,
+    spans: Sequence[Mapping[str, Any]],
+    stages: _StageIndex,
+    sources_by_span: Mapping[str, Mapping[str, Any]],
+    metrics: Mapping[str, Any],
+    prompt_span: Mapping[str, Any] | None,
+    audit: Mapping[str, Any],
+    is_agent_run: bool,
+    has_plan: bool,
+) -> dict[str, Any]:
+    """Agent 这一路的管理端事实：步骤流 + 整 run token + 元信息（交卷方式 / prompt 版本 / 上限）。
+
+    ``plan_origin`` 与 ``truncation`` 的首选来源是 audit_report.json（库里没有这两列）。
+    audit 读不到时的降级只有一条：**从 trace 反推**交卷方式（`submit_final_plan` 的 tool
+    span 在不在 + 有没有落 plan），并在 ``notes`` 里说明这是反推的；``truncation`` 反推
+    不出来 —— 它如实留空，而不是拿"没有 submit span"当成"超时了"。
+    """
+
+    steps = _agent_steps(spans=spans, stages=stages, sources_by_span=sources_by_span)
+    audit_agent = audit.get("agent")
+    audit_agent = audit_agent if isinstance(audit_agent, Mapping) else {}
+    prompt_attributes = (prompt_span or {}).get("attributes") or {}
+    notes: list[str] = []
+
+    prompt_version = (
+        str(audit_agent.get("prompt_version") or "") or str(prompt_attributes.get("prompt_version") or "")
+    ) or None
+    if prompt_version is None:
+        notes.append(
+            "这次 run 没有留下 prompt 版本：audit_report.json 与 trace 的 prompt_version span 都没有"
+        )
+    elif not audit_agent.get("prompt_version"):
+        notes.append("prompt 版本来自 trace 的 prompt_version span（audit_report.json 没读到）")
+
+    origin = str(audit_agent.get("plan_origin") or "") or None
+    origin_source = "audit_report.json" if origin else None
+    submitted = any(step["kind"] == "tool" and step["tool"] == SUBMIT_TOOL_NAME for step in steps)
+    if origin is None:
+        if submitted:
+            origin, origin_source = SUBMIT_TOOL_NAME, "trace_spans"
+            notes.append(
+                "交卷方式由 trace 反推（看到 submit_final_plan 的 tool span）；"
+                "权威口径在 audit_report.json 的 agent.plan_origin"
+            )
+        elif has_plan:
+            origin, origin_source = "message_json", "trace_spans"
+            notes.append(
+                "交卷方式由 trace 反推（没有 submit_final_plan 的 tool span、但落了计划）；"
+                "权威口径在 audit_report.json 的 agent.plan_origin"
+            )
+
+    truncation = str(audit_agent.get("truncation") or "") or None
+    if truncation is None and not audit_agent:
+        notes.append(
+            "truncation（超时 / 超步数 / 成本护栏）只在 audit_report.json 的 agent 里，"
+            "本次没读到该文件 —— 留空而不是从别的事实猜一个"
+        )
+
+    # 与 run_timeline 同一处延迟导入：这个模块的 import 链不背配置层。
+    from .config import current_config
+
+    config = current_config()
+    limits_from_audit = any(
+        audit_agent.get(key) is not None for key in ("max_steps", "timeout_seconds")
+    )
+    limits = {
+        "max_steps": audit_agent.get("max_steps")
+        if audit_agent.get("max_steps") is not None
+        else getattr(config, "max_agent_steps", None),
+        "timeout_seconds": audit_agent.get("timeout_seconds")
+        if audit_agent.get("timeout_seconds") is not None
+        else getattr(config, "agent_run_timeout_seconds", None),
+        "from_audit": limits_from_audit,
+        "note": (
+            "上限来自本次 run 的 audit_report.json"
+            if limits_from_audit
+            else "上限取自**当前**配置（该 run 当时的快照只在 audit_report.json 里，本次没读到）"
+        ),
+    }
+
+    model_steps = [step for step in steps if step["kind"] == "model"]
+    tool_steps = [step for step in steps if step["kind"] == "tool"]
+    step_totals = [step["tokens"]["total"] for step in model_steps if step["tokens"]]
+    tokens = {
+        "input": _int_or_none(metrics.get("input_tokens")),
+        "output": _int_or_none(metrics.get("output_tokens")),
+        "cached": _int_or_none(metrics.get("cached_tokens")),
+        "total": _int_or_none(metrics.get("total_tokens")),
+        "llm_calls": _int_or_none(metrics.get("llm_calls")),
+        "tool_calls": _int_or_none(metrics.get("tool_calls")),
+        "duration_ms": _int_or_none(metrics.get("duration_ms")),
+        "source": "run_metrics",
+        #: 逐条 span 相加的自算值：给"汇总与明细对不对得上"一个当场可核对的数字。
+        "step_total": sum(step_totals) if step_totals else None,
+        "steps_llm": len(model_steps),
+        "steps_tool": len(tool_steps),
+    }
+    if not metrics:
+        notes.append("这次 run 没有 run_metrics 行：总 token / 耗时只能靠逐条 span，页面会显示「无汇总」")
+    elif tokens["total"] is not None and tokens["step_total"] is not None and tokens["total"] != tokens["step_total"]:
+        notes.append(
+            f"汇总 token（{tokens['total']}）与逐条 span 相加（{tokens['step_total']}）不一致："
+            "汇总还包含被截断/未落 span 的调用"
+        )
+
+    tools = prompt_attributes.get("tools")
+    return {
+        "is_agent_run": is_agent_run,
+        "prompt_version": prompt_version,
+        "system_prompt_chars": _int_or_none(prompt_attributes.get("system_prompt_chars")),
+        "tools": [str(item) for item in tools] if isinstance(tools, Sequence) and not isinstance(tools, str) else [],
+        "plan_origin": origin,
+        "plan_origin_label": PLAN_ORIGIN_LABELS.get(origin or "", None),
+        "plan_origin_source": origin_source,
+        "truncation": truncation,
+        "limits": limits,
+        "steps": steps,
+        "tokens": tokens,
+        "notes": notes,
+    }
+
+
+# ======================================================================
 # 主入口
 # ======================================================================
 
@@ -778,6 +1238,22 @@ def run_timeline(store: TravelPlanStore, run_id: str) -> dict[str, Any]:
     snapshot = plan_snapshot(store, run_id)
 
     stages = _StageIndex(progress.get("stages") or [], run_id)
+    # Agent Loop 的步骤身份 / Provider 对齐：两份都在这里算一次，
+    # 事件、步骤流与 Provider 事件共用同一份结果（同一个事实只算一次）。
+    prompt_span = _prompt_span(spans)
+    agent_run = _is_agent_run(spans, prompt_span)
+    sources_by_span, matched_source_ids = _match_sources_to_spans(spans, sources)
+    audit = _run_audit(run_id)
+    agent = _agent_block(
+        spans=spans,
+        stages=stages,
+        sources_by_span=sources_by_span,
+        metrics=metrics,
+        prompt_span=prompt_span,
+        audit=audit,
+        is_agent_run=agent_run,
+        has_plan=plan is not None,
+    )
 
     badcase_by_ref: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for case in badcases:
@@ -803,7 +1279,6 @@ def run_timeline(store: TravelPlanStore, run_id: str) -> dict[str, Any]:
                 for part in (
                     f"模型 {model_name}" if model_name else None,
                     f"预算上限 {'开' if config.budget_enabled else '关'}",
-                    f"Jev {'开' if config.jev_enabled else '关'}",
                     f"计划来源 {run.get('source') or 'quick'}",
                 )
                 if part
@@ -819,7 +1294,6 @@ def run_timeline(store: TravelPlanStore, run_id: str) -> dict[str, Any]:
                 "max_run_cost": getattr(config, "max_run_cost", None),
                 "max_run_seconds": getattr(config, "max_run_seconds", None),
                 "budget_enabled": config.budget_enabled,
-                "jev_enabled": config.jev_enabled,
             },
             notes=[
                 "系统提示词正文不落库：trace 只记录模型调用的 tag / 模型 / 字符数 / 耗时，"
@@ -906,15 +1380,15 @@ def run_timeline(store: TravelPlanStore, run_id: str) -> dict[str, Any]:
     )
 
     # --- 其余事件 ---
-    tool_events = _tool_events(
-        run_id=run_id, spans=spans, sources=sources, stages=stages, badcase_by_ref=badcase_by_ref
+    events.extend(
+        _tool_events(
+            run_id=run_id,
+            spans=spans,
+            sources_by_span=sources_by_span,
+            stages=stages,
+            badcase_by_ref=badcase_by_ref,
+        )
     )
-    matched_source_ids = {
-        str((span.get("attributes") or {}).get("source_id"))
-        for span in spans
-        if str(span.get("component")) in ("tool", "mcp") and (span.get("attributes") or {}).get("source_id")
-    }
-    events.extend(tool_events)
     events.extend(
         _provider_events(
             run_id=run_id,
@@ -922,6 +1396,7 @@ def run_timeline(store: TravelPlanStore, run_id: str) -> dict[str, Any]:
             sources=sources,
             matched_source_ids=matched_source_ids,
             stages=stages,
+            agent_run=agent_run,
         )
     )
     events.extend(
@@ -986,6 +1461,16 @@ def run_timeline(store: TravelPlanStore, run_id: str) -> dict[str, Any]:
         "（单价是用户填的估计值）",
         "逐条决策（选了什么 / 为什么）不在这条时间轴上：见运行详情页的决策链区块",
     ]
+    if agent_run:
+        notes.append(
+            "这次 run 由 Agent Loop 出计划：步骤按 trace_spans 的 tool / llm span 逐条列出"
+            "（run_stages 的 stage_id 是中文步骤名，同名工具的第 N 次调用共享同一行，"
+            "逐次事实以 span 为准）"
+        )
+        notes.append(
+            "整 run 的 token 汇总来自 run_metrics（agent.tokens.step_total 是逐条 span 相加，"
+            "两者对不上时会在 agent.notes 里说明）"
+        )
     if truncated_events:
         notes.append(f"事件数超过 {_MAX_EVENTS} 条，仅返回前 {_MAX_EVENTS} 条")
 
@@ -1013,6 +1498,7 @@ def run_timeline(store: TravelPlanStore, run_id: str) -> dict[str, Any]:
             "fallbacks": len(fallbacks),
             "badcases": len(badcases),
             "stages": len(stages.order),
+            "agent_steps": len(agent["steps"]),
         },
         "stages": [
             {
@@ -1027,6 +1513,10 @@ def run_timeline(store: TravelPlanStore, run_id: str) -> dict[str, Any]:
         ],
         "tracks": tracks,
         "events": events,
+        #: Agent Loop 这一路的步骤流 / 每步 token / 整 run 汇总 / 元信息。
+        #: 旧 run（固定 12 步）走 workflow 视图，这里如实给 `is_agent_run=False` 与空步骤，
+        #: 而不是让前端自己去猜这次跑的是哪条路。
+        "agent": agent,
         "badcases": [_badcase_brief(case) for case in badcases],
         "quality": {
             "score": snapshot.score,
@@ -1065,6 +1555,8 @@ def build_timeline_router(
 __all__ = [
     "EVENT_TYPES",
     "EVENT_TYPE_LABELS",
+    "PLAN_ORIGIN_LABELS",
+    "SUBMIT_TOOL_NAME",
     "build_timeline_router",
     "run_timeline",
 ]

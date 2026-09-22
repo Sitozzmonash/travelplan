@@ -330,7 +330,7 @@ def test_from_env_applies_timeout_override(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_llm_calls_are_reported_to_superharness_observability() -> None:
-    """START.md §9：Router / LLM / Tool / token 由 SuperHarness 原生 Observability 负责。
+    """docs/operations/DEVELOPMENT.md §9：Router / LLM / Tool / token 由 SuperHarness 原生 Observability 负责。
 
     所以模型调用要上报成 llm.started / llm.finished，而不是自己再打一份日志。
     token 用量必须是模型回报的真实值——取不到就留白，不能填 0 冒充。

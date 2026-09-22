@@ -1,154 +1,180 @@
-import type { PlanningStep, PlanningStepState } from "@/types/api";
+import type { RunProgress, RunStageProgress, RunStatus } from "@/types/api";
 
 /**
- * 规划步骤清单（FRONTEND_DESIGN §6）。
+ * 演示模式（``NEXT_PUBLIC_USE_MOCK_API=true``）用的模拟进度。
  *
- * 顺序与 stage_id 必须与后端 Workflow 的 12 个真实节点一致：进度事件按 stage_id 更新状态，
- * 前端不再自己编造步骤。mock 与真实后端共用这同一份定义。
+ * 这里**不再有「固定 12 步」的清单**：主规划已经改成 SuperHarness Agent Loop，
+ * 步骤顺序由 Agent 自己决定。所以演示数据也必须同构地表达「Agent 依次调了哪些工具」，
+ * 否则演示模式下前端会渲染出一份真实后端永远不会产生的进度。
+ *
+ * 与真实后端对齐的三条约定（见 ``app/agent_trace.py``）：
+ *   1. ``stage_id`` 就是中文展示名（「在查机票」），不是机器码；
+ *   2. 同一个 stage_id 只占一行，重复调用覆盖同一行的 facts（写库是 ON CONFLICT DO UPDATE）；
+ *   3. facts 里带 ``tool / status / duration_ms / started / finished / seq / stage_key``。
  */
-export const PLANNING_STEPS: PlanningStep[] = [
+export interface MockAgentStep {
+  /** 步骤展示名，同时也是后端的 stage_id。 */
+  stageId: string;
+  /** 工具名；模型思考步骤为 null（对应 facts.model）。 */
+  tool: string | null;
+  model?: string;
+  /** 这一步做了什么（写进 facts.note，用于演示「事实」区）。 */
+  note: string;
+  /** 收口状态：正常 SUCCESS，拿到缓存或部分数据时 WARNING。 */
+  status: "SUCCESS" | "WARNING";
+  /** 该步耗时，仅用于演示展示与排序。 */
+  durationMs: number;
+  /** 模拟节奏：这一步「跑」多久。 */
+  delayMs: number;
+}
+
+/**
+ * 一次演示 run 的步骤序列。
+ * 顺序刻意不是「先交通后酒店」的教科书顺序：Agent 会先想一轮、再按需查，
+ * 中途还可能停下来再想一次（同一个「在思考行程」出现两次，覆盖同一行）。
+ */
+export const MOCK_AGENT_STEPS: MockAgentStep[] = [
   {
-    id: "parse_intent",
-    label: "理解旅行需求",
-    description: "解析出发地、日期、天数、人数、预算与偏好。",
+    stageId: "在思考行程",
+    tool: null,
+    model: "claude-sonnet",
+    note: "拆解需求，决定先确认城际交通",
+    status: "SUCCESS",
+    durationMs: 2400,
+    delayMs: 700,
   },
   {
-    id: "search_intercity_transport",
-    label: "查询城际交通",
-    description: "查询机票与高铁车次及实时票价。",
+    stageId: "在查火车票",
+    tool: "search_trains",
+    note: "北京 → 成都 · 6 个车次",
+    status: "SUCCESS",
+    durationMs: 3100,
+    delayMs: 800,
   },
   {
-    id: "search_hotels",
-    label: "查询酒店",
-    description: "按区域、价格与评分查询住宿候选。",
+    stageId: "在查机票",
+    tool: "search_flights",
+    note: "北京 → 成都 · 8 个航班",
+    status: "SUCCESS",
+    durationMs: 4200,
+    delayMs: 850,
   },
   {
-    id: "search_social_guides",
-    label: "搜索攻略内容",
-    description: "检索小红书与抖音内容。",
+    stageId: "在查酒店",
+    tool: "search_hotels",
+    note: "春熙路周边 9 家符合价格区间",
+    status: "SUCCESS",
+    durationMs: 5200,
+    delayMs: 900,
   },
   {
-    id: "extract_and_normalize_places",
-    label: "提取并归并地点",
-    description: "合并同义写法，得到唯一地点列表。",
+    stageId: "在翻小红书攻略",
+    tool: "search_xiaohongshu",
+    note: "读到 20 条攻略内容",
+    status: "SUCCESS",
+    durationMs: 2600,
+    delayMs: 750,
   },
   {
-    id: "verify_poi_and_routes",
-    label: "校验地点与路线",
-    description: "用高德核验 POI 坐标与通勤路线。",
+    stageId: "在搜周边地点",
+    tool: "search_poi",
+    note: "提取 19 个唯一地点",
+    status: "SUCCESS",
+    durationMs: 3300,
+    delayMs: 780,
   },
   {
-    id: "score_candidates",
-    label: "评估候选可信度",
-    description: "按可信度与广告风险排序候选。",
+    stageId: "在算路上时间",
+    tool: "route",
+    note: "24 段路线，1 段未返回已按同区域均值估算",
+    status: "WARNING",
+    durationMs: 6100,
+    delayMs: 900,
   },
   {
-    id: "build_initial_plan",
-    label: "生成初版行程",
-    description: "把交通、住宿与地点排进每天的时段。",
+    stageId: "在思考行程",
+    tool: null,
+    model: "claude-sonnet",
+    note: "把地点排进每天的时段并复核预算",
+    status: "SUCCESS",
+    durationMs: 5400,
+    delayMs: 900,
   },
   {
-    id: "check_budget",
-    label: "检查预算",
-    description: "区分实时价格与估算费用并核对总额。",
-  },
-  {
-    id: "check_feasibility",
-    label: "检查时间可行性",
-    description: "校验通勤与停留时间是否走得完。",
-  },
-  {
-    id: "critic_and_revise",
-    label: "复核并修正",
-    description: "对时间冲突与折返做一轮修正。",
-  },
-  {
-    id: "finalize",
-    label: "输出最终行程",
-    description: "产出 plan.json / plan.md / audit_report.json。",
+    stageId: "在查景区门票",
+    tool: "search_scenic_tickets",
+    note: "返回缓存价格，出行前需再次确认",
+    status: "WARNING",
+    durationMs: 2100,
+    delayMs: 700,
   },
 ];
 
+/** 演示 run 的起始时刻（相对 now 往前推，让时间线看起来是刚发生的）。 */
+function stepTimestamps(): { started: string; finished: string }[] {
+  const total = MOCK_AGENT_STEPS.reduce((sum, step) => sum + step.durationMs, 0);
+  let clock = Date.now() - total;
+  return MOCK_AGENT_STEPS.map((step) => {
+    const started = new Date(clock).toISOString();
+    clock += step.durationMs;
+    return { started, finished: new Date(clock).toISOString() };
+  });
+}
+
+const TIMESTAMPS = stepTimestamps();
+
 /**
- * 后端新增了前端清单里还没有的 stage 时，用它兜底出一个可读标题：
- * 宁可多展示一行原始 stage_id，也不能让用户看到一行停在「等待」的假进度。
+ * 生成某一时刻的 ``RunProgress`` 快照：``cursor`` 之前的步骤已完成，``cursor`` 这一步正在跑。
+ * ``cursor`` 超出范围时按「全部完成」处理。
  */
-export function stageLabel(stageId: string): string {
-  const known = PLANNING_STEPS.find((step) => step.id === stageId);
-  return known?.label ?? `未识别阶段（${stageId}）`;
+export function mockRunProgress(runId: string, cursor: number, status: RunStatus = "RUNNING"): RunProgress {
+  const order: string[] = [];
+  const rows = new Map<string, RunStageProgress>();
+  const last = Math.max(0, Math.min(cursor, MOCK_AGENT_STEPS.length - 1));
+
+  MOCK_AGENT_STEPS.forEach((step, index) => {
+    if (index > last) return;
+    const running = status === "RUNNING" && index === last;
+    const { started, finished } = TIMESTAMPS[index];
+    const row: RunStageProgress = {
+      stage_id: step.stageId,
+      status: running ? "RUNNING" : step.status,
+      message: step.stageId,
+      started_at: started,
+      finished_at: running ? null : finished,
+      facts: {
+        ...(step.tool ? { tool: step.tool } : { model: step.model ?? "llm" }),
+        status: running ? "RUNNING" : step.status,
+        duration_ms: running ? null : step.durationMs,
+        started,
+        finished: running ? null : finished,
+        seq: index + 1,
+        stage_key: step.tool ? `tool:${step.tool}` : `llm:${step.model ?? "llm"}`,
+        note: step.note,
+        error: null,
+      },
+    };
+    // 同一 stage_id 只占一行：后来的调用覆盖 facts，但插入位置不变（与后端主键语义一致）。
+    if (!rows.has(step.stageId)) order.push(step.stageId);
+    rows.set(step.stageId, row);
+  });
+
+  const currentStage = order.length ? rows.get(order[order.length - 1])!.stage_id : null;
+  return {
+    run_id: runId,
+    status,
+    current_stage: status === "RUNNING" ? currentStage : null,
+    message: currentStage,
+    started_at: TIMESTAMPS[0].started,
+    updated_at: new Date().toISOString(),
+    finished_at: status === "RUNNING" ? null : new Date().toISOString(),
+    error: null,
+    stages: order.map((id) => rows.get(id)!),
+  };
 }
 
-export function initialStepStates(): PlanningStepState[] {
-  return PLANNING_STEPS.map((step) => ({ ...step, status: "waiting" }));
+/** 演示 run 全部完成后的快照（含终态）。 */
+export function mockCompletedProgress(runId: string, status: RunStatus = "SUCCESS"): RunProgress {
+  const progress = mockRunProgress(runId, MOCK_AGENT_STEPS.length, status);
+  return { ...progress, current_stage: null, message: "规划已结束" };
 }
-
-/** mock 版：每一步的事实与状态，接后端后由真实进度事件替换。 */
-export const MOCK_STEP_RESULTS: Record<
-  string,
-  { status: PlanningStepState["status"]; facts: string[] }
-> = {
-  parse_intent: {
-    status: "success",
-    facts: ["北京 → 成都 · 5 天 4 晚", "2 人 · 预算 ¥6,000", "偏好 美食 / 拍照 / 历史"],
-  },
-  search_intercity_transport: {
-    status: "success",
-    facts: ["找到 14 个交通方案", "途牛 8 个航班 · 12306 6 个车次"],
-  },
-  search_hotels: {
-    status: "success",
-    facts: ["找到 26 家酒店", "春熙路周边 9 家符合价格区间"],
-  },
-  search_social_guides: {
-    status: "success",
-    facts: ["读取 38 条攻略内容", "小红书 20 条 · 抖音 18 条"],
-  },
-  extract_and_normalize_places: {
-    status: "success",
-    facts: ["提取 23 个地点", "合并同义写法后剩 19 个唯一地点"],
-  },
-  verify_poi_and_routes: {
-    status: "warning",
-    facts: ["高德验证 17 个地点", "24 段路线中 1 段未返回，已按同区域均值估算"],
-  },
-  score_candidates: {
-    status: "success",
-    facts: ["按可信度与广告风险排序", "4 个低可信候选被过滤"],
-  },
-  build_initial_plan: {
-    status: "success",
-    facts: ["生成 5 天初版行程，共 25 个安排"],
-  },
-  check_budget: {
-    status: "success",
-    facts: ["已知实时费用 ¥4,894", "预计总计 ¥5,668 / 预算 ¥6,000"],
-  },
-  check_feasibility: {
-    status: "success",
-    facts: ["检测到 1 个时间冲突", "已自动修正 14:10 → 14:40"],
-  },
-  critic_and_revise: {
-    status: "warning",
-    facts: ["修正 Day 3 折返路线", "保留 1 段估算通勤时间"],
-  },
-  finalize: {
-    status: "success",
-    facts: ["输出 plan.json / plan.md / audit_report.json"],
-  },
-};
-
-/** 每步的模拟耗时（毫秒），只影响演示节奏。 */
-export const MOCK_STEP_DELAY_MS: Record<string, number> = {
-  parse_intent: 620,
-  search_intercity_transport: 900,
-  search_hotels: 820,
-  search_social_guides: 760,
-  extract_and_normalize_places: 700,
-  verify_poi_and_routes: 980,
-  score_candidates: 780,
-  build_initial_plan: 860,
-  check_budget: 640,
-  check_feasibility: 720,
-  critic_and_revise: 820,
-  finalize: 680,
-};

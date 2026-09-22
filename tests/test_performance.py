@@ -3,96 +3,17 @@
 这些用例只锁"并发不能让系统变得不可信"的部分 —— 并发本身快不快由
 `scripts/e2e_real.py` 的真实 run 证明，这里保证它没有偷偷破坏：
 
-  1. 结果顺序与任务定义顺序一致（否则同一份输入会产出不同行程）；
-  2. 并发上限真的被遵守（否则"限流"只是文案）；
-  3. 异常仍然按串行语义抛出（第一个出错的先炸，不随线程调度变化）；
-  4. 子 span 的时间戳来自真实调用时刻，不是落盘时刻。
+  1. 子 span 的时间戳来自真实调用时刻，不是落盘时刻；
+  2. 各类上限（并发/token/工具预算）都来自配置，且彼此有明确的大小关系；
+  3. 批抽取超时后会退化成逐篇重试，而不是把整批丢掉。
+
+（原先还锁了 `workflow._run_parallel` 的顺序 / 上限 / 异常语义与摘要降级：
+那两个 helper 随固定 12 步流程一起退役，相关用例一并删除。）
 """
 
 from __future__ import annotations
 
-import threading
-import time
-
-import pytest
-
 from app.observability import finish_iso
-from app.workflow import _run_parallel
-
-
-class TestRunParallel:
-    def test_preserves_definition_order_even_when_finish_order_differs(self) -> None:
-        """先提交的慢、后提交的快 —— 结果仍必须按定义顺序排列。"""
-
-        def slow() -> str:
-            time.sleep(0.12)
-            return "slow"
-
-        def fast() -> str:
-            time.sleep(0.01)
-            return "fast"
-
-        results = _run_parallel([("a", slow), ("b", fast), ("c", fast)], limit=3)
-
-        assert list(results) == ["a", "b", "c"]
-        assert results == {"a": "slow", "b": "fast", "c": "fast"}
-
-    def test_never_exceeds_the_cap(self) -> None:
-        """并发上限来自 config，必须真的生效：峰值并发不能超过 limit。"""
-
-        lock = threading.Lock()
-        active = 0
-        peak = 0
-
-        def task() -> int:
-            nonlocal active, peak
-            with lock:
-                active += 1
-                peak = max(peak, active)
-            time.sleep(0.05)
-            with lock:
-                active -= 1
-            return 1
-
-        tasks = [(f"t{i}", task) for i in range(12)]
-        _run_parallel(tasks, limit=3)
-
-        assert peak <= 3, f"并发峰值 {peak} 超过了上限 3"
-
-    def test_limit_one_degrades_to_serial(self) -> None:
-        """上限=1 时退化成纯串行：测试与保守部署都拿它当开关。"""
-
-        lock = threading.Lock()
-        active = 0
-        peak = 0
-
-        def task() -> None:
-            nonlocal active, peak
-            with lock:
-                active += 1
-                peak = max(peak, active)
-            time.sleep(0.02)
-            with lock:
-                active -= 1
-
-        _run_parallel([("a", task), ("b", task), ("c", task)], limit=1)
-
-        assert peak == 1
-
-    def test_raises_the_first_failure_in_definition_order(self) -> None:
-        """两个任务都失败时，抛的是定义顺序里靠前的那个 —— 与串行版本一致。"""
-
-        def boom_a() -> None:
-            raise ValueError("A")
-
-        def boom_b() -> None:
-            raise RuntimeError("B")
-
-        with pytest.raises(ValueError, match="A"):
-            _run_parallel([("a", boom_a), ("b", boom_b)], limit=2)
-
-    def test_empty_task_list_is_cheap_and_empty(self) -> None:
-        assert _run_parallel([], limit=4) == {}
 
 
 class TestSpanTimestamps:
@@ -198,52 +119,6 @@ class TestPerTagLlmBudgets:
         llm = LLM(model=None, timeout=10.0)
         assert llm._budget_for("critic") == 10.0
         assert llm._budget_for("final_answer") == 10.0
-
-
-class TestDigestNarrowingKeepsJsonValid:
-    """给模型的 digest 超预算时要**按结构**瘦身，绝不能把 JSON 从中间切断。"""
-
-    @staticmethod
-    def _digest() -> dict:
-        return {
-            "days": [
-                {
-                    "day_index": index,
-                    "items": [
-                        {"id": f"d{index}-i{item}", "reason": "很长的理由" * 40}
-                        for item in range(9)
-                    ],
-                }
-                for index in range(9)
-            ],
-            "budget": {"projected_total": 1.0, "breakdown": {"hotel": 1.0}, "breakdown_price_type": {"hotel": "real"}},
-        }
-
-    def test_narrowing_levels_keep_the_payload_serialisable(self) -> None:
-        import json
-
-        from app.workflow import DIGEST_DAYS, DIGEST_ITEMS_PER_DAY, _apply_narrowing
-
-        for level in (1, 2, 3):
-            narrowed = _apply_narrowing(self._digest(), level)
-            # 每一级都必须仍然是一份合法 JSON（这正是"不按字符切断"的全部意义）。
-            assert json.loads(json.dumps(narrowed, ensure_ascii=False, default=str))
-
-        final = _apply_narrowing(self._digest(), 3)
-        assert len(final["days"]) == DIGEST_DAYS
-        assert final["days_dropped"] == 3
-        assert len(final["days"][0]["items"]) == DIGEST_ITEMS_PER_DAY
-        assert final["days"][0]["items_dropped"] == 5
-        # 明细被裁掉时预算只留汇总，避免"看不见的部分被当成不存在"。
-        assert "breakdown" not in final["budget"]
-
-    def test_level_zero_leaves_the_digest_untouched(self) -> None:
-        from app.workflow import _apply_narrowing
-
-        original = self._digest()
-        assert _apply_narrowing(original, 0) is original
-        assert "days_dropped" not in original
-
 
 
 class TestBatchedExtractionRetry:

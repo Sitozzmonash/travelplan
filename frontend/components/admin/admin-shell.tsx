@@ -93,7 +93,7 @@ interface AdminNavItem {
 }
 
 /**
- * 导航信息架构（docs/TravelPlan_Admin_整体优化方案.md §2）。
+ * 导航信息架构（docs/product/ADMIN.md §2）。
  *
  * 分组的依据是**要回答的问题**，不是页面来源：
  *   * 总览   —— 现在系统健康吗、最该修什么？

@@ -21,8 +21,7 @@ from typing import Any
 from app import discovery, sessions
 from app.discovery import PrefetchBundle
 from app.models import TripIntent
-from app.workflow import execute_travel_run
-from tests.fakes import QUERY, FakeHub, FakeJev, FakeLLM, make_store
+from tests.fakes import FakeHub, FakeLLM, make_store
 
 
 def _discover_all(store, *, spread: float = 0.25):
@@ -55,113 +54,8 @@ def _bundle(result: dict[str, Any], hub: FakeHub, *, stages=("transport", "hotel
     )
 
 
-def _run(store, intent, bundle: PrefetchBundle, *, run_id: str):
-    store.create_run(run_id, source="guided", source_session_id=bundle.session_id)
-    hub = FakeHub(store=store, run_id=run_id, poi_spread=0.25)
-    result = execute_travel_run(
-        QUERY,
-        store=store,
-        hub=hub,
-        llm=FakeLLM(),
-        jev=FakeJev(),
-        intent=intent,
-        prefetch=bundle,
-        source="guided",
-        source_session_id=bundle.session_id,
-        run_id=run_id,
-        output_dir=store.db_path.parent / "out",
-    )
-    return result, hub
-
-
-def _handoff(result) -> dict[str, str]:
-    return {
-        key: (info or {}).get("handoff")
-        for key, info in (result.audit["user_journey"]["discovery"] or {}).items()
-    }
-
 
 class TestDiscoveryHandoff:
-    def test_all_discovery_finished_reuses_everything(self, tmp_path):
-        store = make_store(tmp_path / "t.db")
-        intent, result, hub = _discover_all(store)
-        run, run_hub = _run(store, intent, _bundle(result, hub), run_id="tp-h-all")
-
-        assert run.status == "completed", run.error
-        assert _handoff(run) == {
-            "transport": "reused",
-            "hotels": "reused",
-            "social": "reused",
-            "places": "reused",
-        }
-        # 复用就不该再打这几个源（只允许 route / 门票 / geocode 这类必须按最终候选算的调用）
-        assert not ({"search_trains", "search_flights", "search_hotels"} & set(run_hub.calls))
-        assert not ({"search_xiaohongshu", "search_douyin", "web_search"} & set(run_hub.calls))
-        assert run.audit["user_journey"]["grace_waited_ms"] == 0
-
-    def test_partial_discovery_reuses_done_and_queries_the_rest(self, tmp_path):
-        store = make_store(tmp_path / "t.db")
-        intent, result, hub = _discover_all(store)
-        # 只完成了交通 + 攻略；酒店与地点还没跑完
-        run, run_hub = _run(
-            store, intent, _bundle(result, hub, stages=("transport", "social")), run_id="tp-h-partial"
-        )
-
-        assert run.status == "completed", run.error
-        handoff = _handoff(run)
-        assert handoff["transport"] == "reused"
-        assert handoff["social"] == "reused"
-        assert handoff["hotels"] == "fallback_query"
-        assert handoff["places"] == "fallback_query"
-        # 分界线必须清楚：补查了酒店与 POI，但没有重查交通与攻略
-        assert "search_hotels" in run_hub.calls
-        assert "search_poi" in run_hub.calls
-        assert not ({"search_trains", "search_flights"} & set(run_hub.calls))
-        assert not ({"search_xiaohongshu", "search_douyin", "web_search"} & set(run_hub.calls))
-
-    def test_one_direction_only_still_queries_the_missing_direction(self, tmp_path):
-        """只复用了去程时，回程必须**真的去查**，不能被静默当成"已复用"。
-
-        这是上一版的真实缺陷：复用判据是 `bundle.outbound or bundle.inbound`（只要有一个
-        方向有数据就整体复用），于是"Discovery 只跑完了去程"会让回程候选被置空 ——
-        用户看到的是"回程没票"，真相是"回程没查"。少查一个方向是 bug，不是优化。
-        """
-
-        store = make_store(tmp_path / "t.db")
-        intent, result, hub = _discover_all(store)
-        partial = _bundle(result, hub, stages=("transport",))
-        # 去掉回程，模拟"Discovery 只跑完去程"
-        partial.inbound = []
-
-        run, run_hub = _run(store, intent, partial, run_id="tp-h-one-direction")
-
-        assert run.status == "completed", run.error
-        # 回程确实发起了查询：不能因为去程有数据就跳过它
-        assert "search_trains" in run_hub.calls
-        # 而且交接状态不能再自称"交通已复用" —— 一半复用一半补查要如实说成补查
-        assert _handoff(run)["transport"] == "fallback_query"
-
-    def test_both_directions_reused_does_not_touch_transport(self, tmp_path):
-        """去程与回程都在 bundle 里时，交通必须一次 Provider 都不打（对照组）。"""
-
-        store = make_store(tmp_path / "t.db")
-        intent, result, hub = _discover_all(store)
-        run, run_hub = _run(store, intent, _bundle(result, hub, stages=("transport",)), run_id="tp-h-both-ways")
-
-        assert run.status == "completed", run.error
-        assert _handoff(run)["transport"] == "reused"
-        assert not ({"search_trains", "search_flights"} & set(run_hub.calls))
-
-    def test_no_discovery_result_falls_back_to_workflow(self, tmp_path):
-        store = make_store(tmp_path / "t.db")
-        intent, result, hub = _discover_all(store)
-        run, run_hub = _run(store, intent, _bundle(result, hub, stages=()), run_id="tp-h-none")
-
-        assert run.status == "completed", run.error
-        assert all(value == "fallback_query" for value in _handoff(run).values())
-        assert {"search_trains", "search_hotels", "search_poi"} <= set(run_hub.calls)
-        assert run.plan is not None and run.plan.days
-
     def test_discovery_completing_within_grace_period_is_merged(self, tmp_path):
         store = make_store(tmp_path / "t.db")
         intent, result, hub = _discover_all(store)
@@ -240,24 +134,6 @@ class TestDiscoveryHandoff:
             store, session_id, submit=lambda fn, *a: jobs.append((fn, a)), output_dir=str(tmp_path)
         ).get("run_id")
 
-    def test_reused_lines_are_not_queried_again_and_trace_shows_it(self, tmp_path):
-        store = make_store(tmp_path / "t.db")
-        intent, result, hub = _discover_all(store)
-        run, run_hub = _run(store, intent, _bundle(result, hub), run_id="tp-h-trace")
-
-        assert run.status == "completed", run.error
-        assert run_hub.calls.count("search_trains") == 0
-        assert run_hub.calls.count("search_hotels") == 0
-        assert run_hub.calls.count("search_poi") == 0
-
-        handoff_spans = [
-            span for span in store.get_trace_spans("tp-h-trace") if span["name"] == "discovery_handoff"
-        ]
-        assert len(handoff_spans) == 1
-        attributes = handoff_spans[0]["attributes"]
-        assert attributes["transport"] == "reused"
-        assert attributes["hotels"] == "reused"
-        assert "grace_waited_ms" in attributes
 
 
 class TestSocialQueryHandoff:

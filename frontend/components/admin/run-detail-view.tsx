@@ -12,7 +12,6 @@ import {
   GitBranch,
   MessagesSquare,
   RefreshCw,
-  Sparkles,
   Wrench,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -39,7 +38,6 @@ import {
   cleanBadcaseSymptom,
   formatCostWithCurrency,
   formatDurationMs,
-  formatLatency,
   formatMetricValue,
   formatNumber,
   formatRatio,
@@ -60,7 +58,6 @@ import type {
   AdminBadcase,
   AdminCostBreakdown,
   AdminDecision,
-  AdminJevCall,
   AdminLlmCall,
   AdminProviderCall,
   AdminRecord,
@@ -79,7 +76,7 @@ import type {
  *
  * 五个页签回答五个不同的问题：概览回答「用户要什么 / 系统给了什么 / 质量怎么样 / 哪里有问题」，
  * 轨迹回答「这次 run 到底发生了什么」，性能回答「哪里最慢」，Provider 回答「数据源稳不稳」，
- * Bad Case 回答「这次触发了哪些问题」。技术明细（LLM / Jev / Token / 原始 Trace）不再堆在首屏，
+ * Bad Case 回答「这次触发了哪些问题」。技术明细（LLM / Token / 原始 Trace）不再堆在首屏，
  * 但全部保留在对应页签里，只是位置变了。
  */
 type RunTabKey = "overview" | "timeline" | "performance" | "provider" | "badcase";
@@ -318,7 +315,6 @@ function RunDetailBody({
                   hint={metrics.total_tokens === null ? "后端未返回 usage" : undefined}
                 />
                 <StatCard label="LLM 调用" value={formatNumber(metrics.llm_calls)} icon={Cpu} />
-                <StatCard label="Jev 调用" value={formatNumber(metrics.jev_calls)} icon={Sparkles} />
                 <StatCard label="工具调用" value={formatNumber(metrics.tool_calls)} icon={Wrench} />
                 <StatCard
                   label="Provider 失败"
@@ -425,7 +421,6 @@ function RunDetailBody({
             stages={stageRows}
             trace={data.trace}
             llmCalls={llmCalls}
-            jevCalls={data.jev_calls}
             journey={data.user_journey}
           />
 
@@ -444,15 +439,6 @@ function RunDetailBody({
             icon={Cpu}
           >
             <LlmCallList calls={llmCalls} onOpenTimeline={onOpenTimeline} />
-          </CollapsibleSection>
-
-          <CollapsibleSection
-            title="Jev 调用"
-            description="决策类型、输入摘要、选择结果、置信度与 fallback 原因"
-            count={data.jev_calls.length}
-            icon={Sparkles}
-          >
-            <JevCallList calls={data.jev_calls} />
           </CollapsibleSection>
 
           <CollapsibleSection
@@ -1481,7 +1467,7 @@ function TokenBreakdown({ tokens }: { tokens: AdminStageTokens | AdminRunDetail[
   );
 }
 
-/* ------------------------------ LLM / Jev ------------------------------ */
+/* ------------------------------ LLM / Token ------------------------------ */
 
 function LlmCallList({
   calls,
@@ -1568,82 +1554,6 @@ function LlmCallList({
                 label: "开始时间",
                 value: <span className="font-mono">{formatDateTime(selected.started_at)}</span>,
               },
-              { key: "error", label: "错误", value: <ErrorText value={selected.error} /> },
-            ]}
-          />
-        ) : null}
-      </AdminDetailDialog>
-    </>
-  );
-}
-
-function JevCallList({ calls }: { calls: AdminJevCall[] }) {
-  const [selected, setSelected] = useState<AdminJevCall | null>(null);
-  if (calls.length === 0) {
-    return (
-      <SectionEmpty
-        title="这次运行没有 Jev 调用"
-        description="可能 Jev 未启用、未配置密钥，或者本次规划没有触发需要模型判断的取舍。"
-      />
-    );
-  }
-  return (
-    <>
-      <ul className="flex flex-col gap-2">
-        {calls.map((call, index) => (
-          <li key={`${call.tag}-${index}`}>
-            <button
-              type="button"
-              onClick={() => setSelected(call)}
-              className="flex w-full min-w-0 flex-wrap items-center gap-2 rounded-lg border border-border px-2.5 py-2 text-left hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
-            >
-              <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
-                {call.tag}
-              </span>
-              <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground">
-                {missingOr(call.decision_type)}
-              </span>
-              <StatusBadge status={call.status ?? null} />
-              {call.fallback ? <ToneBadge tone="warning">已 fallback</ToneBadge> : null}
-              <span className="tabular shrink-0 text-[11px] text-muted-foreground">
-                {formatLatency(call.latency_ms)}
-              </span>
-              <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
-            </button>
-          </li>
-        ))}
-      </ul>
-
-      <AdminDetailDialog
-        open={selected !== null}
-        onOpenChange={(open) => (open ? null : setSelected(null))}
-        title={selected?.decision_type ? `${selected.decision_type}` : "Jev 调用"}
-        description={selected?.tag}
-        badge={selected ? <StatusBadge status={selected.status ?? null} /> : undefined}
-      >
-        {selected ? (
-          <KeyValueList
-            entries={[
-              { key: "tag", label: "标签", value: <span className="font-mono">{missingOr(selected.tag)}</span> },
-              { key: "type", label: "决策类型", value: missingOr(selected.decision_type) },
-              { key: "status", label: "状态", value: <StatusBadge status={selected.status ?? null} /> },
-              { key: "model", label: "模型", value: <span className="font-mono">{missingOr(selected.model)}</span> },
-              { key: "choice", label: "输出选择", value: missingOr(selected.choice) },
-              { key: "confidence", label: "置信度", value: formatConfidence(selected.confidence) },
-              { key: "latency", label: "时延", value: formatLatency(selected.latency_ms) },
-              {
-                key: "fallback",
-                label: "fallback",
-                value: selected.fallback ? <ToneBadge tone="warning">已触发</ToneBadge> : "未触发",
-              },
-              {
-                key: "fallback_reason",
-                label: "fallback 原因",
-                value: missingOr(selected.fallback_reason),
-              },
-              { key: "quota", label: "配额", value: missingOr(formatMetricValue(selected.quota)) },
-              { key: "input_summary", label: "输入摘要", value: missingOr(selected.input_summary) },
-              { key: "criteria", label: "判定标准", value: missingOr(formatMetricValue(selected.criteria)) },
               { key: "error", label: "错误", value: <ErrorText value={selected.error} /> },
             ]}
           />
@@ -2234,11 +2144,6 @@ function ErrorText({ value }: { value: string | null | undefined }) {
 function missingOr(value: string | null | undefined): string {
   if (value === null || value === undefined || value.trim().length === 0) return "未返回";
   return value;
-}
-
-function formatConfidence(value: number | null | undefined): string {
-  if (value === null || value === undefined || !Number.isFinite(value)) return "未返回";
-  return formatRatio(value);
 }
 
 function durationBetween(startedAt: string | null | undefined, finishedAt: string | null | undefined): number | null {

@@ -16,9 +16,10 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from app.config import current_config
 from app.store import TravelPlanStore
-from app.workflow import execute_travel_run
-from tests.fakes import QUERY, FakeHub, FakeJev, FakeLLM, make_store
+from tests.agent_fixture import run_agent
+from tests.fakes import FakeHub, make_store
 
 RUN_ID = "tp-admin-fixture"
 TOKEN = "admin-test-token"
@@ -27,19 +28,24 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 @pytest.fixture(scope="module")
 def world(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
-    """一次离线 run（带 FakeJev）产出的真实库 + 产物，供所有管理端读接口复用。"""
+    """一次离线 Agent run 产出的真实库 + 产物，供所有管理端读接口复用。
+
+    走主路径 `execute_agent_run`（脚本模型 + 假 Hub，离线）；管理端读的就是这条路径
+    真的写出来的 trace / metrics / 产物。
+    """
 
     base: Path = tmp_path_factory.mktemp("admin-fixture")
     store = TravelPlanStore(db_path=base / "travelplan.db")
-    result = execute_travel_run(
-        QUERY,
-        user_id="admin-test",
+    result = run_agent(
+        store=store,
         run_id=RUN_ID,
         output_dir=base / "outputs",
-        store=store,
-        hub=FakeHub(store=store, run_id=RUN_ID),
-        llm=FakeLLM(),
-        jev=FakeJev(),
+        hub=FakeHub(store=store, run_id=RUN_ID, poi_spread=0.25),
+        user_id="admin-test",
+        tool_calls=(
+            ("search_trains", {"origin": "北京", "destination": "成都", "depart_date": "2026-10-01"}),
+            ("search_hotels", {"city": "成都", "check_in": "2026-10-01", "check_out": "2026-10-04"}),
+        ),
     )
     assert result.status == "completed", result.error
     return {"store": store, "output_dir": base / "outputs", "result": result}
@@ -64,7 +70,6 @@ class TestAuth:
             "/api/v1/admin/badcases",
             "/api/v1/admin/benchmark/runs",
             "/api/v1/admin/config",
-            "/api/v1/admin/jev/health",
             "/api/v1/admin/evolution",
         ):
             assert client.get(path).status_code == 401, path
@@ -82,12 +87,10 @@ class TestAuth:
         assert unconfigured.get("/api/v1/admin/overview").status_code == 503
 
     def test_no_secret_is_ever_echoed(self, client, monkeypatch):
-        monkeypatch.setenv("JEV_API_KEY", "never-return-this")
         monkeypatch.setenv("AMAP_API_KEY", "amap-secret")
-        for path in ("/api/v1/admin/config", "/api/v1/admin/overview", "/api/v1/admin/jev/health"):
+        for path in ("/api/v1/admin/config", "/api/v1/admin/overview"):
             response = client.get(path, headers=AUTH)
             assert response.status_code == 200
-            assert "never-return-this" not in response.text
             assert "amap-secret" not in response.text
 
 
@@ -96,16 +99,13 @@ class TestOverview:
         body = client.get("/api/v1/admin/overview", headers=AUTH).json()
         for key in (
             "run_count", "statuses", "degraded_count", "failed_count", "running_count",
-            "total_tokens", "total_llm_calls", "total_jev_calls", "total_tool_calls",
-            "provider_failures", "badcase_open", "badcase_total", "jev", "benchmark", "evolution",
+            "total_tokens", "total_llm_calls", "total_tool_calls",
+            "provider_failures", "badcase_open", "badcase_total", "benchmark", "evolution",
         ):
             assert key in body, key
         assert body["run_count"] >= 1
-        assert body["total_jev_calls"] >= 1
-        assert "fallback_count" in body["jev"]
-        assert "quota" in body["jev"]
-        # 额度只有服务端真回过才有值；没有就必须是 unknown。
-        assert body["jev"]["quota_source"] in {"reported", "unknown"}
+        # Jev 决策层已删：overview 不再有对应的健康度维度。
+        assert "jev" not in body and "total_jev_calls" not in body
         assert set(body["benchmark"]) == {"latest_run_id", "latest_suites", "latest_pass_rate"}
         assert set(body["evolution"]) == {"enabled", "pending_badcases", "last_run_id", "last_decision"}
 
@@ -129,14 +129,12 @@ class TestRuns:
 
     def test_detail_contains_everything_the_page_renders(self, client):
         body = client.get(f"/api/v1/admin/runs/{RUN_ID}", headers=AUTH).json()
-        for key in ("run", "metrics", "progress", "trace", "decisions", "provider_calls", "jev_calls", "llm_calls", "badcases"):
+        for key in ("run", "metrics", "progress", "trace", "decisions", "provider_calls", "llm_calls", "badcases"):
             assert key in body, key
-        assert body["metrics"]["jev_calls"] >= 1
+        # Jev 决策层已删：Run Detail 不再返回 Jev 调用明细。
+        assert "jev_calls" not in body
         assert body["trace"], "trace 不能为空"
-        # Jev Calls 面板的每个字段都必须有值，否则前端只能渲染一行空白。
-        call = body["jev_calls"][0]
-        for key in ("decision_type", "status", "confidence", "latency_ms", "fallback", "input_summary", "criteria", "quota"):
-            assert key in call, key
+        assert body["provider_calls"], "跑过真实工具的 run 必须有 provider 调用账本"
         # LLM 调用来自 llm span。
         assert body["llm_calls"]
         assert body["llm_calls"][0]["tag"]
@@ -432,23 +430,25 @@ class TestBadcases:
         assert client.patch("/api/v1/admin/badcases/bc-nope", json={"analysis_status": "analyzed"}, headers=AUTH).status_code == 404
 
 
-class TestConfigAndJevHealth:
+class TestConfig:
     def test_config_exposes_tuning_and_levers(self, client):
         body = client.get("/api/v1/admin/config", headers=AUTH).json()
         assert set(body) >= {"config", "planner_tuning", "secret_configured", "evolution", "note"}
         assert "max_items_per_day" in body["planner_tuning"]
         assert body["evolution"]["levers"]
         assert "admin" in body["secret_configured"]
-        # 阈值必须是当前生效值，而不是硬编码。
-        assert body["config"]["jev_min_confidence"] == pytest.approx(0.70) or body["config"]["jev_min_confidence"] > 0
+        # Jev 决策层已删：既不回显它的配置项，也不再有它的密钥探针/可编辑键。
+        assert not any(key.startswith("jev") for key in body["config"])
+        assert not any(key.startswith("JEV_") for key in body["editable_keys"])
+        assert "jev" not in body["secret_configured"]
+        # 配置必须是**当前生效值**，而不是硬编码。
+        assert body["config"]["badcase_enabled"] == current_config().badcase_enabled
+        assert any(key.startswith("TP_") for key in body["editable_keys"])
 
-    def test_jev_health_reports_status_and_quota_honestly(self, client):
-        body = client.get("/api/v1/admin/jev/health", headers=AUTH).json()
-        for key in ("enabled", "configured", "status", "latency_ms", "quota", "quota_source", "fallback_count", "calls", "timeout", "low_confidence", "invalid_response"):
-            assert key in body, key
-        assert body["calls"] >= 1
-        if body["quota_source"] == "unknown":
-            assert body["quota"] == "unknown"
+    def test_jev_health_endpoint_is_gone(self, client):
+        """Jev 决策层已整体删除：专用健康度端点不应再存在。"""
+
+        assert client.get("/api/v1/admin/jev/health", headers=AUTH).status_code == 404
 
     def test_providers_reports_config_and_real_stats(self, client):
         body = client.get("/api/v1/admin/providers", headers=AUTH).json()
@@ -551,7 +551,7 @@ class TestBenchmarkApi:
             return run
 
         monkeypatch.setattr("app.api._benchmark_runner", stub_runner)
-        response = client.post("/api/v1/admin/benchmark/runs", json={"suites": ["basic"], "jev_enabled": False}, headers=AUTH)
+        response = client.post("/api/v1/admin/benchmark/runs", json={"suites": ["basic"]}, headers=AUTH)
         assert response.status_code == 202
         benchmark_run_id = response.json()["benchmark_run_id"]
 
@@ -563,7 +563,7 @@ class TestBenchmarkApi:
                 break
             time.sleep(0.05)
         assert item["status"] == "SUCCESS"
-        assert item["jev_enabled"] is False
+        assert item["live"] is False
         assert item["pass_rate"] == 1.0
 
         detail = client.get(f"/api/v1/admin/benchmark/runs/{benchmark_run_id}", headers=AUTH).json()

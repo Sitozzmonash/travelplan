@@ -1,5 +1,5 @@
 /**
- * TravelPlan 数据模型（对齐 docs/PRD.md §28 plan.json 与 app/models.py）。
+ * TravelPlan 数据模型（对齐 docs/product/PRD.md §28 plan.json 与 app/models.py）。
  *
  * 前端只消费这些结构，不做任何业务判断：Trust / Ad Risk / Feasibility /
  * 预算与最终方案都由后端计算（FRONTEND_DESIGN §34）。

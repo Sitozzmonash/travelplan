@@ -5,15 +5,14 @@ import { useCallback, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { ArrowRight, CalendarDays, CircleAlert, Compass, Database, Lock, MapPin, ShieldCheck, Sparkles, Users, Wallet } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import type { CreatePlanResult, PlanningStepState } from "@/types/api";
+import type { CreatePlanResult, RunProgress } from "@/types/api";
 import {
   API_MODE,
   type ApiErrorKind,
   apiErrorKind,
   createPlan,
-  createPlanningSteps,
   describeApiError,
-  mergeProgressEvent,
+  planningStepsFromProgress,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -30,7 +29,11 @@ type Phase = "idle" | "planning" | "result" | "error";
 export default function HomePage() {
   const router = useRouter();
   const [phase, setPhase] = useState<Phase>("idle");
-  const [steps, setSteps] = useState<PlanningStepState[]>(() => createPlanningSteps());
+  /**
+   * 最近一次轮询到的 run 进度快照：页面只按它渲染「当前步骤 + 已走过的步骤」，
+   * 不再维护一份前端自己的固定步骤清单（Agent Loop 的步骤顺序由 Agent 决定）。
+   */
+  const [progress, setProgress] = useState<RunProgress | null>(null);
   const [query, setQuery] = useState("");
   /**
    * 已经跑完但没有直接进入工作台的 run：DEGRADED 需要先把降级原因说清楚，
@@ -43,16 +46,14 @@ export default function HomePage() {
   const runPlanning = useCallback(
     async (message: string) => {
       setQuery(message);
-      setSteps(createPlanningSteps());
+      setProgress(null);
       setResult(null);
       setError(null);
       setErrorKind(null);
       setPhase("planning");
       try {
         const created = await createPlan(message, {
-          onProgress: (event) => {
-            setSteps((current) => mergeProgressEvent(current, event));
-          },
+          onProgress: setProgress,
         });
         if (created.status === "SUCCESS" && created.plan) {
           router.push(`/plan/${encodeURIComponent(created.run_id)}`);
@@ -106,13 +107,17 @@ export default function HomePage() {
               title="正在规划"
               icon={Sparkles}
               description={query ? `需求：${query}` : undefined}
-              action={<RunStatusBadge status="RUNNING" />}
+              action={<RunStatusBadge status={progress?.status ?? "RUNNING"} />}
               className="shadow-sm"
             >
-              <PlanningProgress steps={steps} />
+              <PlanningProgress
+                steps={planningStepsFromProgress(progress)}
+                currentStage={progress?.current_stage}
+                status={progress?.status ?? "RUNNING"}
+              />
               <div className="mt-4 flex items-center justify-between gap-3 border-t border-border/70 pt-3">
                 <p className="text-[11px] leading-5 text-muted-foreground">
-                  规划过程中会依次查询交通、酒店、攻略与路线数据源，全部完成后自动进入行程工作台。
+                  Agent 会按需要自己决定先查交通、住宿还是攻略，顺序不固定；全部完成后自动进入行程工作台。
                 </p>
                 <Button variant="outline" size="sm" onClick={() => setPhase("idle")}>
                   返回修改
@@ -162,7 +167,12 @@ export default function HomePage() {
               )}
 
               <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-border/70 pt-3">
-                <PlanningProgress steps={steps} className="w-full border-0 bg-transparent shadow-none" />
+                <PlanningProgress
+                  steps={planningStepsFromProgress(progress)}
+                  currentStage={progress?.current_stage}
+                  status={progress?.status ?? result.status}
+                  className="w-full border-0 bg-transparent shadow-none"
+                />
                 <div className="flex flex-wrap items-center gap-2">
                   {result.plan ? (
                     <Button size="sm" onClick={() => openPlan(result.run_id)}>

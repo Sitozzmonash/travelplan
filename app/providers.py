@@ -2,7 +2,7 @@
 
 这个模块为什么存在
 ------------------
-START.md §7 给 `app/` 划了 7 个文件，每个文件一件事。但「调用外部数据源」这件事横跨了
+docs/operations/DEVELOPMENT.md §7 给 `app/` 划了 7 个文件，每个文件一件事。但「调用外部数据源」这件事横跨了
 `workflow.py`（要按流程节点调用）和 `agent.py`（要装配同样的能力给 Agent Loop），
 把它塞进任何一边都会让那一边同时负责"流程编排"和"工具寻址 / 信封解析 / fallback / 审计记录"。
 所以这里单独一层，职责只有四条：
@@ -300,7 +300,7 @@ def default_mcp_servers() -> list[MCPServerSpec]:
     """本项目用到的 MCP Server 清单（目前只有 12306 火车票）。
 
     只在这里定义一次：`app.agent` 把清单交给 SuperHarness 的 harness app，
-    `execute_travel_run` 自建 ProviderHub 时也要交同一份 —— ProviderHub 只对
+    `execute_agent_run` 自建 ProviderHub 时也要交同一份 —— ProviderHub 只对
     **拿到过 spec** 的 server 建句柄，两边各写一份迟早会漏掉一边（曾经就漏在自建
     Hub 这边：12306 每次都报「未注册 MCP Server 'railway_12306'」，主源从未生效）。
     """
@@ -701,7 +701,7 @@ class ProviderHub:
             if timeouts is not None
             else provider_timeouts()
         )
-        #: 上报给 SuperHarness 原生 Observability 的钩子（START.md §9：不要重造）。
+        #: 上报给 SuperHarness 原生 Observability 的钩子（docs/operations/DEVELOPMENT.md §9：不要重造）。
         #: 不传就只是没有 Tool 日志，规划照常跑。
         self._emit_hook = emit
         #: MCP 单独一份预算，不复用 request_timeout：MCP Server 是 npx 拉起的子进程，

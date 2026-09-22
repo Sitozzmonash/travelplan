@@ -1,4 +1,4 @@
-"""本地 CLI（START.md §8.1 / PRD §29）。
+"""本地 CLI（docs/operations/DEVELOPMENT.md §8.1 / PRD §29）。
 
     python main.py -m "10月1日从北京去成都玩5天，两个人，预算6000，喜欢美食和拍照"
 

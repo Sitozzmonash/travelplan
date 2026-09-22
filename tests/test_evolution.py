@@ -151,7 +151,7 @@ class TestRunEvolution:
     def test_no_measure_means_reject_never_accept(self, store):
         """没有评测入口时绝不能凭"看起来应该更好"给 ACCEPT。"""
 
-        store.save_badcase(_badcase("bc-1", category="jev_timeout", symptom="jev_timeout:quality_gate"))
+        store.save_badcase(_badcase("bc-1", category="provider_failure", symptom="tuniu/search_hotels 返回 TIMEOUT"))
         run = run_evolution(store, measure=None, evolution_run_id="evo-nomeasure")
         assert run["decision"] == DECISION_REJECT
         assert "评测" in run["summary"] or any("评测" in step["detail"] for step in run["steps"])
@@ -189,20 +189,14 @@ class TestRunEvolution:
 
 
 class TestCatalog:
-    def test_lever_catalog_is_serialisable_and_covers_jev_categories(self):
+    def test_lever_catalog_is_serialisable_and_covers_every_lever(self):
         catalog = lever_catalog()
         assert catalog
         categories = {entry["category"] for entry in catalog}
-        for jev_category in (
-            "jev_timeout",
-            "jev_quota",
-            "jev_invalid_response",
-            "jev_low_confidence",
-            "jev_wrong_choice",
-            "jev_unnecessary_replan",
-            "jev_missed_replan",
-        ):
-            assert jev_category in categories, jev_category
+        # 目录必须覆盖 LEVERS 里的每个类别（缺失的类别会被判成"需人工改代码"，
+        # 那是另一条明确的分支，不能靠漏配偷偷发生）。
+        for category in LEVERS:
+            assert category in categories, category
 
     def test_tuning_snapshot_matches_config_defaults(self):
         snapshot = tuning_snapshot()

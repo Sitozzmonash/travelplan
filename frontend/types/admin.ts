@@ -46,13 +46,6 @@ export const BADCASE_CATEGORY_LABELS: Record<string, string> = {
   missing_disclosure: "未披露交通/住宿",
   hallucinated_price: "无来源的实时价",
   degradation: "能力降级",
-  jev_timeout: "Jev 超时",
-  jev_quota: "Jev 额度不足",
-  jev_invalid_response: "Jev 返回不合法",
-  jev_low_confidence: "Jev 置信度过低",
-  jev_wrong_choice: "Jev 选错方案",
-  jev_unnecessary_replan: "Jev 多余重排",
-  jev_missed_replan: "Jev 漏判重排",
 };
 
 /** 成本来源：`user_price` 表示按用户配置的每百万 token 单价算出，其余为后端定价表。 */
@@ -68,15 +61,6 @@ export interface AdminCostBreakdown {
 }
 
 /* ------------------------------ 仪表盘 ------------------------------ */
-
-export interface AdminJevSummary {
-  enabled: boolean;
-  configured: boolean;
-  calls: number;
-  fallback: number;
-  timeout: number;
-  low_confidence: number;
-}
 
 export interface AdminBenchmarkSummary {
   latest_run_id: string | null;
@@ -101,12 +85,10 @@ export interface AdminOverview {
   running_count: number;
   total_tokens: number;
   total_llm_calls: number;
-  total_jev_calls: number;
   total_tool_calls: number;
   provider_failures: number;
   badcase_open: number;
   badcase_total: number;
-  jev: AdminJevSummary;
   benchmark: AdminBenchmarkSummary;
   evolution: AdminEvolutionSummary;
 }
@@ -126,7 +108,6 @@ export interface AdminRunSummary {
   /** benchmark 用例运行使用假模型，usage 可能整段为 null。 */
   total_tokens?: number | null;
   llm_calls?: number | null;
-  jev_calls?: number | null;
   tool_calls?: number | null;
   provider_failures?: number | null;
   badcase_count?: number | null;
@@ -166,7 +147,6 @@ export interface AdminRunMetrics {
   cached_tokens?: number | null;
   total_tokens?: number | null;
   llm_calls?: number | null;
-  jev_calls?: number | null;
   tool_calls?: number | null;
   provider_failures?: number | null;
   badcase_count?: number | null;
@@ -237,23 +217,6 @@ export interface AdminProviderCall {
   note: string | null;
 }
 
-export interface AdminJevCall {
-  tag: string;
-  decision_type?: string | null;
-  status?: string | null;
-  choice?: string | null;
-  confidence?: number | null;
-  latency_ms?: number | null;
-  model?: string | null;
-  fallback?: boolean | null;
-  fallback_reason?: string | null;
-  quota?: unknown;
-  input_summary?: string | null;
-  criteria?: unknown;
-  error?: string | null;
-}
-
-/** 一次模型调用。benchmark 用例跑的是假模型，因此多数字段可能为 null。 */
 export interface AdminLlmCall {
   tag: string;
   model?: string | null;
@@ -440,7 +403,6 @@ export interface AdminRunDetail {
   trace: AdminTraceSpan[];
   decisions: AdminDecision[];
   provider_calls: AdminProviderCall[];
-  jev_calls: AdminJevCall[];
   llm_calls: AdminLlmCall[];
   badcases: AdminBadcase[];
   /** 没有引导式来源时后端返回 null（要能优雅显示"这次不是引导式创建的"）。 */
@@ -454,7 +416,6 @@ export const BENCHMARK_SUITES = [
   "hard",
   "badcase_regression",
   "provider_failure",
-  "jev_decision",
   "live_smoke",
 ] as const;
 
@@ -466,7 +427,6 @@ export interface AdminBenchmarkRun {
   superharness_commit: string | null;
   model: string | null;
   fixture_version: string | null;
-  jev_enabled: boolean;
   status: string;
   started_at: string | null;
   finished_at: string | null;
@@ -483,23 +443,21 @@ export interface AdminBenchmarkRunList {
 }
 
 export interface AdminBenchmarkMetrics {
-  /** 六个维度允许为 null 或整段缺失：缺失时页面显示 Partial 提示，而不是整页报错。 */
+  /** 五个维度允许为 null 或整段缺失：缺失时页面显示 Partial 提示，而不是整页报错。 */
   hard_constraints: AdminRecord | null | undefined;
   plan_quality: AdminRecord | null | undefined;
   evidence: AdminRecord | null | undefined;
   provider: AdminRecord | null | undefined;
   performance: AdminRecord | null | undefined;
-  jev: AdminRecord | null | undefined;
 }
 
-/** 六个评测维度：契约固定，顺序也固定，前端只负责贴标签。 */
+/** 五个评测维度：契约固定，顺序也固定，前端只负责贴标签。 */
 export const BENCHMARK_DIMENSIONS = [
   { key: "hard_constraints", label: "硬性约束", description: "预算、时间窗、必去点等不可违背的条件" },
   { key: "plan_quality", label: "行程质量", description: "节奏、连贯性、可执行性" },
   { key: "evidence", label: "证据与来源", description: "来源覆盖、价格新鲜度、广告风险" },
   { key: "provider", label: "Provider 表现", description: "各数据源成功率与降级情况" },
   { key: "performance", label: "性能", description: "端到端耗时与调用次数" },
-  { key: "jev", label: "Jev 决策", description: "决策质量、fallback 与低置信度比例" },
 ] as const;
 
 export type BenchmarkDimensionKey = (typeof BENCHMARK_DIMENSIONS)[number]["key"];
@@ -514,7 +472,7 @@ export interface AdminBenchmarkCaseResult {
 }
 
 /**
- * Jev OFF / ON 基线对比。
+ * OFF / ON 基线对比。
  *
  * 历史后端返回的是扁平对象（没有 off / on / delta_pct 三个分组），
  * 因此三个分组都标成可选；展示层用 `Object.keys(x ?? {})` 兜底，缺一段就退化成空表。
@@ -537,7 +495,6 @@ export interface AdminBenchmarkDetail {
 
 export interface AdminBenchmarkLaunchRequest {
   suites?: string[];
-  jev_enabled?: boolean;
   limit?: number;
   live?: boolean;
 }
@@ -547,7 +504,7 @@ export interface AdminBenchmarkLaunchResult {
   status: string;
 }
 
-/* ------------------------------ 配置与 Jev ------------------------------ */
+/* ------------------------------ 配置 ------------------------------ */
 
 export interface AdminConfig {
   config: AdminRecord;
@@ -573,10 +530,9 @@ export interface AdminConfigPatch {
   values: Record<string, unknown>;
 }
 
-/** 配置分组：预算 / Jev / Planner 阈值 / 模型单价；未命中的落到「其他」。 */
+/** 配置分组：预算 / Planner 阈值 / 模型单价；未命中的落到「其他」。 */
 export const ADMIN_CONFIG_GROUPS = [
   { key: "budget", label: "预算", description: "预算上限与超限处理策略" },
-  { key: "jev", label: "Jev", description: "模型决策层的开关、配额与阈值" },
   { key: "planner", label: "Planner 阈值", description: "规划器的候选门槛与节奏限制" },
   { key: "price", label: "模型单价", description: "按每百万 token 计的成本单价" },
 ] as const;
@@ -834,21 +790,6 @@ export interface AdminPlanningSessionDetail {
   decision: AdminSessionDecision | null;
 }
 
-export interface AdminJevHealth {
-  enabled: boolean;
-  configured: boolean;
-  status: string;
-  latency_ms: number | null;
-  quota: unknown;
-  quota_source: string;
-  fallback_count: number | null;
-  calls: number | null;
-  low_confidence: number | null;
-  timeout: number | null;
-  invalid_response: number | null;
-  last_error: string | null;
-}
-
 /* ------------------------------ Provider 健康 ------------------------------ */
 
 /**
@@ -1038,7 +979,7 @@ export interface AdminEvolutionLaunchResult {
 }
 
 /* ==================================================================
- * 管理端聚合视图（对应 docs/TravelPlan_Admin_整体优化方案.md）
+ * 管理端聚合视图（对应 docs/product/ADMIN.md）
  *
  * 这五组契约服务四件事：首屏该看什么（Dashboard）、行程生成得好不好
  * （Travel Quality）、用户在哪一步流失（Funnel）、一堆 Bad Case 里
@@ -1163,8 +1104,8 @@ export interface AdminDashboard {
     sampled: boolean;
   };
   /**
-   * 决策健康：取代「Jev 是不是活着」的那组指标（文档 §10 把 Jev 降为可选增强）。
-   * 全部来自抽样运行的既有事实，不做任何推断。
+   * 决策健康：一组回答"软决策到底有没有生效"的指标，全部来自抽样运行的既有事实，
+   * 不做任何推断。
    */
   decision_health: {
     runs: number;
@@ -1479,6 +1420,97 @@ export interface AdminTimelineStage {
   finished_at: string | null;
 }
 
+/* ------------------------------ Agent Loop 步骤流 ------------------------------ */
+/*
+ * 主规划已从「固定 12 步工作流」换成 SuperHarness Agent Loop（`app/agent_runner.py`）：
+ * Agent 在循环里自己调工具、最后交卷出计划。这一路的事实形状与固定流程不同，
+ * 所以后端额外给了一份 `agent` 块 —— 后端只读聚合（`app/admin_timeline.py::_agent_block`），
+ * 前端不重算、不拼接，缺字段一律按「后端没给」渲染。
+ */
+
+/** 一次模型调用的 token 四项；取不到的那项是 null（不是 0）。 */
+export interface AdminAgentStepTokens {
+  input: number | null;
+  output: number | null;
+  cached: number | null;
+  total: number | null;
+}
+
+/** Agent 的一步：一次真实调用（工具 span 或模型 span），不是 run_stages 的一行。 */
+export interface AdminAgentStep {
+  /** 展示序号，1 开始，按真实发生顺序（started_at，同一时刻用 seq 兜底）。 */
+  order: number;
+  kind: "tool" | "model" | string;
+  /** span 上记的序号：工具是「该工具的第几次调用」，模型是全局第几次模型调用。 */
+  seq: number | null;
+  span_id: string;
+  /** 与时间轴事件的 id 相同（TOOL / ASSISTANT 事件的 event_id 就是 span_id），可跳转。 */
+  event_id: string;
+  /** 中文步骤名（= run_stages.stage_id，如「在查酒店」）；挂不上时为 null。 */
+  stage: string | null;
+  stage_title: string | null;
+  /** 机器可读的步骤身份（`tool:search_hotels:2` / `llm:gpt-4o`）。 */
+  step_key: string | null;
+  tool: string | null;
+  model: string | null;
+  provider: string | null;
+  status: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  duration_ms: number | null;
+  query: string | null;
+  note: string | null;
+  /** 工具返回条数（对齐上的 Provider 账本行或 span 属性）；取不到为 null。 */
+  returned: unknown;
+  error: string | null;
+  /** 只有模型步有 token；工具步是 null（它不消耗模型 token）。 */
+  tokens: AdminAgentStepTokens | null;
+  /** 到这一步为止的累计 token（模型 span 上带的 cumulative_total_tokens）。 */
+  cumulative_total_tokens: number | null;
+}
+
+/** Agent 运行元信息 + 步骤流 + 整 run token 汇总。 */
+export interface AdminAgentInfo {
+  /** 这次 run 是不是 Agent Loop 出的计划；false 时走固定 12 步的旧展示口径。 */
+  is_agent_run: boolean;
+  prompt_version: string | null;
+  system_prompt_chars: number | null;
+  /** 这次 run 里对模型可见的工具名（trace 的 prompt_version span 上记着）。 */
+  tools: string[];
+  /** `submit_final_plan`（交卷）或 `message_json`（兜底解析）；两者都取不到时为 null。 */
+  plan_origin: string | null;
+  /** plan_origin 的中文一句话；后端没给标签时为 null。 */
+  plan_origin_label: string | null;
+  /** plan_origin 的来源：audit_report.json（权威）/ trace_spans（反推）。 */
+  plan_origin_source: string | null;
+  /** 循环为什么被截断（超时 / 超步数 / 成本护栏）；没有或不详时为 null。 */
+  truncation: string | null;
+  limits: {
+    max_steps: number | null;
+    timeout_seconds: number | null;
+    /** 上限是否来自本次 run 的审计快照；false 表示取自「当前配置」，未必是当次的值。 */
+    from_audit: boolean;
+    note: string;
+  };
+  steps: AdminAgentStep[];
+  tokens: {
+    input: number | null;
+    output: number | null;
+    cached: number | null;
+    total: number | null;
+    llm_calls: number | null;
+    tool_calls: number | null;
+    duration_ms: number | null;
+    /** 汇总口径来源（当前只有 run_metrics）。 */
+    source: string;
+    /** 逐条 span 相加的自算值：用来核对「汇总 vs 明细」。 */
+    step_total: number | null;
+    steps_llm: number;
+    steps_tool: number;
+  };
+  notes: string[];
+}
+
 export interface AdminTimeline {
   run_id: string;
   generated_at: string;
@@ -1503,11 +1535,18 @@ export interface AdminTimeline {
     fallbacks: number;
     badcases: number;
     stages: number;
+    /** Agent 步骤数（工具 span + 模型 span）。 */
+    agent_steps?: number;
   };
   stages: AdminTimelineStage[];
   tracks: AdminTimelineTrack[];
   events: AdminTraceEvent[];
   badcases: AdminTraceBadcaseBrief[];
+  /**
+   * Agent Loop 的步骤流 / 每步 token / 总 token / 元信息。
+   * 可选：后端契约是分批落地的，旧后端不返回这个键时页面必须能优雅降级。
+   */
+  agent?: AdminAgentInfo | null;
   /** 本次 run 的行程质量画像（与质量页同一份口径/同一份缓存）。 */
   quality: {
     score: number | null;

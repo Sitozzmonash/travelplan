@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -237,6 +239,479 @@ class TestRunTimelineLlmPreview:
         response = client.get("/api/v1/admin/runs/tp-raw/timeline", headers=AUTH)
         assert response.status_code == 200
         assert "amap-live-123456" not in response.text
+
+
+class TestAgentRunTimeline:
+    """Agent Loop 出计划的 run：admin 要能看到每一步在做什么、每步 token、总 token。
+
+    这一路的事实形状与固定 12 步流程不同：
+      * `run_stages.stage_id` 是**中文展示名**（「在查酒店」），同名工具的第 N 次调用共享
+        同一行（后写覆盖先写），逐次事实只在 `trace_spans` 上；
+      * 工具 span 带 `stage_key`（`tool:search_hotels:2`）/ `seq`，但**不带** `source_id`；
+      * 模型 span 带 input / output / cached / total 与 `cumulative_*`。
+
+    所以这里守三件事：步骤挂回中文步骤名、每步 token 与整 run 汇总都能读出、
+    agent 元信息（交卷方式 / prompt 版本 / truncation）按来源如实给出。
+    """
+
+    RUN = "tp-agent-1"
+
+    @staticmethod
+    def _tool(
+        store: TravelPlanStore,
+        run_id: str,
+        *,
+        tool: str,
+        display: str,
+        seq: int,
+        started: str,
+        finished: str,
+        status: str = "SUCCESS",
+        duration_ms: int = 1200,
+        query: dict | None = None,
+    ) -> None:
+        """一次工具调用：run_stages 一行（中文展示名）+ trace 一条 tool span。"""
+
+        facts = {
+            "tool": tool,
+            "status": status,
+            "duration_ms": duration_ms,
+            "started": started,
+            "finished": finished,
+            "seq": seq,
+            "stage_key": f"tool:{tool}" if seq == 1 else f"tool:{tool}:{seq}",
+            "query": json.dumps(query or {"city": "成都"}, ensure_ascii=False),
+            "note": "工具返回预览",
+            "error": None,
+        }
+        store.update_stage(
+            run_id,
+            display,
+            status,
+            message=display,
+            facts=facts,
+            started_at=started,
+            finished_at=finished,
+        )
+        store.save_trace_span(
+            run_id,
+            f"{run_id}:tool:{tool}:{seq}",
+            component="tool",
+            name=tool,
+            status=status,
+            started_at=started,
+            finished_at=finished,
+            parent_span_id=f"{run_id}:agent",
+            attributes={
+                "tool": tool,
+                "status": status,
+                "duration_ms": duration_ms,
+                "stage_key": facts["stage_key"],
+                "seq": seq,
+                "query": facts["query"],
+                "note": facts["note"],
+                "output_chars": 12,
+            },
+        )
+
+    @staticmethod
+    def _model(
+        store: TravelPlanStore,
+        run_id: str,
+        *,
+        model: str,
+        seq: int,
+        started: str,
+        finished: str,
+        tokens: tuple[int, int, int],
+        cumulative_total: int,
+    ) -> None:
+        """一次模型调用：run_stages 一行（「在思考行程」）+ trace 一条 llm span。"""
+
+        tokens_in, tokens_out, cached = tokens
+        total = tokens_in + tokens_out
+        store.update_stage(
+            run_id,
+            "在思考行程",
+            "SUCCESS",
+            message="在思考行程",
+            facts={
+                "model": model,
+                "status": "SUCCESS",
+                "duration_ms": 800,
+                "started": started,
+                "finished": finished,
+                "seq": seq,
+                "stage_key": f"llm:{model}",
+                "error": None,
+            },
+            started_at=started,
+            finished_at=finished,
+        )
+        store.save_trace_span(
+            run_id,
+            f"{run_id}:llm:{model}:{seq}",
+            component="llm",
+            name=model,
+            status="SUCCESS",
+            started_at=started,
+            finished_at=finished,
+            parent_span_id=f"{run_id}:agent",
+            attributes={
+                "model": model,
+                "tag": model,
+                "status": "SUCCESS",
+                "duration_ms": 800,
+                "seq": seq,
+                "input_tokens": tokens_in,
+                "output_tokens": tokens_out,
+                "cached_tokens": cached,
+                "total_tokens": total,
+                "cumulative_total_tokens": cumulative_total,
+            },
+        )
+
+    @classmethod
+    def _seed(cls, store: TravelPlanStore, run_id: str = RUN) -> None:
+        store.create_run(run_id, original_query="北京→成都 5 天")
+        # prompt 版本 span：Agent 路径由 `agent_runner._record_prompt_version` 写。
+        store.save_trace_span(
+            run_id,
+            f"{run_id}:workflow:agent_prompt",
+            component="workflow",
+            name="prompt_version",
+            status="SUCCESS",
+            started_at="2026-09-22T10:00:00+00:00",
+            attributes={
+                "prompt_version": "prompt-sha-abc",
+                "system_prompt_chars": 4096,
+                "tools": ["search_hotels", "search_flights", "submit_final_plan"],
+                "agent": "superharness",
+            },
+        )
+        # 先查火车（09:59），再查酒店（10:00:02），最后模型思考 —— 时间顺序与登记顺序不同。
+        cls._tool(
+            store,
+            run_id,
+            tool="search_trains",
+            display="在查火车票",
+            seq=1,
+            started="2026-09-22T09:59:00+00:00",
+            finished="2026-09-22T09:59:02+00:00",
+            duration_ms=2000,
+        )
+        cls._tool(
+            store,
+            run_id,
+            tool="search_hotels",
+            display="在查酒店",
+            seq=1,
+            started="2026-09-22T10:00:02+00:00",
+            finished="2026-09-22T10:00:05+00:00",
+            duration_ms=3000,
+            query={"city": "成都", "checkin": "2026-10-01"},
+        )
+        cls._model(
+            store,
+            run_id,
+            model="gpt-test",
+            seq=1,
+            started="2026-09-22T10:00:06+00:00",
+            finished="2026-09-22T10:00:08+00:00",
+            tokens=(100, 20, 5),
+            cumulative_total=120,
+        )
+        store.save_run_metrics(
+            run_id,
+            {
+                "duration_ms": 9000,
+                "input_tokens": 150,
+                "output_tokens": 50,
+                "cached_tokens": 25,
+                "total_tokens": 200,
+                "llm_calls": 1,
+                "jev_calls": 0,
+                "tool_calls": 2,
+                "provider_failures": 0,
+                "badcase_count": 0,
+                "cost": 0.012,
+            },
+        )
+        store.finish_run(run_id, "completed")
+
+    def test_steps_carry_chinese_stage_status_and_duration(self, client, store):
+        self._seed(store)
+        body = client.get(f"/api/v1/admin/runs/{self.RUN}/timeline", headers=AUTH).json()
+        agent = body["agent"]
+
+        assert agent["is_agent_run"] is True
+        assert body["summary"]["agent_steps"] == 3
+        # 步骤按真实发生顺序（不是登记顺序）：火车 09:59 → 酒店 10:00:02 → 模型 10:00:06
+        assert [step["tool"] or step["model"] for step in agent["steps"]] == [
+            "search_trains",
+            "search_hotels",
+            "gpt-test",
+        ]
+        assert [step["order"] for step in agent["steps"]] == [1, 2, 3]
+        assert [step["kind"] for step in agent["steps"]] == ["tool", "tool", "model"]
+
+        trains, hotels, model = agent["steps"]
+        # 中文步骤名（run_stages 的 stage_id）与状态、耗时都要读出来
+        assert (trains["stage"], trains["stage_title"]) == ("在查火车票", "在查火车票")
+        assert trains["step_key"] == "tool:search_trains"
+        assert trains["status"] == "SUCCESS" and trains["duration_ms"] == 2000
+        assert hotels["stage_title"] == "在查酒店" and hotels["duration_ms"] == 3000
+        assert hotels["tool"] == "search_hotels" and hotels["seq"] == 1
+        assert "成都" in (hotels["query"] or "")
+        assert model["stage_title"] == "在思考行程"
+        assert model["model"] == "gpt-test"
+
+        # 事件侧的阶段归属同样要修好（否则前端分组一律「未归属阶段」）
+        tool_event = next(
+            item for item in body["events"] if item["event_type"] == "TOOL" and item["tool"] == "search_hotels"
+        )
+        assert tool_event["stage"] == "在查酒店"
+        assert tool_event["round_index"] is not None
+        assistant = next(item for item in body["events"] if item["event_type"] == "ASSISTANT")
+        assert assistant["stage"] == "在思考行程"
+        assert (assistant["tokens_in"], assistant["tokens_out"]) == (100, 20)
+        assert assistant["metadata"]["cached_tokens"] == 5
+        assert assistant["metadata"]["total_tokens"] == 120
+
+    def test_each_step_token_and_run_total(self, client, store):
+        self._seed(store)
+        body = client.get(f"/api/v1/admin/runs/{self.RUN}/timeline", headers=AUTH).json()
+        agent = body["agent"]
+
+        # 每步 token 只在模型步上有（工具不消耗模型 token）
+        assert agent["steps"][0]["tokens"] is None
+        assert agent["steps"][2]["tokens"] == {"input": 100, "output": 20, "cached": 5, "total": 120}
+        assert agent["steps"][2]["cumulative_total_tokens"] == 120
+
+        tokens = agent["tokens"]
+        assert tokens["source"] == "run_metrics"
+        assert (tokens["input"], tokens["output"], tokens["cached"], tokens["total"]) == (150, 50, 25, 200)
+        assert (tokens["steps_llm"], tokens["steps_tool"]) == (1, 2)
+        assert tokens["step_total"] == 120
+        assert tokens["duration_ms"] == 9000
+        # 汇总 token 与 run 头部同一份口径
+        assert body["run"]["total_tokens"] == 200
+
+    def test_meta_comes_from_trace_when_audit_is_missing(self, client, store):
+        self._seed(store)
+        body = client.get(f"/api/v1/admin/runs/{self.RUN}/timeline", headers=AUTH).json()
+        agent = body["agent"]
+
+        assert agent["prompt_version"] == "prompt-sha-abc"
+        assert agent["tools"] == ["search_hotels", "search_flights", "submit_final_plan"]
+        # 没有 audit 文件也没有 submit span / plan：交卷方式如实留空，不猜
+        assert agent["plan_origin"] is None and agent["plan_origin_source"] is None
+        assert agent["truncation"] is None
+        assert any("truncation" in note for note in agent["notes"])
+        assert agent["limits"]["from_audit"] is False
+
+    def test_plan_origin_derived_from_submit_span(self, client, store):
+        self._seed(store)
+        self._tool(
+            store,
+            self.RUN,
+            tool="submit_final_plan",
+            display="在调用 submit_final_plan",
+            seq=1,
+            started="2026-09-22T10:00:09+00:00",
+            finished="2026-09-22T10:00:09+00:00",
+            duration_ms=0,
+        )
+        body = client.get(f"/api/v1/admin/runs/{self.RUN}/timeline", headers=AUTH).json()
+
+        assert body["agent"]["plan_origin"] == "submit_final_plan"
+        assert body["agent"]["plan_origin_source"] == "trace_spans"
+        assert "submit_final_plan" in body["agent"]["plan_origin_label"]
+        assert any("反推" in note for note in body["agent"]["notes"])
+
+    def test_audit_agent_block_is_read_when_present(self, client, store, tmp_path, monkeypatch):
+        """audit_report.json 是 plan_origin / truncation / 步数上限的权威来源（库里没有这些列）。"""
+
+        output_dir = tmp_path / "outputs"
+        (output_dir / self.RUN).mkdir(parents=True)
+        (output_dir / self.RUN / "audit_report.json").write_text(
+            json.dumps(
+                {
+                    "agent": {
+                        "prompt_version": "prompt-sha-abc",
+                        "plan_origin": "message_json",
+                        "max_steps": 24,
+                        "timeout_seconds": 600,
+                        "truncation": "Agent 达到最大步数（24 步）仍未收尾",
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("TRAVELPLAN_OUTPUT_DIR", str(output_dir))
+        self._seed(store)
+        body = client.get(f"/api/v1/admin/runs/{self.RUN}/timeline", headers=AUTH).json()
+        agent = body["agent"]
+
+        assert agent["plan_origin"] == "message_json"
+        assert agent["plan_origin_source"] == "audit_report.json"
+        assert "message_json" in agent["plan_origin_label"]
+        assert agent["truncation"] == "Agent 达到最大步数（24 步）仍未收尾"
+        assert agent["limits"]["from_audit"] is True
+        assert (agent["limits"]["max_steps"], agent["limits"]["timeout_seconds"]) == (24, 600)
+
+    def test_provider_call_is_aligned_to_the_tool_step(self, client, store):
+        """Agent 路径的 tool span 不带 source_id：按时间窗口把 Provider 账本行挂回去。"""
+
+        self._seed(store)
+        store.save_source(
+            self.RUN,
+            {
+                "source_id": "src-hotel-1",
+                "provider": "tuniu",
+                "source_type": "run",
+                "query": {"city": "成都"},
+                "fetched_at": "2026-09-22T10:00:03+00:00",  # 落在 search_hotels 的窗口内
+                "normalized": {"count": 7, "items": [{"name": "某酒店"}]},
+                "status": "OK",
+            },
+        )
+        store.save_source(
+            self.RUN,
+            {
+                "source_id": "src-early-1",
+                "provider": "amap",
+                "source_type": "discovery",
+                "query": {"keywords": "熊猫基地"},
+                "fetched_at": "2026-09-22T09:00:00+00:00",  # 不在任何工具窗口内
+                "normalized": {"count": 3, "items": []},
+                "status": "OK",
+            },
+        )
+        body = client.get(f"/api/v1/admin/runs/{self.RUN}/timeline", headers=AUTH).json()
+
+        hotel_step = next(step for step in body["agent"]["steps"] if step["tool"] == "search_hotels")
+        assert (hotel_step["provider"], hotel_step["returned"]) == ("tuniu", 7)
+        hotel_event = next(
+            item for item in body["events"] if item["event_type"] == "TOOL" and item["tool"] == "search_hotels"
+        )
+        assert hotel_event["provider"] == "tuniu"
+        assert hotel_event["metadata"]["source_id"] == "src-hotel-1"
+        assert "返回 7 条" in hotel_event["summary"]
+        assert any("时间窗口" in note for note in hotel_event["notes"])
+
+        # 对齐上的账本行不再作为孤儿 Provider 事件重复出现
+        provider_titles = [item["title"] for item in body["events"] if item["event_type"] == "PROVIDER"]
+        assert "tuniu · run" not in provider_titles
+        # 没对齐上的照旧单独列出，并按 Agent 口径说明原因
+        orphan = next(
+            item for item in body["events"] if item["event_type"] == "PROVIDER" and item["title"].startswith("amap")
+        )
+        assert any("时间窗口" in note for note in orphan["notes"])
+
+    def test_legacy_fixed_flow_run_keeps_its_attribution(self, client, store):
+        """旧 run（固定 12 步）不许被 Agent 口径改写：父 span 关系仍然生效。"""
+
+        run_id = "tp-legacy-flow"
+        store.create_run(run_id, original_query="北京→成都")
+        store.update_stage(
+            run_id,
+            "check_budget",
+            "SUCCESS",
+            message="check_budget",
+            facts={"projected_total": 5000, "status": "within_budget"},
+            started_at="2026-09-20T10:00:00+00:00",
+            finished_at="2026-09-20T10:00:01+00:00",
+        )
+        store.save_trace_span(
+            run_id,
+            f"{run_id}:tool:search_hotels:1",
+            component="tool",
+            name="search_hotels",
+            status="SUCCESS",
+            started_at="2026-09-20T10:00:00+00:00",
+            finished_at="2026-09-20T10:00:01+00:00",
+            parent_span_id=f"{run_id}:check_budget",
+            attributes={"provider": "tuniu", "tool": "search_hotels", "status": "OK", "returned": 12},
+        )
+        store.finish_run(run_id, "completed")
+
+        body = client.get(f"/api/v1/admin/runs/{run_id}/timeline", headers=AUTH).json()
+        assert body["agent"]["is_agent_run"] is False
+        event = next(item for item in body["events"] if item["event_type"] == "TOOL")
+        assert event["stage"] == "check_budget"
+        assert event["provider"] == "tuniu" and event["metadata"]["returned"] == 12
+
+    def test_submit_tool_name_matches_the_runner_constant(self):
+        """两处常量必须一致：`admin_timeline` 刻意不 import agent_runner（重依赖）。"""
+
+        from app.admin_timeline import SUBMIT_TOOL_NAME
+        from app.agent_runner import SUBMIT_TOOL_NAME as RUNNER_SUBMIT_TOOL_NAME
+
+        assert SUBMIT_TOOL_NAME == RUNNER_SUBMIT_TOOL_NAME
+
+    def test_reads_back_what_the_step_reporter_writes(self, tmp_path):
+        """真实写入端（`app/agent_trace.StepReporter`）→ 真实读取端（`run_timeline`）。
+
+        手工造 span 的用例只证明"字段对了就能读"；这一条用同一份落库代码写一遍，
+        守的是两边字段名不许漂移（改一处不改另一处，页面会静默空白）。
+        """
+
+        from app.admin_timeline import run_timeline
+        from app.agent_trace import build_step_reporter
+
+        store = make_store(tmp_path / "agent.db")
+        run_id = "tp-agent-roundtrip"
+        store.create_run(run_id, original_query="北京→成都")
+        reporter = build_step_reporter(store, run_id)
+
+        tool_step = reporter.begin_tool("search_hotels", {"city": "成都"})
+        reporter.finish_tool(tool_step, output='{"items":[1,2,3]}')
+        model_step = reporter.begin_model("gpt-test")
+        reporter.finish_model(model_step, input_tokens=120, output_tokens=30, cached_tokens=10)
+        store.save_run_metrics(
+            run_id,
+            {
+                "duration_ms": 4200,
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "cached_tokens": 10,
+                "total_tokens": 150,
+                "llm_calls": 1,
+                "jev_calls": 0,
+                "tool_calls": 1,
+                "provider_failures": 0,
+                "badcase_count": 0,
+                "cost": 0.004,
+            },
+        )
+        store.finish_run(run_id, "completed")
+
+        body = run_timeline(store, run_id)
+        agent = body["agent"]
+        # prompt_version span 没写（只有 agent_runner 会写）：靠 tool span 的 stage_key 认出来
+        assert agent["is_agent_run"] is True
+        assert [step["kind"] for step in agent["steps"]] == ["tool", "model"]
+
+        tool_row, model_row = agent["steps"]
+        assert tool_row["stage_title"] == "在查酒店"
+        assert tool_row["tool"] == "search_hotels"
+        assert tool_row["status"] == "SUCCESS"
+        assert isinstance(tool_row["duration_ms"], int)
+        assert tool_row["tokens"] is None
+        assert model_row["stage_title"] == "在思考行程"
+        assert model_row["tokens"] == {"input": 120, "output": 30, "cached": 10, "total": 150}
+        assert model_row["cumulative_total_tokens"] == 150
+        assert agent["tokens"]["total"] == 150 and agent["tokens"]["step_total"] == 150
+
+        # 事件侧：工具事件挂在中文步骤名上，模型事件带得上 token
+        tool_event = next(item for item in body["events"] if item["event_type"] == "TOOL")
+        assert tool_event["stage"] == "在查酒店" and tool_event["round_index"] is not None
+        assistant = next(item for item in body["events"] if item["event_type"] == "ASSISTANT")
+        assert assistant["metadata"]["total_tokens"] == 150
+        # 轮询用的那个字段也一致（前端实时进度与事后复盘看的是同一个步骤名）
+        assert store.get_run_progress(run_id)["current_stage"] == "在思考行程"
 
 
 class TestProviderHealth:

@@ -362,7 +362,7 @@ def cmd_render(args: argparse.Namespace) -> int:
     health = _wait_http(f"{base}/api/v1/health", seconds=args.wait_health)
     print(f"       health: {json.dumps(health, ensure_ascii=False)[:600]}")
     store = health.get("store") or {}
-    # 契约字段（database_backend / database_connected）是 docs/09_部署说明.md §2.4 的要求。已部署的旧版本
+    # 契约字段（database_backend / database_connected）是 docs/operations/DEPLOYMENT.md §2.4 的要求。已部署的旧版本
     # 可能还没有这两个字段，此时退回 store.backend / store.ok 判定并明确提示 —— 不假装通过。
     if "database_backend" in health:
         backend_ok = health.get("database_backend") == "postgres"

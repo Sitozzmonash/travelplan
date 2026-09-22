@@ -1,29 +1,22 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { Info, RefreshCw, RotateCcw, Save, Settings2, ShieldCheck, Sparkles } from "lucide-react";
+import { Info, RefreshCw, RotateCcw, Save, Settings2, ShieldCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/admin/page-header";
 import { ActionError, PartialBanner, ResourceView } from "@/components/admin/admin-states";
-import { DescriptionList, MetricList } from "@/components/admin/metric-list";
-import { StatCard } from "@/components/admin/stat-card";
+import { MetricList } from "@/components/admin/metric-list";
 import { SecretBadge, ToneBadge } from "@/components/admin/status-badge";
-import {
-  formatLatency,
-  formatMetricValue,
-  formatNumber,
-  statusLabel,
-} from "@/components/admin/format";
+import { formatMetricValue } from "@/components/admin/format";
 import { useAdminResource } from "@/components/admin/use-admin-resource";
 import { formatDateTime } from "@/lib/format";
-import { getAdminConfig, getAdminJevHealth, patchAdminConfig, toAdminApiError, type AdminApiError } from "@/lib/admin-api";
-import { ADMIN_CONFIG_GROUPS, type AdminConfig, type AdminConfigOverride, type AdminJevHealth, type AdminRecord } from "@/types/admin";
+import { getAdminConfig, patchAdminConfig, toAdminApiError, type AdminApiError } from "@/lib/admin-api";
+import { ADMIN_CONFIG_GROUPS, type AdminConfig, type AdminConfigOverride, type AdminRecord } from "@/types/admin";
 
 /** Secret 只读展示：管理台永远只回答「配没配」，不回显取值。 */
 const SECRET_LABELS: Record<string, string> = {
-  jev: "Jev 密钥",
   admin: "管理 Token",
   amap: "高德密钥",
   tikhub: "TikHub Token",
@@ -35,7 +28,6 @@ type ConfigGroupKey = (typeof GROUP_ORDER)[number];
 
 export function ConfigView() {
   const config = useAdminResource<AdminConfig>("admin-config", getAdminConfig);
-  const health = useAdminResource<AdminJevHealth>("admin-jev-health", getAdminJevHealth);
 
   return (
     <div className="flex flex-col gap-4">
@@ -44,14 +36,7 @@ export function ConfigView() {
         description="非 Secret 的配置项可以在线修改（保存后写入运行时覆盖）；Secret 只报「配没配」，永不回显。"
         badge={<Settings2 className="size-4 text-muted-foreground" aria-hidden />}
         actions={
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => {
-              config.reload();
-              health.reload();
-            }}
-          >
+          <Button variant="outline" size="sm" onClick={config.reload}>
             <RefreshCw />
             刷新
           </Button>
@@ -61,23 +46,6 @@ export function ConfigView() {
       <ResourceView resource={config} loadingRows={5}>
         {(data) => <ConfigBody data={data} onSaved={config.reload} />}
       </ResourceView>
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex flex-wrap items-center gap-2">
-            <Sparkles className="size-4 text-muted-foreground" aria-hidden />
-            Jev 健康
-          </CardTitle>
-          <CardDescription>
-            来自 GET /api/v1/admin/jev/health 的实时探测，与上面的静态配置分开读取。
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <ResourceView resource={health} loadingRows={3}>
-            {(data) => <JevHealthBody data={data} />}
-          </ResourceView>
-        </CardContent>
-      </Card>
     </div>
   );
 }
@@ -137,7 +105,7 @@ function ConfigBody({ data, onSaved }: { data: AdminConfig; onSaved: () => void 
               <CardHeader>
                 <CardTitle>{meta?.label ?? "其他配置"}</CardTitle>
                 <CardDescription>
-                  {meta?.description ?? "不属于预算 / Jev / Planner 阈值 / 模型单价的字段。"}
+                  {meta?.description ?? "不属于预算 / Planner 阈值 / 模型单价的字段。"}
                 </CardDescription>
               </CardHeader>
               <CardContent className="flex flex-col gap-4">
@@ -282,75 +250,6 @@ function ConfigKeyEditor({
   );
 }
 
-function JevHealthBody({ data }: { data: AdminJevHealth }) {
-  const quotaKnown = data.quota_source === "reported" && data.quota !== null && data.quota !== undefined;
-
-  return (
-    <div className="flex flex-col gap-3">
-      {!data.configured ? (
-        <PartialBanner
-          title="Jev 未配置密钥"
-          description="配置里缺少 Jev 所需的密钥，因此所有决策都会走 fallback。这不会让规划失败，但会降低取舍质量。"
-        />
-      ) : null}
-
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-        <StatCard
-          label="状态"
-          value={statusLabel(data.status)}
-          tone={
-            data.status === "OK" || data.status === "HEALTHY"
-              ? "success"
-              : data.status === "ERROR"
-                ? "danger"
-                : "muted"
-          }
-          hint={data.enabled ? "Jev 已启用" : "Jev 未启用"}
-        />
-        <StatCard label="探测时延" value={formatLatency(data.latency_ms)} />
-        <StatCard
-          label="配额"
-          value={quotaKnown ? formatMetricValue(data.quota) : "unknown"}
-          hint={
-            data.quota_source === "reported"
-              ? "由后端上报"
-              : "后端未上报配额，因此不可知"
-          }
-        />
-        <StatCard
-          label="fallback 次数"
-          value={formatNumber(data.fallback_count)}
-          tone={data.fallback_count && data.fallback_count > 0 ? "warning" : "muted"}
-        />
-      </div>
-
-      <DescriptionList
-        items={[
-          { label: "累计调用", value: formatNumber(data.calls) },
-          { label: "低置信度", value: formatNumber(data.low_confidence) },
-          { label: "超时", value: formatNumber(data.timeout) },
-          { label: "非法响应", value: formatNumber(data.invalid_response) },
-          {
-            label: "最后错误",
-            value: data.last_error ? (
-              <span className="font-mono text-[11px] break-words text-danger-subtle-foreground">
-                {data.last_error}
-              </span>
-            ) : (
-              "无"
-            ),
-          },
-          {
-            label: "密钥",
-            value: <SecretBadge configured={Boolean(data.configured)} />,
-          },
-          { label: "配额来源", value: data.quota_source === "reported" ? "后端上报" : "unknown" },
-        ]}
-      />
-    </div>
-  );
-}
-
 /* ------------------------------ 工具函数 ------------------------------ */
 
 type ConfigValueKind = "boolean" | "number" | "text";
@@ -383,7 +282,7 @@ function parseValue(draft: string, kind: ConfigValueKind): unknown {
 }
 
 /**
- * 取值解析：后端 key 可能是大写环境变量名（`JEV_MAX_CALLS_PER_RUN`），
+ * 取值解析：后端 key 可能是大写环境变量名（`TRAVELPLAN_ADMIN_TOKEN`），
  * 而 config / planner_tuning 用的是 snake_case，因此精确匹配失败时再试小写。
  */
 function resolveValue(record: AdminRecord | undefined, key: string): unknown {
@@ -400,7 +299,6 @@ function groupOf(key: string): ConfigGroupKey {
     return "price";
   }
   if (k.includes("budget")) return "budget";
-  if (k.includes("jev")) return "jev";
   if (
     k.startsWith("tp_") ||
     k.includes("threshold") ||

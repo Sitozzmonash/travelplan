@@ -347,7 +347,7 @@ Discovery 的交通线从 177.1s（两次 90s 超时）降到 46s 量级。Disco
 第一轮说"节点不再使用写死数字"，但实际仍有 8 个常量被节点真实引用
 （`SOCIAL_QUERY_LIMIT` / `MAX_EVIDENCE` / `EXTRACT_EVIDENCE_LIMIT` / `ROUTE_MAX_LEG_METERS` …）。
 本轮把这些全部收进 `app/config.py`，并删掉同名"镜像常量"——镜像与 config 迟早漂移，
-而"节点到底读哪一个"从代码上看不出来。新增键与文档见 `docs/02_配置说明.md`。
+而"节点到底读哪一个"从代码上看不出来。新增键与文档见 `docs/operations/CONFIG.md`。
 
 ## 9. 回归验证（本轮）
 

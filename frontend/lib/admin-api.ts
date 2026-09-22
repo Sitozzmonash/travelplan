@@ -13,6 +13,8 @@
  */
 
 import type {
+  AdminAgentInfo,
+  AdminAgentStep,
   AdminBadcase,
   AdminBadcaseGroups,
   AdminBadcaseList,
@@ -36,7 +38,6 @@ import type {
   AdminFunnel,
   AdminFunnelBreakdownRow,
   AdminGrade,
-  AdminJevHealth,
   AdminKpi,
   AdminLlmCall,
   AdminOverview,
@@ -450,7 +451,6 @@ function normalizeRunSummary(value: AdminRecord): AdminRunSummary {
     duration_ms: toNumberOrNull(value.duration_ms),
     total_tokens: toNumberOrNull(value.total_tokens),
     llm_calls: toNumberOrNull(value.llm_calls),
-    jev_calls: toNumberOrNull(value.jev_calls),
     tool_calls: toNumberOrNull(value.tool_calls),
     provider_failures: toNumberOrNull(value.provider_failures),
     badcase_count: toNumberOrNull(value.badcase_count),
@@ -493,7 +493,6 @@ function normalizeRunMetrics(value: unknown): AdminRunMetrics {
     cached_tokens: toNumberOrNull(record.cached_tokens),
     total_tokens: toNumberOrNull(record.total_tokens),
     llm_calls: toNumberOrNull(record.llm_calls),
-    jev_calls: toNumberOrNull(record.jev_calls),
     tool_calls: toNumberOrNull(record.tool_calls),
     provider_failures: toNumberOrNull(record.provider_failures),
     badcase_count: toNumberOrNull(record.badcase_count),
@@ -555,7 +554,6 @@ function normalizeRunDetail(payload: unknown): AdminRunDetail {
     trace: toArray(record.trace).filter(isTraceSpan),
     decisions: toArray(record.decisions).filter(isRecord) as unknown as AdminRunDetail["decisions"],
     provider_calls: toArray(record.provider_calls).filter(isRecord) as unknown as AdminRunDetail["provider_calls"],
-    jev_calls: toArray(record.jev_calls).filter(isRecord) as unknown as AdminRunDetail["jev_calls"],
     llm_calls: toArray(record.llm_calls).filter(isRecord) as unknown as AdminLlmCall[],
     badcases: toArray(record.badcases).filter(isBadcase),
     user_journey: isRecord(record.user_journey)
@@ -615,10 +613,10 @@ function isStagePayload(value: unknown): value is AdminRecord | unknown[] {
 function isOverview(value: unknown): value is AdminOverview {
   if (!isRecord(value)) return false;
   if (!hasMetricCounts(value, ["run_count", "degraded_count", "failed_count", "running_count"])) return false;
-  if (!hasMetricCounts(value, ["total_tokens", "total_llm_calls", "total_jev_calls", "total_tool_calls"])) return false;
+  if (!hasMetricCounts(value, ["total_tokens", "total_llm_calls", "total_tool_calls"])) return false;
   if (!hasMetricCounts(value, ["provider_failures", "badcase_open", "badcase_total"])) return false;
   if (!isRecord(value.statuses)) return false;
-  if (!isRecord(value.jev) || !isRecord(value.benchmark) || !isRecord(value.evolution)) return false;
+  if (!isRecord(value.benchmark) || !isRecord(value.evolution)) return false;
   const benchmark = value.benchmark;
   return isArray(benchmark.latest_suites);
 }
@@ -644,7 +642,7 @@ function isBadcaseList(value: unknown): value is AdminBadcaseList {
 function isBenchmarkRun(value: unknown): boolean {
   if (!isRecord(value)) return false;
   if (!isString(value.benchmark_run_id) || !isString(value.suite) || !isString(value.status)) return false;
-  return typeof value.jev_enabled === "boolean" && isRecord(value.metrics);
+  return isRecord(value.metrics);
 }
 
 function isBenchmarkRunList(value: unknown): value is AdminBenchmarkRunList {
@@ -658,7 +656,6 @@ const DIMENSION_KEYS = [
   "evidence",
   "provider",
   "performance",
-  "jev",
 ] as const;
 
 function isBenchmarkDetail(value: unknown): value is AdminBenchmarkDetail {
@@ -711,16 +708,6 @@ function normalizeConfig(payload: unknown): AdminConfig {
     runtime_overrides: overrides,
     values: isRecord(record.values) ? record.values : {},
   };
-}
-
-function isJevHealth(value: unknown): value is AdminJevHealth {
-  if (!isRecord(value)) return false;
-  return (
-    typeof value.enabled === "boolean" &&
-    typeof value.configured === "boolean" &&
-    isString(value.status) &&
-    isString(value.quota_source)
-  );
 }
 
 /* --------------------------- 引导式会话 --------------------------- */
@@ -1406,13 +1393,6 @@ export function patchAdminConfig(patch: AdminConfigPatch): Promise<AdminConfig> 
   }).then(normalizeConfig);
 }
 
-export function getAdminJevHealth(): Promise<AdminJevHealth> {
-  return adminRequest<AdminJevHealth>("/api/v1/admin/jev/health", {
-    method: "GET",
-    validate: isJevHealth,
-  });
-}
-
 export function getAdminEvolution(): Promise<AdminEvolutionOverview> {
   return adminRequest<AdminEvolutionOverview>("/api/v1/admin/evolution", {
     method: "GET",
@@ -1901,6 +1881,85 @@ function normalizeTimelineEvent(value: AdminRecord): AdminTraceEvent {
   };
 }
 
+/**
+ * Agent Loop 的一步（后端 `admin_timeline._agent_steps` 的一行）。
+ *
+ * 为什么逐字段归一而不是直接透传：这些值要参与排序 / 徽标配色 / 数字格式化，
+ * 一旦某天后端把 `order` 给成字符串，透传会让整个步骤流静默错位；缺字段则落成
+ * null（「后端没给」），UI 才能按缺口口径渲染而不是显示 0。
+ */
+function normalizeAgentStep(value: AdminRecord): AdminAgentStep {
+  const tokens = isRecord(value.tokens) ? value.tokens : null;
+  return {
+    order: toNumberOrNull(value.order) ?? 0,
+    kind: String(value.kind ?? "tool"),
+    seq: toNumberOrNull(value.seq),
+    span_id: String(value.span_id ?? ""),
+    event_id: String(value.event_id ?? value.span_id ?? ""),
+    stage: toStringOrNull(value.stage),
+    stage_title: toStringOrNull(value.stage_title),
+    step_key: toStringOrNull(value.step_key),
+    tool: toStringOrNull(value.tool),
+    model: toStringOrNull(value.model),
+    provider: toStringOrNull(value.provider),
+    status: toStringOrNull(value.status),
+    started_at: toStringOrNull(value.started_at),
+    finished_at: toStringOrNull(value.finished_at),
+    duration_ms: toNumberOrNull(value.duration_ms),
+    query: toStringOrNull(value.query),
+    note: toStringOrNull(value.note),
+    // returned 后端未固定形状（条数 / 布尔 / 空），原样保留由 UI 判类型。
+    returned: value.returned ?? null,
+    error: toStringOrNull(value.error),
+    tokens: tokens
+      ? {
+          input: toNumberOrNull(tokens.input),
+          output: toNumberOrNull(tokens.output),
+          cached: toNumberOrNull(tokens.cached),
+          total: toNumberOrNull(tokens.total),
+        }
+      : null,
+    cumulative_total_tokens: toNumberOrNull(value.cumulative_total_tokens),
+  };
+}
+
+function normalizeAgentInfo(value: unknown): AdminAgentInfo | null {
+  if (!isRecord(value)) return null;
+  const limits = isRecord(value.limits) ? value.limits : {};
+  const tokens = isRecord(value.tokens) ? value.tokens : {};
+  return {
+    is_agent_run: value.is_agent_run === true,
+    prompt_version: toStringOrNull(value.prompt_version),
+    system_prompt_chars: toNumberOrNull(value.system_prompt_chars),
+    tools: toArray(value.tools).map(String),
+    plan_origin: toStringOrNull(value.plan_origin),
+    plan_origin_label: toStringOrNull(value.plan_origin_label),
+    plan_origin_source: toStringOrNull(value.plan_origin_source),
+    truncation: toStringOrNull(value.truncation),
+    limits: {
+      max_steps: toNumberOrNull(limits.max_steps),
+      timeout_seconds: toNumberOrNull(limits.timeout_seconds),
+      from_audit: limits.from_audit === true,
+      note: String(limits.note ?? ""),
+    },
+    steps: toArray(value.steps).filter(isRecord).map(normalizeAgentStep),
+    tokens: {
+      input: toNumberOrNull(tokens.input),
+      output: toNumberOrNull(tokens.output),
+      cached: toNumberOrNull(tokens.cached),
+      total: toNumberOrNull(tokens.total),
+      llm_calls: toNumberOrNull(tokens.llm_calls),
+      tool_calls: toNumberOrNull(tokens.tool_calls),
+      duration_ms: toNumberOrNull(tokens.duration_ms),
+      source: String(tokens.source ?? ""),
+      step_total: toNumberOrNull(tokens.step_total),
+      steps_llm: toNumberOrNull(tokens.steps_llm) ?? 0,
+      steps_tool: toNumberOrNull(tokens.steps_tool) ?? 0,
+    },
+    notes: toArray(value.notes).map(String),
+  };
+}
+
 function normalizeTimeline(payload: unknown): AdminTimeline {
   const record = isRecord(payload) ? payload : {};
   const run = isRecord(record.run) ? record.run : {};
@@ -1929,6 +1988,7 @@ function normalizeTimeline(payload: unknown): AdminTimeline {
       fallbacks: toNumberOrNull(summary.fallbacks) ?? 0,
       badcases: toNumberOrNull(summary.badcases) ?? 0,
       stages: toNumberOrNull(summary.stages) ?? 0,
+      agent_steps: toNumberOrNull(summary.agent_steps) ?? 0,
     },
     stages: toArray(record.stages)
       .filter(isRecord)
@@ -1969,6 +2029,7 @@ function normalizeTimeline(payload: unknown): AdminTimeline {
         analysis_status: toStringOrNull(case_.analysis_status),
       })),
     quality: normalizeTimelineQuality(record.quality),
+    agent: normalizeAgentInfo(record.agent),
     type_options: toArray(record.type_options)
       .filter(isRecord)
       .map((option) => ({ key: String(option.key ?? ""), label: String(option.label ?? option.key ?? "") })),

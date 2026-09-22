@@ -128,53 +128,13 @@ LEVERS: dict[str, Lever] = {
     ),
     "degradation": _tuning_lever(
         "app/config.py",
-        "按降级项逐个排查（模型 / Provider / Jev）",
+        "按降级项逐个排查（模型 / Provider）",
         "降级是外部能力问题，配置层只能调超时与开关",
     ),
     "provider_failure": _tuning_lever(
         "app/providers.py",
         "调整 Provider 优先级与 fallback 顺序（代码/配置修复）",
         "Provider 失败需要换主备或换查询参数，没有通用阈值",
-    ),
-    "jev_timeout": _tuning_lever(
-        "app/config.py",
-        "提高 Jev 超时预算（JEV_TIMEOUT_MS）",
-        "超时说明 1.5s 预算对这类问题偏紧",
-        JEV_TIMEOUT_MS="2500",
-    ),
-    "jev_quota": _tuning_lever(
-        "app/config.py",
-        "下调单次 run 的 Jev 调用上限（JEV_MAX_CALLS_PER_RUN）",
-        "额度紧张时应更保守地使用 Jev",
-        JEV_MAX_CALLS_PER_RUN="3",
-    ),
-    "jev_low_confidence": _tuning_lever(
-        "app/config.py",
-        "下调 Jev 最低置信度（JEV_MIN_CONFIDENCE）以观察是否值得采纳",
-        "置信度阈值过高会让 Jev 的判断被整体丢弃",
-        JEV_MIN_CONFIDENCE="0.6",
-    ),
-    "jev_invalid_response": _tuning_lever(
-        "app/decision/jev.py",
-        "解析层适配（代码修复，无配置杠杆）",
-        "结构不合法是契约问题，不是阈值",
-    ),
-    "jev_wrong_choice": _tuning_lever(
-        "app/config.py / app/decision/planner_decision.py",
-        "提高 Jev 最低置信度（JEV_MIN_CONFIDENCE），只采纳高置信决策",
-        "选错方案说明低置信决策不该被采纳",
-        JEV_MIN_CONFIDENCE="0.85",
-    ),
-    "jev_unnecessary_replan": _tuning_lever(
-        "app/config.py",
-        "提高 Jev 最低置信度（JEV_MIN_CONFIDENCE）",
-        "把低置信的 REPLAN 挡在外面，减少无意义重排",
-        JEV_MIN_CONFIDENCE="0.85",
-    ),
-    "jev_missed_replan": _tuning_lever(
-        "app/decision/planner_decision.py",
-        "质量门必须把硬问题完整传给 Jev，并在 Jev 漏判时由代码兜底 REPLAN",
-        "漏判说明决策输入或兜底逻辑有缺口",
     ),
     "provider_degraded": _tuning_lever(
         "app/config.py",

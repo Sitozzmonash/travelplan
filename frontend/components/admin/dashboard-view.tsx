@@ -6,7 +6,6 @@ import { Activity, FlaskConical, Gauge, HeartPulse, RefreshCw, TriangleAlert } f
 import { Button } from "@/components/ui/button";
 import { AttentionPanel } from "@/components/admin/attention-panel";
 import { CollapsibleSection } from "@/components/admin/collapsible-section";
-import { PanelSection } from "@/components/admin/metric-list";
 import { PageHeader } from "@/components/admin/page-header";
 import { ResourceView, SectionEmpty } from "@/components/admin/admin-states";
 import { StatCard, type StatCardTrend } from "@/components/admin/stat-card";
@@ -37,11 +36,10 @@ import {
 /**
  * 仪表盘：一屏回答「现在系统健康吗、最该修什么」。
  *
- * 与旧版的区别（docs/TravelPlan_Admin_整体优化方案.md §3）：
+ * 与旧版的区别（docs/product/ADMIN.md §3）：
  *   * 首屏只留关键指标，且全部**带环比**与时间范围 —— 历史累计量（总 Token / 总工具调用）
  *     不再占首屏，它们被收进页面底部的「累计用量（历史总量）」折叠区；
- *   * 「当前需要关注」提到最显眼的位置，每条都带可点的入口；
- *   * Jev 不再是核心健康指标（文档 §10 把它降为可选增强），相关明细与累计用量放在一起。
+ *   * 「当前需要关注」提到最显眼的位置，每条都带可点的入口。
  */
 export function DashboardView() {
   const [windowKey, setWindowKey] = useState<AdminWindowKey>(DEFAULT_ADMIN_WINDOW);
@@ -436,7 +434,7 @@ function QualityClosure({ data }: { data: AdminDashboard }) {
 /* ------------------------------ 累计用量（下沉） ------------------------------ */
 
 /**
- * 历史累计量与 Jev 明细。
+ * 历史累计量（总 Token / 总工具调用 / 状态分布）。
  *
  * 为什么不放在首屏：`总 Token = 2,000,000`、`总工具调用 = 18,000` 这类数字**没法指导
  * 下一步该修什么**（文档 §3.1）。但它们仍然有用（容量与成本核对），所以下沉到一个
@@ -489,28 +487,6 @@ function LifetimeUsage() {
                   </div>
                 ))}
               </dl>
-              <PanelSection
-                title="Jev（可选增强）"
-                description="文档 §10 已把 Jev 降为可选增强，因此它只在累计用量里出现，不再是首屏核心指标。"
-              >
-                <dl className="grid grid-cols-2 gap-x-3 gap-y-1.5 md:grid-cols-4">
-                  {(
-                    [
-                      ["开关", data.jev.enabled ? "已启用" : "未启用"],
-                      ["密钥", data.jev.configured ? "已配置" : "未配置"],
-                      ["调用", formatNumber(data.jev.calls)],
-                      ["fallback", formatNumber(data.jev.fallback)],
-                      ["超时", formatNumber(data.jev.timeout)],
-                      ["低置信", formatNumber(data.jev.low_confidence)],
-                    ] as const
-                  ).map(([label, value]) => (
-                    <div key={label} className="flex flex-col gap-0.5">
-                      <dt className="text-[11px] text-muted-foreground">{label}</dt>
-                      <dd className="text-xs font-medium text-foreground">{value}</dd>
-                    </div>
-                  ))}
-                </dl>
-              </PanelSection>
               <p className="text-[11px] text-muted-foreground">
                 状态枚举说明：当前累计里出现{" "}
                 {Object.keys(data.statuses)

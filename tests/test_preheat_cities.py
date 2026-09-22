@@ -1,6 +1,6 @@
 """预热脚本的跳过判定与 `--daily` 定时模式（`scripts/preheat_cities.py`）。
 
-两块内容：
+三块内容：
 
 * 跳过判定（`_skip_reason`）：它是"要不要再花 2~3 分钟 + 一份 Provider 配额重跑一座
   城市"的唯一判据，判反两个方向都很糟 —— 该跑的不跑（空城永远填不上、降级永远停在
@@ -8,9 +8,13 @@
   （返回**跳过理由**、返回 `None` 表示执行），所以四种组合都钉住。
 
 * `--daily` 定时模式：每天最多真正尝试 `--limit` 座城市（默认 15）、起点按
-  day-of-year 轮转、跳过的城市不占额度、与 `--force` 互斥。这些用例全部用替身跑
-  `main()` —— monkeypatch 掉 `load_dotenv` / `TravelPlanStore` / `_row` /
-  `sessions.refresh_city_cache`，不真连库、不真调 Provider。
+  day-of-year 轮转、跳过的城市不占额度、与 `--force` 互斥。
+
+* 失败语义：一座城市失败（抛错 / 没落库）不该中断整批，但退出码必须是 1 —— 这条在
+  "每城内部换成预热 Agent"（P6）之后必须保持不变。
+
+这些用例全部用替身跑 `main()` —— monkeypatch 掉 `load_dotenv` / `TravelPlanStore` /
+`_row` / `preheat_agent.preheat_city`，不真连库、不真调 Provider、不真起 Agent。
 """
 
 from __future__ import annotations
@@ -94,11 +98,21 @@ def _fixed_date(doy: int):
     return _FakeDate
 
 
-def _run_main(preheat, monkeypatch, argv, *, states: dict[str, str], call_log: list[str]) -> int:
-    """替身化跑 `main()`：不连库、不调 Provider，只记录 refresh 调用序列。
+def _run_main(
+    preheat,
+    monkeypatch,
+    argv,
+    *,
+    states: dict[str, str],
+    call_log: list[str],
+    fail: set[str] | None = None,
+    empty: set[str] | None = None,
+) -> int:
+    """替身化跑 `main()`：不连库、不调 Provider、不起预热 Agent，只记录预热调用序列。
 
     `states` 决定每座城市 `_row` 返回的 state（缺省"空"= 会真跑）；`call_log` 按序记录
-    真正调了 `sessions.refresh_city_cache` 的城市。
+    真正调了 `preheat_agent.preheat_city` 的城市；`fail` 里的城市抛异常（Agent 失败），
+    `empty` 里的城市返回 POI 为 0 的摘要（跑完但没落库）。
     """
 
     monkeypatch.setattr(preheat, "load_dotenv", lambda *a, **k: None)
@@ -116,21 +130,28 @@ def _run_main(preheat, monkeypatch, argv, *, states: dict[str, str], call_log: l
             "age": "-",
         },
     )
-    monkeypatch.setattr(
-        preheat.sessions,
-        "refresh_city_cache",
-        lambda store, city: (
-            call_log.append(city),
-            {
-                "city": city,
-                "places": 5,
-                "evidences": 3,
-                "social_evidences": 2,
-                "queries": 1,
-                "notes": [],
-            },
-        )[1],
-    )
+
+    def _fake_preheat_city(store, city):
+        call_log.append(city)
+        if fail and city in fail:
+            raise preheat.preheat_agent.PreheatAgentError(f"测试替身：{city} 的 Agent 失败")
+        if empty and city in empty:
+            return {
+                "city": city, "places": 0, "evidences": 0, "social_evidences": 0,
+                "queries": 0, "notes": ["本轮没有任何通过校验的高德 POI，未写入城市缓存"],
+                "degradations": ["没有写入城市缓存"], "agent": {"provider_calls": 4, "searches": 2},
+            }
+        return {
+            "city": city,
+            "places": 5,
+            "evidences": 3,
+            "social_evidences": 2,
+            "queries": 1,
+            "notes": [],
+            "agent": {"provider_calls": 9, "searches": 3},
+        }
+
+    monkeypatch.setattr(preheat.preheat_agent, "preheat_city", _fake_preheat_city)
     return preheat.main(argv)
 
 
@@ -209,6 +230,39 @@ def test_force_and_daily_are_mutually_exclusive(preheat, monkeypatch, capsys):
     assert rc == 1
     assert call_log == [], "互斥报错时不该真的跑任何城市"
     assert "互斥" in capsys.readouterr().err, "报错信息要说明互斥"
+
+
+def test_failed_city_sets_exit_code_1_and_batch_continues(preheat, monkeypatch, capsys):
+    """一座城市的 Agent 失败：标失败、整批继续跑完、退出码 1（P6 之后语义不变）。"""
+
+    call_log: list[str] = []
+    cities = ["a", "b", "c"]
+    rc = _run_main(
+        preheat, monkeypatch,
+        ["--cities", *cities],
+        states={}, call_log=call_log, fail={"b"},
+    )
+    assert call_log == ["a", "b", "c"], "一座城市失败不该中断整批"
+    assert rc == 1, "有城市失败必须退出码 1（GitHub Actions 靠它判断 job 失败）"
+    err = capsys.readouterr().err
+    assert "1 座城市未成功：b" in err
+    assert "测试替身：b 的 Agent 失败" in err, "失败原因要如实打出来，不能只说'失败'"
+
+
+def test_city_without_pois_is_a_failure_and_prints_agent_notes(preheat, monkeypatch, capsys):
+    """跑完但 POI 为 0 = 未落库 = 失败，且要把 Agent 侧的说明打出来（便于复盘）。"""
+
+    call_log: list[str] = []
+    rc = _run_main(
+        preheat, monkeypatch,
+        ["--cities", "成都"],
+        states={}, call_log=call_log, empty={"成都"},
+    )
+    assert call_log == ["成都"]
+    assert rc == 1, "没有 POI 的城市按 read_candidates 的口径不算命中，必须算失败"
+    err = capsys.readouterr().err
+    assert "跑完但 POI 为 0" in err
+    assert "本轮没有任何通过校验的高德 POI" in err, "失败时要打印 Agent 的 notes"
 
 
 # ------------------------------------------------------------ 默认城市清单

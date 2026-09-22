@@ -15,7 +15,6 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from app.config import TravelPlanConfig
 from app.llm import STATUS_OK, STATUS_UNAVAILABLE, LLMResult
 from app.models import (
     Evidence,
@@ -78,9 +77,8 @@ class FakeHub:
         self.run_id = run_id
         self.failing = set(failing or ())
         self.empty = set(empty or ())
-        #: POI 之间的经纬度间距（度）。默认 0.01° ≈ 1.1km，所有点会落进同一个地理簇 ——
-        #: 那样 Top-K 只会排出一种拓扑，Jev 的"选方案"就无从触发。想测多候选时给
-        #: 一个更大的值（0.25° ≈ 28km），模拟"城市里相距很远的几个区"。
+        #: POI 之间的经纬度间距（度）。默认 0.01° ≈ 1.1km，所有点会落进同一个地理簇。
+        #: 想模拟"城市里相距很远的几个区"时给一个更大的值（0.25° ≈ 28km）。
         self.poi_spread = poi_spread
         #: audit_report.json 的 provider_calls 来源。真实 Hub 从自己的调用账本生成，
         #: 假 Hub 也按同样的形状记，否则 audit 断言测的就是假件的常量。
@@ -565,74 +563,3 @@ def make_store(db_path) -> TravelPlanStore:
     store.init_schema()
     return store
 
-
-class FakeJev:
-    """离线 Jev 替身（PRD §34.3）。
-
-    真实 Jev 是一次 1.5s 预算的 HTTP 调用，单测与 Benchmark 都不能依赖它。这里替换的
-    只是"网络那一层"：返回真实的 `JevResult`，所以产品代码对它的处理路径与线上一致 ——
-    包括 fallback、circuit breaker 计数与 trace 记录。
-
-    ``script`` 决定每个 tag 返回什么：
-      * ``choice``   —— 返回哪个选项（必须是 criteria 里的键）；
-      * ``status``   —— 非 OK 时模拟超时 / 429 / 结构不合法；
-      * 未列出的 tag —— 自动选第一个 criteria 键，让"没写脚本"的调用不会失败。
-    """
-
-    def __init__(
-        self,
-        script: dict[str, dict[str, Any]] | None = None,
-        *,
-        default_confidence: float = 0.9,
-        available: bool = True,
-    ) -> None:
-        self.script = dict(script or {})
-        self.default_confidence = default_confidence
-        self.available = available
-        self.calls: list[Any] = []
-        self.config = TravelPlanConfig.from_env()
-        #: 真实 JevClient 也有这两个属性，产品代码不会因为换了实现而需要分支。
-        self._circuit_open = False
-
-    def choose(self, *, tag: str, state: dict[str, Any], instructions: str, criteria: dict[str, str]):
-        from app.decision.jev import JevResult
-
-        self.calls.append({"tag": tag, "state": state, "instructions": instructions, "criteria": criteria})
-        if not self.available:
-            result = JevResult(tag=tag, status="TIMEOUT", duration_ms=1500, error="fake timeout", attempted=True)
-            return self._record(result)
-        spec = self.script.get(tag, {})
-        if spec.get("status"):
-            result = JevResult(
-                tag=tag,
-                status=str(spec["status"]),
-                duration_ms=12,
-                error=str(spec.get("error") or "脚本指定的失败"),
-                quota=spec.get("quota"),
-                attempted=True,
-            )
-            return self._record(result)
-        choice = str(spec.get("choice") or next(iter(criteria), ""))
-        if choice not in criteria:
-            result = JevResult(
-                tag=tag,
-                status="INVALID_RESPONSE",
-                duration_ms=9,
-                error=f"脚本给出的 {choice!r} 不在选项中",
-                attempted=True,
-            )
-            return self._record(result)
-        result = JevResult(
-            tag=tag,
-            status="OK",
-            choice=choice,
-            confidence=float(spec.get("confidence", self.default_confidence)),
-            duration_ms=int(spec.get("duration_ms", 11)),
-            model="fake-jev",
-            quota=spec.get("quota"),
-            attempted=True,
-        )
-        return self._record(result)
-
-    def _record(self, result: Any) -> Any:
-        return result

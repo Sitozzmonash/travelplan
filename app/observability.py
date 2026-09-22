@@ -49,13 +49,12 @@ class SpanKind(StrEnum):
     """Trace span 的组件分类（管理端按它分组展示与聚合）。
 
     §5 要求 Trace 至少覆盖这些类别。分类的意义是：看到一次 run 变慢或变差时，
-    维护者能先定位到"是 Provider 慢"还是"Jev 拒绝"还是"Planner 反复重排"，
+    维护者能先定位到"是 Provider 慢"还是"Planner 反复重排"，
     而不是在一堆同名 span 里翻。
     """
 
     WORKFLOW = "workflow"
     LLM = "llm"
-    JEV = "jev"
     PROVIDER = "provider"
     TOOL = "tool"
     MCP = "mcp"
@@ -69,7 +68,7 @@ class SpanKind(StrEnum):
 def span_id(run_id: str, component: str | SpanKind, name: str, *, suffix: str | None = None) -> str:
     """span_id 必须稳定且唯一：同一 run 下 (component, name) 可能重复出现。
 
-    ``suffix`` 供调用方在确实会重复的场景（例如多个 Jev 问题）上区分实例；
+    ``suffix`` 供调用方在确实会重复的场景（例如多个同名问题）上区分实例；
     不传时退化为 ``run:component:name``，与既有 workflow span 的命名保持一致。
     """
 

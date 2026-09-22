@@ -7,10 +7,6 @@
     不引入推断性描述。
   * **id 稳定**。同一次 run 反复检测必须命中同一行，否则 Evolution 会把同一件事
     当成多个失败模式。
-
-Jev 相关的规则单独列出（任务 §7 明确要求 7 类）。它们的输入不是猜测：`jev_*` 状态
-直接来自 `JevResult`，而 `jev_wrong_choice` / `jev_unnecessary_replan` /
-`jev_missed_replan` 由 Python 在硬约束复核时判定后作为 signals 传进来。
 """
 
 from __future__ import annotations
@@ -37,13 +33,6 @@ CATEGORY_EVIDENCE_GAP = "evidence_gap"
 CATEGORY_MISSING_DISCLOSURE = "missing_disclosure"
 CATEGORY_HALLUCINATED_PRICE = "hallucinated_price"
 CATEGORY_ROUTE_UNVERIFIED = "route_unverified"
-CATEGORY_JEV_TIMEOUT = "jev_timeout"
-CATEGORY_JEV_QUOTA = "jev_quota"
-CATEGORY_JEV_INVALID_RESPONSE = "jev_invalid_response"
-CATEGORY_JEV_LOW_CONFIDENCE = "jev_low_confidence"
-CATEGORY_JEV_WRONG_CHOICE = "jev_wrong_choice"
-CATEGORY_JEV_UNNECESSARY_REPLAN = "jev_unnecessary_replan"
-CATEGORY_JEV_MISSED_REPLAN = "jev_missed_replan"
 
 # --- 引导式旅程（用户旅程落地任务 §19 / 管理后台增量任务 §15）---
 CATEGORY_DISCOVERY_EMPTY = "discovery_empty"
@@ -67,17 +56,6 @@ JOURNEY_CATEGORIES = (
     CATEGORY_GUIDED_INTENT_MISMATCH,
 )
 
-#: 供管理端按"是不是 Jev 的问题"分组。
-JEV_CATEGORIES = (
-    CATEGORY_JEV_TIMEOUT,
-    CATEGORY_JEV_QUOTA,
-    CATEGORY_JEV_INVALID_RESPONSE,
-    CATEGORY_JEV_LOW_CONFIDENCE,
-    CATEGORY_JEV_WRONG_CHOICE,
-    CATEGORY_JEV_UNNECESSARY_REPLAN,
-    CATEGORY_JEV_MISSED_REPLAN,
-)
-
 SEVERITY_LOW = "low"
 SEVERITY_MEDIUM = "medium"
 SEVERITY_HIGH = "high"
@@ -90,12 +68,8 @@ class BadCaseContext:
     run_id: str
     plan: TripPlan | None = None
     provider_calls: list[dict[str, Any]] = field(default_factory=list)
-    jev_calls: list[dict[str, Any]] = field(default_factory=list)
     degradations: list[str] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
-    #: Python 在硬约束复核阶段对 Jev 决策的判断，例如
-    #: ``{"choice_rejected": "...", "unnecessary_replan": "...", "missed_replan": "..."}``。
-    jev_signals: dict[str, str] = field(default_factory=dict)
     #: 用户旅程上下文（由 workflow 的 `_user_journey_summary` 提供）：
     #: source / prefetch_* / rejected_in_plan / must_missing / discovery 分阶段状态。
     journey: dict[str, Any] = field(default_factory=dict)
@@ -180,7 +154,7 @@ def _degradation_case(ctx: BadCaseContext) -> list[dict[str, Any]]:
             symptom=f"本次 run 有 {len(ctx.degradations)} 项能力降级",
             expected="所有声明的能力都能正常参与规划",
             actual="；".join(ctx.degradations[:5]),
-            suspected_root_cause="外部能力（模型 / Provider / Jev）不可用，已按确定性路径降级",
+            suspected_root_cause="外部能力（模型 / Provider）不可用，已按确定性路径降级",
             trace_refs=[f"{ctx.run_id}:finalize"],
         )
     ]
@@ -337,108 +311,6 @@ def _plan_cases(ctx: BadCaseContext) -> list[dict[str, Any]]:
                 ),
                 suspected_root_cause="高德路线接口降级，或两点之间没有可用路线",
                 trace_refs=[f"{ctx.run_id}:verify_poi_and_routes"],
-            )
-        )
-    return cases
-
-
-def _jev_cases(ctx: BadCaseContext) -> list[dict[str, Any]]:
-    cases: list[dict[str, Any]] = []
-    for call in ctx.jev_calls:
-        tag = str(call.get("tag") or "unknown")
-        status = str(call.get("status") or "")
-        ref = f"{ctx.run_id}:jev:{tag}"
-        if status == "TIMEOUT":
-            cases.append(
-                _case(
-                    ctx,
-                    category=CATEGORY_JEV_TIMEOUT,
-                    severity=SEVERITY_MEDIUM,
-                    symptom=f"jev_timeout:{tag}",
-                    expected="Jev 在超时预算内返回决策",
-                    actual=f"latency_ms={call.get('latency_ms')}，状态 TIMEOUT",
-                    suspected_root_cause="Jev 服务响应慢或网络波动；已在 Python 侧降级",
-                    trace_refs=[ref],
-                )
-            )
-        elif status == "BUDGET_EXCEEDED" or status in {"HTTP_429", "HTTP_402", "FREE_CREDIT_EXHAUSTED"}:
-            cases.append(
-                _case(
-                    ctx,
-                    category=CATEGORY_JEV_QUOTA,
-                    severity=SEVERITY_MEDIUM,
-                    symptom=f"jev_quota:{tag}",
-                    expected="Jev 额度充足",
-                    actual=f"状态 {status}；quota={call.get('quota') or 'unknown'}",
-                    suspected_root_cause="Jev 额度用尽或达到本次 run 的调用上限",
-                    trace_refs=[ref],
-                )
-            )
-        elif status == "INVALID_RESPONSE":
-            cases.append(
-                _case(
-                    ctx,
-                    category=CATEGORY_JEV_INVALID_RESPONSE,
-                    severity=SEVERITY_MEDIUM,
-                    symptom=f"jev_invalid_response:{tag}",
-                    expected="Jev 返回合法 choice 与 confidence",
-                    actual=str(call.get("error") or "响应缺少有效 choice/confidence"),
-                    suspected_root_cause="Jev 接口返回结构与适配层契约不一致",
-                    trace_refs=[ref],
-                )
-            )
-        elif status == "LOW_CONFIDENCE":
-            cases.append(
-                _case(
-                    ctx,
-                    category=CATEGORY_JEV_LOW_CONFIDENCE,
-                    severity=SEVERITY_LOW,
-                    symptom=f"jev_low_confidence:{tag}",
-                    expected="Jev 给出高于阈值的置信度，或明确弃权",
-                    actual=f"confidence={call.get('confidence')}",
-                    suspected_root_cause="候选方案之间差异不明显，或 Jev 对该类问题把握不足",
-                    trace_refs=[ref],
-                )
-            )
-
-    signals = ctx.jev_signals
-    if signals.get("choice_rejected"):
-        cases.append(
-            _case(
-                ctx,
-                category=CATEGORY_JEV_WRONG_CHOICE,
-                severity=SEVERITY_HIGH,
-                symptom="jev_choice_failed_hard_constraint",
-                expected="Jev 选出的方案通过 Python 的硬约束复核",
-                actual=str(signals["choice_rejected"]),
-                suspected_root_cause="Jev 拿到的是摘要，看不到硬约束细节；或候选摘要不足以支撑判断",
-                trace_refs=[f"{ctx.run_id}:jev:plan_choice"],
-            )
-        )
-    if signals.get("unnecessary_replan"):
-        cases.append(
-            _case(
-                ctx,
-                category=CATEGORY_JEV_UNNECESSARY_REPLAN,
-                severity=SEVERITY_MEDIUM,
-                symptom="jev_replan_without_hard_issue",
-                expected="只有存在硬问题时才要求 REPLAN",
-                actual=str(signals["unnecessary_replan"]),
-                suspected_root_cause="质量门阈值过松，或 Jev 把软偏好当成硬问题",
-                trace_refs=[f"{ctx.run_id}:jev:quality_gate"],
-            )
-        )
-    if signals.get("missed_replan"):
-        cases.append(
-            _case(
-                ctx,
-                category=CATEGORY_JEV_MISSED_REPLAN,
-                severity=SEVERITY_HIGH,
-                symptom="jev_kept_plan_with_hard_issue",
-                expected="存在未解决硬问题时必须 REPLAN 或明确标注",
-                actual=str(signals["missed_replan"]),
-                suspected_root_cause="质量门的硬问题输入没有被完整传给 Jev",
-                trace_refs=[f"{ctx.run_id}:jev:quality_gate"],
             )
         )
     return cases
@@ -687,15 +559,21 @@ def _must_missing_reasons(ctx: BadCaseContext, missing: list[str]) -> str:
     return "行程里没有给出原因（可能是时间窗/营业时间限制，建议检查 check_feasibility 的告警）"
 
 
-def _applied_selection_ratio(ctx: BadCaseContext) -> float:
+def _applied_selection_ratio(ctx: BadCaseContext) -> float | None:
     plan = ctx.plan
     if plan is None:
         return 0.0
     planned = {item.place_id for day in plan.days for item in day.items if item.place_id}
-    selections = getattr(ctx, "journey", {}).get("selected_ids") or []
+    selections = {
+        str(place_id)
+        for place_id in (getattr(ctx, "journey", {}).get("selected_ids") or [])
+        if str(place_id).strip()
+    }
+    if not selections:
+        return None
     if not planned:
         return 0.0
-    return 1.0 if planned else 0.0
+    return len(planned & selections) / len(selections)
 
 
 def detect_badcases(ctx: BadCaseContext) -> list[dict[str, Any]]:
@@ -705,7 +583,6 @@ def detect_badcases(ctx: BadCaseContext) -> list[dict[str, Any]]:
         *_provider_failures(ctx),
         *_degradation_case(ctx),
         *_plan_cases(ctx),
-        *_jev_cases(ctx),
         *_journey_cases(ctx),
     ]
     order = {SEVERITY_HIGH: 0, SEVERITY_MEDIUM: 1, SEVERITY_LOW: 2}

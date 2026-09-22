@@ -6,6 +6,11 @@
 * A6：按目的地做地理围栏（成都缓存里混进乐山大佛）；
 * A3/A4：第二次跑同一个城市不再打高德（别名 / 查询缓存命中）；
 * A10：攻略证据挂到 canonical 实体上。
+
+注意：实体层的落库发生在 **Discovery 管线**（`places.PlaceResolver`）里，不是 Agent 的
+`search_poi` 工具里 —— 工具只查高德、不写实体层，所以 quick 模式（不跑 Discovery 的
+Agent run）不会积累可复用的 canonical 实体。这一条随固定 12 步流程的退役一起改变，
+这里如实记下，避免把"发现过的城市"和"Agent 查过的地点"混为一谈。
 """
 
 from __future__ import annotations
@@ -205,45 +210,6 @@ class TestResolverSummaryIsObservable:
         trace_rows = store.list_place_resolver_traces(city=CITY)
         assert trace_rows, "解析过程必须留痕"
         assert all(row["action"] for row in trace_rows)
-
-
-class TestWorkflowPathPersistsEntityLayer:
-    """正式 run 的 POI 节点也必须落实体层 —— 它和 Discovery 共用同一份复用底座。
-
-    漏掉这一处的表现很隐蔽：候选照样出得来，但跨会话复用与 Resolver 留痕都不会发生，
-    等于同一套规则只在一半的路径上生效。
-    """
-
-    def test_quick_run_writes_entities_and_traces(self, tmp_path):
-        from app.workflow import execute_travel_run
-        from tests.fakes import QUERY, FakeJev
-
-        store = make_store(tmp_path / "t.db")
-        run_id = "tp-pipeline-run"
-        store.create_run(run_id, source="quick")
-        hub = FakeHub(store=store, run_id=run_id, poi_spread=0.25)
-        result = execute_travel_run(
-            QUERY,
-            store=store,
-            hub=hub,
-            llm=FakeLLM(),
-            jev=FakeJev(),
-            run_id=run_id,
-            output_dir=tmp_path / "out",
-        )
-        assert result.status in {"completed", "degraded"}, result.error
-        entities = store.get_canonical_places(CITY)
-        assert entities, "正式 run 的候选没有写进实体层"
-        assert store.get_place_provider_refs(CITY), "Provider 引用没落库，复用无从生效"
-        traces = store.list_place_resolver_traces(run_id=run_id)
-        assert traces, "Resolver 留痕缺失：事后无法回答'为什么没重新查高德'"
-        # 落进 run 的候选里不能有附属设施（假 Hub 的 type 是 "attraction"，这里主要验证
-        # 名称类设施也被拦住：检索词里带"成都必去景点"这类词时不会带进子设施）。
-        saved = store.get_places(run_id)
-        assert saved
-        assert not [
-            row for row in saved if places.facility_kind(str(row.get("name")), str(row.get("type")))
-        ]
 
 
 @pytest.mark.parametrize("legacy_rows", [False, True])

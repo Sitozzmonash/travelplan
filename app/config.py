@@ -30,6 +30,72 @@ def database_url() -> str | None:
     return raw or None
 
 
+# ======================================================================
+# 备用模型端点（Model Fallback）
+# ======================================================================
+# 为什么要有这一层：SuperHarness 的 `create_model()` 只认一套
+# `MODEL_NAME / MODEL_BASE_URL / MODEL_API_KEY`，没有多模型降级 —— 主模型限流/欠费/宕机时
+# 整次 run 直接失败。这里把 `.env` 里额外配的 `..._bk1` / `..._bk2` 读出来，
+# 交给装配层按「主 → bk1 → bk2」构造降级链（见 app/agent.py::build_model_with_fallbacks）。
+#
+# 这里刻意**不**进 `TravelPlanConfig`：那三个字段是 Secret，而该 dataclass 会被
+# `public_dict()` 整份回显到管理端。也不进 `EDITABLE_KEYS` —— 运行时能被改写的模型凭据
+# 等于一个"谁都能把流量导走"的入口，和 `DATABASE_URL` 同一类，只允许来自部署环境。
+
+#: 备用模型的环境变量后缀，顺序就是降级尝试顺序。
+BACKUP_MODEL_SUFFIXES: tuple[str, ...] = ("_bk1", "_bk2")
+
+
+@dataclass(frozen=True, slots=True)
+class ModelEndpoint:
+    """一套模型连接信息（主模型或某个备用模型）。"""
+
+    #: 日志/审计里用的名字（main / bk1 / bk2）。**不是**模型名，避免把模型名当身份。
+    label: str
+    model_name: str
+    base_url: str
+    api_key: str
+
+    def __repr__(self) -> str:  # pragma: no cover - 纯防泄漏展示
+        """默认 repr 会把 api_key 打进日志、异常与 traceback，这里一律遮掉。"""
+
+        return (
+            f"ModelEndpoint(label={self.label!r}, model_name={self.model_name!r}, "
+            f"base_url={self.base_url!r}, api_key='***')"
+        )
+
+
+def _model_endpoint(label: str, suffix: str) -> ModelEndpoint | None:
+    """读一套模型变量；三项缺任意一项（或为空白）就返回 None —— 干净跳过。
+
+    为什么按"整套齐全"判，而不是"有一个算一个"：半套配置（有 base_url 没有 key）构造出来的
+    模型一定在第一次调用时 401。那会让降级链在**运行时**才炸，而不是在装配期就被跳过 ——
+    一个配了一半的备用模型不该把"主模型失败"变成"整条链失败"。
+    """
+
+    values = [
+        (os.environ.get(f"{name}{suffix}") or "").strip()
+        for name in ("MODEL_NAME", "MODEL_BASE_URL", "MODEL_API_KEY")
+    ]
+    if not all(values):
+        return None
+    return ModelEndpoint(label=label, model_name=values[0], base_url=values[1], api_key=values[2])
+
+
+def model_endpoints() -> tuple[ModelEndpoint, ...]:
+    """按「主 → bk1 → bk2」返回**已配全**的模型端点，配不全的整套跳过，不报错。
+
+    返回值顺序就是降级顺序，调用方不要再排序。主模型缺失时后面的备用会顶上 ——
+    "主不可用就切备用"本来就包含"主压根没配"这一种；一个都没配全时返回空元组，
+    由上游抛它原本的配置错误（错误文案是既有运维契约，不在这里改写）。
+    """
+
+    ordered = [("main", "")] + [
+        (suffix.lstrip("_"), suffix) for suffix in BACKUP_MODEL_SUFFIXES
+    ]
+    return tuple(e for e in (_model_endpoint(label, suffix) for label, suffix in ordered) if e)
+
+
 @dataclass(frozen=True, slots=True)
 class TravelPlanConfig:
     """一次 run 的非敏感行为配置。
@@ -44,15 +110,6 @@ class TravelPlanConfig:
     max_llm_calls: int | None = None
     max_tool_calls: int | None = None
     max_run_seconds: int | None = None
-
-    jev_enabled: bool = True
-    jev_planner_enabled: bool = True
-    jev_timeout_ms: int = 1500
-    jev_min_confidence: float = 0.70
-    jev_max_calls_per_run: int = 5
-    jev_fallback_enabled: bool = True
-    jev_model: str = "jev-latest"
-    jev_base_url: str = "https://api.typesafe.ai/v1/systemone"
 
     badcase_enabled: bool = True
     benchmark_enabled: bool = True
@@ -180,6 +237,30 @@ class TravelPlanConfig:
     #: 否则"这天真的没车"会被一次慢查询误判成结论。
     transport_hedge_wait_seconds: float = 25.0
 
+    # --- 主规划 Agent Loop（P1）---
+    #: Agent 循环的最大步数。**这是防失控的唯一闸门**：模型一旦陷入"调工具→不满意→再调"
+    #: 的循环，没有上限就会一直烧 token。40 步的取数上限：一次正常规划（去回程交通 +
+    #: 酒店 + 若干 POI + 门票 + 市内路线 + 反复核实）约 15~25 次工具调用，40 留了一倍余量，
+    #: 同时把病态循环挡住。传给 LangGraph 的 `recursion_limit`（不是 middleware 计数：
+    #: 它同时覆盖模型调用与工具调用，超限时 LangGraph 直接抛 GraphRecursionError）。
+    max_agent_steps: int = 40
+    #: 一次 agent 规划的墙钟上限（秒）。比固定流程宽松：工具全部由 Agent 串行调用，
+    #: 一次 12306 冷启动就要 60s 级。超时按"如实失败 + 不编造 plan"处理（见 agent_runner）。
+    agent_run_timeout_seconds: float = 600.0
+
+    # --- 城市预热 Agent（P6：每城内部由 Agent 调工具决定搜什么 / 入库什么）---
+    # 这两个值单独一份，因为预热的"划算"与主规划不同：它是批量离线任务，一座城市卡住会拖住
+    # 整批（GitHub Actions 的 job 有 90 分钟上限，单城历史均值约 2.5 分钟）。
+    #: 预热 Agent 的最大步数（传给 LangGraph 的 `recursion_limit`，同时覆盖模型与工具调用）。
+    #: **不能按"模型轮次"理解这个数**：LangGraph 的 recursion_limit 里含固定的编排开销
+    #: （实测：可用模型轮次 ≈ limit − 11），而预热是"逐条入库"（一条攻略一次、一个地点一次），
+    #: 工具调用次数本来就多。所以它与主规划同量级（40），真正更收敛的是下面的墙钟与工具集。
+    preheat_agent_steps: int = 36
+    #: 一次城市预热的墙钟上限（秒）。比主规划的 600s 紧：超时按"如实失败 + 不写缓存"处理
+    #: （见 app/preheat_agent.py），坏城市要尽快让位给后面的城市。
+    preheat_agent_timeout_seconds: float = 360.0
+
+
     # --- 引导式旅程（Planning Session / Discovery）---
     discovery_enabled: bool = True
     planning_session_ttl_minutes: int = 45
@@ -249,16 +330,6 @@ class TravelPlanConfig:
             max_llm_calls=integer("MAX_LLM_CALLS", defaults.max_llm_calls),
             max_tool_calls=integer("MAX_TOOL_CALLS", defaults.max_tool_calls),
             max_run_seconds=integer("MAX_RUN_SECONDS", defaults.max_run_seconds),
-            jev_enabled=flag("JEV_ENABLED", defaults.jev_enabled),
-            jev_planner_enabled=flag("JEV_PLANNER_ENABLED", defaults.jev_planner_enabled),
-            jev_timeout_ms=integer("JEV_TIMEOUT_MS", defaults.jev_timeout_ms) or defaults.jev_timeout_ms,
-            jev_min_confidence=decimal("JEV_MIN_CONFIDENCE", defaults.jev_min_confidence)
-            or defaults.jev_min_confidence,
-            jev_max_calls_per_run=integer("JEV_MAX_CALLS_PER_RUN", defaults.jev_max_calls_per_run)
-            or defaults.jev_max_calls_per_run,
-            jev_fallback_enabled=flag("JEV_FALLBACK_ENABLED", defaults.jev_fallback_enabled),
-            jev_model=_source("JEV_MODEL") or defaults.jev_model,
-            jev_base_url=_source("JEV_BASE_URL") or defaults.jev_base_url,
             badcase_enabled=flag("BADCASE_ENABLED", defaults.badcase_enabled),
             benchmark_enabled=flag("BENCHMARK_ENABLED", defaults.benchmark_enabled),
             evolution_enabled=flag("EVOLUTION_ENABLED", defaults.evolution_enabled),
@@ -374,6 +445,22 @@ class TravelPlanConfig:
             is not None
             else defaults.transport_hedge_wait_seconds,
             discovery_enabled=flag("DISCOVERY_ENABLED", defaults.discovery_enabled),
+            # --- 主规划 Agent Loop（P1）---
+            # 步数下限给 4：再小连"查交通+查酒店+交卷"都跑不完，那不是配置而是关掉功能。
+            max_agent_steps=max(4, integer("MAX_AGENT_STEPS", defaults.max_agent_steps) or 4),
+            agent_run_timeout_seconds=decimal(
+                "AGENT_RUN_TIMEOUT_SECONDS", defaults.agent_run_timeout_seconds
+            )
+            or defaults.agent_run_timeout_seconds,
+            # --- 城市预热 Agent（P6）---
+            # 步数下限同样是 4：再小连"搜一次 + 查一次 + 入库"都跑不完。
+            preheat_agent_steps=max(
+                4, integer("MAX_PREHEAT_AGENT_STEPS", defaults.preheat_agent_steps) or 4
+            ),
+            preheat_agent_timeout_seconds=decimal(
+                "PREHEAT_AGENT_TIMEOUT_SECONDS", defaults.preheat_agent_timeout_seconds
+            )
+            or defaults.preheat_agent_timeout_seconds,
             planning_session_ttl_minutes=integer(
                 "PLANNING_SESSION_TTL_MINUTES", defaults.planning_session_ttl_minutes
             )
@@ -409,7 +496,7 @@ class TravelPlanConfig:
 # ======================================================================
 # 运行时覆盖（管理端可编辑的非 Secret 配置）
 # ======================================================================
-# 为什么要这一层：维护者要在不重启服务的前提下调阈值（Jev 超时、行程阈值、模型单价）。
+# 为什么要这一层：维护者要在不重启服务的前提下调阈值（行程阈值、Provider 超时、模型单价）。
 # 规则只有三条，都很明确：
 #   1. 只有白名单里的键可改（`EDITABLE_KEYS`），Secret（API Key / Admin Token）永不在此列；
 #   2. 覆盖值优先于环境变量，但 `override_env()` 生效期间环境变量优先 ——
@@ -418,13 +505,6 @@ class TravelPlanConfig:
 
 #: key → (类型, 最小值, 最大值)。类型用于写入时校验，区间用于挡住明显手滑。
 EDITABLE_KEYS: dict[str, tuple[str, float | None, float | None]] = {
-    # Jev
-    "JEV_ENABLED": ("bool", None, None),
-    "JEV_PLANNER_ENABLED": ("bool", None, None),
-    "JEV_TIMEOUT_MS": ("int", 100, 60000),
-    "JEV_MIN_CONFIDENCE": ("float", 0.0, 1.0),
-    "JEV_MAX_CALLS_PER_RUN": ("int", 0, 50),
-    "JEV_FALLBACK_ENABLED": ("bool", None, None),
     # 预算（本轮默认只统计不限制）
     "BUDGET_ENABLED": ("bool", None, None),
     "MAX_RUN_TOKENS": ("int", 1, None),
@@ -498,6 +578,14 @@ EDITABLE_KEYS: dict[str, tuple[str, float | None, float | None]] = {
     # 功能开关
     "BADCASE_ENABLED": ("bool", None, None),
     "EVOLUTION_ENABLED": ("bool", None, None),
+    # 主规划 Agent Loop（P1）：循环步数与墙钟上限。这两个数是"防失控"的闸门，
+    # 上线后要调的是它们，所以必须能在不重启服务的前提下改。
+    "MAX_AGENT_STEPS": ("int", 4, 200),
+    "AGENT_RUN_TIMEOUT_SECONDS": ("float", 30.0, 3600.0),
+    # 城市预热 Agent（P6）：同样要能在 CI 之外临时收紧/放宽（GitHub Actions 用仓库
+    # Variable 传的是 `--limit`，这两个值走环境变量）。
+    "MAX_PREHEAT_AGENT_STEPS": ("int", 4, 200),
+    "PREHEAT_AGENT_TIMEOUT_SECONDS": ("float", 30.0, 3600.0),
 }
 
 _RUNTIME_OVERRIDES: dict[str, str] = {}
@@ -538,8 +626,8 @@ def _format_override(value: Any) -> str:
 def validate_override(key: str, value: Any) -> Any:
     """校验一个待写入的覆盖值，返回规范化后的值；非法就抛 ValueError。
 
-    校验必须在写入前做：一个手滑把 JEV_MIN_CONFIDENCE 写成 8（本意 0.8）会让所有
-    Jev 决策变成低置信度，而线上不会有任何报错 —— 只是"突然都不采纳 Jev 了"。
+    校验必须在写入前做：一个手滑把 MAX_RUN_TOKENS 写成 100（本意 1000000）会让所有
+    run 一开跑就判定超预算，而线上不会有任何报错 —— 只是"突然都不出行程了"。
     """
 
     if key not in EDITABLE_KEYS:

@@ -289,7 +289,7 @@ def cmd_job(args: argparse.Namespace) -> int:
     if status not in (200, 201):
         raise SystemExit(
             f"创建一次性任务失败 HTTP {status}: {json.dumps(data)[:300]}"
-            "（免费层可能不允许；见 docs/09_部署说明.md 的替代验证方式）"
+            "（免费层可能不允许；见 docs/operations/DEPLOYMENT.md 的替代验证方式）"
         )
     job = data.get("job") or data
     print(f"已创建一次性任务 {job.get('id')}：{args.command}")

@@ -56,7 +56,7 @@ def test_地点带上产生它的那次调用的_source_id(monkeypatch):
 
 
 def test_每次调用都上报给_superharness_observability(monkeypatch):
-    """START.md §9：Tool 日志由 SuperHarness 原生 Observability 负责，不要自己再造一套。
+    """docs/operations/DEVELOPMENT.md §9：Tool 日志由 SuperHarness 原生 Observability 负责，不要自己再造一套。
 
     上报口在 `_record` 上，所有 Plugin / MCP 调用都经过它，所以不会漏掉某条链路。
     """

@@ -1,48 +1,23 @@
-"""角色 B（docs/14 决策与规划质量）的验证：动态偏好画像、住宿区域、候选池、
-契约 2 字段、契约 4 阶段码，以及 Jev 不可用时的 LLM Ranking 兜底（E1/E3/E4/E7）。
+"""动态偏好画像（docs/14 §4，角色 B）的验证：画像本身、强调系数、住宿区域、
+候选池，以及画像真的会改变软打分。
 
 为什么这些点必须被单独锁住：它们全是"软决策"，一旦写错不会报错，只会让
 "用户说主要想吃，系统还是按景点权重排"这种问题悄悄回来。
+
+（原先还有 LLM Ranking 兜底与"固定流程 6 个阶段码"两组用例：它们随 12 步固定流程
+与软决策层一起退役，相关断言一并删除。）
 """
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date
 
 from app import discovery, planner, selection
-from app.decision.jev import JevResult
-from app.decision.planner_decision import (
-    DECISION_LLM_RANKING,
-    choose_plan,
-    llm_rank_candidates,
-)
-from app.decision.profile import emphasis, generate_preference_profile
 from app.discovery import extract_hotel_areas, split_poi_pools
-from app.models import (
-    Evidence,
-    HotelOption,
-    ItineraryDay,
-    ItineraryItem,
-    Place,
-    PreferenceProfile,
-    TripIntent,
-    TripPlan,
-)
-from app.planner import PlanCandidate, plan_quality
-from app.workflow import (
-    STAGE_BUDGET_CHECKED,
-    STAGE_DAYS_ARRANGED,
-    STAGE_HOTEL_AREA_SELECTED,
-    STAGE_HOTELS_COMPARED,
-    STAGE_MEALS_MATCHED,
-    STAGE_ROUTES_CHECKED,
-    _emit_progress_stage,
-    _hotel_score,
-    _select_hotel,
-    _user_journey_summary,
-    execute_travel_run,
-)
-from tests.fakes import QUERY, FakeHub, FakeJev, FakeLLM, make_store
+from app.models import Evidence, Place, PreferenceProfile, TripIntent, TripPlan
+from app.profile import emphasis, generate_preference_profile
+from app.workflow import _user_journey_summary
+from tests.fakes import FakeHub, FakeLLM
 
 INTENT = TripIntent(
     origin="北京",
@@ -240,151 +215,16 @@ class TestProfileChangesScoring:
         assert detail["preference_bonus"] > baseline_detail["preference_bonus"]
         assert baseline > 0  # 兜一圈避免未使用告警
 
-    def test_hotel_price_term_scales_with_profile(self):
-        hotel = HotelOption(hotel_id="h1", name="经济酒店", price_per_night=300.0, rating=4.0)
-        baseline, _ = _hotel_score(hotel, INTENT)
-        thrifty = PreferenceProfile.from_llm(
-            {"travel_style": "x", "hotel": {"price": 1.0}}
-        )
-        priced, parts = _hotel_score(hotel, INTENT, profile=thrifty)
-        assert priced > baseline
-        assert parts["每晚价格"] > 0
-
     def test_reject_stays_hard_excluded_under_any_profile(self):
         places = [_place("p1", "某网红店"), _place("p2", "武侯祠")]
         outcome = selection.apply_user_place_preferences(places, {"p1": "REJECT"})
         assert [p.place_id for p in outcome.excluded] == ["p1"]
         assert "p1" not in [p.place_id for p in outcome.kept]
 
-    def test_hotel_area_selection_prefers_hotel_in_area(self):
-        in_area = HotelOption(hotel_id="h1", name="春熙路智选", business_area="春熙路", price_per_night=500.0, rating=4.0)
-        out_area = HotelOption(hotel_id="h2", name="郊区快捷", business_area="双流", price_per_night=120.0, rating=4.0)
-        areas = [{"key": "春熙路", "name": "春熙路", "reason": "", "tags": [], "fit_score": 0.9}]
-        selected, _, reason = _select_hotel([in_area, out_area], INTENT, hotel_areas=areas)
-        # 便宜得多的郊区酒店本会胜出，但"先选区域"让它落在推荐区域内的对手反超。
-        assert selected.hotel_id == "h1"
-        assert "春熙路" in reason
-
 
 # ======================================================================
-# 4. 契约 4：可读阶段码
+# 4. 契约 2：画像 / 住宿区域 / 候选池要能被读出来
 # ======================================================================
-
-
-class TestContractFourStages:
-    def test_emit_progress_stage_calls_hook(self):
-        seen: list[tuple[str, str]] = []
-
-        def hook(stage_id, status, message, facts, started_at, finished_at, **kwargs):
-            seen.append((stage_id, message))
-
-        _emit_progress_stage({"progress_hook": hook}, STAGE_DAYS_ARRANGED, "已安排 3 天")
-        assert seen == [(STAGE_DAYS_ARRANGED, "已安排 3 天")]
-
-    def test_emit_is_noop_without_hook(self):
-        _emit_progress_stage({}, STAGE_DAYS_ARRANGED, "x")  # 不抛异常即可
-
-    def test_stage_codes_are_the_frozen_contract(self):
-        assert {
-            STAGE_HOTEL_AREA_SELECTED,
-            STAGE_HOTELS_COMPARED,
-            STAGE_DAYS_ARRANGED,
-            STAGE_MEALS_MATCHED,
-            STAGE_ROUTES_CHECKED,
-            STAGE_BUDGET_CHECKED,
-        } == {
-            "hotel_area_selected",
-            "hotels_compared",
-            "days_arranged",
-            "meals_matched",
-            "routes_checked",
-            "budget_checked",
-        }
-
-
-# ======================================================================
-# 5. 契约 2：run 侧画像 / 住宿区域 / 候选池
-# ======================================================================
-
-
-class TestJourneyContractFields:
-    def test_user_journey_carries_profile_areas_and_pools(self):
-        profile = PreferenceProfile.from_llm({"travel_style": "food_commercial_centered"})
-        places = [
-            _place("p1", "武侯祠", business_area="武侯区", type="历史古迹"),
-            _place("p2", "老火锅", business_area="春熙路", type="餐饮"),
-        ]
-        plan = TripPlan(run_id="r1", intent=INTENT, days=[], transport=None, hotel=None)
-        state = {
-            "places": places,
-            "profile": profile,
-            "hotel_areas": [{"key": "春熙路", "name": "春熙路", "reason": "x", "tags": ["美食多"], "fit_score": 0.9}],
-            "hotel_area_selected": "春熙路",
-        }
-
-        journey = _user_journey_summary(state, plan)
-
-        assert journey["profile"]["travel_style"] == "food_commercial_centered"
-        assert journey["hotel_area_selected"] == "春熙路"
-        assert journey["hotel_areas"][0]["name"] == "春熙路"
-        assert journey["poi_pools"]["attraction"] == ["p1"]
-        assert journey["poi_pools"]["food"] == ["p2"]
-
-
-# ======================================================================
-# 6. E7：Jev 不可用时的 LLM Ranking 兜底
-# ======================================================================
-
-
-def _candidate(label, areas):
-    days = []
-    for index, area in enumerate(areas):
-        days.append(
-            ItineraryDay(
-                day_index=index,
-                date=date(2026, 10, 1) + timedelta(days=index),
-                area=area,
-                items=[
-                    ItineraryItem(
-                        id=f"d{index}-{area}-{n}",
-                        type="attraction",
-                        place_id=f"p-{area}-{n}",
-                        name=f"{area}景点{n}",
-                        duration_minutes=120,
-                        start_time="09:00",
-                        end_time="11:00",
-                    )
-                    for n in (1, 2)
-                ],
-            )
-        )
-    return PlanCandidate(label=label, variant="nearest", days=days, quality=plan_quality(days, INTENT))
-
-
-CAND_A = _candidate("A", ("青羊区", "武侯区", "锦江区"))
-CAND_B = _candidate("B", ("武侯区", "青羊区", "成华区"))
-
-
-class _RankLLM:
-    def __init__(self, choice):
-        self._choice = choice
-        self.calls: list[str] = []
-
-    def invoke_json(self, system, user, *, tag=""):
-        self.calls.append(tag)
-        if self._choice is None:
-            return JevResult(tag=tag, status="TIMEOUT", error="no")
-        return _Ok({"choice": self._choice, "reason": "更符合偏好"})
-
-
-class _Ok:
-    def __init__(self, value):
-        self.ok = True
-        self.value = value
-        self.status = "OK"
-        self.model = "fake"
-        self.duration_ms = 3
-        self.error = None
 
 
 class TestContractTwoDiscoveryFields:
@@ -408,110 +248,27 @@ class TestContractTwoDiscoveryFields:
         }
 
 
-class TestContractFourEndToEnd:
-    def test_guided_run_emits_all_six_stage_codes(self, tmp_path):
-        store = make_store(tmp_path / "t.db")
-        producer = FakeHub(store=None, run_id="ps-c4", poi_spread=0.25)
-        result = discovery.prefetch(producer, FakeLLM(), GUIDED_INTENT, hotel_pages=2)
-        bundle = discovery.PrefetchBundle(
-            session_id="ps-c4",
-            outbound=list(result["transport"].outbound),
-            inbound=list(result["transport"].inbound),
-            hotels=list(result["hotels"].items),
-            evidences=list(result["social"].evidences),
-            places=list(result["places"].places),
-            social_queries=list(result["social"].queries),
-            social_served_queries=list(result["social"].served_queries),
-            provider_calls=producer.audit_entries(),
-            discovery=dict(result.get("stages") or {}),
-        )
-        run_id = "tp-c4-e2e"
-        store.create_run(run_id, source="guided", source_session_id="ps-c4")
-        run = execute_travel_run(
-            QUERY,
-            store=store,
-            hub=FakeHub(store=store, run_id=run_id, poi_spread=0.25),
-            llm=FakeLLM(),
-            jev=FakeJev(),
-            intent=GUIDED_INTENT,
-            prefetch=bundle,
-            source="guided",
-            source_session_id="ps-c4",
-            run_id=run_id,
-            output_dir=tmp_path / "out",
-        )
+class TestJourneyContractFields:
+    def test_user_journey_carries_profile_areas_and_pools(self):
+        """run 侧审计的 user_journey 必须带上画像 / 住宿区域 / 候选池。"""
 
-        assert run.status == "completed", run.error
-        names = {span["name"] for span in store.get_trace_spans(run_id)}
-        assert {
-            STAGE_HOTEL_AREA_SELECTED,
-            STAGE_HOTELS_COMPARED,
-            STAGE_DAYS_ARRANGED,
-            STAGE_MEALS_MATCHED,
-            STAGE_ROUTES_CHECKED,
-            STAGE_BUDGET_CHECKED,
-        } <= names
-        # contract 2 的 run 侧字段也要出现在 user_journey 审计里。
-        journey = run.audit["user_journey"]
-        assert journey["hotel_area_selected"]
-        assert journey["poi_pools"]["attraction"] or journey["poi_pools"]["experience"]
+        profile = PreferenceProfile.from_llm({"travel_style": "food_commercial_centered"})
+        places = [
+            _place("p1", "武侯祠", business_area="武侯区", type="历史古迹"),
+            _place("p2", "老火锅", business_area="春熙路", type="餐饮"),
+        ]
+        plan = TripPlan(run_id="r1", intent=INTENT, days=[], transport=None, hotel=None)
+        state = {
+            "places": places,
+            "profile": profile,
+            "hotel_areas": [{"key": "春熙路", "name": "春熙路", "reason": "x", "tags": ["美食多"], "fit_score": 0.9}],
+            "hotel_area_selected": "春熙路",
+        }
 
+        journey = _user_journey_summary(state, plan)
 
-class TestLlmRankingFallback:
-    def test_llm_rank_candidates_returns_label(self):
-        label, record = llm_rank_candidates([CAND_A, CAND_B], INTENT, _RankLLM("B"))
-        assert label == "B"
-        assert record["decision_type"] == DECISION_LLM_RANKING
-        assert record["fallback"] is False
-
-    def test_llm_rank_candidates_rejects_unknown_label(self):
-        label, record = llm_rank_candidates([CAND_A, CAND_B], INTENT, _RankLLM("Z"))
-        assert label is None
-        assert record["fallback"] is True
-
-    def test_choose_plan_uses_ranking_when_jev_failed(self):
-        class _FailingJev:
-            def choose(self, *, tag, state, instructions, criteria):
-                return JevResult(tag=tag, status="TIMEOUT", error="boom", attempted=True)
-
-        choice = choose_plan(
-            [CAND_A, CAND_B],
-            INTENT,
-            jev=_FailingJev(),
-            llm_ranker=lambda cands: llm_rank_candidates(cands, INTENT, _RankLLM("B"))[0],
-        )
-        assert choice.candidate.label == "B"
-        assert choice.fallback is True
-        assert "LLM Ranking" in choice.reason
-
-    def test_choose_plan_does_not_rank_when_jev_was_skipped(self):
-        class _SkippedJev:
-            def choose(self, *, tag, state, instructions, criteria):
-                return JevResult(tag=tag, status="SKIPPED", error="未配置", attempted=False)
-
-        ranked: list[bool] = []
-        choice = choose_plan(
-            [CAND_A, CAND_B],
-            INTENT,
-            jev=_SkippedJev(),
-            llm_ranker=lambda cands: ranked.append(True) or "B",
-        )
-        # Jev 只是没配（不是失败），保持一贯行为：不加一次模型调用，直接用默认方案。
-        assert ranked == []
-        assert choice.candidate.label == "A"
-        assert choice.fallback is True
-
-    def test_choose_plan_ranking_respects_hard_constraints(self):
-        class _FailingJev:
-            def choose(self, *, tag, state, instructions, criteria):
-                return JevResult(tag=tag, status="TIMEOUT", error="boom", attempted=True)
-
-        choice = choose_plan(
-            [CAND_A, CAND_B],
-            INTENT,
-            jev=_FailingJev(),
-            llm_ranker=lambda cands: "B",
-            hard_violations=lambda candidate: ["硬约束不允许"] if candidate.label == "B" else [],
-        )
-        assert choice.candidate.label == "A"
-        assert choice.fallback is True
+        assert journey["profile"]["travel_style"] == "food_commercial_centered"
+        assert journey["hotel_area_selected"] == "春熙路"
+        assert journey["hotel_areas"][0]["name"] == "春熙路"
+        assert journey["poi_pools"]["attraction"] == ["p1"]
+        assert journey["poi_pools"]["food"] == ["p2"]

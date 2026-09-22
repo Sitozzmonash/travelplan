@@ -1,4 +1,4 @@
-"""app/agent.py 装配层与 app/api.py HTTP 层的测试（PRD §30 / START.md §7）。
+"""app/agent.py 装配层与 app/api.py HTTP 层的测试（PRD §30 / docs/operations/DEVELOPMENT.md §7）。
 
 两点要守住：
 
@@ -27,10 +27,11 @@ from app.agent import (
 )
 from app.models import TripPlan
 from app.store import TravelPlanStore
-from app.workflow import DEFAULT_OUTPUT_DIR, WORKFLOW_DESCRIPTION, WORKFLOW_NAME, RunResult, execute_travel_run
+from app.workflow import DEFAULT_OUTPUT_DIR, WORKFLOW_DESCRIPTION, WORKFLOW_NAME, RunResult
 
 from superharness import HarnessContext
-from tests.fakes import QUERY, FakeHub, FakeLLM
+from tests.agent_fixture import run_agent
+from tests.fakes import QUERY, FakeHub
 
 
 # ======================================================================
@@ -212,15 +213,15 @@ def test_run_travel_raises_when_route_mismatches_the_return_shape() -> None:
         run_travel("从北京去成都", route=Route.WORKFLOW, app=runner)
 
 
-def test_workflow_runnable_shims_input_to_the_fixed_flow(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Runnable 只做形状适配，真正的流程交给 execute_travel_run。"""
+def test_workflow_runnable_shims_input_to_the_main_planner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Runnable 只做形状适配，真正的规划交给 Agent Loop 入口（execute_agent_run）。"""
     seen: dict[str, Any] = {}
 
     def fake_execute(query: str, **kwargs: Any) -> RunResult:
         seen.update({"query": query, **kwargs})
         return _stub_result()
 
-    monkeypatch.setattr("app.agent.execute_travel_run", fake_execute)
+    monkeypatch.setattr("app.agent.execute_agent_run", fake_execute)
 
     runnable = TravelWorkflowRunnable(output_dir=DEFAULT_OUTPUT_DIR)
     result = runnable.invoke(
@@ -250,19 +251,22 @@ from fastapi.testclient import TestClient  # noqa: E402
 def finished_run(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
     """跑一次离线规划，产出一份真实的库 + 三件产物，供所有读接口复用。
 
-    module 作用域：一次离线 run 要十几秒，读接口之间共用同一份 fixture 才不会重复跑。
+    走的是主路径 `execute_agent_run`（Agent Loop 自己调工具出 plan），脚本模型 + 假 Hub
+    保证离线。module 作用域：读接口之间共用同一份 fixture 才不会重复跑。
     """
     base: Path = tmp_path_factory.mktemp("api-fixture")
     output_dir = base / "outputs"
     store = TravelPlanStore(db_path=base / "travelplan.db")
-    result = execute_travel_run(
-        QUERY,
-        user_id="api-test",
-        run_id="api-fixture-run",
-        output_dir=output_dir,
+    run_id = "api-fixture-run"
+    result = run_agent(
         store=store,
-        hub=FakeHub(store=store, run_id="api-fixture-run"),
-        llm=FakeLLM(),
+        run_id=run_id,
+        output_dir=output_dir,
+        hub=FakeHub(store=store, run_id=run_id, poi_spread=0.25),
+        user_id="api-test",
+        tool_calls=(
+            ("search_trains", {"origin": "北京", "destination": "成都", "depart_date": "2026-10-01"}),
+        ),
     )
     assert result.status == "completed", result.error
     return {"store": store, "output_dir": output_dir, "result": result}
@@ -330,7 +334,10 @@ def test_create_plan_returns_the_plan(
     assert body["run_id"] == "api-fixture-run"
     assert body["status"] == "completed"
     assert body["plan"]["days"]
-    assert body["plan"]["evidence"]
+    # Agent 路径不写证据库（攻略由 Agent 在循环里查、只把结论写进 plan 的 sources），
+    # 所以 evidence 明细如实为空 —— 这条断言要的是"字段在且形状对"，不是"必须有内容"。
+    assert body["plan"]["evidence"] == []
+    assert body["plan"]["sources"]
 
 
 def test_create_plan_maps_needs_clarification_to_422(client: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -380,16 +387,25 @@ def test_get_plan_returns_stored_plan_and_markdown(client: Any) -> None:
     assert body["plan_md"].strip()
 
 
-def test_run_status_exposes_real_workflow_stage_progress(client: Any) -> None:
-    """轮询状态来自节点包装器的真实开始/结束事件，不是前端计时器模拟。"""
+def test_run_status_exposes_real_agent_step_progress(client: Any) -> None:
+    """轮询状态来自 Agent 每一步的真实开始/结束事件，不是前端计时器模拟。
+
+    stage_id 是**中文展示名**（`app/agent_trace` 的口径）：工具调用按工具显示名、
+    模型调用统一是「在思考行程」。这里用那两份常量拼期望值，避免把中文抄死在测试里。
+    """
+    from app.agent_trace import MODEL_STEP_LABEL, display_name_for
+
     response = client.get("/api/v1/plans/api-fixture-run/status")
     assert response.status_code == 200
     body = response.json()
     assert body["status"] in {"SUCCESS", "DEGRADED"}
     stages = {stage["stage_id"]: stage for stage in body["stages"]}
-    assert set(stages) >= {"parse_intent", "search_intercity_transport", "finalize"}
-    assert stages["parse_intent"]["status"] in {"SUCCESS", "WARNING"}
-    assert stages["finalize"]["finished_at"]
+    # 模型思考 + 真实工具调用 + 交卷，三者都要留下步骤行。
+    assert MODEL_STEP_LABEL in stages
+    assert display_name_for("search_trains") in stages
+    assert display_name_for("submit_final_plan") in stages
+    assert stages[MODEL_STEP_LABEL]["status"] in {"SUCCESS", "WARNING"}
+    assert stages[display_name_for("submit_final_plan")]["finished_at"]
 
 
 def test_background_create_returns_run_id_without_faking_completion(
@@ -423,14 +439,16 @@ def test_admin_api_requires_token_and_does_not_expose_secrets(
     client: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("TRAVELPLAN_ADMIN_TOKEN", "admin-test-token")
-    monkeypatch.setenv("JEV_API_KEY", "never-return-this")
+    monkeypatch.setenv("AMAP_API_KEY", "never-return-this")
 
     assert client.get("/api/v1/admin/overview").status_code == 401
     response = client.get(
         "/api/v1/admin/config", headers={"Authorization": "Bearer admin-test-token"}
     )
     assert response.status_code == 200
-    assert response.json()["secret_configured"]["jev"] is True
+    assert response.json()["secret_configured"]["amap"] is True
+    # Jev 决策层已删：它不再出现在密钥探针里。
+    assert "jev" not in response.json()["secret_configured"]
     assert "never-return-this" not in response.text
 
 

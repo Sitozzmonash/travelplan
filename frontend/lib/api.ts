@@ -15,7 +15,6 @@
 import type {
   AuditReport,
   CreatePlanResult,
-  PlanProgressEvent,
   PlanningStepState,
   ReviseRequest,
   ReviseResult,
@@ -25,7 +24,7 @@ import type {
   StepStatus,
 } from "@/types/api";
 import type { Evidence, TripPlan } from "@/types/plan";
-import { MOCK_STEP_DELAY_MS, MOCK_STEP_RESULTS, initialStepStates, stageLabel } from "./mock/progress";
+import { MOCK_AGENT_STEPS, mockCompletedProgress, mockRunProgress } from "./mock/progress";
 import { mockAudit } from "./mock/audit";
 import { mockPlan } from "./mock/plan";
 
@@ -230,8 +229,12 @@ export function apiErrorKind(error: unknown): ApiErrorKind | null {
 }
 
 export interface CreatePlanOptions {
-  /** 规划过程回调。接 FastAPI 后由真实进度驱动，当前 mock 版为合理模拟。 */
-  onProgress?: (event: PlanProgressEvent) => void;
+  /**
+   * 规划过程回调。每次轮询都推一份**完整的** run 进度快照（不是增量事件）：
+   * Agent Loop 的步骤顺序不固定，前端只按快照渲染「当前在哪一步 + 已经走过哪些步」，
+   * 不需要自己维护一份会和后端跑偏的累加状态。
+   */
+  onProgress?: (progress: RunProgress) => void;
   /**
    * 轮询期间的继续条件。页面卸载后返回 false 即可停止轮询，
    * 避免用户在离开「仍在生成中」页面后仍在后台反复请求 /status。
@@ -239,41 +242,64 @@ export interface CreatePlanOptions {
   shouldContinue?: () => boolean;
 }
 
-/**
- * 规划步骤清单（FRONTEND_DESIGN §6）。
- * mock 与真实后端共用同一份步骤定义，进度事件按 stage_id 更新状态。
- */
-export function createPlanningSteps(): PlanningStepState[] {
-  return initialStepStates();
-}
+/** 状态轮询间隔。Agent 一次 run 要几分钟到十几分钟，1.2 秒足够实时，又不会把后端打爆。 */
+export const RUN_POLL_INTERVAL_MS = 1200;
 
 /**
- * 把一个进度事件合并进步骤清单。
- * 后端新增前端还不认识的 stage 时追加一行，而不是把事件丢掉：
- * 丢掉的后果是这一行永远停在「等待」，用户以为规划卡住了。
+ * 把后端 run 进度翻译成「Agent 实际走过的步骤序列」。
+ *
+ * 这里**没有任何前端写死的步骤名或顺序**（旧的 12 节点清单已删除）：
+ *   * 标题取 ``stage_id`` 本身 —— Agent Loop 下后端写库的就是「在查机票」这类中文展示名；
+ *   * 顺序按真实开始时间排（``facts.started`` 优先，回落 ``started_at``，再按后端给出的次序稳定兜底）；
+ *   * 耗时取 ``facts.duration_ms``，工具名取 ``facts.tool``。
+ * 这样后端新增一个工具、Agent 换个调用顺序，前端不用改一行代码就能正确展示。
  */
-export function mergeProgressEvent(
-  steps: PlanningStepState[],
-  event: PlanProgressEvent,
-): PlanningStepState[] {
-  const index = steps.findIndex((step) => step.id === event.step_id);
-  if (index === -1) {
-    return [
-      ...steps,
-      {
-        id: event.step_id,
-        label: event.label ?? stageLabel(event.step_id),
-        description: event.description,
-        status: event.status,
-        facts: event.facts,
-        unknown: true,
-      },
-    ];
-  }
-  const next = steps.slice();
-  const current = next[index];
-  next[index] = { ...current, status: event.status, facts: event.facts ?? current.facts };
-  return next;
+export function planningStepsFromProgress(progress: RunProgress | null | undefined): PlanningStepState[] {
+  if (!progress?.stages?.length) return [];
+  return progress.stages
+    .map((stage, index) => ({ stage, index, started: stageStartedAt(stage) }))
+    .sort((left, right) => {
+      if (left.started !== right.started) return left.started < right.started ? -1 : 1;
+      return left.index - right.index;
+    })
+    .map(({ stage }) => toPlanningStep(stage));
+}
+
+/** 步骤的真实开始时刻：facts.started（后端每次调用写入）优先，回落 run_stages.started_at。 */
+function stageStartedAt(stage: RunStageProgress): string {
+  const fromFacts = stage.facts?.["started"];
+  if (typeof fromFacts === "string" && fromFacts) return fromFacts;
+  return stage.started_at ?? "";
+}
+
+function factString(stage: RunStageProgress, key: string): string | null {
+  const value = stage.facts?.[key];
+  return typeof value === "string" && value ? value : null;
+}
+
+function toPlanningStep(stage: RunStageProgress): PlanningStepState {
+  const tool = factString(stage, "tool");
+  const model = factString(stage, "model");
+  const duration = stage.facts?.["duration_ms"];
+  const error = factString(stage, "error");
+  const message = stage.message && stage.message !== stage.stage_id ? stage.message : null;
+  // 展示名本身就是 stage_id：后端不会给出更漂亮的别称，前端也不要再编一个。
+  const label = stage.stage_id || "未命名步骤";
+  // 事实行只放「用户能从中得到信息」的内容：出错的原始说明、与标题不同的补充说明。
+  // query / note / token 数这类工程字段不给用户看（它们属于管理端 trace）。
+  const facts = [error, message].filter((item): item is string => Boolean(item));
+  return {
+    id: label,
+    label,
+    status: toStepStatus(stage.status),
+    tool: tool ?? undefined,
+    model: model ?? undefined,
+    durationMs: typeof duration === "number" && Number.isFinite(duration) ? duration : undefined,
+    message: message ?? undefined,
+    startedAt: stage.started_at,
+    finishedAt: stage.finished_at,
+    facts: facts.length ? facts : undefined,
+  };
 }
 
 function toStepStatus(status: RunStageProgress["status"]): StepStatus {
@@ -287,29 +313,20 @@ function toStepStatus(status: RunStageProgress["status"]): StepStatus {
   return statuses[status];
 }
 
-function progressFacts(stage: RunStageProgress): string[] {
-  const facts = Object.entries(stage.facts ?? {}).map(([label, value]) => `${label}：${String(value)}`);
-  return stage.message ? [stage.message, ...facts] : facts;
-}
-
-function emitProgress(progress: RunProgress, onProgress?: CreatePlanOptions["onProgress"]): void {
-  for (const stage of progress.stages) {
-    onProgress?.({
-      step_id: stage.stage_id,
-      status: toStepStatus(stage.status),
-      facts: progressFacts(stage),
-      label: stageLabel(stage.stage_id),
-    });
-  }
-}
-
-/** DEGRADED 时要能说清「哪一步降级了」，只给一个状态码对用户没有意义。 */
-function collectDegradations(progress: RunProgress): string[] {
+/**
+ * DEGRADED / FAILED 时要能说清「哪一步出了问题」，只给一个状态码对用户没有意义。
+ * 步骤名直接用 stage_id：Agent Loop 下它就是中文展示名。
+ */
+export function runDegradations(progress: RunProgress | null | undefined): string[] {
+  if (!progress?.stages?.length) return [];
   return progress.stages
     .filter((stage) => stage.status === "WARNING" || stage.status === "FAILED")
     .map((stage) => {
-      const detail = stage.message || progressFacts(stage).join("；");
-      return detail ? `${stageLabel(stage.stage_id)}：${detail}` : stageLabel(stage.stage_id);
+      const label = stage.stage_id || "未命名步骤";
+      const error = typeof stage.facts?.["error"] === "string" ? (stage.facts["error"] as string) : "";
+      const message = stage.message && stage.message !== stage.stage_id ? stage.message : "";
+      const detail = error || message;
+      return detail ? `${label}：${detail}` : `${label} 本次没有正常完成`;
     });
 }
 
@@ -318,6 +335,9 @@ const STOPPED_STATUSES: RunStatus[] = ["FAILED", "CANCELLED"];
 
 /**
  * 轮询 run 状态直到终态（createPlan 与「仍在生成中」页面共用同一份逻辑）。
+ *
+ * 每次拿到状态都先把**完整快照**交给调用方：页面据此渲染「当前步骤」（progress.current_stage）
+ * 与「已经走过的步骤序列」（stages）。到终态就返回，不再继续请求。
  *
  * FAILED / CANCELLED 返回结果而不是抛异常：调用方要按状态分别渲染，
  * 统一抛成 ApiError 只会让用户看到一句笼统的「服务出错」，看不出是失败还是被取消。
@@ -329,14 +349,14 @@ export async function waitForRun(runId: string, options: CreatePlanOptions = {})
       throw new ApiError("已停止查询规划状态", "timeout", `run_id=${runId} 的轮询被调用方终止`);
     }
     const progress: RunProgress = await getPlanStatus(runId);
-    emitProgress(progress, options.onProgress);
+    options.onProgress?.(progress);
     if (DONE_STATUSES.includes(progress.status)) {
       return {
         run_id: runId,
         status: progress.status,
         plan: await getPlan(runId),
         message: progress.message,
-        degradations: progress.status === "DEGRADED" ? collectDegradations(progress) : undefined,
+        degradations: progress.status === "DEGRADED" ? runDegradations(progress) : undefined,
       };
     }
     if (STOPPED_STATUSES.includes(progress.status)) {
@@ -344,11 +364,12 @@ export async function waitForRun(runId: string, options: CreatePlanOptions = {})
         run_id: runId,
         status: progress.status,
         plan: null,
+        // 终态失败时后端把原因写在 error 上，message 只是「规划已结束」这类占位文案。
         message: progress.error ?? progress.message,
-        degradations: collectDegradations(progress),
+        degradations: runDegradations(progress),
       };
     }
-    await delay(900);
+    await delay(RUN_POLL_INTERVAL_MS);
   }
   throw new ApiError(
     "规划请求超时",
@@ -373,20 +394,24 @@ export async function createPlan(message: string, options: CreatePlanOptions = {
     return waitForRun(payload.run_id, options);
   }
 
-  for (const [stepId, result] of Object.entries(MOCK_STEP_RESULTS)) {
-    options.onProgress?.({ step_id: stepId, status: "running", label: stageLabel(stepId) });
-    await delay(MOCK_STEP_DELAY_MS[stepId] ?? 600);
-    options.onProgress?.({
-      step_id: stepId,
-      status: result.status,
-      facts: result.facts,
-      label: stageLabel(stepId),
-    });
+  // 演示模式：按 Agent 的调用顺序逐条推进模拟进度，形态与真实 /status 返回一致。
+  const runId = mockPlan.run_id;
+  for (let cursor = 0; cursor < MOCK_AGENT_STEPS.length; cursor += 1) {
+    options.onProgress?.(mockRunProgress(runId, cursor));
+    await delay(MOCK_AGENT_STEPS[cursor].delayMs);
   }
+  const degraded = MOCK_AGENT_STEPS.some((step) => step.status === "WARNING");
+  options.onProgress?.(mockCompletedProgress(runId, degraded ? "DEGRADED" : "SUCCESS"));
 
   const plan = clone(mockPlan);
   plan.query = message;
-  return { run_id: plan.run_id, status: "SUCCESS", plan };
+  return {
+    run_id: plan.run_id,
+    status: degraded ? "DEGRADED" : "SUCCESS",
+    plan,
+    message: degraded ? "规划完成，但存在降级" : undefined,
+    degradations: degraded ? runDegradations(mockCompletedProgress(runId)) : undefined,
+  };
 }
 
 export async function getPlanStatus(id: string): Promise<RunProgress> {

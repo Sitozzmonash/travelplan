@@ -953,15 +953,16 @@ def _start_job(
 ) -> None:
     """正式 run 的执行体：带上用户确认过的结构化意图与 Discovery 候选。
 
-    这里直接调 `execute_travel_run`（而不是经 HybridRunner 的 payload 形状）：
+    这里直接调 `execute_agent_run`（而不是经 HybridRunner 的 payload 形状）：
     结构化 intent 与 prefetch 是 HybridRunner 的 messages 载荷装不下的东西。
-    两条入口最终仍然汇聚到**同一个** `execute_travel_run`，没有第二套 Planner。
+    它与 `app/agent.py::run_travel` 汇聚到**同一个**主规划入口（SuperHarness Agent Loop），
+    没有第二套 Planner —— 也保证"引导式"和"一句话"两条入口跑的是同一套算法。
     """
 
-    from app.workflow import execute_travel_run
+    from app.agent_runner import execute_agent_run
 
     try:
-        execute_travel_run(
+        execute_agent_run(
             query,
             output_dir=output_dir or DEFAULT_OUTPUT_DIR,
             run_id=run_id,

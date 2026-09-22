@@ -1,0 +1,41 @@
+{
+  "benchmark_version": "v0.3-agent-loop",
+  "scope": "agent_loop",
+  "fixture_version": "agent_loop.fixtures.v1",
+  "travelplan_commit": "6005966",
+  "superharness_commit": "d013ee8",
+  "model": "scripted-offline",
+  "suites": [
+    "basic",
+    "hard",
+    "provider_failure",
+    "badcase_regression"
+  ],
+  "case_count": 12,
+  "passed": 12,
+  "failed": 0,
+  "metrics": {
+    "hard_constraint_violation_rate": 0.0,
+    "days_nonempty_rate": 1.0,
+    "reject_intrusion_rate": 0.0,
+    "unresolved_time_conflict_rate": 0.0,
+    "time_conflict_resolved_rate": 1.0,
+    "budget_overflow_rate": 0.0,
+    "avg_items_per_day": 1.2153,
+    "category_diversity": 0.7153,
+    "preference_coverage": 0.5,
+    "grounded_number_rate": 1.0,
+    "unsupported_number_rate": 0.0,
+    "source_traceable_rate": 1.0,
+    "provider_success_rate": 0.8916,
+    "provider_failure_calls": 0.375,
+    "injected_failure_hit_rate": 1.0,
+    "duration_ms": 1135.5833,
+    "llm_calls": 6.75,
+    "tool_calls": 4.875,
+    "total_tokens": 270.0,
+    "input_tokens": 202.5,
+    "output_tokens": 67.5
+  },
+  "generated_at": "2026-09-22T12:24:24.379168+00:00"
+}

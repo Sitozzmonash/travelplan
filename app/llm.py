@@ -297,7 +297,7 @@ class LLM:
             )
 
     def _emit(self, event_type: str, data: dict[str, Any], *, status: str | None = None) -> None:
-        """把这次模型调用报给 SuperHarness 的原生 Observability（START.md §9：不要重造）。
+        """把这次模型调用报给 SuperHarness 的原生 Observability（docs/operations/DEVELOPMENT.md §9：不要重造）。
 
         上报失败绝不能影响规划：模型调用的结果照常返回，观测缺席只是少一行日志。
         """

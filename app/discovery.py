@@ -1196,7 +1196,7 @@ def prefetch(
     import threading
     import time as _time
 
-    from app.decision.profile import generate_preference_profile
+    from app.profile import generate_preference_profile
 
     books = ledger or CallLedger(scope="discovery")
     outcomes: dict[str, Any] = {}

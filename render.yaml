@@ -1,6 +1,6 @@
 # TravelPlan 生产架构的「后端常驻容器」蓝图（Render Blueprint）。
 #
-# 固定架构（docs/09_部署说明.md）：
+# 固定架构（docs/operations/DEPLOYMENT.md）：
 #
 #     Browser → Vercel（Next.js 前端）→ Render（FastAPI 常驻容器）→ Neon PostgreSQL
 #

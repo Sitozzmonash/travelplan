@@ -1187,9 +1187,9 @@ def _pass_rate(benchmark_run: Mapping[str, Any]) -> float | None:
 
 
 def _decision_health(facts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """决策健康：替代"Jev 是不是活着"的那一组指标。
+    """决策健康：一组回答"软决策到底有没有生效"的指标。
 
-    文档 §10 把 Jev 降为可选增强，主指标换成**决策层自己**的事实：
+    主指标取**决策过程自己**的事实：
     动态偏好画像有没有真的由模型生成、硬校验有没有把问题留下、REJECT 有没有进计划。
     这三件事都能从已抽样的运行上直接数出来，不需要任何新埋点。
     """

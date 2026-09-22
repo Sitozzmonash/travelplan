@@ -4,20 +4,17 @@ import Link from "next/link";
 import { ArrowLeft, FlaskConical, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { AdminTable, type AdminColumn } from "@/components/admin/admin-table";
 import { CollapsibleSection } from "@/components/admin/collapsible-section";
 import { PageHeader } from "@/components/admin/page-header";
 import { PartialBanner, ResourceView, SectionEmpty } from "@/components/admin/admin-states";
 import { DescriptionList, MetricList } from "@/components/admin/metric-list";
-import { BooleanBadge, StatusBadge } from "@/components/admin/status-badge";
-import { formatMetricKey, formatMetricValue, formatNumber } from "@/components/admin/format";
+import { StatusBadge } from "@/components/admin/status-badge";
+import { formatNumber } from "@/components/admin/format";
 import { useAdminResource } from "@/components/admin/use-admin-resource";
 import { getAdminBenchmarkRun } from "@/lib/admin-api";
-import { formatDateTime } from "@/lib/format";
 import {
   BENCHMARK_DIMENSIONS,
   BENCHMARK_SUITES,
-  type AdminBenchmarkBaseline,
   type AdminBenchmarkCaseResult,
   type AdminBenchmarkDetail,
   type BenchmarkDimensionKey,
@@ -27,8 +24,8 @@ import {
  * Benchmark 详情。
  *
  * 三条硬性展示规则：
- * 1) 六个维度分开展示，不给"总分" —— 聚合分会掩盖掉具体哪一维退化。
- * 2) 六个维度都是固定文案，不因为后端返回空就少渲染一节（空就是"没有指标"）。
+ * 1) 五个维度分开展示，不给"总分" —— 聚合分会掩盖掉具体哪一维退化。
+ * 2) 五个维度都是固定文案，不因为后端返回空就少渲染一节（空就是"没有指标"）。
  * 3) 用例按 suite 分组，每组给出通过 / 失败数量。
  */
 export function BenchmarkDetailView({ benchmarkRunId }: { benchmarkRunId: string }) {
@@ -41,7 +38,7 @@ export function BenchmarkDetailView({ benchmarkRunId }: { benchmarkRunId: string
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Benchmark 详情"
-        description="六个评测维度、按 suite 分组的用例结果，以及 Jev OFF / ON 的基线对比（如果这次运行有对照）。"
+        description="五个评测维度与按 suite 分组的用例结果；维度各自独立，不给聚合总分。"
         badge={
           <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] break-all text-muted-foreground">
             {benchmarkRunId}
@@ -83,12 +80,6 @@ function BenchmarkDetailBody({ data }: { data: AdminBenchmarkDetail }) {
           <CardTitle className="flex flex-wrap items-center gap-2">
             <span>运行信息</span>
             <StatusBadge status={run.status} />
-            <BooleanBadge
-              value={run.jev_enabled}
-              onLabel="Jev ON"
-              offLabel="Jev OFF"
-              onTone="info"
-            />
           </CardTitle>
           <CardDescription>
             评测基线要连同版本、模型与 fixture 版本一起读，否则无法复现。
@@ -179,22 +170,6 @@ function BenchmarkDetailBody({ data }: { data: AdminBenchmarkDetail }) {
       </CollapsibleSection>
 
       <CollapsibleSection
-        title="Jev OFF / ON 基线对比"
-        description="同一批用例在 Jev 关闭与开启时的指标差异"
-        icon={FlaskConical}
-        defaultOpen={Boolean(data.baseline_compare)}
-      >
-        {data.baseline_compare ? (
-          <BaselineCompare baseline={data.baseline_compare} />
-        ) : (
-          <SectionEmpty
-            title="这次运行没有基线对照"
-            description="后端没有返回 baseline_compare。要得到对照，需要在 Jev 关闭与开启两种配置下各跑一次同一批用例。"
-          />
-        )}
-      </CollapsibleSection>
-
-      <CollapsibleSection
         title="原始运行指标"
         description="run.metrics 的原始键值（未分组）"
         count={Object.keys(run.metrics ?? {}).length}
@@ -228,90 +203,6 @@ function CaseResultCard({ result }: { result: AdminBenchmarkCaseResult }) {
   );
 }
 
-interface BaselineRow {
-  key: string;
-  off: unknown;
-  on: unknown;
-  delta: unknown;
-}
-
-function buildBaselineRows(baseline: AdminBenchmarkBaseline): BaselineRow[] {
-  // 后端历史上返回过扁平对象（没有 off / on / delta_pct 分组），
-  // 因此这里对每个分组都做 `?? {}` 兜底：缺一段就退化成空表，而不是整页崩溃。
-  const off = baseline.off ?? {};
-  const on = baseline.on ?? {};
-  const delta = baseline.delta_pct ?? {};
-  const keys = new Set<string>();
-  for (const key of Object.keys(off)) keys.add(key);
-  for (const key of Object.keys(on)) keys.add(key);
-  for (const key of Object.keys(delta)) keys.add(key);
-  return [...keys].map((key) => ({
-    key,
-    off: off[key],
-    on: on[key],
-    delta: delta[key],
-  }));
-}
-
-const BASELINE_COLUMNS: AdminColumn<BaselineRow>[] = [
-  {
-    key: "metric",
-    header: "指标",
-    primary: true,
-    cell: (row) => <span className="text-xs text-foreground">{formatMetricKey(row.key)}</span>,
-  },
-  {
-    key: "off",
-    header: "Jev OFF",
-    align: "right",
-    cell: (row) => <span className="tabular text-xs">{formatMetricValue(row.off)}</span>,
-  },
-  {
-    key: "on",
-    header: "Jev ON",
-    align: "right",
-    cell: (row) => <span className="tabular text-xs">{formatMetricValue(row.on)}</span>,
-  },
-  {
-    key: "delta",
-    header: "变化",
-    align: "right",
-    cell: (row) => <span className="tabular text-xs">{formatMetricValue(row.delta)}</span>,
-  },
-];
-
-function BaselineCompare({ baseline }: { baseline: AdminBenchmarkBaseline }) {
-  const rows = buildBaselineRows(baseline);
-  if (rows.length === 0) {
-    return (
-      <SectionEmpty
-        title="基线对比为空"
-        description="后端返回了 baseline_compare，但 off / on / delta_pct 三个分组都没有可对比的指标（也可能是旧版后端返回的扁平对象）。"
-        hint="这不影响页面其余部分；等后端按契约回填三个分组后，这里会自动出现逐项对比。"
-      />
-    );
-  }
-  return (
-    <div className="flex flex-col gap-2">
-      <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-[11px] text-muted-foreground">
-        <span>
-          Jev OFF 生成于：
-          <span className="font-mono text-foreground">{formatDateTime(baseline.off_generated_at)}</span>
-        </span>
-        <span>
-          Jev ON 生成于：
-          <span className="font-mono text-foreground">{formatDateTime(baseline.on_generated_at)}</span>
-        </span>
-      </div>
-      <AdminTable columns={BASELINE_COLUMNS} rows={rows} getRowKey={(row) => row.key} />
-      <p className="text-[11px] leading-4 text-muted-foreground">
-        变化值直接来自后端的 delta_pct，管理台不做方向判断：耗时与错误的上升是坏消息，通过率的上升是好消息，
-        两者都会显示成同一个正数。
-      </p>
-    </div>
-  );
-}
-
 interface SuiteGroup {
   suite: string;
   label: string;
@@ -325,7 +216,6 @@ function groupBySuite(cases: AdminBenchmarkCaseResult[]): SuiteGroup[] {
     hard: "困难用例",
     badcase_regression: "Bad Case 回归",
     provider_failure: "Provider 故障",
-    jev_decision: "Jev 决策",
     live_smoke: "线上冒烟",
   };
   const order: string[] = [...BENCHMARK_SUITES];

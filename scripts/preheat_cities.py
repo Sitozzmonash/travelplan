@@ -17,10 +17,13 @@
 
 跑的是什么
 ----------
-复用 `sessions.refresh_city_cache()`。它构造的 intent 只有目的地、没有出发地和日期，
-而 `fetch_transport_candidates` / `fetch_hotel_candidates` 在缺少这两项时会自己跳过
-（`app/discovery.py:158`）——所以预热只跑「攻略检索 + 地点抽取」两条线，正是城市缓存
-要存的东西，机酒价格与时刻表**永远不会**进缓存（这是设计不变量）。
+每座城市内部跑一次**预热 Agent**（`app/preheat_agent.py`）：代码给定城市，Agent 自己在循环里
+决定搜哪些攻略（小红书 / 抖音 / 网页）、从正文里抽哪些地点、哪些点要到高德核实、把什么入库。
+入库仍然只走已有两条路径（`app/places.py` 实体归一化 + `app/city_cache.py` 的城市缓存四张表），
+所以缓存结构与实时路径完全一致，读路径（`sessions` 的城市缓存命中）不需要任何改动。
+
+**批调度仍然归代码**：跑哪些城、串行、每天限量、跳过判定、退出码都在本脚本 —— Agent 管不了
+"今天跑几座城"。机酒价格与时刻表**永远不会**进缓存（预热工具集里根本没有那些工具，这是设计不变量）。
 
 一个必须盯住的降级：社媒限流
 ----------------------------
@@ -49,7 +52,7 @@
 * 每天最多**真正尝试**预热 `--limit` 座城市（默认 15），到额度就停 —— 不会一次烧光配额；
 * 起点按当天是一年中的第几天轮转（`day_of_year % len(cities)`），失败/卡住的城市
   不会天天排在队首挡住后面的城市，隔几天自然把每座城都轮一遍；
-* 因"新鲜 / 未过期"跳过的城市**不占**额度，只有真的调了 `refresh_city_cache` 才算；
+* 因"新鲜 / 未过期"跳过的城市**不占**额度，只有真的调了 `preheat_agent.preheat_city` 才算；
 * 与 `--force` 互斥：定时任务不该强制重跑全部城市，两个一起给会直接报错。
 
 退出码：0 = 全部成功 / daily 正常截断到额度（降级不算失败，但会打印警告）；
@@ -67,7 +70,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dotenv import load_dotenv  # noqa: E402
-from app import city_cache, sessions  # noqa: E402
+from app import city_cache, preheat_agent, sessions  # noqa: E402
 from app.store import TravelPlanStore  # noqa: E402
 
 #: `.env` 的位置。**不在 import 时加载** —— 见 `main()` 里的说明。
@@ -254,10 +257,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[{index}/{len(cities)}] {city}：跳过（{skip}）")
             continue
         attempted += 1
-        print(f"[{index}/{len(cities)}] {city}：开始预热……", flush=True)
+        print(f"[{index}/{len(cities)}] {city}：开始预热（Agent 自己决定搜什么、入库什么）……", flush=True)
         began = time.perf_counter()
         try:
-            summary = sessions.refresh_city_cache(store, city)
+            summary = preheat_agent.preheat_city(store, city)
         except Exception as exc:  # noqa: BLE001 —— 一座城市失败不该中断整批
             took = time.perf_counter() - began
             failed.append(city)
@@ -267,15 +270,26 @@ def main(argv: list[str] | None = None) -> int:
         places = int(summary.get("places") or 0)
         evidences = int(summary.get("evidences") or 0)
         social = int(summary.get("social_evidences") or 0)
+        agent_info = summary.get("agent") or {}
         if not places:
-            # 没有 POI 就不算命中（`read_candidates` 的口径），等于白跑，必须如实报出来。
+            # 没有 POI 就不算命中（`read_candidates` 的口径），等于白跑，必须如实报出来 ——
+            # 连"Agent 跑了什么、哪一步空了"一起打印，否则这条失败无从复盘。
             failed.append(city)
-            print(f"    未落库：{took:.0f}s 跑完但 POI 为 0", file=sys.stderr, flush=True)
+            print(
+                f"    未落库：{took:.0f}s 跑完但 POI 为 0"
+                f"（工具调用 {agent_info.get('provider_calls', '?')} 次，"
+                f"检索 {agent_info.get('searches', '?')} 次）",
+                file=sys.stderr,
+                flush=True,
+            )
+            for note in summary.get("notes") or []:
+                print(f"      · {note}", file=sys.stderr, flush=True)
             continue
         if social:
             print(
                 f"    完成（{took:.0f}s）：POI {places}，正文 {evidences}（社媒 {social}），"
-                f"检索词 {int(summary.get('queries') or 0)}",
+                f"检索词 {int(summary.get('queries') or 0)}，"
+                f"工具调用 {agent_info.get('provider_calls', '?')} 次",
                 flush=True,
             )
             continue

@@ -263,8 +263,8 @@ def test_one_worker_finishes_without_duplicate_work(intent, social_failure):
 
 
 def test_prefetch_does_not_add_provider_or_llm_work(intent):
-    from app.decision.profile import generate_preference_profile
     from app.observability import CallLedger
+    from app.profile import generate_preference_profile
 
     baseline_hub, baseline_llm = FakeHub(store=None), FakeLLM()
     ledger = CallLedger(scope="discovery")

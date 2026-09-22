@@ -27,7 +27,7 @@ from difflib import SequenceMatcher
 from typing import Any, Mapping, Sequence
 
 from app.config import PlannerTuning, current_tuning
-from app.decision.profile import emphasis
+from app.profile import emphasis
 from app.models import (
     BUDGET_CATEGORIES,
     BUDGET_CATEGORY_CITY_TRANSPORT,
@@ -2663,32 +2663,14 @@ def _hotel_item(hotel: HotelOption, *, item_id: str, check_in: bool) -> Itinerar
     )
 
 
-#: 候选方案的拓扑变体（Top-K 用）。
+#: 候选方案的拓扑变体（`_order_clusters` 的排序策略）。
 #: 它们**只改"区域先后的排序策略"**，不改任何时间/约束逻辑，因此每个变体都是同一套
-#: 硬约束下的合法行程。这正是让 Jev 去选的前提：选项之间只有偏好与节奏的差别，
-#: 没有可行性差别 —— 否则把"选哪份行程"交给软决策就是在赌。
+#: 硬约束下的合法行程。
 PLAN_VARIANT_NEAREST = "nearest"
 PLAN_VARIANT_SCORE_FIRST = "score_first"
 PLAN_VARIANT_PREFERENCE_FIRST = "preference_first"
 PLAN_VARIANT_LIGHT_FIRST = "light_first"
 PLAN_VARIANT_DISTINCT_FIRST = "distinct_first"
-
-PLAN_VARIANTS: tuple[str, ...] = (
-    PLAN_VARIANT_NEAREST,
-    PLAN_VARIANT_SCORE_FIRST,
-    PLAN_VARIANT_PREFERENCE_FIRST,
-    PLAN_VARIANT_LIGHT_FIRST,
-    PLAN_VARIANT_DISTINCT_FIRST,
-)
-
-#: 给 Jev 看的方案标签（不用中文全文，避免摘要里混入无关说明）。
-VARIANT_LABELS: dict[str, str] = {
-    PLAN_VARIANT_NEAREST: "A",
-    PLAN_VARIANT_SCORE_FIRST: "B",
-    PLAN_VARIANT_PREFERENCE_FIRST: "C",
-    PLAN_VARIANT_LIGHT_FIRST: "D",
-    PLAN_VARIANT_DISTINCT_FIRST: "E",
-}
 
 
 def _order_clusters(
@@ -2801,8 +2783,8 @@ def build_initial_plan(
     所以这里排出来的时间本身就是可行的，后续 feasibility 阶段只负责发现问题与修订。
 
     ``variant`` 只改变"区域先后的排序策略"（见 `_order_clusters`），不改变任何时间
-    与约束逻辑 —— 因此每个变体都是同一套硬约束下的合法方案，这正是 Top-K 让 Jev 去选
-    的前提：给它的选项之间只有偏好与节奏的差别，没有可行性差别。
+    与约束逻辑 —— 因此每个变体都是同一套硬约束下的合法方案：选项之间只有偏好与节奏
+    的差别，没有可行性差别。
     """
     day_count = max(1, intent.days)
     city = city or (intent.destination[0] if intent.destination else None)
@@ -3373,10 +3355,10 @@ def critique(
 
 
 # ==================================================
-# 十二、方案质量度量与 Top-K 候选（接管任务 §4 §9）
+# 十二、方案质量度量（接管任务 §4 §9）
 # ==================================================
 # 这些指标是**横向比较用的相对量**，不是绝对真理：它们的用途是回答
-# "Jev 选出来的方案是不是真的比其它候选更好"。因此全部由代码从已算好的
+# "这份行程的节奏与连贯性到底怎么样"。因此全部由代码从已算好的
 # days 上计算，可复现、可单测、可审计 —— 不引入任何模型打分。
 
 #: 节奏目标（分钟/天）。与 models.PACES 的三个取值一一对应。
@@ -3568,167 +3550,3 @@ def plan_quality(
         active_minutes=active_minutes,
         playable_days=len(playable),
     )
-
-
-def quality_signals(quality: PlanQuality) -> dict[str, float]:
-    """给 Jev 质量门看的三个软分 + 一个由代码算出的置信度。
-
-    ``confidence`` 是硬事实与软分的最小值：只要有任何硬问题（路线未核实、末日排不下、
-    用餐时间错位），置信度就必须掉下来 —— 否则软指标会把硬错误盖过去（任务 §9 明确禁止）。
-    """
-
-    hard = min(
-        quality.backtracking_score,
-        quality.daily_load_balance,
-        quality.first_day_quality if quality.first_day_quality else 1.0,
-        quality.last_day_quality if quality.last_day_quality else 1.0,
-    )
-    return {
-        "pace_score": round(quality.pace_match, 3),
-        "preference_match": round(quality.preference_coverage, 3),
-        "diversity_score": round(quality.category_diversity, 3),
-        "confidence": round(max(0.0, min(1.0, 0.4 * quality.pace_match + 0.3 * quality.preference_coverage + 0.3 * hard)), 3),
-    }
-
-
-@dataclass(slots=True)
-class PlanCandidate:
-    """一个硬约束可行的整份方案，供 Jev 在 Top-K 里选。"""
-
-    label: str
-    variant: str
-    days: list[ItineraryDay]
-    quality: PlanQuality
-
-    @property
-    def signature(self) -> tuple[Any, ...]:
-        """拓扑指纹：用于去重（不同变体很可能排出同一份行程）。"""
-
-        return tuple(
-            (
-                day.day_index,
-                tuple(sorted(item.place_id or item.id for item in _stay_items(day))),
-            )
-            for day in self.days
-        )
-
-    def summary(self) -> dict[str, Any]:
-        """给 Jev 的方案摘要。
-
-        刻意**不含**价格、来源 URL、原始 Provider 响应、用户身份 —— 任务 §4 允许发送
-        "候选行程摘要与证据摘要"，这里只给决策真正需要的结构信息。
-        """
-
-        return {
-            "label": self.label,
-            "variant": self.variant,
-            "quality": self.quality.to_dict(),
-            "days": [
-                {
-                    "day_index": day.day_index,
-                    "date": day.date.isoformat() if day.date else None,
-                    "area": day.area,
-                    "item_count": len(_stay_items(day)),
-                    "active_minutes": _active_minutes(day),
-                    "items": [
-                        {
-                            "name": item.name,
-                            "type": item.type,
-                            "start": item.start_time,
-                            "end": item.end_time,
-                        }
-                        for item in day.items
-                        if item.type != "free_time"
-                    ],
-                }
-                for day in self.days
-            ],
-        }
-
-
-def build_plan_variants(
-    intent: TripIntent,
-    places: Sequence[Place],
-    *,
-    variants: Sequence[str] | None = None,
-    limit: int = 5,
-    quality_places: Mapping[str, Place] | None = None,
-    quality_evidences: Mapping[str, Sequence[Evidence]] | None = None,
-    **kwargs: Any,
-) -> list[PlanCandidate]:
-    """跑多个拓扑变体，返回去重后的候选方案（默认第一个是历史默认策略）。
-
-    单个变体抛异常不应该让整次规划失败：那只是"少一个选项"，不是"行程没了"。
-    """
-
-    selected = list(variants or PLAN_VARIANTS[:limit])
-    candidates: list[PlanCandidate] = []
-    seen: set[tuple[Any, ...]] = set()
-    for variant in selected:
-        try:
-            days = build_initial_plan(intent, places, variant=variant, **kwargs)
-        except Exception:  # noqa: BLE001 —— 少一个候选可以接受，整趟失败不可以
-            continue
-        candidate = PlanCandidate(
-            label=VARIANT_LABELS.get(variant, variant[:1].upper()),
-            variant=variant,
-            days=days,
-            quality=plan_quality(
-                days, intent, places=quality_places, evidences=quality_evidences
-            ),
-        )
-        signature = candidate.signature
-        if signature in seen:
-            continue
-        seen.add(signature)
-        candidates.append(candidate)
-    return candidates[: max(1, limit)]
-
-
-def hard_constraint_violations(
-    days: Sequence[ItineraryDay],
-    intent: TripIntent,
-    *,
-    outbound: FlightOption | TrainOption | None = None,
-) -> list[str]:
-    """Top-K 候选的硬约束复核（任务 §4A 的"Python 再次复核"）。
-
-    只检查**构造性不变量** —— 也就是一份合法候选方案必然满足的东西：日期对齐、
-    时间不倒置、不超当日窗口、同一地点不跨天重复、交通日不排游玩点。
-
-    这里刻意**不**检查"末日是否赶得上返程""营业时间"这类问题：它们是 feasibility
-    阶段（第 10 步）的职责，而且候选在生成时还没经过那一轮修订 —— 拿它当复核条件
-    会把所有候选都判为不合法，等于把 Jev 的选择权废掉。
-    """
-
-    violations: list[str] = []
-    day_count = max(1, intent.days)
-    arrival_index = arrival_day_index(outbound, intent.start_date, day_count)
-    seen_places: dict[str, int] = {}
-    window_end = tuning().day_end_minutes
-
-    if len(days) != day_count:
-        violations.append(f"天数不符：期望 {day_count} 天，实际 {len(days)} 天")
-
-    for position, day in enumerate(days):
-        if day.day_index != position:
-            violations.append(f"第 {position + 1} 个 day 的 day_index={day.day_index} 与位置不一致")
-        expected_date = None if intent.start_date is None else intent.start_date + timedelta(days=day.day_index)
-        if expected_date is not None and day.date is not None and day.date != expected_date:
-            violations.append(f"第 {day.day_index + 1} 天日期 {day.date} 与出行日期 {expected_date} 不一致")
-        for item in day.items:
-            if day.day_index < arrival_index and item.type not in ("transport", "free_time", "hotel"):
-                violations.append(f"第 {day.day_index + 1} 天是在途日，却排了 {item.name}")
-                break
-            start = item.start_minutes
-            end = item.end_minutes
-            if start is not None and end is not None and end <= start:
-                violations.append(f"第 {day.day_index + 1} 天《{item.name}》时间倒置 {item.start_time}→{item.end_time}")
-            if end is not None and end > window_end:
-                violations.append(f"第 {day.day_index + 1} 天《{item.name}》结束 {item.end_time} 超出当日窗口")
-            if item.place_id and item.type in STAY_TYPES:
-                previous = seen_places.get(item.place_id)
-                if previous is not None and previous != day.day_index:
-                    violations.append(f"《{item.name}》同时出现在第 {previous + 1} 天和第 {day.day_index + 1} 天")
-                seen_places[item.place_id] = day.day_index
-    return violations

@@ -1,4 +1,4 @@
-"""FastAPI 层（START.md §8.2 / PRD §30）。
+"""FastAPI 层（docs/operations/DEVELOPMENT.md §8.2 / PRD §30）。
 
     uvicorn app.api:api --reload
 
@@ -246,7 +246,7 @@ def health() -> dict[str, Any]:
     `postgresql://***@host/db`（绝不回显用户名/密码）。连库失败时也要如实报
     "配置目标是哪个后端"，而不是假装一切正常。
 
-    顶层另有两个**契约字段**（部署契约，见 `docs/09_部署说明.md` §2.4；供部署/监控直接消费，不必再解析
+    顶层另有两个**契约字段**（部署契约，见 `docs/operations/DEPLOYMENT.md` §2.4；供部署/监控直接消费，不必再解析
     `store` 嵌套结构）：`database_backend = sqlite|postgres`、
     `database_connected = true|false`。`database_connected` 表示"这次真的把库连上了"
     （一次 `SELECT 1` 走通；建表在 store 构造时已经做过，探针里不重复跑 DDL）；
@@ -290,7 +290,7 @@ def health() -> dict[str, Any]:
         "status": "ok" if store_ok else "degraded",
         "workflow": WORKFLOW_NAME,
         "project_id": PROJECT_ID,
-        # 部署契约字段（docs/09_部署说明.md §2.4）：后端类型固定二选一，连接状态来自"真的连上并建表"。
+        # 部署契约字段（docs/operations/DEPLOYMENT.md §2.4）：后端类型固定二选一，连接状态来自"真的连上并建表"。
         "database_backend": store_info.get("backend") or "unknown",
         "database_connected": store_ok,
         "store": store_info,
@@ -400,7 +400,6 @@ class BadCasePatch(BaseModel):
 
 class BenchmarkRequest(BaseModel):
     suites: list[str] | None = Field(default=None, description="留空表示跑全部离线套件")
-    jev_enabled: bool | None = Field(default=None, description="留空跟随当前配置")
     limit: int | None = Field(default=None, ge=1, le=200)
     live: bool = Field(default=False, description="true 时额外跑 Live Smoke（会真的打第三方）")
 
@@ -412,34 +411,6 @@ class EvolutionRequest(BaseModel):
 def _span_attributes(span: dict) -> dict[str, Any]:
     attributes = span.get("attributes")
     return attributes if isinstance(attributes, dict) else {}
-
-
-def _jev_calls_from_spans(spans: list[dict]) -> list[dict]:
-    """把 component=jev 的 span 还原成管理端 Run Detail 的 "Jev Calls"。"""
-
-    calls: list[dict] = []
-    for span in spans:
-        if span.get("component") != "jev":
-            continue
-        attributes = _span_attributes(span)
-        calls.append(
-            {
-                "tag": attributes.get("tag") or span.get("name"),
-                "decision_type": attributes.get("decision_type"),
-                "status": attributes.get("status"),
-                "choice": attributes.get("choice"),
-                "confidence": attributes.get("confidence"),
-                "latency_ms": attributes.get("latency_ms"),
-                "model": attributes.get("model"),
-                "fallback": attributes.get("fallback"),
-                "fallback_reason": attributes.get("fallback_reason"),
-                "quota": attributes.get("quota"),
-                "input_summary": attributes.get("input_summary"),
-                "criteria": attributes.get("criteria"),
-                "error": span.get("error"),
-            }
-        )
-    return calls
 
 
 def _llm_calls_from_spans(spans: list[dict]) -> list[dict]:
@@ -509,12 +480,10 @@ def admin_overview(include_tokens: bool = True) -> dict[str, Any]:
         "failed_count": statuses.get("FAILED", 0),
         "running_count": statuses.get("RUNNING", 0),
         "total_llm_calls": sum(int(run.get("llm_calls") or 0) for run in runs),
-        "total_jev_calls": sum(int(run.get("jev_calls") or 0) for run in runs),
         "total_tool_calls": sum(int(run.get("tool_calls") or 0) for run in runs),
         "provider_failures": sum(int(run.get("provider_failures") or 0) for run in runs),
         "badcase_open": badcase_open,
         "badcase_total": badcase_total,
-        "jev": _jev_health(store, runs),
         "benchmark": {
             "latest_run_id": benchmarks[0]["benchmark_run_id"] if benchmarks else None,
             # 数组而不是逗号串：字段名是复数，前端的契约校验按数组断言（曾经这里是字符串，
@@ -555,47 +524,6 @@ def _suite_list(benchmark_run: dict) -> list[str]:
     return [item.strip() for item in str(raw).split(",") if item.strip()]
 
 
-def _jev_health(store: TravelPlanStore, runs: list[dict]) -> dict[str, Any]:
-    """Jev 健康度：从最近的 run 的 jev span 汇总。
-
-    ``quota`` 只报告**服务端真的回过**的额度；没有就写 ``unknown`` —— 不推算、不编造。
-    """
-
-    config = current_config()
-    calls = 0
-    fallback = 0
-    statuses: dict[str, int] = {}
-    latencies: list[int] = []
-    quota: Any = "unknown"
-    last_error: str | None = None
-    for run in runs[:20]:
-        for call in _jev_calls_from_spans(store.get_trace_spans(run["run_id"])):
-            calls += 1
-            status = str(call.get("status") or "UNKNOWN")
-            statuses[status] = statuses.get(status, 0) + 1
-            if call.get("fallback"):
-                fallback += 1
-            if isinstance(call.get("latency_ms"), int):
-                latencies.append(call["latency_ms"])
-            if call.get("quota") not in (None, "unknown"):
-                quota = call["quota"]
-            if call.get("error"):
-                last_error = str(call["error"])
-    return {
-        "enabled": config.jev_enabled,
-        "configured": bool(os.environ.get("JEV_API_KEY") or os.environ.get("TYPESAFE_API_KEY")),
-        "status": "ok" if calls and not fallback else ("no-calls" if not calls else "degraded"),
-        "latency_ms": round(sum(latencies) / len(latencies)) if latencies else None,
-        "quota": quota,
-        "quota_source": "reported" if quota != "unknown" else "unknown",
-        "fallback_count": fallback,
-        "calls": calls,
-        "low_confidence": statuses.get("LOW_CONFIDENCE", 0),
-        "timeout": statuses.get("TIMEOUT", 0),
-        "invalid_response": statuses.get("INVALID_RESPONSE", 0),
-        "last_error": last_error,
-        "statuses": statuses,
-    }
 
 
 # ======================================================================
@@ -821,7 +749,7 @@ def admin_runs(
 ) -> dict[str, Any]:
     store = get_store()
     # 列表只补"这次行程好不好、有几个问题"两列质量信息；token / LLM / 工具调用
-    # 这些技术指标下沉到详情页 —— 一屏 12 列没人扫得动（见 docs/TravelPlan_Admin_整体优化方案.md §6）。
+    # 这些技术指标下沉到详情页 —— 一屏 12 列没人扫得动（见 docs/product/ADMIN.md §6）。
     return {
         "items": enrich_runs(
             store,
@@ -1010,7 +938,6 @@ def admin_run_detail(run_id: str) -> dict[str, Any]:
         "decisions": store.get_decisions(run_id),
         "provider_calls": store.list_sources(run_id),
         # 明细从 span 还原：它与管理端看到的 trace 是同一份事实，不会出现两套数字。
-        "jev_calls": _jev_calls_from_spans(spans),
         "llm_calls": _llm_calls_from_spans(spans),
         "badcases": badcases,
     }
@@ -1112,7 +1039,6 @@ def _run_benchmark_job(benchmark_run_id: str, request: BenchmarkRequest) -> None
         runner(
             store=get_store(),
             suites=request.suites,
-            jev_enabled=request.jev_enabled,
             limit=request.limit,
             live=request.live,
             benchmark_run_id=benchmark_run_id,
@@ -1146,7 +1072,7 @@ def admin_benchmark_detail(benchmark_run_id: str) -> dict[str, Any]:
     if isinstance(metrics, dict) and isinstance(metrics.get("groups"), dict):
         groups = metrics["groups"]
     else:
-        # 兼容"扁平指标"的写法：按指标名前缀归组，保证管理端永远能画出六个维度。
+        # 兼容"扁平指标"的写法：按指标名前缀归组，保证管理端永远能画出五个维度。
         groups = _group_metrics(metrics if isinstance(metrics, dict) else {})
     return {
         "run": run,
@@ -1157,7 +1083,14 @@ def admin_benchmark_detail(benchmark_run_id: str) -> dict[str, Any]:
 
 
 def _benchmark_baselines() -> tuple[dict[str, Any], dict[str, Any]]:
-    """读两份基线文件；读不到就返回空（页面显示空表，而不是崩）。"""
+    """读两份对照基线文件；读不到就返回空（页面显示空表，而不是崩）。
+
+    这里读的是"两种配置各跑一遍"的对照（历史上是 Jev 关/开）。Agent Loop 主路径上
+    没有这种对照：`benchmark/baselines/agent_loop.json` 只有**一份**当前基线，
+    `run_benchmark` 也默认不覆盖它（管理端触发的一轮评测不该改仓库里的基线）。
+    所以这两个文件在本路径下不存在，`baseline_compare` 会是 None，详情页如实显示
+    "这次运行没有基线对照"。要对比就本地跑 `python -m benchmark --compare-baseline`。
+    """
 
     try:
         from benchmark.runner import BASELINES_DIR
@@ -1165,7 +1098,7 @@ def _benchmark_baselines() -> tuple[dict[str, Any], dict[str, Any]]:
         return {}, {}
     out: list[dict[str, Any]] = []
     for mode in ("off", "on"):
-        path = BASELINES_DIR / f"jev_{mode}.json"
+        path = BASELINES_DIR / f"{mode}.json"
         try:
             out.append(json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {})
         except (OSError, ValueError):
@@ -1176,7 +1109,7 @@ def _benchmark_baselines() -> tuple[dict[str, Any], dict[str, Any]]:
 def _baseline_compare(pair: tuple[dict[str, Any], dict[str, Any]]) -> dict[str, Any] | None:
     """返回契约里的 `{off, on, delta_pct}` 形状。
 
-    历史上这里返回的是扁平结构（quality_delta_with_jev 摊在顶层），而前端按
+    历史上这里返回的是扁平结构（指标增量摊在顶层），而前端按
     `Object.keys(baseline.off)` 渲染 → 直接抛 "Cannot convert undefined or null to
     object"，整个 Benchmark 详情页白屏。契约与实现必须对齐，以文档形状为准。
     """
@@ -1204,7 +1137,7 @@ def _baseline_compare(pair: tuple[dict[str, Any], dict[str, Any]]) -> dict[str, 
     }
 
 
-#: 扁平指标 → 六维分组的前缀表（与 §9 的指标清单一致）。
+#: 扁平指标 → 五维分组的前缀表（与 §9 的指标清单一致）。
 METRIC_GROUP_PREFIXES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("hard_constraints", ("date_mismatch", "hard_time_conflict", "opening_hours", "missing_transport",
                           "missing_hotel", "budget_math", "hallucinated", "missing_source",
@@ -1214,7 +1147,6 @@ METRIC_GROUP_PREFIXES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("evidence", ("evidence_coverage", "multi_source", "poi_verified", "unsupported_recommendation")),
     ("provider", ("provider_success", "fallback_success", "timeout_rate")),
     ("performance", ("latency", "_tokens", "calls", "e2e")),
-    ("jev", ("jev_", "quality_delta", "latency_delta")),
 )
 
 
@@ -1239,13 +1171,14 @@ def _group_metrics(metrics: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def admin_start_benchmark(request: BenchmarkRequest = Body(default=BenchmarkRequest())) -> dict[str, Any]:
     _benchmark_runner()  # 先确认套件可用，避免建了一条永远停在 RUNNING 的记录
     benchmark_run_id = f"bm-{_now().replace(':', '').replace('-', '')[:15]}-{uuid.uuid4().hex[:4]}"
-    config = current_config()
     get_store().save_benchmark_run(
         {
             "benchmark_run_id": benchmark_run_id,
             "suite": ",".join(request.suites) if request.suites else "all",
             "version": "v0.1",
-            "jev_enabled": 1 if (config.jev_enabled if request.jev_enabled is None else request.jev_enabled) else 0,
+            # 历史列（benchmark_runs.jev_enabled），Jev 决策层已删，这里恒为 0；
+            # 列本身保留在表结构里，避免一次删除就要求所有存量库做迁移。
+            "jev_enabled": 0,
             "live": 1 if request.live else 0,
             "status": "RUNNING",
             "started_at": _now(),
@@ -1275,7 +1208,6 @@ def _config_payload() -> dict[str, Any]:
         },
         "planner_tuning": tuning_snapshot(),
         "secret_configured": {
-            "jev": bool(os.environ.get("JEV_API_KEY") or os.environ.get("TYPESAFE_API_KEY")),
             "admin": bool(os.environ.get("TRAVELPLAN_ADMIN_TOKEN")),
             "amap": bool(os.environ.get("AMAP_API_KEY")),
             "tikhub": bool(os.environ.get("TIKHUB_API_TOKEN")),
@@ -1304,8 +1236,8 @@ class ConfigPatchRequest(BaseModel):
 def admin_update_config(request: ConfigPatchRequest) -> dict[str, Any]:
     """改非 Secret 的运行时配置。
 
-    校验必须在写入前做：把 JEV_MIN_CONFIDENCE 手滑写成 8（本意 0.8）会让所有 Jev 决策
-    变成低置信度，而线上不会报任何错 —— 只是"突然都不采纳 Jev 了"。
+    校验必须在写入前做：把 MAX_RUN_TOKENS 手滑写成 100（本意 1000000）会让所有 run
+    一开跑就判定超预算，而线上不会报任何错 —— 只是"突然都不出行程了"。
     """
 
     store = get_store()
@@ -1328,17 +1260,6 @@ def admin_update_config(request: ConfigPatchRequest) -> dict[str, Any]:
     return _config_payload()
 
 
-@api.get("/api/v1/admin/jev/health", dependencies=[Depends(require_admin)])
-def admin_jev_health() -> dict[str, Any]:
-    store = get_store()
-    health = _jev_health(store, store.list_runs(limit=20))
-    health["note"] = (
-        "quota 只在 Jev 响应里真的带了额度时才有值，否则为 unknown（不推算、不伪造）；"
-        "fallback_count 是这些 run 里最终由 Python 确定性决策的次数。"
-    )
-    return health
-
-
 #: Provider → 中文名（展示用）。未列出的 Provider 原样显示 —— 页面必须能自动扩展。
 PROVIDER_LABELS: dict[str, str] = {
     "12306": "铁路 12306",
@@ -1347,7 +1268,6 @@ PROVIDER_LABELS: dict[str, str] = {
     "tikhub": "小红书 / 抖音（TikHub）",
     "mediacrawler": "本地抓取（MediaCrawler）",
     "tavily": "网页搜索",
-    "jev": "Jev 决策",
     "unknown": "未知来源",
 }
 
@@ -1411,7 +1331,6 @@ def _provider_configured() -> dict[str, bool]:
         "tikhub": bool(os.environ.get("TIKHUB_API_TOKEN")),
         "mediacrawler": bool(os.environ.get("MEDIACRAWLER_DIR")),
         "tavily": bool(os.environ.get("TAVILY_API_KEY")),
-        "jev": bool(os.environ.get("JEV_API_KEY") or os.environ.get("TYPESAFE_API_KEY")),
     }
 
 

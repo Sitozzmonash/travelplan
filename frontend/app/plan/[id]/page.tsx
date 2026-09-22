@@ -10,10 +10,13 @@ import {
   describeApiError,
   getPlan,
   getPlanStatus,
+  planningStepsFromProgress,
+  runDegradations,
 } from "@/lib/api";
 import { ErrorState, PartialNotice, RunStatusBadge, UnauthorizedState } from "@/components/state-views";
 import { PlanPending } from "@/components/plan-pending";
 import { PlanWorkspace } from "@/components/plan-workspace";
+import { PlanningProgress } from "@/components/planning-progress";
 
 export const dynamic = "force-dynamic";
 
@@ -52,6 +55,12 @@ export default async function PlanPage({ params }: PageProps<"/plan/[id]">) {
     errorKind = apiErrorKind(cause);
   }
 
+  const planSteps = planningStepsFromProgress(progress);
+  const degradations = runDegradations(progress);
+  // 后端失败时把原因写在 run_progress.error 上，message 只是「规划已结束」这类占位文案：
+  // 只说 message 等于瞒着用户真正发生了什么。两者都没有时才退回通用说明。
+  const failureReason = progress?.error ?? progress?.message ?? null;
+
   return (
     <div className="mx-auto w-full max-w-[1440px] px-4 py-6 pb-24 sm:px-6 lg:pb-8">
       <div className="mb-4 flex items-center justify-between gap-3">
@@ -70,15 +79,27 @@ export default async function PlanPage({ params }: PageProps<"/plan/[id]">) {
         </span>
       </div>
 
-      {progress?.status === "RUNNING" ? <PlanPending runId={id} /> : null}
+      {progress?.status === "RUNNING" ? <PlanPending runId={id} initialProgress={progress} /> : null}
 
       {progress?.status === "FAILED" ? (
-        <div className="mx-auto max-w-2xl space-y-4">
+        <div className="mx-auto max-w-3xl space-y-4">
           <ErrorState
             title="这次没有生成行程"
             description="规划在生成过程中中断，本次没有产出可用行程。可以重新发起一次规划。"
-            detail={progress.message ?? undefined}
+            detail={failureReason ? `服务端说明：${failureReason}` : undefined}
           />
+          {/* 中断不是「什么都没发生」：把 Agent 中断前真实走过的步骤给出来，
+              用户能看到它是走到查询酒店还是路线校验时断的。 */}
+          {planSteps.length ? (
+            <PlanningProgress steps={planSteps} currentStage={progress.current_stage} status="FAILED" />
+          ) : null}
+          {degradations.length ? (
+            <PartialNotice
+              title="这些步骤本次没有正常返回"
+              description={degradations.join("；")}
+              detail="它们可能是这次中断的原因；重新规划时会再次尝试。"
+            />
+          ) : null}
           <BackHomeLink />
         </div>
       ) : null}
@@ -91,7 +112,7 @@ export default async function PlanPage({ params }: PageProps<"/plan/[id]">) {
               这次规划已被取消
             </div>
             <p className="mt-2 max-w-prose text-xs leading-5 text-muted-foreground">
-              {progress.message ?? "任务在完成前被终止，通常是服务重启或手动停止。本次没有产出可用行程。"}
+              {progress.error ?? progress.message ?? "任务在完成前被终止，通常是服务重启或手动停止。本次没有产出可用行程。"}
             </p>
             <p className="mt-1.5 text-[11px] leading-5 text-muted-foreground/80">行程编号：{id}</p>
           </div>
@@ -102,11 +123,24 @@ export default async function PlanPage({ params }: PageProps<"/plan/[id]">) {
       {plan ? (
         <div className="space-y-5">
           {progress?.status === "DEGRADED" ? (
-            <PartialNotice
-              title="行程已生成，部分信息暂未验证"
-              description={progress.message ?? "部分数据源本次只返回了缓存或部分数据，行程仍然可用。"}
-              detail="降级会影响个别价格或通勤时间的准确性，出行前请再次确认。"
-            />
+            <>
+              <PartialNotice
+                title="行程已生成，部分信息暂未验证"
+                description={progress.message ?? "部分数据源本次只返回了缓存或部分数据，行程仍然可用。"}
+                detail="降级会影响个别价格或通勤时间的准确性，出行前请再次确认。"
+              />
+              {/* 只说「有降级」等于没说：逐条列出是哪些步骤没有正常返回。 */}
+              {degradations.length ? (
+                <ul className="grid gap-1.5 rounded-lg border border-warning/25 bg-warning-subtle/60 px-3.5 py-3">
+                  {degradations.map((item) => (
+                    <li key={item} className="flex gap-2 text-xs leading-5 text-warning-subtle-foreground">
+                      <span aria-hidden>·</span>
+                      <span className="min-w-0 break-words">{item}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </>
           ) : null}
           <PlanWorkspace plan={plan} />
         </div>

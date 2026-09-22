@@ -2,7 +2,15 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import { AlertTriangle, MessagesSquare, RefreshCw, Search, Timer, Workflow } from "lucide-react";
+import {
+  AlertTriangle,
+  Cpu,
+  MessagesSquare,
+  RefreshCw,
+  Search,
+  Timer,
+  Workflow,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -24,6 +32,8 @@ import { getAdminRunTimeline } from "@/lib/admin-api";
 import { formatDateTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type {
+  AdminAgentInfo,
+  AdminAgentStep,
   AdminRecord,
   AdminTimeline,
   AdminTimelineTrack,
@@ -41,13 +51,67 @@ import type {
  * 2) 事件默认只给类型 / 标题 / 摘要 / 状态 / 耗时（§17），Input / Output / metadata 折叠在详情里。
  * 3) 事件级 token 与成本通常是 null（Provider 不按调用回报用量），这里不显示裸「—」，
  *    而是明确写「按整次 run 统计」，避免把「没有逐条口径」读成「没有消耗」。
- * 4) 同一份事实给两个视图（feedback §3）：Workflow View 按阶段组织（回答「哪一步慢 / 哪一步错」），
- *    Conversation View 按真实执行顺序串成对话（回答「模型收到了什么 / 返回了什么」）。
- *    两个视图共用同一次取数、同一套筛选与同一段详情渲染，切视图不重新请求、不重算。
+ * 4) 同一份事实给两个视图（feedback §3）：第一个视图按步骤 / 阶段组织，第二个视图按真实
+ *    执行顺序串成对话。两个视图共用同一次取数、同一套筛选与同一段详情渲染，切视图不重新
+ *    请求、不重算。
+ *
+ * 主路径已换成 Agent Loop（`app/agent_runner.py`）之后的第一个视图
+ * ------------------------------------------------------------------
+ * Agent 自己调工具出计划，**没有固定 12 步的阶段**，所以第一个视图按 run 的类型切换内容：
+ *
+ * * Agent run（`timeline.agent.is_agent_run`）→ **Agent View**：先给一张 Agent 运行卡
+ *   （prompt 版本、出计划方式、truncation、步数与墙钟上限、整 run token 汇总），下面是一条
+ *   按真实发生顺序排好的步骤流（工具/模型 + 中文步骤名 + 状态 + 耗时 + 每步 token），
+ *   顺序与序号都来自后端算好的 `timeline.agent.steps`，前端不重排；
+ * * 旧 run（固定 12 步）→ 原来的 Workflow View：按 workflow 阶段分组的事件列表。
+ *
+ * 视图的 key 仍然是 `workflow`（只是标签与内容随 run 类型切换）：深链、父组件状态与既有
+ * 习惯都不动一处，也不会留下一个「永远空白」的固定流程页签。
  */
 
-/** 轨迹视图（feedback §3）。 */
+/** 轨迹视图（feedback §3）。`workflow` 这个 key 同时承载 Agent View（见文件头说明）。 */
 export type TraceViewMode = "workflow" | "conversation";
+
+interface TraceViewSpec {
+  key: TraceViewMode;
+  label: string;
+  description: string;
+  icon: "agent" | "workflow" | "conversation";
+}
+
+/** 两个视图的说明文案：切换器上要一眼看出「这个视图回答什么问题」。 */
+function traceViews(isAgentRun: boolean): TraceViewSpec[] {
+  return [
+    isAgentRun
+      ? {
+          key: "workflow",
+          label: "Agent View",
+          icon: "agent",
+          description:
+            "按 Agent 的每一步看：工具中文名 + 状态 + 耗时、每步 token、整 run token 汇总，外加 prompt 版本 / 交卷方式 / 截断。回答「Agent 每一步在做什么、花了多少」。",
+        }
+      : {
+          key: "workflow",
+          label: "Workflow View",
+          icon: "workflow",
+          description:
+            "按 workflow 阶段看执行过程：轨道概览 + 阶段内事件。回答「这次 run 走到哪一步、哪一步慢、哪一步错」。",
+        },
+    {
+      key: "conversation",
+      label: "Conversation View",
+      icon: "conversation",
+      description:
+        "按真实执行顺序串成一条对话：System → User → Context → Assistant → Tool（含 Tool Result）→ Assistant。回答「模型实际收到了什么、实际返回了什么」。",
+    },
+  ];
+}
+
+/** Agent 步骤选中的说明（步骤流与对话视图共用的角色词表在这里对齐）。 */
+const AGENT_STEP_KINDS: Record<string, { label: string; tone: AdminTone; hint: string }> = {
+  tool: { label: "工具", tone: "success", hint: "Agent 调了一次工具（外部取数）" },
+  model: { label: "模型", tone: "info", hint: "Agent 的一次模型调用（token 在这里）" },
+};
 
 /** 「未归属阶段」的筛选取值：真实 stage_id 不会等于它。 */
 const STAGE_NONE = "__none__";
@@ -96,22 +160,6 @@ const FALLBACK_TYPE_OPTIONS: { key: string; label: string }[] = [
   { key: "PROVIDER", label: "Provider" },
   { key: "VALIDATION", label: "校验" },
   { key: "ERROR", label: "错误" },
-];
-
-/** 两个视图的说明文案：切换器上要一眼看出「这个视图回答什么问题」。 */
-const TRACE_VIEWS: { key: TraceViewMode; label: string; description: string }[] = [
-  {
-    key: "workflow",
-    label: "Workflow View",
-    description:
-      "按 workflow 阶段看执行过程：轨道概览 + 阶段内事件。回答「这次 run 走到哪一步、哪一步慢、哪一步错」。",
-  },
-  {
-    key: "conversation",
-    label: "Conversation View",
-    description:
-      "按真实执行顺序串成一条对话：System → User → Context → Assistant → Tool（含 Tool Result）→ Assistant。回答「模型实际收到了什么、实际返回了什么」。",
-  },
 ];
 
 /**
@@ -212,23 +260,25 @@ export function RunTimeline({
 /* ------------------------------ 视图切换 ------------------------------ */
 
 /**
- * Workflow / Conversation 切换器。
+ * Workflow / Agent / Conversation 切换器。
  *
  * 为什么把说明文案跟切换器放在一起：两个视图的差别不是排版而是「回答哪个问题」，
  * 不放说明的话运营只会记住默认那个视图。
  */
 function TraceViewSwitch({
+  views,
   value,
   onChange,
 }: {
+  views: TraceViewSpec[];
   value: TraceViewMode;
   onChange: (view: TraceViewMode) => void;
 }) {
-  const active = TRACE_VIEWS.find((item) => item.key === value) ?? TRACE_VIEWS[0];
+  const active = views.find((item) => item.key === value) ?? views[0];
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl bg-card p-3 ring-1 ring-foreground/10">
       <div role="tablist" aria-label="轨迹视图" className="flex items-center gap-1 rounded-lg bg-muted p-[3px]">
-        {TRACE_VIEWS.map((item) => {
+        {views.map((item) => {
           const selected = item.key === value;
           return (
             <button
@@ -242,7 +292,9 @@ function TraceViewSwitch({
                 selected ? "bg-background text-foreground shadow-sm" : "text-foreground/60 hover:text-foreground",
               )}
             >
-              {item.key === "workflow" ? (
+              {item.icon === "agent" ? (
+                <Cpu className="size-3.5" aria-hidden />
+              ) : item.icon === "workflow" ? (
                 <Workflow className="size-3.5" aria-hidden />
               ) : (
                 <MessagesSquare className="size-3.5" aria-hidden />
@@ -308,6 +360,18 @@ function TimelineBody({
 
   const typeOptions = timeline.type_options.length > 0 ? timeline.type_options : FALLBACK_TYPE_OPTIONS;
   const runTotalTokens = timeline.run.total_tokens;
+  // Agent Loop 的 run：第一个视图换成「步骤流 + Agent 元信息」，旧 run 保持 Workflow View。
+  const agentInfo = timeline.agent ?? null;
+  const isAgentRun = Boolean(agentInfo?.is_agent_run);
+  const views = traceViews(isAgentRun);
+  // 步骤流按后端算好的顺序给序号：前端不重排（重排会改掉「真实先后」）。
+  const stepByEventId = useMemo(() => {
+    const map = new Map<string, AdminAgentStep>();
+    for (const step of agentInfo?.steps ?? []) {
+      if (step.event_id) map.set(step.event_id, step);
+    }
+    return map;
+  }, [agentInfo]);
 
   const stageRows = useMemo(() => {
     const rows = timeline.stages.map((stage) => ({
@@ -421,12 +485,12 @@ function TimelineBody({
         ]}
       />
       <FilterSelect
-        label="Workflow 阶段"
+        label={isAgentRun ? "Agent 步骤 / 阶段" : "Workflow 阶段"}
         value={stageFilter}
         onChange={setStageFilter}
         className="w-44"
         options={[
-          { value: FILTER_ALL, label: "全部阶段" },
+          { value: FILTER_ALL, label: isAgentRun ? "全部步骤" : "全部阶段" },
           ...stageRows.map((stage) => ({ value: stage.id, label: stage.title })),
           { value: STAGE_NONE, label: "未归属阶段" },
         ]}
@@ -482,7 +546,7 @@ function TimelineBody({
 
   return (
     <div className="flex flex-col gap-4">
-      <TraceViewSwitch value={viewMode} onChange={changeView} />
+      <TraceViewSwitch views={views} value={viewMode} onChange={changeView} />
 
       <Card>
         <CardHeader>
@@ -503,9 +567,21 @@ function TimelineBody({
             <ToneBadge tone="muted" className="text-[0.6875rem]">
               阶段 {formatNumber(timeline.summary.stages)}
             </ToneBadge>
+            {isAgentRun ? (
+              <ToneBadge tone="info" className="text-[0.6875rem]">
+                Agent 步骤 {formatNumber(timeline.summary.agent_steps ?? agentInfo?.steps.length ?? 0)}
+              </ToneBadge>
+            ) : null}
+            {isAgentRun && agentInfo?.truncation ? (
+              <ToneBadge tone="warning" className="text-[0.6875rem]">
+                循环被截断
+              </ToneBadge>
+            ) : null}
           </CardTitle>
           <CardDescription>
-            按真实执行顺序把 trace / Provider 账本 / 校验与 Bad Case 归并成一条时间轴；点类型徽标可只看该类事件。
+            {isAgentRun
+              ? "这次 run 由 Agent Loop 出计划：按 trace_spans 的逐步事实（工具 / 模型调用）串成时间轴，点类型徽标可只看该类事件。"
+              : "按真实执行顺序把 trace / Provider 账本 / 校验与 Bad Case 归并成一条时间轴；点类型徽标可只看该类事件。"}
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-wrap items-center gap-1.5">
@@ -535,22 +611,39 @@ function TimelineBody({
 
       {viewMode === "workflow" ? (
         <>
+          {isAgentRun && agentInfo ? (
+            <AgentMetaCard agent={agentInfo} runDurationMs={timeline.run.duration_ms} cost={timeline.run.cost} />
+          ) : null}
+
           <TrackOverview timeline={timeline} onPickBlock={pickBlock} />
 
           {filterBar}
 
-          <WorkflowEventCard
-            groups={groups}
-            stageTitles={stageTitles}
-            runTotalTokens={runTotalTokens}
-            selectedEventId={selectedEventId}
-            onSelectEvent={(eventId) =>
-              setSelectedEventId((current) => (current === eventId ? null : eventId))
-            }
-            onSelectStage={onSelectStage}
-            onOpenPerformance={onOpenPerformance}
-            visibleCount={visible.length}
-          />
+          {isAgentRun ? (
+            <AgentStepStream
+              events={visible}
+              stepByEventId={stepByEventId}
+              runTotalTokens={runTotalTokens}
+              selectedEventId={selectedEventId}
+              onSelectEvent={(eventId) =>
+                setSelectedEventId((current) => (current === eventId ? null : eventId))
+              }
+              onOpenPerformance={onOpenPerformance}
+            />
+          ) : (
+            <WorkflowEventCard
+              groups={groups}
+              stageTitles={stageTitles}
+              runTotalTokens={runTotalTokens}
+              selectedEventId={selectedEventId}
+              onSelectEvent={(eventId) =>
+                setSelectedEventId((current) => (current === eventId ? null : eventId))
+              }
+              onSelectStage={onSelectStage}
+              onOpenPerformance={onOpenPerformance}
+              visibleCount={visible.length}
+            />
+          )}
         </>
       ) : (
         <>
@@ -729,6 +822,285 @@ function TrackRow({
   );
 }
 
+/* ------------------------------ Agent View ------------------------------ */
+
+/**
+ * Agent 运行卡：这次 run 的元信息 + 整 run token 汇总（主路径换成 Agent Loop 之后新增）。
+ *
+ * 三条刻意的取舍：
+ * 1) 「没有」与「不知道」分开写：交卷方式 / truncation 只在 audit_report.json 里有，
+ *    没读到就写「审计文件没读到，无法判断」，而不是写成「没有截断」——
+ *    把「没记录」读成「没发生」正是最贵的一类误判。
+ * 2) 上限（步数 / 墙钟）标明来源：取自 audit 就是本次 run 的快照，取自当前配置只能当参考。
+ * 3) token 同时给「整 run 汇总（run_metrics）」与「逐条 span 相加」两个数字：
+ *    对不上时后端会说明（agent.notes），前端不替它对账、也不挑一个显示。
+ */
+function AgentMetaCard({
+  agent,
+  runDurationMs,
+  cost,
+}: {
+  agent: AdminAgentInfo;
+  runDurationMs: number | null;
+  cost: number | null;
+}) {
+  const tokens = agent.tokens;
+  // 没有 audit 时 truncation 是「读不到」而不是「没截断」——这两种必须能分开读。
+  const truncationText = agent.truncation
+    ? agent.truncation
+    : agent.limits.from_audit
+      ? "没有截断（循环正常收尾）"
+      : "—（audit_report.json 没读到，无法判断）";
+  const limitText = (value: number | null, unit: string) =>
+    value === null ? "—（未记录）" : `${formatNumber(value)}${unit}`;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex flex-wrap items-center gap-2">
+          <span>Agent 运行</span>
+          <ToneBadge tone="info" className="text-[0.6875rem]">
+            SuperHarness Agent Loop
+          </ToneBadge>
+          {agent.truncation ? (
+            <ToneBadge tone="warning" className="text-[0.6875rem]">
+              循环被截断
+            </ToneBadge>
+          ) : null}
+        </CardTitle>
+        <CardDescription>
+          Agent 自己调工具出计划：本卡是这次 run 的元信息与 token 汇总，下面那条「Agent 步骤流」是逐步事实。
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        <KeyValueList
+          entries={[
+            {
+              key: "plan_origin",
+              label: "出计划方式",
+              value: (
+                <span className="flex flex-wrap items-center gap-2">
+                  {agent.plan_origin_label ?? "—（后端未返回）"}
+                  {agent.plan_origin ? (
+                    <span className="font-mono text-[10px] text-muted-foreground">{agent.plan_origin}</span>
+                  ) : null}
+                  <span className="text-[10px] text-muted-foreground">
+                    {agent.plan_origin_source === "audit_report.json"
+                      ? "来源：本次 run 的审计文件"
+                      : agent.plan_origin_source === "trace_spans"
+                        ? "来源：由 trace 反推（审计文件没读到）"
+                        : agent.plan_origin_source === null
+                          ? "来源：无（没有交卷迹象也没有落计划）"
+                          : `来源：${agent.plan_origin_source}`}
+                  </span>
+                </span>
+              ),
+            },
+            {
+              key: "truncation",
+              label: "循环截断",
+              value: <span>{truncationText}</span>,
+            },
+            {
+              key: "limits",
+              label: "循环上限",
+              value: (
+                <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                  <span className="tabular">
+                    步数 {limitText(agent.limits.max_steps, " 步")} · 墙钟{" "}
+                    {limitText(agent.limits.timeout_seconds, "s")}
+                  </span>
+                  <span className="text-[10px] text-muted-foreground">{agent.limits.note}</span>
+                </span>
+              ),
+            },
+            {
+              key: "prompt_version",
+              label: "Prompt 版本",
+              value: agent.prompt_version ? (
+                <span className="font-mono text-[11px]">{agent.prompt_version}</span>
+              ) : (
+                <span className="text-muted-foreground">—（后端未返回）</span>
+              ),
+            },
+            {
+              key: "system_prompt_chars",
+              label: "System Prompt",
+              value:
+                agent.system_prompt_chars === null
+                  ? "—（未记录字符数）"
+                  : `${formatNumber(agent.system_prompt_chars)} 字符`,
+            },
+            {
+              key: "tools",
+              label: "可见工具",
+              value:
+                agent.tools.length > 0 ? (
+                  <span className="font-mono text-[11px]">
+                    {agent.tools.length} 个：{agent.tools.join("、")}
+                  </span>
+                ) : (
+                  <span className="text-muted-foreground">—（trace 没记下拉起的工具清单）</span>
+                ),
+            },
+            {
+              key: "calls",
+              label: "调用次数",
+              value: (
+                <span className="tabular">
+                  模型 {formatNumber(tokens.steps_llm)} 次
+                  {tokens.llm_calls !== null ? `（run_metrics ${formatNumber(tokens.llm_calls)}）` : ""} · 工具{" "}
+                  {formatNumber(tokens.steps_tool)} 次
+                  {tokens.tool_calls !== null ? `（run_metrics ${formatNumber(tokens.tool_calls)}）` : ""}
+                </span>
+              ),
+            },
+            {
+              key: "tokens_total",
+              label: "总 Token",
+              value:
+                tokens.total === null ? (
+                  <span className="text-muted-foreground">—（没有 run_metrics 汇总）</span>
+                ) : (
+                  <span className="tabular">
+                    <span className="font-medium text-foreground">{formatNumber(tokens.total)}</span>
+                    {" = "}
+                    输入 {formatNumber(tokens.input)} + 输出 {formatNumber(tokens.output)}
+                    {tokens.cached !== null ? `（其中缓存命中 ${formatNumber(tokens.cached)}）` : ""}
+                    <span className="ml-1 font-mono text-[10px] text-muted-foreground">{tokens.source}</span>
+                  </span>
+                ),
+            },
+            {
+              key: "tokens_steps",
+              label: "逐条相加",
+              value: (
+                <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <span className="tabular">
+                    {tokens.step_total === null ? "—（没有一条模型调用记了 token）" : formatNumber(tokens.step_total)}
+                  </span>
+                  {tokens.step_total !== null && tokens.total !== null && tokens.step_total !== tokens.total ? (
+                    <ToneBadge tone="warning" className="text-[0.625rem]">
+                      与汇总不一致
+                    </ToneBadge>
+                  ) : null}
+                  <span className="text-[10px] text-muted-foreground">
+                    span 逐条相加，用来核对上面的汇总
+                  </span>
+                </span>
+              ),
+            },
+            {
+              key: "duration",
+              label: "耗时",
+              value: (
+                <span className="tabular">
+                  {formatDurationMs(tokens.duration_ms ?? runDurationMs)}
+                  <span className="ml-1 text-[10px] text-muted-foreground">
+                    {tokens.duration_ms !== null ? "run_metrics" : "run 记录"}
+                  </span>
+                </span>
+              ),
+            },
+            {
+              key: "cost",
+              label: "成本",
+              value: cost !== null ? formatCostWithCurrency(cost, null) : "—（没有单价快照）",
+            },
+          ]}
+        />
+
+        {agent.notes.length > 0 ? (
+          <section className="flex flex-col gap-1.5">
+            <h3 className="text-xs font-medium text-foreground">这张卡的口径说明</h3>
+            <ul className="flex list-disc flex-col gap-1 pl-5 text-[11px] leading-5 text-muted-foreground">
+              {agent.notes.map((note) => (
+                <li key={note} className="break-words">
+                  {note}
+                </li>
+              ))}
+            </ul>
+          </section>
+        ) : null}
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * Agent 步骤流：把事件按**真实发生顺序**平铺（不再按 workflow 阶段分组）。
+ *
+ * 为什么不再分组：Agent 的阶段就是"它这一步在调哪个工具"，同一个工具可能被调很多次，
+ * 按阶段分组会把「第 1 次查酒店 → 查机票 → 第 2 次查酒店」的真实先后压平成两组。
+ * 这里直接复用事件行（步骤序号 / 工具中文名 / 每步 token 由行自己渲染），
+ * 于是筛选、展开、跳转性能页这些既有交互一个都不丢。
+ */
+function AgentStepStream({
+  events,
+  stepByEventId,
+  runTotalTokens,
+  selectedEventId,
+  onSelectEvent,
+  onOpenPerformance,
+}: {
+  events: AdminTraceEvent[];
+  stepByEventId: Map<string, AdminAgentStep>;
+  runTotalTokens: number | null;
+  selectedEventId: string | null;
+  onSelectEvent: (eventId: string) => void;
+  onOpenPerformance?: (eventId: string) => void;
+}) {
+  const stepCount = events.filter((event) => stepByEventId.has(event.event_id)).length;
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex flex-wrap items-center gap-2">
+          <span>Agent 步骤流</span>
+          <Badge variant="secondary" className="tabular text-[0.6875rem]">
+            {formatNumber(events.length)} 条
+          </Badge>
+          <ToneBadge tone="muted" className="text-[0.6875rem]">
+            含步骤 {formatNumber(stepCount)}
+          </ToneBadge>
+        </CardTitle>
+        <CardDescription>
+          顺序就是后端记录的先后（按真实发生时间；工具 span 的 seq 是「该工具的第几次调用」）。
+          每行给步骤序号 / 工具中文名 / 状态 / 耗时，模型步另有每步 token；点开才渲染参数与返回。
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {events.length === 0 ? (
+          <SectionEmpty
+            title="当前筛选下没有事件"
+            description="这次运行里没有同时满足「类型 + 步骤 + 状态 + 关键词」的事件。清空筛选可以看到全部步骤。"
+          />
+        ) : (
+          <ol className="flex flex-col gap-2 border-l border-dashed border-border pl-3 sm:pl-4">
+            {events.map((event) => (
+              <TimelineEventRow
+                key={event.event_id}
+                event={event}
+                step={stepByEventId.get(event.event_id)}
+                runTotalTokens={runTotalTokens}
+                selected={selectedEventId === event.event_id}
+                onSelect={() => onSelectEvent(event.event_id)}
+                onOpenPerformance={onOpenPerformance}
+              />
+            ))}
+          </ol>
+        )}
+        {stepCount < events.length ? (
+          <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
+            其余 {formatNumber(events.length - stepCount)} 条不是 Agent 步骤（系统 / 用户 / 上下文 /
+            校验 / Provider 账本 / 错误）：它们没有 span 服务端序号的步骤身份，但仍是这次 run 的真实事件，
+            所以一并按时间排在流里。
+          </p>
+        ) : null}
+      </CardContent>
+    </Card>
+  );
+}
+
 /* ------------------------------ Workflow View ------------------------------ */
 
 /**
@@ -840,12 +1212,15 @@ function WorkflowEventCard({
 
 function TimelineEventRow({
   event,
+  step,
   runTotalTokens,
   selected,
   onSelect,
   onOpenPerformance,
 }: {
   event: AdminTraceEvent;
+  /** Agent 步骤身份（Agent View 才有）；其他视图不传。 */
+  step?: AdminAgentStep;
   runTotalTokens: number | null;
   selected: boolean;
   onSelect: () => void;
@@ -854,6 +1229,9 @@ function TimelineEventRow({
   const tone = EVENT_TONES[event.event_type] ?? "muted";
   const tokens = readEventTokenFacts(event);
   const hasTokenFacts = tokens.length > 0 || event.cost !== null;
+  const stepKind = step ? AGENT_STEP_KINDS[step.kind] : undefined;
+  // 步骤的中文名：后端给的是 run_stages 的那份展示名（「在查酒店」）。
+  const stepLabel = step?.stage_title ?? null;
 
   return (
     <li
@@ -871,9 +1249,22 @@ function TimelineEventRow({
         aria-expanded={selected}
       >
         <span className="flex min-w-0 flex-wrap items-center gap-2">
+          {step ? (
+            <span className="tabular shrink-0 rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-medium text-foreground">
+              步骤 #{step.order}
+            </span>
+          ) : null}
           <ToneBadge tone={tone} className="text-[0.6875rem]">
             {event.event_type_label || event.event_type}
           </ToneBadge>
+          {stepKind ? (
+            <ToneBadge tone={stepKind.tone} className="text-[0.6875rem]">
+              {stepKind.label}
+            </ToneBadge>
+          ) : null}
+          {stepLabel ? (
+            <span className="shrink-0 text-[11px] font-medium text-foreground">{stepLabel}</span>
+          ) : null}
           <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground" title={event.title}>
             {event.title || "（没有标题）"}
           </span>
@@ -899,7 +1290,9 @@ function TimelineEventRow({
           {event.model ? <span className="font-mono">模型 {event.model}</span> : null}
           {event.provider ? <span className="font-mono">Provider {event.provider}</span> : null}
           {event.tool ? <span className="font-mono">工具 {event.tool}</span> : null}
-          {event.round_index !== null ? <span>阶段序 #{event.round_index + 1}</span> : null}
+          {/* Agent 步骤行不再显示「阶段序 #N」：那是 run_stages 里第几个**不同步骤名**，
+              与真实的第几步不是一回事（同名工具多次调用共享一行），两个序号并排只会误读。 */}
+          {event.round_index !== null && !step ? <span>阶段序 #{event.round_index + 1}</span> : null}
           {hasTokenFacts ? (
             <>
               {tokens.length > 0 ? <span className="tabular">Token {tokens.join(" / ")}</span> : null}
@@ -907,6 +1300,25 @@ function TimelineEventRow({
             </>
           ) : runTotalTokens !== null ? (
             <span>token 与成本按整次 run 统计</span>
+          ) : null}
+          {/* 步骤口径：模型步给这一步的 token 合计与累计；工具步明确写「不消耗模型 token」，
+              免得读者把工具行的空白当成「后端漏了」。 */}
+          {step ? (
+            step.kind === "model" ? (
+              <span className="tabular">
+                本步 Token {formatNumber(step.tokens?.total ?? null)}
+                {step.cumulative_total_tokens !== null
+                  ? ` · 累计 ${formatNumber(step.cumulative_total_tokens)}`
+                  : ""}
+                {step.seq !== null ? ` · 第 ${formatNumber(step.seq)} 次模型调用` : ""}
+              </span>
+            ) : (
+              <span className="tabular">
+                工具步（不消耗模型 token）
+                {step.seq !== null ? ` · 第 ${formatNumber(step.seq)} 次调用` : ""}
+                {typeof step.returned === "number" ? ` · 返回 ${formatNumber(step.returned)} 条` : ""}
+              </span>
+            )
           ) : null}
           <span>
             点击展开模型收到 / 返回的预览
@@ -943,7 +1355,12 @@ function TimelineEventRow({
           行上的 aria-expanded 因此是真的（旧实现用嵌套 <details>，行点击并不展开，读屏会读错）。 */}
       {selected ? (
         <div className="border-t border-border/70 px-3 py-3">
-          <EventDetail event={event} runTotalTokens={runTotalTokens} onOpenPerformance={onOpenPerformance} />
+          <EventDetail
+            event={event}
+            step={step}
+            runTotalTokens={runTotalTokens}
+            onOpenPerformance={onOpenPerformance}
+          />
         </div>
       ) : null}
     </li>
@@ -1149,10 +1566,13 @@ function ConversationEventRow({
  */
 function EventDetail({
   event,
+  step,
   runTotalTokens,
   onOpenPerformance,
 }: {
   event: AdminTraceEvent;
+  /** Agent 步骤身份（Agent View 才有）：补上 run_stages 侧的步骤事实。 */
+  step?: AdminAgentStep;
   runTotalTokens: number | null;
   onOpenPerformance?: (eventId: string) => void;
 }) {
@@ -1161,6 +1581,49 @@ function EventDetail({
       <KeyValueList
         entries={[
           { key: "event_id", label: "事件 ID", value: <span className="font-mono text-[11px]">{event.event_id}</span> },
+          ...(step
+            ? [
+                {
+                  key: "step",
+                  label: "Agent 步骤",
+                  value: (
+                    <span>
+                      第 {step.order} 步 · {AGENT_STEP_KINDS[step.kind]?.label ?? step.kind}
+                      {step.stage_title ? ` · ${step.stage_title}` : ""}
+                      {step.seq !== null ? `（第 ${step.seq} 次调用）` : ""}
+                      <span className="ml-1 font-mono text-[10px] text-muted-foreground">
+                        {step.step_key ?? "—"}
+                      </span>
+                    </span>
+                  ),
+                },
+                {
+                  key: "step_tokens",
+                  label: "本步 Token",
+                  value: (
+                    <span className="tabular">
+                      {step.kind === "model"
+                        ? `输入 ${formatNumber(step.tokens?.input ?? null)} / 输出 ${formatNumber(
+                            step.tokens?.output ?? null,
+                          )} / 缓存 ${formatNumber(step.tokens?.cached ?? null)} / 合计 ${formatNumber(
+                            step.tokens?.total ?? null,
+                          )}`
+                        : "工具调用不消耗模型 token"}
+                    </span>
+                  ),
+                },
+                {
+                  key: "step_returned",
+                  label: "返回条数",
+                  value:
+                    typeof step.returned === "number" ? (
+                      <span className="tabular">{formatNumber(step.returned)}</span>
+                    ) : (
+                      <span className="text-muted-foreground">—（这条 span 没记返回条数）</span>
+                    ),
+                },
+              ]
+            : []),
           {
             key: "type",
             label: "类型",

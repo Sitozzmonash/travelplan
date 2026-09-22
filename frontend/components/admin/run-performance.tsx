@@ -9,7 +9,6 @@ import { formatDurationMs, formatNumber, formatRatio } from "@/components/admin/
 import { StatCard } from "@/components/admin/stat-card";
 import { StatusBadge, ToneBadge } from "@/components/admin/status-badge";
 import type {
-  AdminJevCall,
   AdminLlmCall,
   AdminRecord,
   AdminRunMetrics,
@@ -25,7 +24,7 @@ import type {
  *
  * 数据来源分两级，全部取自后端**已经返回**的字段：
  * 1) 后端把性能摘要写进 `run_metrics`（`metrics.performance_summary` 或同名扁平字段）时优先使用；
- * 2) 尚未落地时，前端按 `/runs/{id}/stages` 的阶段耗时 + Trace 里的 workflow / tool / llm / jev
+ * 2) 尚未落地时，前端按 `/runs/{id}/stages` 的阶段耗时 + Trace 里的 workflow / tool / llm
  *    span 现场推导。
  *
  * 绝不编造：任何一处推不出来就显示「—」，并把缺口写进 `gaps`，在明细弹窗里如实列出。
@@ -80,7 +79,6 @@ const BUCKET_LABELS: Record<string, string> = {
   route: "路线",
   planner: "规划",
   llm: "LLM",
-  jev: "Jev",
 };
 
 /** 维度 → 对应的 workflow 阶段 id。 */
@@ -101,7 +99,6 @@ const METRIC_ORDER = [
   "route",
   "planner",
   "llm",
-  "jev",
 ] as const;
 
 /* ------------------------------ 工具 ------------------------------ */
@@ -172,7 +169,6 @@ const SUMMARY_MS_KEYS: Record<(typeof METRIC_ORDER)[number], readonly string[]> 
   route: ["route_ms", "route_lookup_ms"],
   planner: ["planner_ms", "plan_ms", "planning_ms"],
   llm: ["llm_ms", "llm_duration_ms"],
-  jev: ["jev_ms", "jev_duration_ms"],
 };
 
 /* ------------------------------ 阶段耗时 ------------------------------ */
@@ -215,6 +211,51 @@ function routeFromTrace(trace: AdminTraceSpan[]): { ms: number | null; count: nu
     sum += spanDurationMs(span) ?? 0;
   }
   return { ms: count > 0 ? sum : null, count };
+}
+
+/**
+ * 这次 run 是不是 Agent Loop 出的计划（`app/agent_runner.py`）。
+ *
+ * 只看 trace 就能判：Agent 路径会写一条 `workflow / prompt_version` span（属性 `agent=superharness`），
+ * 且每个工具 span 都带 `stage_key`（`tool:search_hotels:2`）。两条任一成立即可 ——
+ * 旧 run（固定 12 步）两条都命不中，因此下面按工具归并的那套口径不会改写旧 run 的任何数字。
+ */
+function isAgentLoopRun(trace: AdminTraceSpan[]): boolean {
+  return trace.some(
+    (span) =>
+      (span.component === "workflow" &&
+        span.name === "prompt_version" &&
+        span.attributes?.agent === "superharness") ||
+      (span.component === "tool" && typeof span.attributes?.stage_key === "string"),
+  );
+}
+
+/**
+ * Agent 步骤 → 展示维度：只按**工具名**归并 Trace 里的工具 span。
+ *
+ * 为什么需要它：Agent 路径没有固定 12 步阶段（run_stages 的 stage_id 是「在查酒店」这类
+ * 中文步骤名），按阶段码求和的四个维度会全是「—」。这里按工具名求和，数字全部来自真实
+ * span（耗时取 attributes.duration_ms），不补 0、不猜。
+ */
+const AGENT_TOOL_BUCKETS: Record<string, string[]> = {
+  transport: ["search_trains", "search_flights"],
+  hotel: ["search_hotels"],
+  discovery: ["search_xiaohongshu", "search_douyin", "web_search"],
+  poi_verify: ["search_poi", "poi_detail", "geocode"],
+};
+
+function toolDurationFromTrace(trace: AdminTraceSpan[], tools: string[]): number | null {
+  let sum = 0;
+  let count = 0;
+  for (const span of trace) {
+    if (span.component !== "tool") continue;
+    const tool = spanTool(span);
+    // 带 Provider 前缀的工具名（tuniu_search_hotels）按后缀匹配，与后端同一套规则。
+    if (!tools.some((name) => tool === name || tool.endsWith(name))) continue;
+    count += 1;
+    sum += spanDurationMs(span) ?? 0;
+  }
+  return count > 0 ? sum : null;
 }
 
 function sumDurations(values: (number | null | undefined)[]): number | null {
@@ -308,14 +349,12 @@ export function buildPerformanceSummary({
   stages,
   trace,
   llmCalls,
-  jevCalls,
   journey,
 }: {
   metrics: AdminRunMetrics;
   stages: AdminStageDetail[];
   trace: AdminTraceSpan[];
   llmCalls: AdminLlmCall[];
-  jevCalls: AdminJevCall[];
   journey: AdminUserJourney | null;
 }): PerformanceSummary {
   const metricRecord = metrics as AdminRecord;
@@ -323,23 +362,35 @@ export function buildPerformanceSummary({
   const gaps: string[] = [];
 
   const stageMap = buildStageDurationMap(stages, trace);
+  // Agent Loop 的 run 没有固定阶段：四个按阶段码求和的维度改按工具名归并（见上面的说明）。
+  const agentRun = isAgentLoopRun(trace);
+  const agentProvenance = "Trace 中对应工具的 span 耗时之和（Agent 路径没有固定阶段）";
 
   // ---- 各阶段耗时：后端摘要优先，其次按阶段推导 ----
   const derived: Record<(typeof METRIC_ORDER)[number], { ms: number | null; provenance: string }> = {
-    transport: { ms: sumStageDurations(stageMap, STAGE_BUCKETS.transport), provenance: "阶段 search_intercity_transport" },
-    hotel: { ms: sumStageDurations(stageMap, STAGE_BUCKETS.hotel), provenance: "阶段 search_hotels" },
-    discovery: {
-      ms: sumStageDurations(stageMap, STAGE_BUCKETS.discovery),
-      provenance: "阶段 社交攻略 + 地点抽取",
-    },
-    poi_verify: { ms: null, provenance: "阶段 verify_poi_and_routes" },
+    transport: agentRun
+      ? { ms: toolDurationFromTrace(trace, AGENT_TOOL_BUCKETS.transport), provenance: agentProvenance }
+      : { ms: sumStageDurations(stageMap, STAGE_BUCKETS.transport), provenance: "阶段 search_intercity_transport" },
+    hotel: agentRun
+      ? { ms: toolDurationFromTrace(trace, AGENT_TOOL_BUCKETS.hotel), provenance: agentProvenance }
+      : { ms: sumStageDurations(stageMap, STAGE_BUCKETS.hotel), provenance: "阶段 search_hotels" },
+    discovery: agentRun
+      ? { ms: toolDurationFromTrace(trace, AGENT_TOOL_BUCKETS.discovery), provenance: agentProvenance }
+      : {
+          ms: sumStageDurations(stageMap, STAGE_BUCKETS.discovery),
+          provenance: "阶段 社交攻略 + 地点抽取",
+        },
+    poi_verify: agentRun
+      ? { ms: toolDurationFromTrace(trace, AGENT_TOOL_BUCKETS.poi_verify), provenance: agentProvenance }
+      : { ms: null, provenance: "阶段 verify_poi_and_routes" },
     route: { ms: null, provenance: "Trace 中 tool=route 的 span（同一工具多次调用会合并成一条）" },
-    planner: {
-      ms: sumStageDurations(stageMap, STAGE_BUCKETS.planner),
-      provenance: "阶段 候选打分 + 生成初始行程",
-    },
+    planner: agentRun
+      ? { ms: null, provenance: "Agent 路径不单独排程：规划在模型调用里（见 llm 维度）" }
+      : {
+          ms: sumStageDurations(stageMap, STAGE_BUCKETS.planner),
+          provenance: "阶段 候选打分 + 生成初始行程",
+        },
     llm: { ms: sumDurations(llmCalls.map((call) => call.duration_ms)), provenance: "累计所有 LLM 调用耗时" },
-    jev: { ms: sumDurations(jevCalls.map((call) => call.latency_ms)), provenance: "累计所有 Jev 决策时延" },
   };
 
   // POI 核验与路线共用同一个阶段：POI 核验取阶段耗时，路线单列 Trace。
@@ -399,6 +450,12 @@ export function buildPerformanceSummary({
   }
   if (!journey) {
     gaps.push("本次运行不是引导式创建，没有 user_journey，因此没有 Discovery 复用 / 补查信息。");
+  }
+  if (agentRun) {
+    gaps.push(
+      "这次 run 由 Agent Loop 出计划，没有固定 12 步阶段：交通 / 酒店 / 攻略 / 地点核验四个维度改按工具 span 归并；"
+        + "「排程与生成」不再是独立阶段（并入模型调用，见 llm 维度）。逐步的耗时与 token 见「轨迹」页的 Agent 步骤流。",
+    );
   }
 
   const prefetchValue = stageCounts.reusedText ?? journeyReusedText ?? (prefetchReused === null ? "—" : formatNumber(prefetchReused));
@@ -520,18 +577,16 @@ export function RunPerformanceSummary({
   stages,
   trace,
   llmCalls,
-  jevCalls,
   journey,
 }: {
   metrics: AdminRunMetrics;
   stages: AdminStageDetail[];
   trace: AdminTraceSpan[];
   llmCalls: AdminLlmCall[];
-  jevCalls: AdminJevCall[];
   journey: AdminUserJourney | null;
 }) {
   const [open, setOpen] = useState(false);
-  const summary = buildPerformanceSummary({ metrics, stages, trace, llmCalls, jevCalls, journey });
+  const summary = buildPerformanceSummary({ metrics, stages, trace, llmCalls, journey });
   const total = summary.totalMs && summary.totalMs > 0 ? summary.totalMs : null;
 
   return (
@@ -604,7 +659,7 @@ export function RunPerformanceSummary({
         <section className="flex flex-col gap-2">
           <h3 className="text-xs font-medium text-foreground">阶段耗时</h3>
           <p className="text-[11px] leading-4 text-muted-foreground">
-            LLM / Jev / 路线发生在所属阶段内部，与阶段耗时有重叠，占比合计可能超过 100%。
+            LLM / 路线发生在所属阶段内部，与阶段耗时有重叠，占比合计可能超过 100%。
           </p>
           <dl className="grid grid-cols-1 gap-x-5 gap-y-2 sm:grid-cols-2">
             {summary.metrics.map((metric) => (

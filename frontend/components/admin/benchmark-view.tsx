@@ -22,7 +22,7 @@ import {
   PartialBanner,
   ResourceView,
 } from "@/components/admin/admin-states";
-import { BooleanBadge, StatusBadge } from "@/components/admin/status-badge";
+import { StatusBadge } from "@/components/admin/status-badge";
 import { formatDurationMs, formatNumber } from "@/components/admin/format";
 import { useAdminResource } from "@/components/admin/use-admin-resource";
 import {
@@ -39,7 +39,6 @@ const SUITE_LABELS: Record<string, string> = {
   hard: "困难用例",
   badcase_regression: "Bad Case 回归",
   provider_failure: "Provider 故障",
-  jev_decision: "Jev 决策",
   live_smoke: "线上冒烟",
 };
 
@@ -104,13 +103,6 @@ export function BenchmarkView() {
         <span className="text-xs text-muted-foreground">
           {run.suite ? SUITE_LABELS[run.suite] ?? run.suite : "全部"}
         </span>
-      ),
-    },
-    {
-      key: "jev",
-      header: "Jev",
-      cell: (run) => (
-        <BooleanBadge value={run.jev_enabled} onLabel="ON" offLabel="OFF" onTone="info" />
       ),
     },
     {
@@ -184,7 +176,7 @@ export function BenchmarkView() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Benchmark"
-        description="在固定用例集上跑回归：六个维度分别看硬性约束、行程质量、证据、Provider、性能与 Jev 决策。"
+        description="在固定用例集上跑回归：五个维度分别看硬性约束、行程质量、证据、Provider 与性能。"
         badge={<FlaskConical className="size-4 text-muted-foreground" aria-hidden />}
         actions={
           <div className="flex items-center gap-1.5">
@@ -253,7 +245,6 @@ function LaunchDialog({
   onLaunched: (benchmarkRunId: string) => void;
 }) {
   const [suites, setSuites] = useState<string[]>([]);
-  const [jevEnabled, setJevEnabled] = useState(true);
   const [live, setLive] = useState(false);
   const [limit, setLimit] = useState("20");
   const [pending, setPending] = useState(false);
@@ -267,7 +258,6 @@ function LaunchDialog({
       const parsedLimit = Number.parseInt(limit, 10);
       const result = await launchAdminBenchmark({
         suites: suites.length > 0 ? suites : undefined,
-        jev_enabled: jevEnabled,
         live,
         limit: Number.isFinite(parsedLimit) && parsedLimit > 0 ? parsedLimit : undefined,
       });
@@ -319,15 +309,6 @@ function LaunchDialog({
           </div>
 
           <div className="flex flex-col gap-2">
-            <label className="flex items-center gap-2 text-xs text-foreground">
-              <input
-                type="checkbox"
-                className="size-4 accent-primary"
-                checked={jevEnabled}
-                onChange={(event) => setJevEnabled(event.target.checked)}
-              />
-              <span>启用 Jev（可与历史 OFF 结果对比）</span>
-            </label>
             <label className="flex items-center gap-2 text-xs text-foreground">
               <input
                 type="checkbox"
