@@ -86,6 +86,45 @@ export function JsonBlock({
   );
 }
 
+/**
+ * 预览块：模型交互正文（Prompt / 上下文 / 返回）的统一展示形状。
+ *
+ * 三条约定，都是为了「默认只给摘要、点击后才展开」这条产品要求：
+ * 1) 正文只在这个块内部渲染（调用方负责把块放进折叠区或弹窗里），
+ *    并且**不写进 title / aria-label** —— 一个 hover 就能绕过折叠，
+ *    脱敏后的 Prompt 也会被顺手看见；
+ * 2) 正文限高可滚动，不让一段长 Prompt 把整页撑开；
+ * 3) value 为空时不渲染空框，而是写明缺口口径，避免把「后端没返回」
+ *    读成「模型确实什么都没收到」。
+ */
+export function PreviewBlock({
+  label,
+  value,
+  missing = "—（后端未返回这段正文）",
+  maxHeight = "20rem",
+}: {
+  label: string;
+  value: string | null | undefined;
+  missing?: string;
+  maxHeight?: string;
+}) {
+  return (
+    <section className="flex flex-col gap-2">
+      <h3 className="text-xs font-medium text-foreground">{label}</h3>
+      {value ? (
+        <pre
+          className="max-w-full overflow-auto rounded-md border border-border bg-muted/40 p-2 font-mono text-[11px] leading-4 break-all whitespace-pre-wrap text-foreground"
+          style={{ maxHeight }}
+        >
+          {value}
+        </pre>
+      ) : (
+        <p className="text-[11px] leading-5 text-muted-foreground">{missing}</p>
+      )}
+    </section>
+  );
+}
+
 function stringify(value: unknown): string {
   try {
     return JSON.stringify(value, null, 2);

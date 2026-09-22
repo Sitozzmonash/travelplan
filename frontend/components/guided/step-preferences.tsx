@@ -7,7 +7,7 @@ import { StepPace } from "./step-pace";
 import { StepTransport } from "./step-transport";
 
 /**
- * 第 3 步「偏好」：交通 + 酒店 + 节奏合成一页。
+ * 第 2 步「偏好」：交通 + 酒店 + 节奏合成一页。
  *
  * 这三块原本各占一页，但每页其实只问一两件事，用户要点三次「继续」才到开始，
  * 体感很磨。它们都是"选个偏好"而不是"填信息"，且彼此独立 —— 合成一页既不增加
@@ -15,6 +15,9 @@ import { StepTransport } from "./step-transport";
  *
  * 一页里每一项都仍然可以「随便 / 帮我选 / 不确定」，直接点「开始规划」即可：
  * 没表态的项不会写进 PATCH，交给后端的稳定默认策略。
+ *
+ * 三块之间用分隔线分组，因此内外统一用 gap-5：同组内的题目间距与跨组的分隔线两侧
+ * 留白一致，整页的呼吸节奏只有一种，不再出现某块偏松、某块偏紧。
  */
 
 interface StepPreferencesProps {
@@ -22,30 +25,14 @@ interface StepPreferencesProps {
   onTransport: (patch: Partial<GuidedDraft["transport"]>) => void;
   onHotel: (patch: Partial<GuidedDraft["hotel"]>) => void;
   onPace: (pace: Pace) => void;
-  /** 后端能力声明：false 时「最低星级」置灰（数据源不返回星级）。 */
-  hotelStarFilterAvailable?: boolean;
-  /** 后端能力声明：false 时「接受换酒店」置灰（当前全程只订一家）。 */
-  hotelAllowChangeAvailable?: boolean;
 }
 
-export function StepPreferences({
-  draft,
-  onTransport,
-  onHotel,
-  onPace,
-  hotelStarFilterAvailable,
-  hotelAllowChangeAvailable,
-}: StepPreferencesProps) {
+export function StepPreferences({ draft, onTransport, onHotel, onPace }: StepPreferencesProps) {
   return (
-    <div className="grid gap-7">
+    <div className="grid gap-5">
       <StepTransport draft={draft} onChange={onTransport} />
       <Divider label="住哪一类" />
-      <StepHotel
-        draft={draft}
-        onChange={onHotel}
-        hotelStarFilterAvailable={hotelStarFilterAvailable}
-        hotelAllowChangeAvailable={hotelAllowChangeAvailable}
-      />
+      <StepHotel draft={draft} onChange={onHotel} />
       <Divider label="每天怎么玩" />
       <StepPace pace={draft.pace} onChange={onPace} />
     </div>

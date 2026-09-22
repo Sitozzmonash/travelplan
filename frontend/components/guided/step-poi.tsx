@@ -27,7 +27,6 @@ interface StepPoiProps {
   session: SessionView | null;
   settled: boolean;
   unusable: boolean;
-  resetNotice: boolean;
   pollStalled: boolean;
   selections: Record<string, PoiSelection>;
   expanded: string[];
@@ -42,7 +41,6 @@ export function StepPoi({
   session,
   settled,
   unusable,
-  resetNotice,
   pollStalled,
   selections,
   expanded,
@@ -105,13 +103,6 @@ export function StepPoi({
           {bulk === "best" ? "（当前为「只安排最值得去的」）" : ""}
         </p>
       </div>
-
-      {resetNotice ? (
-        <InlineWarning
-          title="出发信息变了，攻略地点已重新整理。"
-          description="新的目的地不会沿用上一座城市的地点，这里只会显示这次检索到的内容。"
-        />
-      ) : null}
 
       {pollStalled ? (
         <div className="grid gap-2">

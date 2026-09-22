@@ -262,6 +262,10 @@ export interface AdminLlmCall {
   chars?: number | null;
   error?: string | null;
   started_at?: string | null;
+  /** 逐次调用的 token 用量（后端把 `usage` 带进审计记录后才会有）；缺失时 UI 写「后端未返回 usage」。 */
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cached_tokens?: number | null;
 }
 
 /** 阶段详情里的模型调用摘要。 */
@@ -272,6 +276,10 @@ export interface AdminStageLlmCall {
   duration_ms?: number | null;
   chars?: number | null;
   error?: string | null;
+  /** 同 AdminLlmCall：逐次调用的 token 用量，后端未返回时为 null。 */
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cached_tokens?: number | null;
 }
 
 /** 阶段详情里的工具 / 数据源调用摘要。 */
@@ -1420,6 +1428,28 @@ export interface AdminTraceEvent {
   /** 口径说明（例如「模型输入正文未持久化」），展开详情时展示。 */
   notes: string[];
   badcases: AdminTraceBadcaseBrief[];
+
+  // ---- 模型交互预览（后端 A13：**已脱敏 + 已截断**，前端只负责不做二次泄露）----
+  // 为什么单独一组而不是复用 input_preview / output_preview：一次 ASSISTANT 调用是
+  // 「模型收到了什么（system + user + context）→ 模型返回了什么（assistant）」两件事，
+  // 现有 input/output_preview 回答不了「Dynamic Preference 有没有进 prompt」
+  // 「Tool Result 有没有进下一轮上下文」这两个坏 Case 排查里最常问的问题。
+  // 全部可选：后端契约分批落地，缺字段时前端写「—」并说明「后端未返回」，绝不前端假造正文。
+  /** 脱敏截断后的系统提示预览（SYSTEM 事件与 ASSISTANT 调用上都有意义）。 */
+  system_preview?: string | null;
+  /** 脱敏截断后的用户输入预览（USER 事件与 ASSISTANT 调用）。 */
+  user_preview?: string | null;
+  /** 脱敏截断后注入的上下文预览（CONTEXT 事件与 ASSISTANT 调用）；动态偏好是否传给模型看这里。 */
+  context_preview?: string | null;
+  /** 脱敏截断后的模型返回预览（ASSISTANT 事件）。 */
+  assistant_preview?: string | null;
+  /** Prompt 模板版本 / 内容哈希：用来回答「Prompt 给错了吗」。 */
+  prompt_version?: string | null;
+  prompt_hash?: string | null;
+  /** 这一次调用自己的 token 用量（后端 A12 把 `usage` 带进审计记录后才有）。 */
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cached_tokens?: number | null;
 }
 
 export interface AdminTimelineTrackBlock {

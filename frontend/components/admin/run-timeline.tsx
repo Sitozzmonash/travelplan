@@ -2,14 +2,13 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import { AlertTriangle, RefreshCw, Search, Timer } from "lucide-react";
+import { AlertTriangle, MessagesSquare, RefreshCw, Search, Timer, Workflow } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { ResourceView, SectionEmpty } from "@/components/admin/admin-states";
-import { CollapsibleSection } from "@/components/admin/collapsible-section";
-import { JsonBlock, KeyValueList } from "@/components/admin/detail-dialog";
+import { JsonBlock, KeyValueList, PreviewBlock } from "@/components/admin/detail-dialog";
 import { FILTER_ALL, FilterSelect, type FilterOption } from "@/components/admin/filter-select";
 import {
   badcaseCategoryLabel,
@@ -36,13 +35,19 @@ import type {
 /**
  * Agent Execution Timeline（docs §12–19）。
  *
- * 三个刻意的取舍：
+ * 四个刻意的取舍：
  * 1) 顶部轨道只画「有时间戳」的节点；没有起点的节点不静默丢掉，而是在轨道下方如实列出，
  *    否则读者会以为这次 run 根本没调过那个工具。
  * 2) 事件默认只给类型 / 标题 / 摘要 / 状态 / 耗时（§17），Input / Output / metadata 折叠在详情里。
  * 3) 事件级 token 与成本通常是 null（Provider 不按调用回报用量），这里不显示裸「—」，
  *    而是明确写「按整次 run 统计」，避免把「没有逐条口径」读成「没有消耗」。
+ * 4) 同一份事实给两个视图（feedback §3）：Workflow View 按阶段组织（回答「哪一步慢 / 哪一步错」），
+ *    Conversation View 按真实执行顺序串成对话（回答「模型收到了什么 / 返回了什么」）。
+ *    两个视图共用同一次取数、同一套筛选与同一段详情渲染，切视图不重新请求、不重算。
  */
+
+/** 轨迹视图（feedback §3）。 */
+export type TraceViewMode = "workflow" | "conversation";
 
 /** 「未归属阶段」的筛选取值：真实 stage_id 不会等于它。 */
 const STAGE_NONE = "__none__";
@@ -93,6 +98,46 @@ const FALLBACK_TYPE_OPTIONS: { key: string; label: string }[] = [
   { key: "ERROR", label: "错误" },
 ];
 
+/** 两个视图的说明文案：切换器上要一眼看出「这个视图回答什么问题」。 */
+const TRACE_VIEWS: { key: TraceViewMode; label: string; description: string }[] = [
+  {
+    key: "workflow",
+    label: "Workflow View",
+    description:
+      "按 workflow 阶段看执行过程：轨道概览 + 阶段内事件。回答「这次 run 走到哪一步、哪一步慢、哪一步错」。",
+  },
+  {
+    key: "conversation",
+    label: "Conversation View",
+    description:
+      "按真实执行顺序串成一条对话：System → User → Context → Assistant → Tool（含 Tool Result）→ Assistant。回答「模型实际收到了什么、实际返回了什么」。",
+  },
+];
+
+/**
+ * 对话视图的角色标签。
+ *
+ * 这里刻意用英文角色名（System / User / …）而不是中文：它对应的是模型 API 里的 role，
+ * 排查 Prompt / Context 问题时跟日志、跟后端字段名对得上号，比「助手」更省一次翻译。
+ */
+const CONVERSATION_ROLES: Record<string, { label: string; tone: AdminTone; hint: string }> = {
+  SYSTEM: { label: "System", tone: "muted", hint: "系统提示 / 运行配置" },
+  USER: { label: "User", tone: "info", hint: "用户请求" },
+  CONTEXT: { label: "Context", tone: "muted", hint: "注入到模型上下文的内容" },
+  ASSISTANT: { label: "Assistant", tone: "info", hint: "模型调用：收到什么 → 返回什么" },
+  TOOL: { label: "Tool", tone: "success", hint: "工具调用与工具返回（Tool Result）" },
+  PROVIDER: { label: "Provider", tone: "warning", hint: "外部数据源调用" },
+  VALIDATION: { label: "Validation", tone: "warning", hint: "硬校验与告警" },
+  ERROR: { label: "Error", tone: "danger", hint: "错误" },
+};
+
+const MISSING_PREVIEW_HINT =
+  "后端尚未落库脱敏预览（feedback §3 的 system / user / context / assistant preview 字段）；" +
+  "在它到位之前，这几段只能按上面的缺口口径留空，管理台不会拿别的内容顶替。";
+
+/** 工具返回（对话里的 Tool Result）：TOOL 事件的 output_preview 就是它。 */
+const TOOL_RESULT_LABEL = "工具返回（Tool Result）";
+
 export interface RunTimelineProps {
   runId: string;
   /** 打开时预置的阶段筛选（stage_id）。 */
@@ -105,6 +150,12 @@ export interface RunTimelineProps {
   onSelectStage?: (stage: string | null) => void;
   /** 跳到性能页（事件级），用于回答「这次调用慢在哪」。 */
   onOpenPerformance?: (eventId: string) => void;
+  /**
+   * 当前轨迹视图（受控）。不传时组件内部自己管，方便单独引用；
+   * 运行详情页把状态放在自己这一层，是为了像 TimelineFocus 一样支持深链（`?view=conversation`）。
+   */
+  view?: TraceViewMode;
+  onViewChange?: (view: TraceViewMode) => void;
   className?: string;
 }
 
@@ -115,6 +166,8 @@ export function RunTimeline({
   focusToken,
   onSelectStage,
   onOpenPerformance,
+  view,
+  onViewChange,
   className,
 }: RunTimelineProps) {
   const resource = useAdminResource<AdminTimeline>(
@@ -147,9 +200,59 @@ export function RunTimeline({
             focusToken={focusToken}
             onSelectStage={onSelectStage}
             onOpenPerformance={onOpenPerformance}
+            view={view}
+            onViewChange={onViewChange}
           />
         )}
       </ResourceView>
+    </div>
+  );
+}
+
+/* ------------------------------ 视图切换 ------------------------------ */
+
+/**
+ * Workflow / Conversation 切换器。
+ *
+ * 为什么把说明文案跟切换器放在一起：两个视图的差别不是排版而是「回答哪个问题」，
+ * 不放说明的话运营只会记住默认那个视图。
+ */
+function TraceViewSwitch({
+  value,
+  onChange,
+}: {
+  value: TraceViewMode;
+  onChange: (view: TraceViewMode) => void;
+}) {
+  const active = TRACE_VIEWS.find((item) => item.key === value) ?? TRACE_VIEWS[0];
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl bg-card p-3 ring-1 ring-foreground/10">
+      <div role="tablist" aria-label="轨迹视图" className="flex items-center gap-1 rounded-lg bg-muted p-[3px]">
+        {TRACE_VIEWS.map((item) => {
+          const selected = item.key === value;
+          return (
+            <button
+              key={item.key}
+              type="button"
+              role="tab"
+              aria-selected={selected}
+              onClick={() => onChange(item.key)}
+              className={cn(
+                "inline-flex h-7 items-center gap-1.5 rounded-md border border-transparent px-2.5 text-xs font-medium whitespace-nowrap transition-all focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none",
+                selected ? "bg-background text-foreground shadow-sm" : "text-foreground/60 hover:text-foreground",
+              )}
+            >
+              {item.key === "workflow" ? (
+                <Workflow className="size-3.5" aria-hidden />
+              ) : (
+                <MessagesSquare className="size-3.5" aria-hidden />
+              )}
+              {item.label}
+            </button>
+          );
+        })}
+      </div>
+      <p className="min-w-[15rem] flex-1 text-[11px] leading-5 text-muted-foreground">{active.description}</p>
     </div>
   );
 }
@@ -164,6 +267,8 @@ function TimelineBody({
   focusToken,
   onSelectStage,
   onOpenPerformance,
+  view,
+  onViewChange,
 }: {
   timeline: AdminTimeline;
   onReload: () => void;
@@ -172,12 +277,21 @@ function TimelineBody({
   focusToken?: number;
   onSelectStage?: (stage: string | null) => void;
   onOpenPerformance?: (eventId: string) => void;
+  view?: TraceViewMode;
+  onViewChange?: (view: TraceViewMode) => void;
 }) {
   const [typeFilter, setTypeFilter] = useState<string>(FILTER_ALL);
   const [stageFilter, setStageFilter] = useState<string>(initialStage ?? FILTER_ALL);
   const [statusFilter, setStatusFilter] = useState<string>(FILTER_ALL);
   const [query, setQuery] = useState<string>(initialQuery ?? "");
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
+  // 视图默认 Workflow：多数人是上来定位「哪一步出问题」，Conversation 是顺着问到底时才切。
+  const [internalView, setInternalView] = useState<TraceViewMode>("workflow");
+  const viewMode = view ?? internalView;
+  const changeView = (next: TraceViewMode) => {
+    setInternalView(next);
+    onViewChange?.(next);
+  };
   // 待滚动目标存 ref 而不是 state：滚动是「渲染完成后同步 DOM」，不需要再触发一次渲染。
   const pendingScrollRef = useRef<string | null>(null);
 
@@ -289,8 +403,87 @@ function TimelineBody({
 
   const filtered = visible.length !== timeline.events.length;
 
+  // 筛选条两个视图共用：Provider / Validation 事件筛选、关键词定位、阶段定位在对话视图里同样有用
+  // （例如「只看 ASSISTANT + 某阶段」就是把一次模型交互从别的噪音里拎出来的最快方式）。
+  const filterBar = (
+    <div className="flex flex-wrap items-end gap-2 rounded-xl bg-card p-3 ring-1 ring-foreground/10">
+      <FilterSelect
+        label="事件类型"
+        value={typeFilter}
+        onChange={setTypeFilter}
+        className="w-36"
+        options={[
+          { value: FILTER_ALL, label: "全部类型" },
+          ...typeOptions.map((option) => ({
+            value: option.key,
+            label: `${option.label}（${formatNumber(readCount(timeline.summary.by_type, option.key) ?? 0)}）`,
+          })),
+        ]}
+      />
+      <FilterSelect
+        label="Workflow 阶段"
+        value={stageFilter}
+        onChange={setStageFilter}
+        className="w-44"
+        options={[
+          { value: FILTER_ALL, label: "全部阶段" },
+          ...stageRows.map((stage) => ({ value: stage.id, label: stage.title })),
+          { value: STAGE_NONE, label: "未归属阶段" },
+        ]}
+      />
+      <FilterSelect
+        label="状态"
+        value={statusFilter}
+        onChange={setStatusFilter}
+        className="w-32"
+        options={statusOptions}
+      />
+      <div className="flex min-w-[12rem] flex-1 flex-col gap-1">
+        <span className="text-[11px] text-muted-foreground">关键词</span>
+        <div className="relative">
+          <Search
+            className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground"
+            aria-hidden
+          />
+          <Input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="标题 / 摘要 / 工具 / Provider / 阶段 / 预览正文"
+            className="h-8 pl-7"
+            aria-label="按关键词过滤事件"
+          />
+        </div>
+      </div>
+      <div className="flex items-center gap-2">
+        <span className="tabular text-[11px] text-muted-foreground">
+          {formatNumber(visible.length)} / {formatNumber(timeline.events.length)} 条
+        </span>
+        {filtered ? (
+          <Button
+            variant="outline"
+            size="xs"
+            onClick={() => {
+              setTypeFilter(FILTER_ALL);
+              setStageFilter(FILTER_ALL);
+              setStatusFilter(FILTER_ALL);
+              setQuery("");
+            }}
+          >
+            清空筛选
+          </Button>
+        ) : null}
+        <Button variant="outline" size="xs" onClick={onReload}>
+          <RefreshCw />
+          刷新轨迹
+        </Button>
+      </div>
+    </div>
+  );
+
   return (
     <div className="flex flex-col gap-4">
+      <TraceViewSwitch value={viewMode} onChange={changeView} />
+
       <Card>
         <CardHeader>
           <CardTitle className="flex flex-wrap items-center gap-2">
@@ -340,157 +533,41 @@ function TimelineBody({
         </CardContent>
       </Card>
 
-      <TrackOverview timeline={timeline} onPickBlock={pickBlock} />
+      {viewMode === "workflow" ? (
+        <>
+          <TrackOverview timeline={timeline} onPickBlock={pickBlock} />
 
-      <div className="flex flex-wrap items-end gap-2 rounded-xl bg-card p-3 ring-1 ring-foreground/10">
-        <FilterSelect
-          label="事件类型"
-          value={typeFilter}
-          onChange={setTypeFilter}
-          className="w-36"
-          options={[
-            { value: FILTER_ALL, label: "全部类型" },
-            ...typeOptions.map((option) => ({
-              value: option.key,
-              label: `${option.label}（${formatNumber(readCount(timeline.summary.by_type, option.key) ?? 0)}）`,
-            })),
-          ]}
-        />
-        <FilterSelect
-          label="Workflow 阶段"
-          value={stageFilter}
-          onChange={setStageFilter}
-          className="w-44"
-          options={[
-            { value: FILTER_ALL, label: "全部阶段" },
-            ...stageRows.map((stage) => ({ value: stage.id, label: stage.title })),
-            { value: STAGE_NONE, label: "未归属阶段" },
-          ]}
-        />
-        <FilterSelect
-          label="状态"
-          value={statusFilter}
-          onChange={setStatusFilter}
-          className="w-32"
-          options={statusOptions}
-        />
-        <div className="flex min-w-[12rem] flex-1 flex-col gap-1">
-          <span className="text-[11px] text-muted-foreground">关键词</span>
-          <div className="relative">
-            <Search
-              className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground"
-              aria-hidden
-            />
-            <Input
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="标题 / 摘要 / 工具 / Provider / 阶段 / 预览"
-              className="h-8 pl-7"
-              aria-label="按关键词过滤事件"
-            />
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <span className="tabular text-[11px] text-muted-foreground">
-            {formatNumber(visible.length)} / {formatNumber(timeline.events.length)} 条
-          </span>
-          {filtered ? (
-            <Button
-              variant="outline"
-              size="xs"
-              onClick={() => {
-                setTypeFilter(FILTER_ALL);
-                setStageFilter(FILTER_ALL);
-                setStatusFilter(FILTER_ALL);
-                setQuery("");
-              }}
-            >
-              清空筛选
-            </Button>
-          ) : null}
-          <Button variant="outline" size="xs" onClick={onReload}>
-            <RefreshCw />
-            刷新轨迹
-          </Button>
-        </div>
-      </div>
+          {filterBar}
 
-      <Card>
-        <CardHeader>
-          <CardTitle>详细事件时间线</CardTitle>
-          <CardDescription>
-            左侧竖线是 workflow 阶段的分组；默认只给类型 / 标题 / 摘要 / 状态 / 耗时，展开详情才看 Input、Output 与 metadata。
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          {visible.length === 0 ? (
-            <SectionEmpty
-              title="当前筛选下没有事件"
-              description="这次运行里没有同时满足「类型 + 阶段 + 状态 + 关键词」的事件。清空筛选可以看到全部事件。"
-            />
-          ) : (
-            <ol className="flex flex-col gap-5">
-              {groups.map((group) => {
-                const stage = stageTitles.get(group.key);
-                const title = stage
-                  ? stage.title
-                  : group.key === STAGE_PROLOGUE
-                    ? "运行前置"
-                    : group.key === STAGE_NONE
-                      ? "未归属阶段"
-                      : group.key;
-                return (
-                  <li key={group.key} className="relative pl-5 sm:pl-7">
-                    <span className="absolute top-2 left-[3px] h-[calc(100%-0.75rem)] w-px bg-border" aria-hidden />
-                    <span className="absolute top-1.5 left-0 size-[7px] rounded-full bg-border" aria-hidden />
-                    <div className="flex flex-wrap items-center gap-2">
-                      {stage ? (
-                        <Badge variant="secondary" className="tabular text-[0.6875rem]">
-                          #{stage.ordinal}
-                        </Badge>
-                      ) : null}
-                      <span className="text-xs font-medium text-foreground">{title}</span>
-                      {stage ? (
-                        <span className="font-mono text-[10px] text-muted-foreground">{group.key}</span>
-                      ) : (
-                        <span className="text-[11px] text-muted-foreground">
-                          {group.key === STAGE_PROLOGUE
-                            ? "系统 / 用户 / 上下文：发生在第一个阶段之前"
-                            : "挂不上 workflow 阶段"}
-                        </span>
-                      )}
-                      <StatusBadge status={stage?.status ?? null} />
-                      <span className="tabular ml-auto text-[11px] text-muted-foreground">
-                        {formatNumber(group.events.length)} 条
-                      </span>
-                      {stage && onSelectStage ? (
-                        <Button variant="ghost" size="xs" onClick={() => onSelectStage(group.key)}>
-                          看该阶段性能
-                        </Button>
-                      ) : null}
-                    </div>
+          <WorkflowEventCard
+            groups={groups}
+            stageTitles={stageTitles}
+            runTotalTokens={runTotalTokens}
+            selectedEventId={selectedEventId}
+            onSelectEvent={(eventId) =>
+              setSelectedEventId((current) => (current === eventId ? null : eventId))
+            }
+            onSelectStage={onSelectStage}
+            onOpenPerformance={onOpenPerformance}
+            visibleCount={visible.length}
+          />
+        </>
+      ) : (
+        <>
+          {filterBar}
 
-                    <ol className="mt-2 flex flex-col gap-2">
-                      {group.events.map((event) => (
-                        <TimelineEventRow
-                          key={event.event_id}
-                          event={event}
-                          runTotalTokens={runTotalTokens}
-                          selected={selectedEventId === event.event_id}
-                          onSelect={() =>
-                            setSelectedEventId((current) => (current === event.event_id ? null : event.event_id))
-                          }
-                          onOpenPerformance={onOpenPerformance}
-                        />
-                      ))}
-                    </ol>
-                  </li>
-                );
-              })}
-            </ol>
-          )}
-        </CardContent>
-      </Card>
+          <ConversationTimeline
+            events={visible}
+            stageTitles={stageTitles}
+            runTotalTokens={runTotalTokens}
+            selectedEventId={selectedEventId}
+            onSelectEvent={(eventId) =>
+              setSelectedEventId((current) => (current === eventId ? null : eventId))
+            }
+            onOpenPerformance={onOpenPerformance}
+          />
+        </>
+      )}
 
       <div className="grid gap-3 lg:grid-cols-2">
         <BadcaseSummary badcases={timeline.badcases} />
@@ -652,6 +729,113 @@ function TrackRow({
   );
 }
 
+/* ------------------------------ Workflow View ------------------------------ */
+
+/**
+ * Workflow View 的事件列表：按 workflow 阶段分组。
+ *
+ * 分组顺序 = 运行前置（系统 / 用户 / 上下文）→ workflow 阶段（stage.ordinal）→
+ * 未登记阶段（按首次出现）→ 挂不上阶段的其余事件 —— 顺序在 TimelineBody 里算好，
+ * 这里只负责渲染，保证「切视图不改动取数与排序」。
+ */
+function WorkflowEventCard({
+  groups,
+  stageTitles,
+  runTotalTokens,
+  selectedEventId,
+  onSelectEvent,
+  onSelectStage,
+  onOpenPerformance,
+  visibleCount,
+}: {
+  groups: { key: string; events: AdminTraceEvent[] }[];
+  stageTitles: Map<string, { title: string; status: string | null; ordinal: number }>;
+  runTotalTokens: number | null;
+  selectedEventId: string | null;
+  onSelectEvent: (eventId: string) => void;
+  onSelectStage?: (stage: string | null) => void;
+  onOpenPerformance?: (eventId: string) => void;
+  visibleCount: number;
+}) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>详细事件时间线</CardTitle>
+        <CardDescription>
+          左侧竖线是 workflow 阶段的分组；默认只给类型 / 标题 / 摘要 / 状态 / 耗时，展开详情才看模型收到
+          / 返回的预览、Input / Output 与 metadata。
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {visibleCount === 0 ? (
+          <SectionEmpty
+            title="当前筛选下没有事件"
+            description="这次运行里没有同时满足「类型 + 阶段 + 状态 + 关键词」的事件。清空筛选可以看到全部事件。"
+          />
+        ) : (
+          <ol className="flex flex-col gap-5">
+            {groups.map((group) => {
+              const stage = stageTitles.get(group.key);
+              const title = stage
+                ? stage.title
+                : group.key === STAGE_PROLOGUE
+                  ? "运行前置"
+                  : group.key === STAGE_NONE
+                    ? "未归属阶段"
+                    : group.key;
+              return (
+                <li key={group.key} className="relative pl-5 sm:pl-7">
+                  <span className="absolute top-2 left-[3px] h-[calc(100%-0.75rem)] w-px bg-border" aria-hidden />
+                  <span className="absolute top-1.5 left-0 size-[7px] rounded-full bg-border" aria-hidden />
+                  <div className="flex flex-wrap items-center gap-2">
+                    {stage ? (
+                      <Badge variant="secondary" className="tabular text-[0.6875rem]">
+                        #{stage.ordinal}
+                      </Badge>
+                    ) : null}
+                    <span className="text-xs font-medium text-foreground">{title}</span>
+                    {stage ? (
+                      <span className="font-mono text-[10px] text-muted-foreground">{group.key}</span>
+                    ) : (
+                      <span className="text-[11px] text-muted-foreground">
+                        {group.key === STAGE_PROLOGUE
+                          ? "系统 / 用户 / 上下文：发生在第一个阶段之前"
+                          : "挂不上 workflow 阶段"}
+                      </span>
+                    )}
+                    <StatusBadge status={stage?.status ?? null} />
+                    <span className="tabular ml-auto text-[11px] text-muted-foreground">
+                      {formatNumber(group.events.length)} 条
+                    </span>
+                    {stage && onSelectStage ? (
+                      <Button variant="ghost" size="xs" onClick={() => onSelectStage(group.key)}>
+                        看该阶段性能
+                      </Button>
+                    ) : null}
+                  </div>
+
+                  <ol className="mt-2 flex flex-col gap-2">
+                    {group.events.map((event) => (
+                      <TimelineEventRow
+                        key={event.event_id}
+                        event={event}
+                        runTotalTokens={runTotalTokens}
+                        selected={selectedEventId === event.event_id}
+                        onSelect={() => onSelectEvent(event.event_id)}
+                        onOpenPerformance={onOpenPerformance}
+                      />
+                    ))}
+                  </ol>
+                </li>
+              );
+            })}
+          </ol>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 /* ------------------------------ 事件行 ------------------------------ */
 
 function TimelineEventRow({
@@ -668,7 +852,8 @@ function TimelineEventRow({
   onOpenPerformance?: (eventId: string) => void;
 }) {
   const tone = EVENT_TONES[event.event_type] ?? "muted";
-  const hasTokenFacts = event.tokens_in !== null || event.tokens_out !== null || event.cost !== null;
+  const tokens = readEventTokenFacts(event);
+  const hasTokenFacts = tokens.length > 0 || event.cost !== null;
 
   return (
     <li
@@ -717,17 +902,16 @@ function TimelineEventRow({
           {event.round_index !== null ? <span>阶段序 #{event.round_index + 1}</span> : null}
           {hasTokenFacts ? (
             <>
-              {event.tokens_in !== null || event.tokens_out !== null ? (
-                <span className="tabular">
-                  Token {formatNumber(event.tokens_in)} → {formatNumber(event.tokens_out)}
-                </span>
-              ) : null}
+              {tokens.length > 0 ? <span className="tabular">Token {tokens.join(" / ")}</span> : null}
               {event.cost !== null ? <span className="tabular">成本 {formatCostWithCurrency(event.cost, null)}</span> : null}
             </>
           ) : runTotalTokens !== null ? (
             <span>token 与成本按整次 run 统计</span>
           ) : null}
-          <span>展开详情看 Input / Output / metadata</span>
+          <span>
+            点击展开模型收到 / 返回的预览
+            {event.notes.length > 0 ? ` · ${event.notes.length} 条口径` : ""}
+          </span>
         </span>
       </button>
 
@@ -755,130 +939,474 @@ function TimelineEventRow({
         </div>
       ) : null}
 
-      <CollapsibleSection
-        title="展开详情"
-        description="Input / Output 预览、metadata 与口径说明"
-        count={event.notes.length > 0 ? `${event.notes.length} 条口径` : undefined}
-        className="rounded-none bg-transparent ring-0"
-      >
-        <div className="flex flex-col gap-3">
-          <KeyValueList
-            entries={[
-              { key: "event_id", label: "事件 ID", value: <span className="font-mono text-[11px]">{event.event_id}</span> },
-              {
-                key: "type",
-                label: "类型",
-                value: (
-                  <span>
-                    {event.event_type_label || event.event_type}
-                    <span className="ml-1 font-mono text-[10px] text-muted-foreground">{event.event_type}</span>
-                  </span>
-                ),
-              },
-              {
-                key: "stage",
-                label: "阶段",
-                value: event.stage ? <span className="font-mono">{event.stage}</span> : "未归属阶段",
-              },
-              {
-                key: "round",
-                label: "阶段序号",
-                value: event.round_index === null ? "—" : `第 ${event.round_index + 1} 个阶段`,
-              },
-              { key: "status", label: "状态", value: <StatusBadge status={event.status} /> },
-              { key: "started", label: "开始", value: <span className="font-mono">{formatDateTime(event.started_at)}</span> },
-              { key: "finished", label: "结束", value: <span className="font-mono">{formatDateTime(event.finished_at)}</span> },
-              { key: "duration", label: "耗时", value: formatDurationMs(event.duration_ms) },
-              { key: "model", label: "模型", value: <span className="font-mono">{event.model ?? "—"}</span> },
-              { key: "provider", label: "Provider", value: <span className="font-mono">{event.provider ?? "—"}</span> },
-              { key: "tool", label: "工具", value: <span className="font-mono">{event.tool ?? "—"}</span> },
-              {
-                key: "tokens_in",
-                label: "输入 Token",
-                value: eventTokenText(event.tokens_in, runTotalTokens),
-              },
-              {
-                key: "tokens_out",
-                label: "输出 Token",
-                value: eventTokenText(event.tokens_out, runTotalTokens),
-              },
-              {
-                key: "cost",
-                label: "成本",
-                value:
-                  event.cost !== null
-                    ? formatCostWithCurrency(event.cost, null)
-                    : runTotalTokens !== null
-                      ? "按整次 run 统计"
-                      : "—",
-              },
-              { key: "cache", label: "缓存命中", value: boolText(event.cache_hit) },
-              { key: "prefetch", label: "复用预取", value: boolText(event.prefetch_reused) },
-              { key: "fallback", label: "fallback", value: boolText(event.fallback) },
-              {
-                key: "parent",
-                label: "父事件",
-                value: event.parent_event_id ? (
-                  <span className="font-mono text-[11px]">{event.parent_event_id}</span>
-                ) : (
-                  "无（顶层事件）"
-                ),
-              },
-            ]}
-          />
-
-          <PreviewBlock label="Input 预览" value={event.input_preview} />
-          <PreviewBlock label="Output 预览" value={event.output_preview} />
-
-          {Object.keys(event.metadata).length > 0 ? (
-            <section className="flex flex-col gap-2">
-              <h3 className="text-xs font-medium text-foreground">Metadata</h3>
-              <JsonBlock value={event.metadata} maxHeight="16rem" />
-            </section>
-          ) : null}
-
-          {event.notes.length > 0 ? (
-            <section className="flex flex-col gap-2">
-              <h3 className="text-xs font-medium text-foreground">这次事件的口径说明</h3>
-              <ul className="flex list-disc flex-col gap-1 pl-5 text-[11px] leading-5 text-muted-foreground">
-                {event.notes.map((note) => (
-                  <li key={note} className="break-words">
-                    {note}
-                  </li>
-                ))}
-              </ul>
-            </section>
-          ) : null}
-
-          {onOpenPerformance ? (
-            <div>
-              <Button variant="outline" size="xs" onClick={() => onOpenPerformance(event.event_id)}>
-                <Timer />
-                在性能里查看这次调用
-              </Button>
-            </div>
-          ) : null}
+      {/* 与对话视图同一套交互：点这一行展开正文，展开内容才挂进 DOM。
+          行上的 aria-expanded 因此是真的（旧实现用嵌套 <details>，行点击并不展开，读屏会读错）。 */}
+      {selected ? (
+        <div className="border-t border-border/70 px-3 py-3">
+          <EventDetail event={event} runTotalTokens={runTotalTokens} onOpenPerformance={onOpenPerformance} />
         </div>
-      </CollapsibleSection>
+      ) : null}
     </li>
   );
 }
 
-function PreviewBlock({ label, value }: { label: string; value: string | null }) {
+/* ------------------------------ Conversation View（feedback §3） ------------------------------ */
+/**
+ * Conversation View：把同一份事件按**后端给出的真实执行顺序**线性串起来。
+ *
+ * 三条刻意的取舍：
+ * 1) 不在这里重新排序。后端已经把 SYSTEM / USER / CONTEXT 这类运行前置事件排在阶段事件之前，
+ *    其余按 started_at（见 `admin_timeline` 的 head_order 与 sort），前端再排一次只会改掉
+ *    「真实先后」——而排查坏 Case 靠的正是先后（Tool Result 有没有进下一轮上下文，看顺序最快）。
+ * 2) 每行仍是「摘要 → 点击展开」：角色 / 标题 / 状态 / 耗时 / token 一行读完，正文只在展开后渲染，
+ *    并且正文**不写进 title / aria-label**（一个 hover 就能绕过折叠）。
+ * 3) TOOL 事件的 summary 是调用，`output_preview` 就是对话里的 Tool Result：
+ *    后端现在把「调用 + 返回」放在同一条事件里，这里不拆成两条，避免凭空造出不存在的事件。
+ */
+function ConversationTimeline({
+  events,
+  stageTitles,
+  runTotalTokens,
+  selectedEventId,
+  onSelectEvent,
+  onOpenPerformance,
+}: {
+  events: AdminTraceEvent[];
+  stageTitles: Map<string, { title: string; status: string | null; ordinal: number }>;
+  runTotalTokens: number | null;
+  selectedEventId: string | null;
+  onSelectEvent: (eventId: string) => void;
+  onOpenPerformance?: (eventId: string) => void;
+}) {
   return (
-    <section className="flex flex-col gap-2">
-      <h3 className="text-xs font-medium text-foreground">{label}</h3>
-      {value ? (
-        <pre className="max-h-60 overflow-auto rounded-md border border-border bg-muted/40 p-2 font-mono text-[11px] leading-4 break-all whitespace-pre-wrap text-foreground">
-          {value}
-        </pre>
-      ) : (
-        <p className="text-[11px] leading-5 text-muted-foreground">
-          —（这次事件没有记录该预览；模型输入 / 输出正文按口径不落库）
-        </p>
-      )}
-    </section>
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex flex-wrap items-center gap-2">
+          <span>对话顺序</span>
+          <Badge variant="secondary" className="tabular text-[0.6875rem]">
+            {formatNumber(events.length)} 条
+          </Badge>
+        </CardTitle>
+        <CardDescription>
+          顺序就是后端记录的先后：System → User → Context → Assistant → Tool（含 Tool Result）→
+          Assistant …… 每条默认只给摘要，点开才渲染模型收到 / 返回的正文。
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {events.length === 0 ? (
+          <SectionEmpty
+            title="当前筛选下没有事件"
+            description="这次运行里没有同时满足「类型 + 阶段 + 状态 + 关键词」的事件。清空筛选可以看到全部对话。"
+          />
+        ) : (
+          <ol className="flex flex-col gap-2 border-l border-dashed border-border pl-3 sm:pl-4">
+            {events.map((event, index) => (
+              <ConversationEventRow
+                key={event.event_id}
+                event={event}
+                index={index}
+                stage={event.stage ? stageTitles.get(event.stage) : undefined}
+                runTotalTokens={runTotalTokens}
+                selected={selectedEventId === event.event_id}
+                onSelect={() => onSelectEvent(event.event_id)}
+                onOpenPerformance={onOpenPerformance}
+              />
+            ))}
+          </ol>
+        )}
+      </CardContent>
+    </Card>
   );
+}
+
+function ConversationEventRow({
+  event,
+  index,
+  stage,
+  runTotalTokens,
+  selected,
+  onSelect,
+  onOpenPerformance,
+}: {
+  event: AdminTraceEvent;
+  index: number;
+  stage?: { title: string; status: string | null; ordinal: number };
+  runTotalTokens: number | null;
+  selected: boolean;
+  onSelect: () => void;
+  onOpenPerformance?: (eventId: string) => void;
+}) {
+  const role =
+    CONVERSATION_ROLES[event.event_type] ?? {
+      label: event.event_type_label || event.event_type,
+      tone: "muted" as AdminTone,
+      hint: "未登记的事件类型",
+    };
+  const tokens = readEventTokenFacts(event);
+  // Tool Result 只标「有没有」，内容仍然折叠：这句话本身就是排查「工具返回有没有进下一轮上下文」的路标。
+  const carriesToolResult = event.event_type === "TOOL" && Boolean(event.output_preview);
+
+  return (
+    <li
+      id={eventAnchorId(event.event_id)}
+      data-timeline-event={event.event_id}
+      className={cn(
+        "overflow-hidden rounded-lg border border-border bg-card",
+        selected && "ring-2 ring-primary/40",
+      )}
+    >
+      <button
+        type="button"
+        onClick={onSelect}
+        className="flex w-full min-w-0 flex-col gap-1.5 px-3 py-2.5 text-left hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+        aria-expanded={selected}
+      >
+        <span className="flex min-w-0 flex-wrap items-center gap-2">
+          <span className="tabular shrink-0 text-[10px] text-muted-foreground">#{index + 1}</span>
+          <ToneBadge tone={role.tone} className="text-[0.6875rem]">
+            {role.label}
+          </ToneBadge>
+          {stage ? (
+            <span className="shrink-0 text-[11px] text-muted-foreground">
+              阶段 #{stage.ordinal} {stage.title}
+            </span>
+          ) : (
+            <span className="shrink-0 text-[11px] text-muted-foreground">未归属阶段</span>
+          )}
+          <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground" title={event.title}>
+            {event.title || "（没有标题）"}
+          </span>
+          {carriesToolResult ? <ToneBadge tone="muted">含工具返回</ToneBadge> : null}
+          {event.fallback ? <ToneBadge tone="warning">fallback</ToneBadge> : null}
+          {event.cache_hit ? <ToneBadge tone="muted">缓存命中</ToneBadge> : null}
+          {event.badcases.length > 0 ? (
+            <ToneBadge tone="danger">
+              ⚠ {event.badcases.length > 1 ? `${event.badcases.length} 个 Bad Case` : "Bad Case"}
+            </ToneBadge>
+          ) : null}
+          <StatusBadge status={event.status} />
+          <span className="tabular shrink-0 text-[11px] text-muted-foreground">
+            {formatDurationMs(event.duration_ms)}
+          </span>
+        </span>
+
+        <span className="line-clamp-2 text-xs leading-5 break-words text-muted-foreground">
+          {event.summary || "—"}
+        </span>
+
+        <span className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+          <span className="shrink-0 text-muted-foreground">{role.hint}</span>
+          {event.model ? <span className="font-mono">模型 {event.model}</span> : null}
+          {event.provider ? <span className="font-mono">Provider {event.provider}</span> : null}
+          {event.tool ? <span className="font-mono">工具 {event.tool}</span> : null}
+          {tokens.length > 0 ? (
+            <span className="tabular">{tokens.join(" · ")}</span>
+          ) : runTotalTokens !== null ? (
+            <span>token 按整次 run 统计</span>
+          ) : null}
+          <span>
+            点击展开模型收到 / 返回的正文
+            {event.notes.length > 0 ? ` · ${event.notes.length} 条口径` : ""}
+          </span>
+        </span>
+      </button>
+
+      {event.badcases.length > 0 ? (
+        <div className="border-t border-danger/20 bg-danger-subtle/60 px-3 py-2 text-[11px] leading-5">
+          {event.badcases.map((badcase) => (
+            <div key={badcase.badcase_id} className="flex flex-col gap-0.5">
+              <p className="flex flex-wrap items-center gap-1.5 font-medium text-danger-subtle-foreground">
+                <AlertTriangle className="size-3.5 shrink-0" aria-hidden />
+                {badcaseCategoryLabel(badcase.category)}
+                <StatusBadge status={badcase.severity} />
+                <StatusBadge status={badcase.analysis_status} />
+              </p>
+              <p className="break-words text-danger-subtle-foreground/90">
+                {cleanBadcaseSymptom(badcase.symptom, badcase.category)}
+              </p>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      {/* 展开的正文只在这一行被选中时才挂进 DOM：默认摘要、点击展开，和 feedback §3 的要求一致。 */}
+      {selected ? (
+        <div className="border-t border-border/70 px-3 py-3">
+          <EventDetail event={event} runTotalTokens={runTotalTokens} onOpenPerformance={onOpenPerformance} />
+        </div>
+      ) : null}
+    </li>
+  );
+}
+
+/* ------------------------------ 事件详情（两个视图共用） ------------------------------ */
+
+/**
+ * 事件详情：两个视图共用同一份渲染。
+ *
+ * 为什么必须共用：Workflow 与 Conversation 只是同一次 run 的两种对齐方式，
+ * 「一次调用到底收到了什么」不能有两个答案 —— 各渲染一套迟早会出现两处口径不一致。
+ */
+function EventDetail({
+  event,
+  runTotalTokens,
+  onOpenPerformance,
+}: {
+  event: AdminTraceEvent;
+  runTotalTokens: number | null;
+  onOpenPerformance?: (eventId: string) => void;
+}) {
+  return (
+    <div className="flex flex-col gap-3">
+      <KeyValueList
+        entries={[
+          { key: "event_id", label: "事件 ID", value: <span className="font-mono text-[11px]">{event.event_id}</span> },
+          {
+            key: "type",
+            label: "类型",
+            value: (
+              <span>
+                {event.event_type_label || event.event_type}
+                <span className="ml-1 font-mono text-[10px] text-muted-foreground">{event.event_type}</span>
+              </span>
+            ),
+          },
+          {
+            key: "stage",
+            label: "阶段",
+            value: event.stage ? <span className="font-mono">{event.stage}</span> : "未归属阶段",
+          },
+          {
+            key: "round",
+            label: "阶段序号",
+            value: event.round_index === null ? "—" : `第 ${event.round_index + 1} 个阶段`,
+          },
+          { key: "status", label: "状态", value: <StatusBadge status={event.status} /> },
+          { key: "started", label: "开始", value: <span className="font-mono">{formatDateTime(event.started_at)}</span> },
+          { key: "finished", label: "结束", value: <span className="font-mono">{formatDateTime(event.finished_at)}</span> },
+          { key: "duration", label: "耗时", value: formatDurationMs(event.duration_ms) },
+          { key: "model", label: "模型", value: <span className="font-mono">{event.model ?? "—"}</span> },
+          { key: "provider", label: "Provider", value: <span className="font-mono">{event.provider ?? "—"}</span> },
+          { key: "tool", label: "工具", value: <span className="font-mono">{event.tool ?? "—"}</span> },
+          {
+            key: "tokens_in",
+            label: "输入 Token",
+            // 新字段（后端 A12 补的 usage）优先，旧字段（tokens_in）兜底：同一次调用的两种口径都认。
+            value: eventTokenText(event.input_tokens ?? event.tokens_in, runTotalTokens),
+          },
+          {
+            key: "tokens_out",
+            label: "输出 Token",
+            value: eventTokenText(event.output_tokens ?? event.tokens_out, runTotalTokens),
+          },
+          {
+            key: "tokens_cached",
+            label: "命中缓存 Token",
+            value: eventTokenText(event.cached_tokens ?? null, runTotalTokens),
+          },
+          {
+            key: "cost",
+            label: "成本",
+            value:
+              event.cost !== null
+                ? formatCostWithCurrency(event.cost, null)
+                : runTotalTokens !== null
+                  ? "按整次 run 统计"
+                  : "—",
+          },
+          {
+            key: "prompt_version",
+            label: "Prompt 版本",
+            value: a13FieldText(event.prompt_version),
+          },
+          { key: "prompt_hash", label: "Prompt 哈希", value: a13FieldText(event.prompt_hash) },
+          { key: "cache", label: "缓存命中", value: boolText(event.cache_hit) },
+          { key: "prefetch", label: "复用预取", value: boolText(event.prefetch_reused) },
+          { key: "fallback", label: "fallback", value: boolText(event.fallback) },
+          {
+            key: "parent",
+            label: "父事件",
+            value: event.parent_event_id ? (
+              <span className="font-mono text-[11px]">{event.parent_event_id}</span>
+            ) : (
+              "无（顶层事件）"
+            ),
+          },
+        ]}
+      />
+
+      <EventBodyPreviews event={event} />
+
+      {Object.keys(event.metadata).length > 0 ? (
+        <section className="flex flex-col gap-2">
+          <h3 className="text-xs font-medium text-foreground">Metadata</h3>
+          <JsonBlock value={event.metadata} maxHeight="16rem" />
+        </section>
+      ) : null}
+
+      {event.notes.length > 0 ? (
+        <section className="flex flex-col gap-2">
+          <h3 className="text-xs font-medium text-foreground">这次事件的口径说明</h3>
+          <ul className="flex list-disc flex-col gap-1 pl-5 text-[11px] leading-5 text-muted-foreground">
+            {event.notes.map((note) => (
+              <li key={note} className="break-words">
+                {note}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
+      {onOpenPerformance ? (
+        <div>
+          <Button variant="outline" size="xs" onClick={() => onOpenPerformance(event.event_id)}>
+            <Timer />
+            在性能里查看这次调用
+          </Button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/* ------------------------------ 模型交互预览（feedback §3） ------------------------------ */
+
+type PreviewSlot = "system_preview" | "user_preview" | "context_preview" | "assistant_preview";
+
+/** 槽位 → 短标签（聚合「哪些没返回」时用）。 */
+const PREVIEW_SHORT_LABELS: Record<PreviewSlot, string> = {
+  system_preview: "系统提示",
+  user_preview: "用户输入",
+  context_preview: "注入的上下文",
+  assistant_preview: "模型返回",
+};
+
+/**
+ * 各角色要展示的预览槽位。
+ * ASSISTANT 才是完整的一次模型交互：三段输入 + 一段返回，缺哪段都要能一眼看出来；
+ * SYSTEM / USER / CONTEXT 是这条交互的三段输入，各自只展示自己那一段。
+ * 未登记的类型没有槽位，退回既有的 input_preview / output_preview 口径（见 EventBodyPreviews）。
+ */
+const ROLE_PREVIEW_SLOTS: Record<string, PreviewSlot[]> = {
+  SYSTEM: ["system_preview"],
+  USER: ["user_preview"],
+  CONTEXT: ["context_preview"],
+  ASSISTANT: ["system_preview", "user_preview", "context_preview", "assistant_preview"],
+};
+
+/**
+ * 单个槽位的取值。
+ *
+ * 旧字段兜底只在语义对得上的地方做（都是后端已经脱敏 + 截断过的既有字段，前端不拼接、不改写）：
+ * USER 事件的 input_preview 就是用户请求，CONTEXT 事件与 ASSISTANT 的 output_preview 是上下文摘要 / 模型输出。
+ */
+function previewValue(event: AdminTraceEvent, slot: PreviewSlot): string | null {
+  const direct: Record<PreviewSlot, string | null | undefined> = {
+    system_preview: event.system_preview,
+    user_preview: event.user_preview,
+    context_preview: event.context_preview,
+    assistant_preview: event.assistant_preview,
+  };
+  const directValue = direct[slot];
+  if (typeof directValue === "string" && directValue.trim().length > 0) return directValue;
+  const legacy: Record<PreviewSlot, string | null> = {
+    system_preview: null,
+    user_preview: event.input_preview,
+    context_preview: event.output_preview,
+    assistant_preview: event.output_preview,
+  };
+  const legacyValue = legacy[slot];
+  return typeof legacyValue === "string" && legacyValue.trim().length > 0 ? legacyValue : null;
+}
+
+/**
+ * 「模型收到了什么 / 返回了什么」。
+ *
+ * 后端字段（A13）还没落地的槽位只渲染一行缺口口径（不渲染空框、也不拿别的字段顶替）——
+ * 假造一段正文比空着更糟：它会让人以为模型真的收到了那段内容。
+ */
+function EventBodyPreviews({ event }: { event: AdminTraceEvent }) {
+  const slots = ROLE_PREVIEW_SLOTS[event.event_type] ?? [];
+
+  if (slots.length === 0) {
+    // 工具 / Provider / 校验 / 错误：没有对话角色，沿用既有预览口径；
+    // TOOL 的 output_preview 就是对话里的 Tool Result，标签直接写出来。
+    return (
+      <>
+        <PreviewBlock
+          label={event.event_type === "TOOL" ? "调用参数" : "Input 预览"}
+          value={event.input_preview}
+          missing="—（这次事件没有记录该预览）"
+        />
+        <PreviewBlock
+          label={event.event_type === "TOOL" ? TOOL_RESULT_LABEL : "Output 预览"}
+          value={event.output_preview}
+          missing="—（这次事件没有记录该预览）"
+        />
+      </>
+    );
+  }
+
+  const values = slots.map((slot) => ({
+    slot,
+    side: slot === "assistant_preview" ? "模型返回" : "模型收到",
+    value: previewValue(event, slot),
+  }));
+  const present = values.filter((item) => item.value !== null);
+  const absent = values.filter((item) => item.value === null);
+  // 只有旧的 input_preview（不区分 system / user / context）时也要显示：它至少能回答
+  // 「模型收到的是不是这一份」，只是归不了段 —— 按它自己的标签单独列出来，不冒充某一段。
+  const undividedInput =
+    values.every((item) => item.slot === "assistant_preview" || item.value === null)
+      ? (event.input_preview ?? null)
+      : null;
+
+  return (
+    <>
+      {present.map((item) => (
+        <PreviewBlock
+          key={item.slot}
+          label={`${item.side} · ${PREVIEW_SHORT_LABELS[item.slot]}（${item.slot}）`}
+          value={item.value}
+        />
+      ))}
+      {undividedInput ? (
+        <PreviewBlock
+          label="模型收到 · 输入预览（input_preview，未区分系统 / 用户 / 上下文）"
+          value={undividedInput}
+        />
+      ) : null}
+      {absent.length > 0 ? (
+        <p className="rounded-md border border-dashed border-border px-3 py-2 text-[11px] leading-5 break-words text-muted-foreground">
+          未返回的正文：{absent.map((item) => `${item.side} · ${PREVIEW_SHORT_LABELS[item.slot]}`).join("、")}。
+          {MISSING_PREVIEW_HINT}
+        </p>
+      ) : null}
+    </>
+  );
+}
+
+/** 后端 A13 新增的标量字段：有就显示，没有就写「—（后端未返回）」，不留空白行。 */
+function a13FieldText(value: string | null | undefined) {
+  if (typeof value === "string" && value.length > 0) {
+    return <span className="font-mono text-[11px]">{value}</span>;
+  }
+  return <span className="text-muted-foreground">—（后端未返回）</span>;
+}
+
+/**
+ * 事件级 token 事实。新字段（input/output/cached_tokens）优先，旧字段（tokens_in/out）兜底；
+ * 一个都没有时返回空数组，让调用方写「按整次 run 统计」——而不是一个会被误读成「没消耗」的「—」。
+ */
+function readEventTokenFacts(event: AdminTraceEvent): string[] {
+  const input = event.input_tokens ?? event.tokens_in;
+  const output = event.output_tokens ?? event.tokens_out;
+  const cached = event.cached_tokens ?? null;
+  const parts: string[] = [];
+  if (input !== null) parts.push(`输入 ${formatNumber(input)}`);
+  if (output !== null) parts.push(`输出 ${formatNumber(output)}`);
+  if (cached !== null) parts.push(`缓存 ${formatNumber(cached)}`);
+  return parts;
 }
 
 /* ------------------------------ 汇总 ------------------------------ */
@@ -971,6 +1499,13 @@ function rankGroup(key: string, order: Map<string, number>): number {
   return order.get(key) ?? Number.MAX_SAFE_INTEGER - 1;
 }
 
+/**
+ * 关键词匹配。
+ *
+ * 为什么连预览正文也一起搜：feedback §3 里「Dynamic Preference 有没有传给模型」这类问题，
+ * 最快的验证方式就是拿偏好关键词在轨迹里搜一遍，看它出现在哪个调用的 context / user 预览里。
+ * 正文是后端脱敏截断过的，前端只是把它当作可搜文本，不渲染、不外泄。
+ */
 function matchesQuery(event: AdminTraceEvent, needle: string): boolean {
   const haystack = [
     event.title,
@@ -980,6 +1515,12 @@ function matchesQuery(event: AdminTraceEvent, needle: string): boolean {
     event.stage,
     event.input_preview,
     event.output_preview,
+    event.system_preview,
+    event.user_preview,
+    event.context_preview,
+    event.assistant_preview,
+    event.prompt_version,
+    event.prompt_hash,
   ]
     .filter((value): value is string => typeof value === "string" && value.length > 0)
     .join("\n")

@@ -10,7 +10,6 @@
 
 import { formatCNY, formatDateShort } from "@/lib/format";
 import type {
-  BooleanPreference,
   CreateSessionInput,
   NumericPreference,
   Pace,
@@ -29,7 +28,6 @@ import {
   BUDGET_MODE_LABELS,
   discoveryPlaces,
   HOTEL_PRIORITY_OPTIONS,
-  MIN_STAR_OPTIONS,
   PACE_OPTIONS,
   ROOM_TYPE_OPTIONS,
   TRANSPORT_CONSTRAINT_OPTIONS,
@@ -67,9 +65,7 @@ export interface HotelDraft {
   priority: HotelPriority | null;
   maxPriceText: string;
   maxPriceSentinel: PreferenceSentinel | null;
-  minStar: NumericPreference;
   roomType: StringPreference;
-  allowChange: BooleanPreference;
 }
 
 export interface PoiDraft {
@@ -107,9 +103,7 @@ export function createEmptyDraft(): GuidedDraft {
       priority: null,
       maxPriceText: "",
       maxPriceSentinel: null,
-      minStar: null,
       roomType: null,
-      allowChange: null,
     },
     poi: { selections: {}, bulk: null, expanded: [] },
     pace: null,
@@ -174,21 +168,6 @@ function budgetValue(basic: BasicDraft): number | PreferenceSentinel | null {
   return amount;
 }
 
-/**
- * Prefetch 失效键（§15）：出发地 / 目的地 / 日期 / 天数一变，
- * 旧 Session 的交通、酒店与攻略都必须重查，POI 也必须换掉。
- */
-export function prefetchKey(basic: BasicDraft): string {
-  const endDate = basic.durationMode === "endDate" ? basic.endDate : "";
-  return [
-    basic.origin.trim(),
-    basic.destination.trim(),
-    basic.startDate,
-    endDate,
-    String(resolvedDays(basic) ?? ""),
-  ].join("|");
-}
-
 export function toCreateInput(basic: BasicDraft): CreateSessionInput {
   const days = resolvedDays(basic);
   return {
@@ -225,9 +204,7 @@ export function hotelPatch(draft: GuidedDraft): SessionPatchInput {
   const patch: SessionPatchInput = { hotel_priority: draft.hotel.priority ?? "auto" };
   const maxPrice = maxPriceValue(draft.hotel);
   if (maxPrice !== undefined) patch.hotel_max_price_per_night = maxPrice;
-  if (draft.hotel.minStar !== null) patch.hotel_min_star = draft.hotel.minStar;
   if (draft.hotel.roomType !== null) patch.hotel_room_type = draft.hotel.roomType;
-  if (draft.hotel.allowChange !== null) patch.hotel_allow_change = draft.hotel.allowChange;
   return patch;
 }
 
@@ -240,20 +217,17 @@ export function pacePatch(draft: GuidedDraft): SessionPatchInput {
   return { pace: draft.pace ?? "auto" };
 }
 
-export function budgetPatch(draft: GuidedDraft): SessionPatchInput {
-  return { budget_total: budgetValue(draft.basic) };
-}
-
 /**
  * 某一步「继续」时要写回后端的字段（索引与 `STEP_META` 对齐）。
- * 第 0 页（基础信息）不在这里 —— 它是创建会话、不是 PATCH；
+ * 第 0 页（探索确认）写回的就是这一页勾选的 POI；
  * 最后一页（偏好）由向导先 PATCH 再开跑，两份合起来就是这一页改过的全部字段。
+ * 基础信息不在这里 —— 它由首页带进 URL，只在创建会话时提交一次。
  */
 export function stepPatch(stepIndex: number, draft: GuidedDraft): SessionPatchInput {
   switch (stepIndex) {
-    case 1:
+    case 0:
       return poiPatch(draft);
-    case 2:
+    case 1:
       return { ...transportPatch(draft), ...hotelPatch(draft), ...pacePatch(draft) };
     default:
       return {};
@@ -287,9 +261,7 @@ export function hasAnyPreference(draft: GuidedDraft): boolean {
     draft.hotel.priority !== null ||
     draft.hotel.maxPriceSentinel !== null ||
     draft.hotel.maxPriceText.trim() !== "" ||
-    draft.hotel.minStar !== null ||
     draft.hotel.roomType !== null ||
-    draft.hotel.allowChange !== null ||
     draft.pace !== null ||
     Object.keys(draft.poi.selections).length > 0
   );
@@ -338,31 +310,16 @@ function group(places: PlaceCandidate[]): PoiNameGroup {
 }
 
 /**
- * 酒店补充项的中文标签。
- * `includeStar: false` 时不再展示「最低星级」——数据源不返回星级时这条过滤不生效，
- * 摘要里也不应该出现一个做不到的承诺。
+ * 酒店补充项的中文标签（每晚价格上限 + 房型）。
+ * 这两项是酒店页现在仅剩的补充条件：星级过滤与「接受换酒店」已从界面移除，
+ * 摘要里自然也不会再出现一个前端根本没让用户选过的承诺。
  */
-export function hotelDetailLabels(
-  hotel: HotelDraft,
-  options: { includeStar?: boolean; includeAllowChange?: boolean } = {},
-): string[] {
-  const includeStar = options.includeStar ?? true;
-  // 行程全程只订一家酒店时不展示「换酒店」：后端 capabilities.hotel_allow_change=false
-  // 时它不参与排程，写进摘要会让人以为这个选择起了作用。
-  const includeAllowChange = options.includeAllowChange ?? true;
+export function hotelDetailLabels(hotel: HotelDraft): string[] {
   const labels: string[] = [];
   if (hotel.maxPriceSentinel) {
     labels.push(`每晚价格上限：${sentinelLabel(hotel.maxPriceSentinel) ?? hotel.maxPriceSentinel}`);
   } else if (hotel.maxPriceText.trim()) {
     labels.push(`每晚价格上限：${formatCNY(Number(hotel.maxPriceText))}`);
-  }
-  if (includeStar) {
-    if (typeof hotel.minStar === "number") {
-      const matched = MIN_STAR_OPTIONS.find((item) => item.value === hotel.minStar);
-      labels.push(`最低星级：${matched ? matched.label : `${hotel.minStar} 星起`}`);
-    } else if (hotel.minStar) {
-      labels.push(`最低星级：${sentinelLabel(hotel.minStar) ?? hotel.minStar}`);
-    }
   }
   if (typeof hotel.roomType === "string") {
     // 哨兵（auto / undecided / unlimited）本身也是字符串，必须先翻译成中文；
@@ -373,13 +330,6 @@ export function hotelDetailLabels(
     } else {
       const matched = ROOM_TYPE_OPTIONS.find((item) => item.value === hotel.roomType);
       labels.push(`房型：${matched ? matched.label : hotel.roomType}`);
-    }
-  }
-  if (includeAllowChange) {
-    if (typeof hotel.allowChange === "boolean") {
-      labels.push(`换酒店：${hotel.allowChange ? "可以换" : "不想换"}`);
-    } else if (hotel.allowChange) {
-      labels.push(`换酒店：${sentinelLabel(hotel.allowChange) ?? hotel.allowChange}`);
     }
   }
   return labels;
@@ -440,12 +390,7 @@ export function summarize(draft: GuidedDraft, session: SessionView | null): Summ
     transportPriority: optionLabel(TRANSPORT_PRIORITY_OPTIONS, draft.transport.priority) ?? "帮我选（默认）",
     transportConstraints: transportConstraintsLabel(draft.transport.constraints),
     hotelPriority: optionLabel(HOTEL_PRIORITY_OPTIONS, draft.hotel.priority) ?? "帮我选（默认）",
-    // 后端声明星级过滤不可用时，摘要也不展示星级（来源是 Session 的能力声明）。
-    hotelExtras: hotelDetailLabels(draft.hotel, {
-      includeStar: session?.capabilities.hotel_star_filter !== false,
-      // 同理：「接受换酒店」不生效时不写进摘要，免得用户以为它起了作用。
-      includeAllowChange: session?.capabilities.hotel_allow_change !== false,
-    }),
+    hotelExtras: hotelDetailLabels(draft.hotel),
     paceLabel: optionLabel(PACE_OPTIONS, draft.pace) ?? "帮我安排（默认）",
     must: group(must),
     want: group(want),

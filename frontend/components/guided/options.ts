@@ -69,22 +69,10 @@ export const HOTEL_PRIORITY_OPTIONS: Option<HotelPriority>[] = [
   { value: "auto", label: "随便，帮我选" },
 ];
 
-export const MIN_STAR_OPTIONS: Option<number>[] = [
-  { value: 2, label: "2 星起" },
-  { value: 3, label: "3 星起" },
-  { value: 4, label: "4 星起" },
-  { value: 5, label: "5 星" },
-];
-
 export const ROOM_TYPE_OPTIONS: Option<string>[] = [
   { value: "大床房", label: "大床房" },
   { value: "双床房", label: "双床房" },
   { value: "家庭房", label: "家庭房 / 三人间" },
-];
-
-export const ALLOW_CHANGE_OPTIONS: Option<boolean>[] = [
-  { value: false, label: "不想换酒店", hint: "全程住同一家" },
-  { value: true, label: "可以换酒店", hint: "按行程就近安排" },
 ];
 
 export const PACE_OPTIONS: Option<Pace>[] = [

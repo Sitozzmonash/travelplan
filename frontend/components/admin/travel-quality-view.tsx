@@ -37,6 +37,7 @@ import {
   type AdminQualityDimension,
   type AdminQualityMetric,
   type AdminQualityRun,
+  type AdminRecord,
   type AdminTravelQuality,
   type AdminTrendSeries,
   type AdminWindowKey,
@@ -48,6 +49,10 @@ import {
  * 两条不可退让的展示规则（与 Provider 页同一套纪律）：
  * 1) `score / score_percent` 为 null 时显示「无数据」，绝不落成 0 分；
  * 2) 六个维度按后端返回原样渲染（不写死分值），未知维度追加在末尾，不丢数据。
+ *
+ * 口径（feedback/TravelPlan_Admin_Feedback_01.md §2）：质量分不是「系统统一认为
+ * 这趟旅行好不好」，而是「这趟旅行是否适合这个用户」——软维度按本次动态偏好画像
+ * 调权。**加权数值由后端算**（A16），前端只负责解释与展示。
  */
 
 /** 页面的默认窗口是 7d：质量问题的样本量本来就小，24h 经常只剩个位数。 */
@@ -99,6 +104,17 @@ const GRADE_TONE: Record<string, AdminTone> = {
   FAIR: "warning",
   POOR: "danger",
   UNKNOWN: "muted",
+};
+
+/**
+ * 动态偏好画像来源 → 文案。
+ * `llm` = 模型真的按用户生成了画像（分数才算「适合这个用户」）；
+ * `fallback` = 模型没给出、用了均衡基线（仍能出计划，但个性化有限）。
+ * 未登记的取值原样显示，便于对照后端。
+ */
+const PROFILE_SOURCE_LABELS: Record<string, string> = {
+  llm: "已个性化",
+  fallback: "均衡基线",
 };
 
 export function TravelQualityView() {
@@ -166,6 +182,40 @@ function dimensionAnchorId(key: string): string {
   return `quality-dim-${key}`;
 }
 
+/* --------------- 运行时容错读取（画像/加权字段名后端未定稿） --------------- */
+
+/**
+ * 后端 A16（质量分动态化）的字段名尚未定稿，因此不绑定单一键名：
+ * 这里按 `AdminRecord` 做运行时读取，取不到就返回 null，由展示层落成
+ * 「—（后端未返回）」。与 run-detail-view / sessions-view 的 readString 同一套写法。
+ * 前端**绝不**自己按固定权重重算分数 —— 那会和后端口径打架，也会把
+ * 「后端还没算」伪装成一个看起来很确定的数。
+ */
+function readString(record: AdminRecord, key: string): string | null {
+  const value = record[key];
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function readNumber(record: AdminRecord, key: string): number | null {
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function readBoolean(record: AdminRecord, key: string): boolean | null {
+  const value = record[key];
+  return typeof value === "boolean" ? value : null;
+}
+
+function readRecord(record: AdminRecord, key: string): AdminRecord | null {
+  const value = record[key];
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as AdminRecord)
+    : null;
+}
+
+/** 后端未返回时的占位：显式写「后端未返回」，避免空值被读成 0 或「无问题」。 */
+const NOT_RETURNED = "—（后端未返回）";
+
 function QualityBody({ data, focusKey }: { data: AdminTravelQuality; focusKey: string | null }) {
   const dimensions = orderDimensions(data.dimensions);
 
@@ -204,6 +254,8 @@ function QualityBody({ data, focusKey }: { data: AdminTravelQuality; focusKey: s
       ) : null}
 
       <OverallScore data={data} />
+
+      <PreferenceWeightingCard data={data} />
 
       {dimensions.map((dimension) => (
         <DimensionSection
@@ -269,7 +321,9 @@ function OverallScore({ data }: { data: AdminTravelQuality }) {
 
         {weightEntries.length > 0 ? (
           <div className="flex flex-col gap-1.5">
-            <span className="text-[11px] text-muted-foreground">单 run 质量分权重</span>
+            <span className="text-[11px] text-muted-foreground">
+              单 run 质量分权重（画像缺失时的均衡基线；画像可用时后端按用户类型调整）
+            </span>
             <ul className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
               {weightEntries.map(([key, value]) => (
                 <li key={key} className="inline-flex items-baseline gap-1">
@@ -287,6 +341,112 @@ function OverallScore({ data }: { data: AdminTravelQuality }) {
   );
 }
 
+/**
+ * 「质量分为什么因用户类型而不同」的口径卡。
+ *
+ * 后端 A16（质量分动态化）的字段名尚未定稿，因此不绑定单一键名：按候选键做运行时
+ * 容错读取，取不到就显示「—（后端未返回）」。前端绝不用固定权重自己重算分数。
+ *
+ * 假设 / 尝试的字段名（待与后端对齐，见汇报）：
+ *   overall.profile_source | overall.source
+ *   overall.profile_style | overall.travel_style
+ *   overall.weighting_mode | overall.weight_mode
+ *   overall.profile_weighted | overall.dynamic_weighted
+ *   overall.profile_weights | overall.dynamic_weights | overall.weights_by_profile
+ *   overall.profile_note | overall.weight_note
+ * 顶层同名键一并尝试（信封可能把画像放在 overall 之外）。
+ */
+function PreferenceWeightingCard({ data }: { data: AdminTravelQuality }) {
+  const overall = data.overall as unknown as AdminRecord;
+  const payload = data as unknown as AdminRecord;
+
+  const source =
+    readString(overall, "profile_source") ??
+    readString(overall, "source") ??
+    readString(payload, "profile_source");
+  const style =
+    readString(overall, "profile_style") ??
+    readString(overall, "travel_style") ??
+    readString(payload, "profile_style") ??
+    readString(payload, "travel_style");
+  const mode =
+    readString(overall, "weighting_mode") ??
+    readString(overall, "weight_mode") ??
+    readString(payload, "weighting_mode") ??
+    readString(payload, "weight_mode");
+  const weighted =
+    readBoolean(overall, "profile_weighted") ??
+    readBoolean(overall, "dynamic_weighted") ??
+    readBoolean(payload, "profile_weighted") ??
+    readBoolean(payload, "dynamic_weighted");
+  const weights =
+    readRecord(overall, "profile_weights") ??
+    readRecord(overall, "dynamic_weights") ??
+    readRecord(overall, "weights_by_profile") ??
+    readRecord(payload, "profile_weights") ??
+    readRecord(payload, "dynamic_weights");
+  const note = readString(overall, "profile_note") ?? readString(overall, "weight_note");
+
+  const modeText =
+    mode ??
+    (weighted === true ? "已按画像动态加权" : weighted === false ? "固定权重（未动态化）" : null);
+  const weightEntries = Object.entries(weights ?? {});
+  const fields: { label: string; value: string }[] = [
+    { label: "本次画像来源", value: source ? (PROFILE_SOURCE_LABELS[source] ?? source) : NOT_RETURNED },
+    { label: "画像风格", value: style ?? NOT_RETURNED },
+    { label: "加权模式", value: modeText ?? NOT_RETURNED },
+  ];
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>质量分口径：按本次偏好画像加权</CardTitle>
+        <CardDescription>
+          质量分不是「系统统一认为这趟旅行好不好」，而是「这趟旅行是否适合这个用户」。
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        <p className="text-[11px] leading-5 text-muted-foreground">
+          软维度（偏好匹配、美食、节奏、路线等）按本次行程的动态偏好画像调权：美食型抬高美食与
+          商圈 / 夜间便利；老人轻松型抬高路线距离、交通便利与节奏舒适，并压低「每天景点数量」；
+          景点型抬高兴趣匹配、MUST 覆盖与区域规划。硬性约束（时间窗、营业时间、预算）不参与调权，
+          仍由规则判定。画像缺失（Quick 或 fallback）时回退到均衡基线。加权由后端计算，前端不自行算分。
+        </p>
+        <dl className="grid grid-cols-2 gap-x-3 gap-y-1.5 sm:grid-cols-3">
+          {fields.map((field) => (
+            <div key={field.label} className="flex flex-col gap-0.5">
+              <dt className="text-[11px] text-muted-foreground">{field.label}</dt>
+              <dd className="text-xs font-medium text-foreground">{field.value}</dd>
+            </div>
+          ))}
+        </dl>
+        {weightEntries.length > 0 ? (
+          <div className="flex flex-col gap-1.5">
+            <span className="text-[11px] text-muted-foreground">本次画像加权（后端返回）</span>
+            <ul className="flex flex-wrap gap-1.5">
+              {weightEntries.map(([key, value]) => (
+                <li
+                  key={key}
+                  className="inline-flex items-baseline gap-1 rounded bg-muted px-1.5 py-0.5 text-[11px]"
+                >
+                  <span className="text-muted-foreground">{WEIGHT_LABELS[key] ?? key}</span>
+                  <span className="tabular font-medium text-foreground">{formatMetricValue(value)}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : (
+          <p className="text-[11px] leading-4 text-muted-foreground">
+            后端未返回「本次画像加权」明细。上面几项显示「后端未返回」表示该字段尚未提供，
+            并不代表这趟旅行没有画像：单次 run 的画像可在运行详情页查看。
+          </p>
+        )}
+        {note ? <p className="text-[11px] leading-4 text-muted-foreground">口径说明：{note}</p> : null}
+      </CardContent>
+    </Card>
+  );
+}
+
 function DimensionSection({
   dimension,
   focused,
@@ -295,6 +455,10 @@ function DimensionSection({
   focused: boolean;
 }) {
   const label = dimension.label || DIMENSION_LABELS[dimension.key] || dimension.key;
+  // 单个维度的画像权重（后端动态化后才会返回）；取不到就不显示，不猜。
+  const dimensionRecord = dimension as unknown as AdminRecord;
+  const profileWeight =
+    readNumber(dimensionRecord, "profile_weight") ?? readNumber(dimensionRecord, "weight");
 
   return (
     <Card
@@ -308,12 +472,32 @@ function DimensionSection({
             <GradeBadge grade={dimension.grade} label={dimension.grade_label} />
           </CardTitle>
           {dimension.score_percent === null ? (
-            <span className="text-sm text-muted-foreground" title="这一维度没有足够数据打分">
-              无数据
+            <span className="flex flex-wrap items-center gap-2">
+              {profileWeight !== null ? (
+                <span
+                  className="text-[11px] text-muted-foreground"
+                  title="按本次动态偏好画像调整后的维度权重（后端返回）"
+                >
+                  画像权重 {formatRatio(profileWeight)}
+                </span>
+              ) : null}
+              <span className="text-sm text-muted-foreground" title="这一维度没有足够数据打分">
+                无数据
+              </span>
             </span>
           ) : (
-            <span className="tabular text-sm font-semibold text-foreground">
-              {formatPercentNumber(dimension.score_percent)}
+            <span className="flex flex-wrap items-baseline gap-2">
+              {profileWeight !== null ? (
+                <span
+                  className="text-[11px] text-muted-foreground"
+                  title="按本次动态偏好画像调整后的维度权重（后端返回）"
+                >
+                  画像权重 {formatRatio(profileWeight)}
+                </span>
+              ) : null}
+              <span className="tabular text-sm font-semibold text-foreground">
+                {formatPercentNumber(dimension.score_percent)}
+              </span>
             </span>
           )}
         </div>
@@ -506,6 +690,30 @@ function RunsTable({ runs }: { runs: AdminQualityRun[] }) {
       ),
     },
     {
+      // 画像来源决定了这一行的分数是「按这个用户加权」还是「均衡基线」——
+      // 同一分数在不同来源下含义不同，所以必须和分数并排出现。
+      key: "profile",
+      header: "偏好画像",
+      cell: (run) =>
+        run.profile_source ? (
+          <ToneBadge tone={run.profile_source === "llm" ? "info" : "muted"}>
+            {PROFILE_SOURCE_LABELS[run.profile_source] ?? run.profile_source}
+          </ToneBadge>
+        ) : (
+          <span className="text-[11px] text-muted-foreground" title="后端未返回这次 run 的画像来源">
+            —
+          </span>
+        ),
+    },
+    {
+      key: "hotel_area",
+      header: "住宿区域",
+      mobileHidden: true,
+      cell: (run) => (
+        <span className="whitespace-nowrap text-xs text-foreground">{run.hotel_area ?? "—"}</span>
+      ),
+    },
+    {
       key: "status",
       header: "状态",
       cell: (run) => <StatusBadge status={run.status} />,
@@ -589,6 +797,7 @@ function RunsTable({ runs }: { runs: AdminQualityRun[] }) {
         </CardTitle>
         <CardDescription>
           后端按质量分从低到高返回，最差的运行排在最上面（最该先看的那条在第一行）。
+          「偏好画像」列标出这次分数是按用户画像加权（已个性化）还是走均衡基线。
         </CardDescription>
       </CardHeader>
       <CardContent>

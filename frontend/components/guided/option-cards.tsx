@@ -23,8 +23,6 @@ interface ChoiceGridProps<T extends string | number | boolean> {
   columns?: 1 | 2 | 3;
   /** 移动端触摸目标高度：默认大按钮。 */
   dense?: boolean;
-  /** 后端声明该偏好不生效时置灰：可选但点了没用，比"能点却没作用"诚实。 */
-  disabled?: boolean;
 }
 
 export function ChoiceGrid<T extends string | number | boolean>({
@@ -34,7 +32,6 @@ export function ChoiceGrid<T extends string | number | boolean>({
   ariaLabel,
   columns = 2,
   dense = false,
-  disabled = false,
 }: ChoiceGridProps<T>) {
   return (
     <div
@@ -55,7 +52,6 @@ export function ChoiceGrid<T extends string | number | boolean>({
             type="button"
             role="radio"
             aria-checked={selected}
-            disabled={disabled}
             onClick={() => onChange(option.value)}
             className={cn(
               "flex w-full items-start gap-2.5 rounded-xl border px-3.5 text-left transition-colors",
@@ -64,7 +60,6 @@ export function ChoiceGrid<T extends string | number | boolean>({
               selected
                 ? "border-primary/50 bg-accent text-accent-foreground shadow-sm"
                 : "border-border bg-card text-foreground hover:border-primary/30 hover:bg-muted/40",
-              disabled && "cursor-not-allowed opacity-50 hover:border-border",
             )}
           >
             <span className="min-w-0 flex-1">
@@ -101,8 +96,6 @@ interface ChipToggleProps<T extends string | number> {
   values: T[];
   onToggle: (value: T) => void;
   ariaLabel: string;
-  /** 后端声明这条过滤不可用时整组置灰，避免用户选了一个永远不生效的条件。 */
-  disabled?: boolean;
 }
 
 export function ChipToggle<T extends string | number>({
@@ -110,7 +103,6 @@ export function ChipToggle<T extends string | number>({
   values,
   onToggle,
   ariaLabel,
-  disabled = false,
 }: ChipToggleProps<T>) {
   return (
     <div role="group" aria-label={ariaLabel} className="flex flex-wrap gap-2">
@@ -121,14 +113,12 @@ export function ChipToggle<T extends string | number>({
             key={String(option.value)}
             type="button"
             aria-pressed={selected}
-            disabled={disabled}
             onClick={() => onToggle(option.value)}
             className={cn(
               "inline-flex min-h-[40px] items-center gap-1.5 rounded-full border px-3.5 text-xs transition-colors",
               selected
                 ? "border-primary/50 bg-accent text-accent-foreground"
                 : "border-border bg-card text-muted-foreground hover:text-foreground",
-              disabled && "cursor-not-allowed opacity-50 hover:border-border hover:text-muted-foreground",
             )}
           >
             {selected ? <Check className="size-3" aria-hidden /> : null}
@@ -148,8 +138,6 @@ interface SentinelRowProps {
   options: Option<PreferenceSentinel>[];
   /** 允许再点一次取消（回到「没表态」）。 */
   clearable?: boolean;
-  /** 同 ChipToggle：整组不可用（用于「最低星级」）。 */
-  disabled?: boolean;
 }
 
 export function SentinelRow({
@@ -158,7 +146,6 @@ export function SentinelRow({
   ariaLabel,
   options,
   clearable = true,
-  disabled = false,
 }: SentinelRowProps) {
   return (
     <div role="group" aria-label={ariaLabel} className="flex flex-wrap gap-2">
@@ -169,14 +156,12 @@ export function SentinelRow({
             key={option.value}
             type="button"
             aria-pressed={selected}
-            disabled={disabled}
             onClick={() => onChange(selected && clearable ? null : option.value)}
             className={cn(
               "inline-flex min-h-[36px] items-center rounded-full border px-3 text-xs transition-colors",
               selected
                 ? "border-primary/50 bg-accent text-accent-foreground"
                 : "border-dashed border-border bg-card text-muted-foreground hover:text-foreground",
-              disabled && "cursor-not-allowed opacity-50 hover:border-border hover:text-muted-foreground",
             )}
           >
             {option.label}

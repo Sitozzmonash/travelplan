@@ -1821,6 +1821,36 @@ function isTimelinePayload(value: unknown): value is AdminRecord {
   return isRecord(value) && isArray(value.events) && isArray(value.tracks) && isRecord(value.summary);
 }
 
+/**
+ * 预览正文：空白串按「没有」处理（空串与 null 在 UI 上是同一件事：「后端这次没给这段正文」），
+ * 正文内部原样保留 —— 前端不做任何改写，脱敏与截断都是后端的职责。
+ */
+function toPreviewOrNull(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  return value.trim().length > 0 ? value : null;
+}
+
+/**
+ * 模型交互预览的读取（后端 A13）。
+ *
+ * 为什么读两个位置：字段落在事件顶层（`_event()` 直接带出来）还是落在 llm span 的
+ * attributes（经 `metadata` 透出）取决于后端的实现位置；两处都读一遍，
+ * 契约无论落哪边前端都不用再改一次。顶层优先。
+ */
+function readEventPreviewText(event: AdminRecord, key: string): string | null {
+  const direct = toPreviewOrNull(event[key]);
+  if (direct !== null) return direct;
+  const metadata = isRecord(event.metadata) ? event.metadata : null;
+  return metadata ? toPreviewOrNull(metadata[key]) : null;
+}
+
+function readEventPreviewNumber(event: AdminRecord, key: string): number | null {
+  const direct = toNumberOrNull(event[key]);
+  if (direct !== null) return direct;
+  const metadata = isRecord(event.metadata) ? event.metadata : null;
+  return metadata ? toNumberOrNull(metadata[key]) : null;
+}
+
 function normalizeTimelineEvent(value: AdminRecord): AdminTraceEvent {
   return {
     event_id: String(value.event_id ?? ""),
@@ -1858,6 +1888,16 @@ function normalizeTimelineEvent(value: AdminRecord): AdminTraceEvent {
         symptom: toStringOrNull(case_.symptom),
         analysis_status: toStringOrNull(case_.analysis_status),
       })),
+    // 模型交互预览：缺字段一律落成 null（不是空串），UI 才能把「后端没给」讲清楚。
+    system_preview: readEventPreviewText(value, "system_preview"),
+    user_preview: readEventPreviewText(value, "user_preview"),
+    context_preview: readEventPreviewText(value, "context_preview"),
+    assistant_preview: readEventPreviewText(value, "assistant_preview"),
+    prompt_version: readEventPreviewText(value, "prompt_version"),
+    prompt_hash: readEventPreviewText(value, "prompt_hash"),
+    input_tokens: readEventPreviewNumber(value, "input_tokens"),
+    output_tokens: readEventPreviewNumber(value, "output_tokens"),
+    cached_tokens: readEventPreviewNumber(value, "cached_tokens"),
   };
 }
 

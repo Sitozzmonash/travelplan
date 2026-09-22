@@ -16,8 +16,6 @@ import {
   describeSessionError,
   getPlanningSession,
   hasSocialDegradation,
-  hotelAllowChangeAvailable,
-  hotelStarFilterAvailable,
   isDiscoverySettled,
   isSessionUnusable,
   patchPlanningSession,
@@ -27,10 +25,8 @@ import { cn } from "@/lib/utils";
 import type { Pace, PoiSelection, SessionPatchInput, SessionView } from "@/types/session";
 import {
   basicIssues,
-  budgetPatch,
   createEmptyDraft,
   hasAnyPreference,
-  prefetchKey,
   preferenceReplayPatch,
   stepPatch,
   summarize,
@@ -41,7 +37,6 @@ import {
 } from "./draft";
 import { bestValueSelections } from "./options";
 import { STEP_META, WizardProgress } from "./wizard-progress";
-import { StepBasic } from "./step-basic";
 import { DiscoveryResearch } from "./discovery-research";
 import { StepPoi } from "./step-poi";
 import { StepPreferences } from "./step-preferences";
@@ -54,42 +49,23 @@ const POLL_MAX_FAILURES = 4;
 const POI_SYNC_DEBOUNCE_MS = 700;
 
 /**
- * 数据源不支持星级过滤时，从 PATCH 里删掉 `hotel_min_star`。
- * 这一步是「不提交一个永远不生效的过滤条件」的最后一道保险：即使用户在能力声明
- * 到达之前选过星级，也不会把它写回后端。
- */
-function dropStarFilter(patch: SessionPatchInput): SessionPatchInput {
-  if (!("hotel_min_star" in patch)) return patch;
-  const next: SessionPatchInput = { ...patch };
-  delete next.hotel_min_star;
-  return next;
-}
-
-/**
- * 「接受换酒店」当前不影响排程（全程只订一家）时，从 PATCH 里删掉 `hotel_allow_change`。
- * 理由同星级：不要提交一个后端不消费、却看起来生效了的偏好。
- */
-function dropAllowChange(patch: SessionPatchInput): SessionPatchInput {
-  if (!("hotel_allow_change" in patch)) return patch;
-  const next: SessionPatchInput = { ...patch };
-  delete next.hotel_allow_change;
-  return next;
-}
-
-/**
  * Guided 向导（§17）唯一的状态机。
  *
- * 会话生命周期：
- *   Step 1「继续」→ POST /planning-sessions（后台立刻 Prefetch）→ 轮询 GET 直到 READY/PARTIAL
- *   Step 2~5「继续」→ PATCH 结构化偏好
- *   Step 6「开始规划」→ POST .../start → 拿 run_id → 跳现有 /plan/{run_id} 轮询页
+ * 只剩两步：0「探索确认」→ 1「偏好」。「基础信息」页已经删掉 —— 它的 6 个字段里
+ * 5 个与首页重复，用户刚填完又填一遍；现在基础信息只由首页收集、经 URL 带进来。
  *
- * 基础信息（出发地 / 目的地 / 日期 / 天数）一变：旧会话取消、POI 清空、重新创建会话，
- * 绝不沿用旧城市的地点（§16）。
+ * 会话生命周期（因为不再有第 1 页，创建时机整体前移）：
+ *   挂载 → POST /planning-sessions（附上 URL 带来的基础信息，后台立刻 Prefetch）
+ *        → 轮询 GET 直到 READY/PARTIAL，第 0 页就是 POI 列表
+ *   第 0 页「继续」→ PATCH poi_selections
+ *   第 1 页「开始规划」→ POST .../start → 拿 run_id → 跳现有 /plan/{run_id} 轮询页
+ *
+ * 基础信息这回是一次性的：URL 缺必填项时直接给错误态并请用户回首页，绝不静默拿默认值开跑。
+ * 会话过期/被取消后仍可原地重建，重建时把已经选过的偏好（不含 POI）照旧补写回去。
  */
 interface GuidedWizardProps {
-  /** 首页只预填基础信息；最终校验仍由 Step 1 执行。 */
-  initialBasic?: Partial<Pick<BasicDraft, "origin" | "destination" | "startDate" | "days">>;
+  /** 首页是基础信息的唯一入口：URL 上带过来的就是这次会话的全部出发信息。 */
+  initialBasic?: Partial<BasicDraft>;
 }
 
 export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
@@ -104,10 +80,14 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
     if (fromUrl.destination?.trim()) basic.destination = fromUrl.destination;
     if (fromUrl.startDate?.trim()) basic.startDate = fromUrl.startDate;
     if (fromUrl.days?.trim()) basic.days = fromUrl.days;
+    if (fromUrl.endDate?.trim()) basic.endDate = fromUrl.endDate;
+    if (fromUrl.travelers?.trim()) basic.travelers = fromUrl.travelers;
+    if (fromUrl.budgetAmount?.trim()) basic.budgetAmount = fromUrl.budgetAmount;
+    if (fromUrl.durationMode) basic.durationMode = fromUrl.durationMode;
+    if (fromUrl.budgetMode) basic.budgetMode = fromUrl.budgetMode;
     return { ...empty, basic };
   });
   const [session, setSession] = useState<SessionView | null>(null);
-  const [sessionKey, setSessionKey] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
@@ -115,11 +95,10 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
   const [syncing, setSyncing] = useState(false);
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
-  const [showIssues, setShowIssues] = useState(false);
   const [pollStalled, setPollStalled] = useState(false);
   const [pollNonce, setPollNonce] = useState(0);
-  const [poiReset, setPoiReset] = useState(false);
   const poiTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bootstrapped = useRef(false);
 
   const sessionId = session?.session_id ?? null;
   const settled = isDiscoverySettled(session);
@@ -127,10 +106,8 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
   const socialFailed = hasSocialDegradation(session?.degradations ?? []);
   const model = summarize(draft, session);
   const isLast = step === STEP_META.length - 1;
-  // 后端能力声明：false 时禁用「最低星级」并从 PATCH 里删掉该字段。
-  const starFilterAvailable = hotelStarFilterAvailable(session);
-  // 「接受换酒店」当前不影响排程（全程只订一家），后端声明不生效时同样置灰 —— 不留假按钮。
-  const allowChangeAvailable = hotelAllowChangeAvailable(session);
+  // draft.basic 在向导里不会再被编辑（基础信息只由首页决定），所以每次渲染重算就够了。
+  const missingBasic = basicIssues(draft.basic);
 
   useEffect(() => {
     if (!sessionId || settled || unusable || pollStalled) return;
@@ -183,9 +160,23 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
     };
   }, []);
 
-  function patchBasic(patch: Partial<GuidedDraft["basic"]>) {
-    setDraft((current) => ({ ...current, basic: { ...current.basic, ...patch } }));
-  }
+  /**
+   * 挂载即建会话：第 0 页已经是 POI 列表，后台 Prefetch 不能再等用户点「继续」。
+   *
+   * 两处必须小心：
+   * 1. StrictMode 在开发模式下会把 effect 跑两遍，用 ref 兜住，绝不重复 POST
+   *    （重复创建不只是一个多余请求，还会把上一个会话晾在那里等 TTL）。
+   * 2. URL 缺必填项时不建会话、不轮询，直接走下面的错误态 —— 拿默认值静默开跑
+   *    会规划出一趟用户没说过要去的旅行。
+   */
+  useEffect(() => {
+    if (bootstrapped.current) return;
+    if (missingBasic.length > 0) return;
+    bootstrapped.current = true;
+    void rebuildSession();
+    // 只在挂载时跑一次：rebuildSession 读的是此刻的 draft，之后的会话生命周期由用户操作驱动。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function patchTransport(patch: Partial<GuidedDraft["transport"]>) {
     setDraft((current) => ({ ...current, transport: { ...current.transport, ...patch } }));
@@ -211,7 +202,7 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
     }));
   }
 
-  /** 清空旧城市的 POI：基础信息变了以后必须走这里。 */
+  /** 清空 POI 选择：重建会话后必须走这里，否则界面还留着没写进新会话的旧勾选。 */
   function clearPoi(): void {
     setDraft((current) => ({ ...current, poi: { selections: {}, bulk: null, expanded: [] } }));
   }
@@ -266,18 +257,13 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
     try {
       const created = await createPlanningSession(toCreateInput(draft.basic));
       setSession(created);
-      setSessionKey(prefetchKey(draft.basic));
       setPollStalled(false);
       setSyncError(null);
       setPendingPatch(null);
       setStartError(null);
       if (hasAnyPreference(draft)) {
         try {
-          const replay = preferenceReplayPatch(draft);
-          const replayed = await patchPlanningSession(
-            created.session_id,
-            starFilterAvailable ? replay : dropStarFilter(replay),
-          );
+          const replayed = await patchPlanningSession(created.session_id, preferenceReplayPatch(draft));
           setSession(replayed);
         } catch {
           // 偏好补写失败不阻塞：用户继续往下走时还会再写一次。
@@ -298,25 +284,21 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
       setStep(advanceTo);
       return;
     }
-    // 数据源不支持星级过滤时，绝不把 hotel_min_star 提交上去；
-    // 「接受换酒店」不生效时同理 —— 提交一个后端不消费的偏好只会制造"我选过了"的错觉。
-    let effective = starFilterAvailable ? patch : dropStarFilter(patch);
-    if (!allowChangeAvailable) effective = dropAllowChange(effective);
     // 这次要发的就是最新的 POI 选择时，取消还在等待的防抖同步，避免重复 PATCH。
-    if (effective.poi_selections && poiTimer.current) {
+    if (patch.poi_selections && poiTimer.current) {
       clearTimeout(poiTimer.current);
       poiTimer.current = null;
     }
     setSyncing(true);
     try {
-      const view = await patchPlanningSession(id, effective);
+      const view = await patchPlanningSession(id, patch);
       setSession(view);
       setSyncError(null);
       setPendingPatch(null);
     } catch (cause) {
       // 写不回后端也不拦住用户：明确告知 + 提供重试，而不是把人卡在这一步。
       setSyncError(describeSessionError(cause));
-      setPendingPatch(effective);
+      setPendingPatch(patch);
     } finally {
       setSyncing(false);
       setStep(advanceTo);
@@ -324,32 +306,13 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
   }
 
   async function handleContinue(): Promise<void> {
-    if (step === 0) {
-      const issues = basicIssues(draft.basic);
-      if (issues.length > 0) {
-        setShowIssues(true);
-        return;
-      }
-      setShowIssues(false);
-      const key = prefetchKey(draft.basic);
-      const changed = sessionKey !== null && sessionKey !== key;
-      if (!session || changed || unusable) {
-        const previousKey = sessionKey;
-        const ok = await rebuildSession();
-        if (!ok) return;
-        if ((previousKey !== null && previousKey !== key) || Object.keys(draft.poi.selections).length > 0) {
-          clearPoi();
-          setPoiReset(previousKey !== null && previousKey !== key);
-        }
-        setStep(1);
-        return;
-      }
-      await syncNow(budgetPatch(draft), 1);
+    if (!sessionId) {
+      // 还没建好会话（创建失败，或挂载时那次创建还在飞）：这一页勾的 POI 没有落点，
+      // 所以此刻这颗按钮就是「重新创建会话」，绝不静默跳到下一屏。
+      await rebuildSession();
       return;
     }
-    if (step >= 1 && step < STEP_META.length - 1) {
-      await syncNow(stepPatch(step, draft), step + 1);
-    }
+    await syncNow(stepPatch(step, draft), step + 1);
   }
 
   /**
@@ -366,8 +329,7 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
 
   async function handleStart(): Promise<void> {
     if (!sessionId) {
-      setStep(0);
-      setShowIssues(true);
+      setStartError("会话还没创建成功，无法开始规划。请先重新创建会话。");
       return;
     }
     setStarting(true);
@@ -397,7 +359,7 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
     }
   }
 
-  /** 会话过期 / 被取消后的重建入口：按当前基础信息重开，偏好原样补写回去。 */
+  /** 会话过期 / 被取消后的重建入口：按 URL 带来的基础信息重开，偏好原样补写回去。 */
   async function handleRestart(): Promise<void> {
     const ok = await rebuildSession();
     if (!ok) {
@@ -405,14 +367,14 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
       return;
     }
     clearPoi();
-    setPoiReset(false);
     setPollNonce((value) => value + 1);
   }
 
   function retrySync(): void {
     // 重试时留在当前步骤：偏好没写回去也要让用户能继续，而不是把人卡在这一步。
-    // 最后一页没有"上一步的 PATCH"，它自己那页（交通+酒店+节奏）就是要重试的对象。
-    const patch = pendingPatch ?? stepPatch(isLast ? step : Math.max(step - 1, 0), draft);
+    // 两步流程里「当前页自己的字段」就是 stepPatch(step)：第 0 页是 POI，
+    // 最后一页是交通 / 酒店 / 节奏，不需要像旧的三步流程那样回退一页。
+    const patch = pendingPatch ?? stepPatch(step, draft);
     void syncNow(patch, step);
   }
 
@@ -421,17 +383,40 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
     setPollNonce((value) => value + 1);
   }
 
-  const discoveryPending = step === 1 && !settled && !unusable;
+  const discoveryPending = step === 0 && !settled && !unusable;
   const primaryLabel = isLast
     ? "开始规划"
-    : step === 0
-      ? creating
-        ? "正在创建会话…"
-        : "继续，后台开始找攻略"
-      : discoveryPending
-        ? "都随便，继续"
-        : "继续";
+    : creating && !session
+      ? "正在创建会话…"
+      : !session && createError
+        ? "重新创建会话"
+        : discoveryPending
+          ? "都随便，继续"
+          : "继续";
   const busy = creating || syncing || starting;
+
+  if (missingBasic.length > 0) {
+    return (
+      <div className="mx-auto w-full max-w-2xl px-4 py-8 pb-20 sm:px-6">
+        <Link
+          href="/"
+          className="inline-flex w-fit items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <ArrowLeft className="size-3.5" aria-hidden />
+          返回首页
+        </Link>
+        <div className="mt-4">
+          <ErrorState
+            title="这次向导缺少出发信息"
+            description="向导现在直接从「探索确认」开始，出发地、目的地、日期和人数由首页带过来；这份参数不完整，所以没有替你创建会话。"
+            detail={`还缺少：${missingBasic.join("；")}`}
+            onRetry={() => router.push("/")}
+            retryLabel="回首页填写"
+          />
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="mx-auto w-full max-w-[1440px] px-4 py-6 pb-24 sm:px-6 lg:pb-10">
@@ -446,8 +431,8 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
         <div>
           <h1 className="text-xl font-semibold tracking-tight text-foreground sm:text-2xl">逐项选择旅行偏好</h1>
           <p className="mt-1.5 max-w-2xl text-xs leading-5 text-muted-foreground sm:text-sm sm:leading-6">
-            每一步只问一件事，任何一项都能「随便 / 帮我选 / 不确定」。这些选择会原样提交给规划服务，
-            不存在只做样子的按钮。
+            两步就够：先确认探索出来的地点，再定交通、酒店与节奏。任何一项都能「随便 / 帮我选 / 不确定」，
+            这些选择会原样提交给规划服务，不存在只做样子的按钮。
           </p>
         </div>
         <p className="lg:hidden text-xs text-muted-foreground">
@@ -465,7 +450,7 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
                 title="没能创建这次的会话"
                 description={createError}
                 detail={`会话服务地址：${API_BASE_URL}`}
-                onRetry={() => void handleContinue()}
+                onRetry={() => void rebuildSession()}
                 retryLabel="重新创建"
               />
             ) : null}
@@ -485,7 +470,7 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
               </div>
             ) : null}
 
-            {unusable && step > 0 ? (
+            {unusable ? (
               <SessionUnusableNotice
                 status={session?.status ?? "EXPIRED"}
                 busy={creating}
@@ -515,30 +500,20 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
               />
             ) : null}
 
-            {session && step !== 1 ? <DiscoveryResearch session={session} settled={settled} /> : null}
+            {session && isLast ? <DiscoveryResearch session={session} settled={settled} /> : null}
           </div>
 
           <SectionCard
             title={STEP_META[step].title}
             description={STEP_META[step].subtitle}
-            action={session ? <SessionStatusChip session={session} poiStep={step === 1} /> : null}
+            action={session ? <SessionStatusChip session={session} poiStep={step === 0} /> : null}
             className="mt-3 shadow-sm"
           >
             {step === 0 ? (
-              <StepBasic
-                value={draft.basic}
-                onChange={patchBasic}
-                issues={basicIssues(draft.basic)}
-                showIssues={showIssues}
-                busy={creating}
-              />
-            ) : null}
-            {step === 1 ? (
               <StepPoi
                 session={session}
                 settled={settled}
                 unusable={unusable}
-                resetNotice={poiReset}
                 pollStalled={pollStalled}
                 selections={draft.poi.selections}
                 expanded={draft.poi.expanded}
@@ -555,16 +530,17 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
                 onTransport={patchTransport}
                 onHotel={patchHotel}
                 onPace={patchPace}
-                hotelStarFilterAvailable={starFilterAvailable}
-                hotelAllowChangeAvailable={allowChangeAvailable}
               />
             ) : null}
           </SectionCard>
 
           <div className="sticky bottom-0 z-20 mt-4 flex items-center justify-between gap-3 border-t border-border/70 bg-background/95 py-3 backdrop-blur-sm sm:static sm:bg-transparent sm:py-0 sm:pt-4">
             {step === 0 ? (
+              // 不写死「会话已经建好」：创建失败时上面已经有错误卡，这里再宣称建好了就是自相矛盾。
               <span className="hidden text-[11px] text-muted-foreground sm:block">
-                点「继续」后请保持页面打开，系统会在后台开始查交通、酒店与攻略。
+                {session
+                  ? "会话已经建好，交通、酒店与攻略正在后台继续查；你在这页慢慢挑，点「继续」进入偏好设置。"
+                  : "会话还没建好，这页勾选的地点暂时没有落点；先按上面的提示重新创建会话。"}
               </span>
             ) : (
               <Button
@@ -581,7 +557,7 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
             <Button
               size="lg"
               className="h-11 min-w-[150px] sm:h-9 sm:min-w-[120px]"
-              disabled={busy || (unusable && step > 0)}
+              disabled={busy || unusable}
               onClick={() => {
                 if (isLast) void handleFinish();
                 else void handleContinue();
@@ -649,7 +625,7 @@ function SessionUnusableNotice({
         {expired ? "这次会话已过期，请重新开始。" : "这次会话已被取消。"}
       </p>
       <p className="text-[11px] leading-5 text-warning-subtle-foreground/90">
-        会话只在一段时间内有效，过期不会产生失败记录。点下面的按钮会按当前填写的出发信息重新创建一次，
+        会话只在一段时间内有效，过期不会产生失败记录。点下面的按钮会按这次出发信息重新创建一次，
         已经选过的交通 / 酒店 / 节奏会一并带过去。
       </p>
       <div className="flex justify-end">

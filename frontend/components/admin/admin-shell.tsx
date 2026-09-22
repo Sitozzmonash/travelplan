@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import { createContext, useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import {
   Activity,
   ArrowLeft,
@@ -49,7 +49,23 @@ import {
   ServerTokenMissingView,
   UnauthorizedView,
 } from "@/components/admin/admin-states";
-import { useAdminResource, useHydrated } from "@/components/admin/use-admin-resource";
+import {
+  useAdminResource,
+  useHydrated,
+  type AdminResource,
+} from "@/components/admin/use-admin-resource";
+
+/**
+ * 把外壳已经探到的 `/admin/overview` 共享给子树。
+ *
+ * 为什么要共享：外壳为了在页面级数据之前分辨 401 / 503，进入管理台时必然要探一次
+ * overview，而页面上唯一消费这份数据的「累计用量（历史总量）」折叠卡原本会在展开时
+ * **再拉一次同一端点**。`useAdminResource` 的状态是按 hook 实例存的、没有跨实例缓存，
+ * 所以这里用 context 显式复用这一次请求，而不是给所有资源加一层全局缓存
+ * （那会改变每个页面的刷新语义）。页面依旧保留自己的按需请求兜底，
+ * 拿不到 context 时行为与改造前完全一致。
+ */
+export const AdminOverviewContext = createContext<AdminResource<AdminOverview> | null>(null);
 
 /**
  * 管理台外壳。
@@ -265,17 +281,19 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
         </aside>
 
         <main className="min-w-0 flex-1 pb-16 lg:pb-4">
-          {authIssue?.kind === "unauthorized" ? (
-            <UnauthorizedView
-              detail={authIssue.detail}
-              onClearToken={handleClearToken}
-              onRetry={probe.reload}
-            />
-          ) : authIssue?.kind === "unconfigured" ? (
-            <ServerTokenMissingView detail={authIssue.detail} onRetry={probe.reload} />
-          ) : (
-            children
-          )}
+          <AdminOverviewContext.Provider value={probe}>
+            {authIssue?.kind === "unauthorized" ? (
+              <UnauthorizedView
+                detail={authIssue.detail}
+                onClearToken={handleClearToken}
+                onRetry={probe.reload}
+              />
+            ) : authIssue?.kind === "unconfigured" ? (
+              <ServerTokenMissingView detail={authIssue.detail} onRetry={probe.reload} />
+            ) : (
+              children
+            )}
+          </AdminOverviewContext.Provider>
         </main>
       </div>
 

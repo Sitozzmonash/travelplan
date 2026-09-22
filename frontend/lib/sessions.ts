@@ -447,6 +447,9 @@ function normalizeEvents(value: unknown): SessionEvent[] {
 /**
  * 能力开关归一：只认真正的布尔值，其余（缺失 / 字符串 / 对象）都当「未声明」= 不限制。
  * 缺字段时按「可用」处理，这样旧后端或创建接口的即时返回也不会把功能误关掉。
+ *
+ * 注意：`hotel_star_filter` / `hotel_allow_change` 仍然原样解析并保留 —— 它们是后端契约声明，
+ * 前端界面已不再有对应的星级与换酒店选项，但字段本身仍描述服务端行为，不在这一层收口。
  */
 function normalizeCapabilities(value: unknown): SessionCapabilities {
   if (!isRecord(value)) return {};
@@ -463,23 +466,6 @@ function normalizeCapabilities(value: unknown): SessionCapabilities {
     hotel_allow_change_note:
       typeof value.hotel_allow_change_note === "string" ? value.hotel_allow_change_note : null,
   };
-}
-
-/**
- * 「最低星级」是否可用。
- * 只有后端明确说 `hotel_star_filter === false` 才禁用；未声明时保持可用（向后兼容）。
- */
-export function hotelStarFilterAvailable(session: SessionView | null): boolean {
-  return session?.capabilities.hotel_star_filter !== false;
-}
-
-/**
- * 「接受换酒店」是否真的会影响排程。
- * 后端声明 `hotel_allow_change === false` 时置灰：行程目前全程只订一家酒店，
- * 选它不会改变任何安排。未声明时保持可用（向后兼容）。
- */
-export function hotelAllowChangeAvailable(session: SessionView | null): boolean {
-  return session?.capabilities.hotel_allow_change !== false;
 }
 
 /* --------------------- 数值型偏好的哨兵字符串收敛 --------------------- */

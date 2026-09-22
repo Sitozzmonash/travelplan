@@ -17,7 +17,21 @@ export function formatNumber(value: number | null | undefined, fraction = 0): st
   });
 }
 
+/**
+ * Token 数量（KPI 行 / 环比口径）。
+ *
+ * 为什么不能只用 formatNumber：token 会到千万、亿这个量级，纯千分位在窄卡片里
+ * 会挤成一长串数字，读不出数量级。10^4 以上收成「万」、10^8 以上收成「亿」，
+ * 一眼能看出「多大」；万以下仍保留千分位，精确值不丢。
+ *
+ * 注意与 formatTokenCount 的区别：那个是明细里的精确计数（null 显示「未知」），
+ * 这个专供聚合指标的展示，null 必须落成「—」（缺失 ≠ 0 个 token）。
+ */
 export function formatTokens(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+  const abs = Math.abs(value);
+  if (abs >= 1e8) return `${(value / 1e8).toFixed(1)} 亿`;
+  if (abs >= 1e4) return `${(value / 1e4).toFixed(1)} 万`;
   return formatNumber(value);
 }
 

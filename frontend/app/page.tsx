@@ -3,7 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useCallback, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
-import { ArrowRight, CalendarDays, CircleAlert, Compass, Database, Lock, MapPin, ShieldCheck, Sparkles, Users } from "lucide-react";
+import { ArrowRight, CalendarDays, CircleAlert, Compass, Database, Lock, MapPin, ShieldCheck, Sparkles, Users, Wallet } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { CreatePlanResult, PlanningStepState } from "@/types/api";
 import {
@@ -15,11 +15,15 @@ import {
   describeApiError,
   mergeProgressEvent,
 } from "@/lib/api";
+import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { CityCombobox } from "@/components/city-combobox";
 import { PlanningProgress } from "@/components/planning-progress";
 import { SectionCard } from "@/components/section-card";
 import { ErrorState, PartialNotice, RunStatusBadge, UnauthorizedState } from "@/components/state-views";
 import { TripSearch } from "@/components/trip-search";
+import { BUDGET_MODE_LABELS, formatTripLength } from "@/components/guided/options";
+import { basicIssues, createEmptyDraft, resolvedDays, type BasicDraft, type BudgetMode } from "@/components/guided/draft";
 
 type Phase = "idle" | "planning" | "result" | "error";
 
@@ -258,24 +262,51 @@ function AboutCard({
   );
 }
 
+const BUDGET_MODES: BudgetMode[] = ["amount", "undecided", "auto"];
+
+/**
+ * 首页是基础信息的唯一入口：向导里已经没有「基础信息」页了，这里填的东西会经 URL
+ * 原样变成创建 Planning Session 的输入。所以它直接复用向导的 BasicDraft 字段、
+ * basicIssues() 校验与 CityCombobox，而不是另立一套字段名和排版语言 ——
+ * 同一件事只保留一份规则，改口径时不会两处跑偏。
+ */
 function HomeLaunchpad({ onQuickSubmit }: { onQuickSubmit: (message: string) => void }) {
   const router = useRouter();
-  const [origin, setOrigin] = useState("");
-  const [destination, setDestination] = useState("");
-  const [startDate, setStartDate] = useState("");
-  const [days, setDays] = useState("5");
-  const [travelers, setTravelers] = useState("2");
+  const [basic, setBasic] = useState<BasicDraft>(() => createEmptyDraft().basic);
+  const [issues, setIssues] = useState<string[]>([]);
+
+  function patchBasic(patch: Partial<BasicDraft>) {
+    setBasic((current) => ({ ...current, ...patch }));
+    // 用户已经动过手，旧报错就不再对应当前状态了：先收起来，提交时整套重新校验。
+    setIssues((current) => (current.length > 0 ? [] : current));
+  }
 
   function startGuided(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const params = new URLSearchParams();
-    if (origin.trim()) params.set("origin", origin.trim());
-    if (destination.trim()) params.set("destination", destination.trim());
-    if (startDate) params.set("start_date", startDate);
-    if (days.trim()) params.set("days", days.trim());
-    router.push(`/guided${params.size ? `?${params.toString()}` : ""}`);
+    // 校验不过就地报错，不跳转：带着半份基础信息进向导只会让人白走一趟。
+    const found = basicIssues(basic);
+    if (found.length > 0) {
+      setIssues(found);
+      return;
+    }
+    setIssues([]);
+    const params = new URLSearchParams({
+      origin: basic.origin.trim(),
+      destination: basic.destination.trim(),
+      start_date: basic.startDate,
+      duration_mode: basic.durationMode,
+      travelers: basic.travelers.trim(),
+      budget_mode: basic.budgetMode,
+    });
+    if (basic.durationMode === "days") params.set("days", basic.days.trim());
+    else params.set("end_date", basic.endDate);
+    if (basic.budgetMode === "amount" && basic.budgetAmount.trim()) {
+      params.set("budget_amount", basic.budgetAmount.trim());
+    }
+    router.push(`/guided?${params.toString()}`);
   }
 
+  const days = resolvedDays(basic);
   const destinations = ["成都", "重庆", "杭州", "西安"];
   const styles = ["美食旅行", "亲子出行", "拍照漫游", "轻松度假"];
 
@@ -287,29 +318,139 @@ function HomeLaunchpad({ onQuickSubmit }: { onQuickSubmit: (message: string) => 
             <Compass className="size-4 text-primary" aria-hidden />
             你想去哪里？
           </p>
-          <p className="mt-1 text-xs leading-5 text-muted-foreground">从基础信息开始，接着用六步确认你真正想要的旅行方式。</p>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">
+            先在这里把出发信息填全，接下来两步只确认你真正想要的旅行方式。
+          </p>
         </div>
         <div className="grid gap-3 p-4 sm:grid-cols-2 sm:p-5">
           <LabelField label="出发地" icon={MapPin}>
-            <input value={origin} onChange={(event) => setOrigin(event.target.value)} placeholder="例如 北京" className={HOME_INPUT_CLASS} />
+            <CityCombobox
+              value={basic.origin}
+              onChange={(next) => patchBasic({ origin: next })}
+              placeholder="北京"
+              ariaLabel="出发地"
+              className={HOME_INPUT_CLASS}
+            />
           </LabelField>
           <LabelField label="目的地" icon={MapPin}>
-            <input value={destination} onChange={(event) => setDestination(event.target.value)} placeholder="例如 成都" className={HOME_INPUT_CLASS} />
+            <CityCombobox
+              value={basic.destination}
+              onChange={(next) => patchBasic({ destination: next })}
+              placeholder="成都"
+              ariaLabel="目的地"
+              className={HOME_INPUT_CLASS}
+            />
           </LabelField>
+
           <LabelField label="出发日期" icon={CalendarDays}>
-            <input value={startDate} onChange={(event) => setStartDate(event.target.value)} type="date" className={HOME_INPUT_CLASS} />
+            <input
+              type="date"
+              value={basic.startDate}
+              aria-label="出发日期"
+              onChange={(event) => patchBasic({ startDate: event.target.value })}
+              className={HOME_INPUT_CLASS}
+            />
           </LabelField>
-          <div className="grid grid-cols-2 gap-3">
-            <LabelField label="玩几天" icon={CalendarDays}>
-              <input value={days} onChange={(event) => setDays(event.target.value)} inputMode="numeric" placeholder="5" className={HOME_INPUT_CLASS} />
-            </LabelField>
-            <LabelField label="几个人" icon={Users}>
-              <input value={travelers} onChange={(event) => setTravelers(event.target.value)} inputMode="numeric" placeholder="2" className={HOME_INPUT_CLASS} />
-            </LabelField>
-          </div>
+
+          <LabelField label="行程长度" icon={CalendarDays}>
+            <div className="grid gap-2">
+              <div className="flex gap-2">
+                <HomeSegmentedButton
+                  selected={basic.durationMode === "days"}
+                  onClick={() => patchBasic({ durationMode: "days" })}
+                >
+                  按天数
+                </HomeSegmentedButton>
+                <HomeSegmentedButton
+                  selected={basic.durationMode === "endDate"}
+                  onClick={() => patchBasic({ durationMode: "endDate" })}
+                >
+                  按返程日期
+                </HomeSegmentedButton>
+              </div>
+              {basic.durationMode === "days" ? (
+                <input
+                  value={basic.days}
+                  inputMode="numeric"
+                  aria-label="行程天数"
+                  placeholder="5"
+                  onChange={(event) => patchBasic({ days: event.target.value })}
+                  className={HOME_INPUT_CLASS}
+                />
+              ) : (
+                <input
+                  type="date"
+                  value={basic.endDate}
+                  aria-label="返程日期"
+                  onChange={(event) => patchBasic({ endDate: event.target.value })}
+                  className={HOME_INPUT_CLASS}
+                />
+              )}
+              <p className="text-[11px] text-muted-foreground">
+                {days ? `共 ${formatTripLength(days)}` : "填好日期后这里会显示总天数"}
+              </p>
+            </div>
+          </LabelField>
+
+          <LabelField label="几个人" icon={Users}>
+            <input
+              value={basic.travelers}
+              inputMode="numeric"
+              aria-label="出行人数"
+              placeholder="2"
+              onChange={(event) => patchBasic({ travelers: event.target.value })}
+              className={HOME_INPUT_CLASS}
+            />
+          </LabelField>
+
+          <LabelField label="预算" icon={Wallet}>
+            <div className="grid gap-2">
+              <div className="flex flex-wrap gap-2">
+                {BUDGET_MODES.map((mode) => (
+                  <HomeSegmentedButton
+                    key={mode}
+                    selected={basic.budgetMode === mode}
+                    onClick={() => patchBasic({ budgetMode: mode })}
+                  >
+                    {BUDGET_MODE_LABELS[mode]}
+                  </HomeSegmentedButton>
+                ))}
+              </div>
+              {basic.budgetMode === "amount" ? (
+                <input
+                  value={basic.budgetAmount}
+                  inputMode="numeric"
+                  aria-label="总预算"
+                  placeholder="6000"
+                  onChange={(event) => patchBasic({ budgetAmount: event.target.value })}
+                  className={HOME_INPUT_CLASS}
+                />
+              ) : (
+                <p className="text-[11px] leading-5 text-muted-foreground">
+                  {basic.budgetMode === "undecided"
+                    ? "系统不会用预算卡你，只会在结果里给出花费明细。"
+                    : "系统会按性价比控制总花费，并在结果里说明取舍。"}
+                </p>
+              )}
+            </div>
+          </LabelField>
         </div>
+
+        {issues.length > 0 ? (
+          <ul className="grid gap-1 border-t border-border/70 bg-danger-subtle px-4 py-3 text-xs text-danger-subtle-foreground sm:px-5">
+            {issues.map((issue) => (
+              <li key={issue} className="flex items-start gap-1.5">
+                <CircleAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+                <span>{issue}</span>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+
         <div className="flex flex-col gap-3 border-t border-border/70 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between sm:px-5">
-          <p className="text-[11px] leading-5 text-muted-foreground">不确定也没关系，向导里每一项都能交给系统决定。</p>
+          <p className="text-[11px] leading-5 text-muted-foreground">
+            出发地、目的地、出发日期与人数是必填的；预算可以填一个数，也可以交给系统控制。
+          </p>
           <Button type="submit" className="min-h-10 shrink-0">
             开始逐步规划
             <ArrowRight className="size-4" aria-hidden />
@@ -323,7 +464,7 @@ function HomeLaunchpad({ onQuickSubmit }: { onQuickSubmit: (message: string) => 
             <button
               key={place}
               type="button"
-              onClick={() => setDestination(place)}
+              onClick={() => patchBasic({ destination: place })}
               className="rounded-full border border-border bg-card px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:border-primary/35 hover:text-foreground"
             >
               {place}
@@ -343,6 +484,33 @@ function HomeLaunchpad({ onQuickSubmit }: { onQuickSubmit: (message: string) => 
         </details>
       </div>
     </div>
+  );
+}
+
+/** 首页的分段按钮：高度与 HOME_INPUT_CLASS 对齐，一行里的控件不再三种高度。 */
+function HomeSegmentedButton({
+  selected,
+  onClick,
+  children,
+}: {
+  selected: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={selected}
+      onClick={onClick}
+      className={cn(
+        "inline-flex h-10 shrink-0 items-center rounded-lg border px-3 text-xs transition-colors",
+        selected
+          ? "border-primary/50 bg-accent font-medium text-accent-foreground"
+          : "border-border bg-card text-muted-foreground hover:text-foreground",
+      )}
+    >
+      {children}
+    </button>
   );
 }
 

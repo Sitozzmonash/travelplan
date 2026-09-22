@@ -7,46 +7,34 @@ import type { GuidedDraft } from "./draft";
 import { hotelDetailLabels, maxPricePresetLabel } from "./draft";
 import { ChoiceGrid, ChipToggle, SentinelRow, StepSection } from "./option-cards";
 import {
-  ALLOW_CHANGE_OPTIONS,
   HOTEL_PRIORITY_OPTIONS,
   MAX_PRICE_PRESETS,
-  MIN_STAR_OPTIONS,
   ROOM_TYPE_OPTIONS,
   SENTINEL_OPTIONS,
   optionLabel,
 } from "./options";
 
 /**
- * Step 3 酒店偏好（§7）。
- * 策略 → hotel_priority；四个补充项 → hotel_max_price_per_night / hotel_min_star /
- * hotel_room_type / hotel_allow_change。
+ * 酒店偏好（§7）。
+ * 三项：策略 → hotel_priority；每晚价格上限 → hotel_max_price_per_night；房型 → hotel_room_type。
  * 补充项都能选「不限 / 不确定 / 帮我选」，三者在后端是三种不同的值；
  * 完全没表态的项不会写进 PATCH，让后端自己的稳定默认策略生效。
+ *
+ * 「最低星级」与「接受换酒店」已整体删除：数据源不返回星级、行程全程也只订一家酒店，
+ * 留着它们只会让用户以为自己的选择起了作用（详见 feedback/2026-09-21-引导式流程-首页与基础信息重叠等.md §二）。
  */
 
 interface StepHotelProps {
   draft: GuidedDraft;
   onChange: (patch: Partial<GuidedDraft["hotel"]>) => void;
-  /** 后端能力声明：false 时「最低星级」置灰（数据源不返回星级）。缺省视为可用。 */
-  hotelStarFilterAvailable?: boolean;
-  /** 后端能力声明：false 时「接受换酒店」置灰（当前全程只订一家）。缺省视为可用。 */
-  hotelAllowChangeAvailable?: boolean;
 }
 
-export function StepHotel({
-  draft,
-  onChange,
-  hotelStarFilterAvailable = true,
-  hotelAllowChangeAvailable = true,
-}: StepHotelProps) {
+export function StepHotel({ draft, onChange }: StepHotelProps) {
   const hotel = draft.hotel;
-  const details = hotelDetailLabels(hotel, {
-    includeStar: hotelStarFilterAvailable,
-    includeAllowChange: hotelAllowChangeAvailable,
-  });
+  const details = hotelDetailLabels(hotel);
 
   return (
-    <div className="grid gap-6">
+    <div className="grid gap-5">
       <StepSection title="酒店你更看重什么？" hint="这一项会进入酒店候选的真实评分；选「帮我选」时按位置与评分不差、再综合价格的稳定策略来。">
         <ChoiceGrid
           ariaLabel="酒店策略"
@@ -65,7 +53,7 @@ export function StepHotel({
             inputMode="numeric"
             aria-label="每晚价格上限"
             placeholder="例如 500"
-            className="w-[140px]"
+            className="h-9 w-[140px]"
             disabled={hotel.maxPriceSentinel !== null}
             onChange={(event) => onChange({ maxPriceText: event.target.value, maxPriceSentinel: null })}
           />
@@ -86,35 +74,6 @@ export function StepHotel({
         />
       </StepSection>
 
-      <StepSection
-        title="最低星级"
-        hint={
-          hotelStarFilterAvailable
-            ? "选具体星级表示「至少这个档次」。"
-            : "数据源当前不返回星级，暂不可用 —— 选了也不会生效，因此这里禁用。"
-        }
-      >
-        <ChipToggle
-          ariaLabel="最低星级"
-          options={MIN_STAR_OPTIONS}
-          values={typeof hotel.minStar === "number" ? [hotel.minStar] : []}
-          disabled={!hotelStarFilterAvailable}
-          onToggle={(value) => onChange({ minStar: typeof hotel.minStar === "number" && hotel.minStar === value ? null : value })}
-        />
-        <SentinelRow
-          ariaLabel="最低星级的其他选择"
-          options={SENTINEL_OPTIONS}
-          value={typeof hotel.minStar === "string" ? hotel.minStar : null}
-          disabled={!hotelStarFilterAvailable}
-          onChange={(value) => onChange({ minStar: value })}
-        />
-        {!hotelStarFilterAvailable ? (
-          <p className="rounded-md bg-muted/60 px-2.5 py-2 text-[11px] leading-5 text-muted-foreground">
-            数据源当前不返回星级，暂不可用。每晚价格上限等其他条件仍然生效。
-          </p>
-        ) : null}
-      </StepSection>
-
       <StepSection title="房型" hint="人多或带小孩时，可以指定房型。">
         <ChipToggle
           ariaLabel="房型"
@@ -128,37 +87,6 @@ export function StepHotel({
           value={typeof hotel.roomType === "string" && SENTINEL_OPTIONS.some((item) => item.value === hotel.roomType) ? (hotel.roomType as PreferenceSentinel) : null}
           onChange={(value) => onChange({ roomType: value })}
         />
-      </StepSection>
-
-      <StepSection
-        title="接受换酒店吗？"
-        hint={
-          hotelAllowChangeAvailable
-            ? "行程跨度大时，换到就近的酒店能减少通勤；不想折腾就固定一家。"
-            : "当前行程全程只订一家酒店，中途换酒店尚未支持 —— 选了也不会改变排程，因此这里禁用。"
-        }
-      >
-        <ChoiceGrid
-          ariaLabel="是否接受换酒店"
-          options={ALLOW_CHANGE_OPTIONS}
-          value={typeof hotel.allowChange === "boolean" ? hotel.allowChange : null}
-          disabled={!hotelAllowChangeAvailable}
-          onChange={(next) => onChange({ allowChange: next })}
-          dense
-        />
-        <SentinelRow
-          ariaLabel="是否接受换酒店的其他选择"
-          options={SENTINEL_OPTIONS}
-          value={typeof hotel.allowChange === "string" ? hotel.allowChange : null}
-          disabled={!hotelAllowChangeAvailable}
-          onChange={(value) => onChange({ allowChange: value })}
-        />
-        {!hotelAllowChangeAvailable ? (
-          <p className="rounded-md bg-muted/60 px-2.5 py-2 text-[11px] leading-5 text-muted-foreground">
-            行程目前全程只订一家酒店，中途换酒店尚未支持。你的选择会被记录，但不会改变排程；
-            想影响住宿请用上面的「酒店策略」与价格上限。
-          </p>
-        ) : null}
       </StepSection>
 
       <p className="rounded-lg bg-muted/50 px-3 py-2.5 text-[11px] leading-5 text-muted-foreground">

@@ -275,5 +275,5 @@ ObservabilityMiddleware：before_agent 建 trace_id，wrap_model_call / wrap_too
 ## 8. 不在本轮的理想图（明确未实现）
 
 - 完整 Span 树（Trace）对固定流程 —— **当前未实现**（§7-B）。
-- Bad Case 结构化记录 / Benchmark 评测 / RSI 自改进 —— **当前未实现**，是下一阶段设计（见同目录 `TRACE_BADCASE_SPEC.md`、`BENCHMARK_SPEC.md`）。
+- Bad Case 结构化记录 / Benchmark 评测 / RSI 自改进 —— **当时未实现，现已全部落地**（BadCase 见 `docs/06_BadCase机制.md`、Benchmark 见 `docs/07_评测体系.md`、Evolution 见 `docs/08_进化机制.md`；对应的两份设计稿 `TRACE_BADCASE_SPEC.md` / `BENCHMARK_SPEC.md` 因与实现几乎零重合，已于 2026-09-21 删除）。
 - `runs/<run_id>/trace.json` 统一目录 —— **当前未实现**，现有产物在 `outputs/<run_id>/`。

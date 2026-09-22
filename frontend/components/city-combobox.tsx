@@ -11,6 +11,8 @@ interface CityComboboxProps {
   placeholder?: string;
   /** 无障碍名称，例如「出发地」。 */
   ariaLabel: string;
+  /** 高度与边框由调用页决定：首页要它和旁边几个原生输入一样高（同一行不留三种高度）。 */
+  className?: string;
 }
 
 /** 空输入时的建议：只放常见旅行城市，避免一上来就列出一串地名。 */
@@ -25,7 +27,7 @@ const COMMON_CITIES = COMMON_CITY_NAMES.map((name) => CHINA_CITIES.find((city) =
  * 只做输入建议，不做校验：后端接受任意自然语言，所以任何不在数据集里的城市
  * 都必须能照样输入并提交。键盘支持 ↑ / ↓ 选择、Enter 采纳、Esc 关闭。
  */
-export function CityCombobox({ value, onChange, placeholder, ariaLabel }: CityComboboxProps) {
+export function CityCombobox({ value, onChange, placeholder, ariaLabel, className }: CityComboboxProps) {
   const listId = useId();
   const [open, setOpen] = useState(false);
   const [highlight, setHighlight] = useState(0);
@@ -73,6 +75,7 @@ export function CityCombobox({ value, onChange, placeholder, ariaLabel }: CityCo
         aria-autocomplete="list"
         autoComplete="off"
         placeholder={placeholder}
+        className={className}
         onChange={(event) => {
           onChange(event.target.value);
           setOpen(true);

@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { AdminDetailDialog, JsonBlock, KeyValueList } from "@/components/admin/detail-dialog";
+import { AdminDetailDialog, JsonBlock, KeyValueList, PreviewBlock } from "@/components/admin/detail-dialog";
 import {
   formatDurationMs,
   formatTraceAttributeKey,
@@ -11,6 +11,28 @@ import {
 } from "@/components/admin/format";
 import { StatusBadge } from "@/components/admin/status-badge";
 import type { AdminTraceSpan } from "@/types/admin";
+
+/**
+ * 预览类属性（后端 A13 的脱敏 + 截断正文）→ 对话视角的中文标签。
+ *
+ * 为什么标签写在自己文件里而不加进 `format.ts` 的 `TRACE_ATTRIBUTE_SPECS`：
+ * 那个文件的归属不在本次任务的文件边界内。未登记的键本来就会原样透传，
+ * 所以这里补的是可读性，不是「能不能显示」。
+ */
+const TRACE_ATTRIBUTE_LABELS: Record<string, string> = {
+  system_preview: "系统提示预览（system_preview）",
+  user_preview: "用户输入预览（user_preview）",
+  context_preview: "上下文预览（context_preview）",
+  assistant_preview: "模型返回预览（assistant_preview）",
+  prompt_version: "Prompt 版本",
+  prompt_hash: "Prompt 哈希",
+  input_tokens: "输入 Token",
+  output_tokens: "输出 Token",
+  cached_tokens: "命中缓存 Token",
+};
+
+/** 正文类属性：不进「属性」两列小表（会被 160 字截断），单独用预览块展示。 */
+const PREVIEW_KEY_SUFFIX = "_preview";
 
 export interface AdminTraceNode extends AdminTraceSpan {
   children: AdminTraceNode[];
@@ -62,8 +84,9 @@ export function buildTraceTree(spans: AdminTraceSpan[]): AdminTraceNode[] {
  * Trace 树。
  *
  * 页面默认只给摘要：每一行是「组件 + 名称 + 状态 + 耗时」，
- * 点击任意一行打开完整属性弹窗（含友好标签与原始 JSON）。
- * 这样既不会在主页面里摊开几十行内部属性，也保证每个 span 都点得开。
+ * 点击任意一行打开完整属性弹窗（含模型交互预览、友好标签与原始 JSON）。
+ * 这样既不会在主页面里摊开几十行内部属性，也保证每个 span 都点得开；
+ * 正文类属性（`*_preview`）在弹窗里也走独立的预览块，不会被两列表格的 160 字截断吃掉。
  */
 export function TraceTree({ spans, className }: { spans: AdminTraceSpan[]; className?: string }) {
   const [selected, setSelected] = useState<AdminTraceSpan | null>(null);
@@ -141,6 +164,10 @@ function SpanDetailDialog({
 }) {
   const attributes = span?.attributes ?? {};
   const entries = Object.entries(attributes);
+  // 模型交互正文单独走预览块：两列小表会把长文本截到 160 字，
+  // 而「模型收到了什么」恰恰必须能完整读到（脱敏与截断都已经在服务端做过）。
+  const previewEntries = entries.filter(([key]) => key.endsWith(PREVIEW_KEY_SUFFIX));
+  const scalarEntries = entries.filter(([key]) => !key.endsWith(PREVIEW_KEY_SUFFIX));
 
   return (
     <AdminDetailDialog
@@ -167,19 +194,38 @@ function SpanDetailDialog({
             ]}
           />
 
+          {previewEntries.length > 0 ? (
+            <section className="flex flex-col gap-2">
+              <h3 className="text-xs font-medium text-foreground">模型交互预览</h3>
+              <p className="text-[11px] leading-5 text-muted-foreground">
+                已由后端脱敏 + 截断；没有这段说明这次 span 没带该字段，不是「内容为空」。
+              </p>
+              {previewEntries.map(([key, value]) => (
+                <PreviewBlock
+                  key={key}
+                  label={TRACE_ATTRIBUTE_LABELS[key] ?? formatTraceAttributeKey(key)}
+                  value={typeof value === "string" ? value : null}
+                  missing="—（这个 span 没有带该预览字段）"
+                />
+              ))}
+            </section>
+          ) : null}
+
           <section className="flex flex-col gap-2">
             <h3 className="text-xs font-medium text-foreground">属性</h3>
-            {entries.length === 0 ? (
-              <p className="text-xs text-muted-foreground">这个 span 没有属性。</p>
+            {scalarEntries.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                {previewEntries.length > 0 ? "除预览外这个 span 没有其他属性。" : "这个 span 没有属性。"}
+              </p>
             ) : (
               <dl className="grid gap-x-6 gap-y-2 sm:grid-cols-2">
-                {entries.map(([key, value]) => (
+                {scalarEntries.map(([key, value]) => (
                   <div
                     key={key}
                     className="flex items-baseline justify-between gap-3 border-b border-border/60 pb-1.5"
                   >
                     <dt className="shrink-0 text-[11px] text-muted-foreground" title={key}>
-                      {formatTraceAttributeKey(key)}
+                      {TRACE_ATTRIBUTE_LABELS[key] ?? formatTraceAttributeKey(key)}
                     </dt>
                     <dd className="min-w-0 text-right text-xs break-words text-foreground">
                       {formatTraceAttributeValue(key, value)}

@@ -10,6 +10,7 @@ import {
   Coins,
   Cpu,
   GitBranch,
+  MessagesSquare,
   RefreshCw,
   Sparkles,
   Wrench,
@@ -29,7 +30,7 @@ import {
   readGraceWaitedMs,
   readHandoffRows,
 } from "@/components/admin/run-performance";
-import { RunTimeline } from "@/components/admin/run-timeline";
+import { RunTimeline, type TraceViewMode } from "@/components/admin/run-timeline";
 import { StatCard } from "@/components/admin/stat-card";
 import { SourceTag, StatusBadge, ToneBadge, type AdminTone } from "@/components/admin/status-badge";
 import { TraceTree } from "@/components/admin/trace-tree";
@@ -103,6 +104,17 @@ interface StageFocus {
   token: number;
 }
 
+/**
+ * 轨迹视图的深链：`/admin/runs/{id}?view=conversation` 直接落到轨迹页的对话视图。
+ *
+ * 只读不写 URL（不引 router 状态同步，静态导出下少一处水合风险）；挂载时读一次，
+ * 与 runs-view / badcases-view 的 `readInitialParam` 是同一套习惯。
+ */
+function readInitialTraceView(): TraceViewMode | null {
+  if (typeof window === "undefined") return null;
+  return new URLSearchParams(window.location.search).get("view") === "conversation" ? "conversation" : null;
+}
+
 export function RunDetailView({ runId }: { runId: string }) {
   const resource = useAdminResource<AdminRunDetail>(`admin-run:${runId}`, () => getAdminRun(runId));
   // 阶段明细来自独立端点，404/未实现时只影响「阶段」这一块，不会让整页失败。
@@ -116,12 +128,16 @@ export function RunDetailView({ runId }: { runId: string }) {
     Boolean(runId),
   );
 
-  const [tab, setTab] = useState<RunTabKey>("overview");
+  // 视图状态放在这一层（跟 tab 同级）：RunTimeline 只负责渲染，
+  // 这样「从别处跳进来看对话」与「用户自己切视图」是同一份状态，不会出现两套。
+  const [tab, setTab] = useState<RunTabKey>(() => (readInitialTraceView() ? "timeline" : "overview"));
+  const [traceView, setTraceView] = useState<TraceViewMode>(() => readInitialTraceView() ?? "workflow");
   const [timelineFocus, setTimelineFocus] = useState<TimelineFocus>({ stage: null, query: "", token: 0 });
   const [stageFocus, setStageFocus] = useState<StageFocus>({ stage: null, token: 0 });
 
-  const openTimeline = (stage: string | null, query = "") => {
+  const openTimeline = (stage: string | null, query = "", view?: TraceViewMode) => {
     setTimelineFocus((previous) => ({ stage, query, token: previous.token + 1 }));
+    if (view) setTraceView(view);
     setTab("timeline");
   };
   const openPerformance = (stage: string | null) => {
@@ -133,7 +149,7 @@ export function RunDetailView({ runId }: { runId: string }) {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="运行详情"
-        description="Trace 按 span 的父子关系展开；阶段来自后端 workflow 的落库进度。点击任意一行查看完整明细。"
+        description="轨迹有两个视图：Workflow View 按 12 个阶段看执行过程，Conversation View 按真实执行顺序看模型收到了什么 / 返回了什么；原始 Trace 按 span 父子关系展开。点击任意一行查看完整明细。"
         badge={
           <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] break-all text-muted-foreground">
             {runId}
@@ -169,6 +185,8 @@ export function RunDetailView({ runId }: { runId: string }) {
             timeline={timeline.data}
             tab={tab}
             onTabChange={setTab}
+            traceView={traceView}
+            onTraceViewChange={setTraceView}
             timelineFocus={timelineFocus}
             stageFocus={stageFocus}
             onOpenTimeline={openTimeline}
@@ -236,6 +254,8 @@ function RunDetailBody({
   timeline,
   tab,
   onTabChange,
+  traceView,
+  onTraceViewChange,
   timelineFocus,
   stageFocus,
   onOpenTimeline,
@@ -246,9 +266,11 @@ function RunDetailBody({
   timeline: AdminTimeline | null;
   tab: RunTabKey;
   onTabChange: (key: RunTabKey) => void;
+  traceView: TraceViewMode;
+  onTraceViewChange: (view: TraceViewMode) => void;
   timelineFocus: TimelineFocus;
   stageFocus: StageFocus;
-  onOpenTimeline: (stage: string | null, query?: string) => void;
+  onOpenTimeline: (stage: string | null, query?: string, view?: TraceViewMode) => void;
   onOpenPerformance: (stage: string | null) => void;
 }) {
   const { run, metrics, progress } = data;
@@ -376,6 +398,8 @@ function RunDetailBody({
           initialStage={timelineFocus.stage}
           initialQuery={timelineFocus.query}
           focusToken={timelineFocus.token}
+          view={traceView}
+          onViewChange={onTraceViewChange}
           onSelectStage={onOpenPerformance}
           onOpenPerformance={(eventId) => {
             // 事件级跳转：性能页是按阶段组织的，因此先把事件映射到它所属的阶段再跳。
@@ -386,7 +410,7 @@ function RunDetailBody({
 
         <CollapsibleSection
           title="原始 Trace（工程视图）"
-          description="按 span 父子关系展开；轨迹页已经把同一份事实归并成人话时间轴"
+          description="按 span 父子关系展开，看更底层的采集字段；轨迹的两个视图已经把同一份事实归并成人话"
           count={data.trace.length}
           icon={Cpu}
         >
@@ -415,11 +439,11 @@ function RunDetailBody({
 
           <CollapsibleSection
             title="LLM 调用"
-            description="模型调用的标签、模型、状态、耗时与字符数"
+            description="模型调用的标签、模型、状态、耗时、字符数与 token；要还原「模型收到 / 返回了什么」去轨迹的对话视图"
             count={llmCalls.length}
             icon={Cpu}
           >
-            <LlmCallList calls={llmCalls} />
+            <LlmCallList calls={llmCalls} onOpenTimeline={onOpenTimeline} />
           </CollapsibleSection>
 
           <CollapsibleSection
@@ -517,14 +541,14 @@ function RunFirstScreen({
 }: {
   data: AdminRunDetail;
   timeline: AdminTimeline | null;
-  onOpenTimeline: (stage: string | null, query?: string) => void;
+  onOpenTimeline: (stage: string | null, query?: string, view?: TraceViewMode) => void;
 }) {
   return (
     <div className="grid gap-3 lg:grid-cols-2">
       <UserAskCard data={data} timeline={timeline} />
       <SystemGaveCard data={data} timeline={timeline} />
       <QualityCard data={data} timeline={timeline} onOpenTimeline={onOpenTimeline} />
-      <IssuesCard data={data} timeline={timeline} />
+      <IssuesCard data={data} timeline={timeline} onOpenTimeline={onOpenTimeline} />
     </div>
   );
 }
@@ -833,7 +857,15 @@ function QualityCard({
   );
 }
 
-function IssuesCard({ data, timeline }: { data: AdminRunDetail; timeline: AdminTimeline | null }) {
+function IssuesCard({
+  data,
+  timeline,
+  onOpenTimeline,
+}: {
+  data: AdminRunDetail;
+  timeline: AdminTimeline | null;
+  onOpenTimeline: (stage: string | null, query?: string, view?: TraceViewMode) => void;
+}) {
   const warnings = readWarningCount(data, timeline);
   const errors = timeline?.summary.errors ?? null;
   const fallbacks = timeline?.summary.fallbacks ?? null;
@@ -902,6 +934,10 @@ function IssuesCard({ data, timeline }: { data: AdminRunDetail; timeline: AdminT
         ) : null}
 
         <div className="flex flex-wrap gap-2">
+          <Button variant="outline" size="xs" onClick={() => onOpenTimeline(null, "", "conversation")}>
+            <MessagesSquare />
+            去对话视图顺着看这次交互
+          </Button>
           <Button variant="outline" size="xs" nativeButton={false} render={<Link href="/admin/badcases" />}>
             打开问题案例页
           </Button>
@@ -1350,6 +1386,15 @@ const STAGE_LLM_COLUMNS: AdminColumn<AdminStageLlmCall>[] = [
   },
   { key: "status", header: "状态", cell: (call) => <StatusBadge status={call.status ?? null} /> },
   {
+    key: "tokens",
+    header: "Token",
+    align: "right",
+    mobileHidden: true,
+    cell: (call) => (
+      <span className="tabular text-[11px] text-muted-foreground">{callTokenParts(call).join(" / ") || "—"}</span>
+    ),
+  },
+  {
     key: "chars",
     header: "字符数",
     align: "right",
@@ -1362,6 +1407,29 @@ const STAGE_LLM_COLUMNS: AdminColumn<AdminStageLlmCall>[] = [
     cell: (call) => <span className="tabular text-xs">{formatDurationMs(call.duration_ms)}</span>,
   },
 ];
+
+/**
+ * 逐次调用的 token 用量。
+ *
+ * 为什么按 unknown 读而不是直接用字段类型：这几个字段是后端补 `usage` 之后才有的，
+ * 而 `llm_calls` 在 admin-api 里是原样透传（raw cast），不是逐字段归一 ——
+ * 后端哪天把数字写成字符串，这里必须降级成「后端未返回 usage」而不是渲染出 NaN。
+ */
+function callTokenParts(call: AdminLlmCall | AdminStageLlmCall): string[] {
+  const record = call as unknown as AdminRecord;
+  const read = (key: string): number | null => {
+    const value = record[key];
+    return typeof value === "number" && Number.isFinite(value) ? value : null;
+  };
+  const parts: string[] = [];
+  const input = read("input_tokens");
+  const output = read("output_tokens");
+  const cached = read("cached_tokens");
+  if (input !== null) parts.push(`输入 ${formatNumber(input)}`);
+  if (output !== null) parts.push(`输出 ${formatNumber(output)}`);
+  if (cached !== null) parts.push(`缓存 ${formatNumber(cached)}`);
+  return parts;
+}
 
 function progressToStage(stage: AdminStageProgress): AdminStageDetail {
   return {
@@ -1415,7 +1483,13 @@ function TokenBreakdown({ tokens }: { tokens: AdminStageTokens | AdminRunDetail[
 
 /* ------------------------------ LLM / Jev ------------------------------ */
 
-function LlmCallList({ calls }: { calls: AdminLlmCall[] }) {
+function LlmCallList({
+  calls,
+  onOpenTimeline,
+}: {
+  calls: AdminLlmCall[];
+  onOpenTimeline?: (stage: string | null, query?: string, view?: TraceViewMode) => void;
+}) {
   const [selected, setSelected] = useState<AdminLlmCall | null>(null);
   if (calls.length === 0) {
     return (
@@ -1428,24 +1502,32 @@ function LlmCallList({ calls }: { calls: AdminLlmCall[] }) {
   return (
     <>
       <ul className="flex flex-col gap-2">
-        {calls.map((call, index) => (
-          <li key={`${call.tag}-${index}`}>
-            <button
-              type="button"
-              onClick={() => setSelected(call)}
-              className="flex w-full min-w-0 items-center gap-2 rounded-lg border border-border px-2.5 py-2 text-left hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
-            >
-              <span className="min-w-0 flex-1 truncate font-mono text-xs text-foreground" title={call.tag}>
-                {call.tag || "未命名"}
-              </span>
-              <StatusBadge status={call.status ?? null} />
-              <span className="tabular shrink-0 text-[11px] text-muted-foreground">
-                {formatDurationMs(call.duration_ms)}
-              </span>
-              <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
-            </button>
-          </li>
-        ))}
+        {calls.map((call, index) => {
+          const tokens = callTokenParts(call);
+          return (
+            <li key={`${call.tag}-${index}`}>
+              <button
+                type="button"
+                onClick={() => setSelected(call)}
+                className="flex w-full min-w-0 items-center gap-2 rounded-lg border border-border px-2.5 py-2 text-left hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+              >
+                <span className="min-w-0 flex-1 truncate font-mono text-xs text-foreground" title={call.tag}>
+                  {call.tag || "未命名"}
+                </span>
+                {tokens.length > 0 ? (
+                  <span className="tabular shrink-0 text-[11px] text-muted-foreground">
+                    {tokens.join(" / ")}
+                  </span>
+                ) : null}
+                <StatusBadge status={call.status ?? null} />
+                <span className="tabular shrink-0 text-[11px] text-muted-foreground">
+                  {formatDurationMs(call.duration_ms)}
+                </span>
+                <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+              </button>
+            </li>
+          );
+        })}
       </ul>
 
       <AdminDetailDialog
@@ -1453,6 +1535,18 @@ function LlmCallList({ calls }: { calls: AdminLlmCall[] }) {
         onOpenChange={(open) => (open ? null : setSelected(null))}
         title={selected?.tag || "LLM 调用"}
         badge={<StatusBadge status={selected?.status ?? null} />}
+        footer={
+          selected && onOpenTimeline ? (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => onOpenTimeline(null, selected.tag, "conversation")}
+            >
+              <MessagesSquare />
+              在轨迹的对话视图里找这次调用
+            </Button>
+          ) : undefined
+        }
       >
         {selected ? (
           <KeyValueList
@@ -1462,6 +1556,13 @@ function LlmCallList({ calls }: { calls: AdminLlmCall[] }) {
               { key: "status", label: "状态", value: <StatusBadge status={selected.status ?? null} /> },
               { key: "duration", label: "耗时", value: formatDurationMs(selected.duration_ms) },
               { key: "chars", label: "字符数", value: formatNumber(selected.chars) },
+              {
+                key: "tokens",
+                label: "Token",
+                value:
+                  callTokenParts(selected).join(" / ") ||
+                  <span className="text-muted-foreground">—（后端未返回 usage）</span>,
+              },
               {
                 key: "started",
                 label: "开始时间",

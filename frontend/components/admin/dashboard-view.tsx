@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useContext, useState } from "react";
 import Link from "next/link";
 import { Activity, FlaskConical, Gauge, HeartPulse, RefreshCw, TriangleAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -19,9 +19,11 @@ import {
   formatNumber,
   formatPassRate,
   formatRatio,
+  formatTokens,
   statusLabel,
 } from "@/components/admin/format";
 import { useAdminResource } from "@/components/admin/use-admin-resource";
+import { AdminOverviewContext } from "@/components/admin/admin-shell";
 import { getAdminDashboard, getAdminOverview } from "@/lib/admin-api";
 import {
   DEFAULT_ADMIN_WINDOW,
@@ -115,6 +117,7 @@ function formatDelta(kpi: AdminKpi): string | null {
   const absolute = Math.abs(kpi.delta);
   const unit = kpi.unit ?? "";
   if (unit === "ratio" || unit === "score") return formatRatio(absolute);
+  if (unit === "tokens") return formatTokens(absolute);
   if (unit === "ms") return formatDurationMs(absolute);
   if (unit === "cny") return formatCost(absolute);
   return formatNumber(absolute);
@@ -123,9 +126,14 @@ function formatDelta(kpi: AdminKpi): string | null {
 function formatKpiValue(kpi: AdminKpi): string {
   if (kpi.value === null) return "—";
   // 质量分虽然按比率存（0~1），但页面上用「分」比用「%」更贴合它的含义。
+  // 这是**唯一**按 key 的特判：新增指标（如 token）一律按 unit 走，未知 unit 退回普通数字，
+  // 这样后端加指标时前端不必再加一个 key 分支，也不会把 0.86 这种值渲染成「1」。
   if (kpi.key === "quality_score") return `${(kpi.value * 100).toFixed(0)} 分`;
   const unit = kpi.unit ?? "";
-  if (unit === "ratio") return formatRatio(kpi.value);
+  if (unit === "ratio" || unit === "score") return formatRatio(kpi.value);
+  // 后端新增的 token KPI 可能带 unit="tokens"，也可能复用 count / 干脆不给 unit；
+  // 只有明确是 tokens 时走大数格式化，其余落到 formatNumber 兜底（已是千分位，可读）。
+  if (unit === "tokens") return formatTokens(kpi.value);
   if (unit === "ms") return formatDurationMs(kpi.value);
   if (unit === "cny") return formatCost(kpi.value);
   return formatNumber(kpi.value);
@@ -433,15 +441,25 @@ function QualityClosure({ data }: { data: AdminDashboard }) {
  * 为什么不放在首屏：`总 Token = 2,000,000`、`总工具调用 = 18,000` 这类数字**没法指导
  * 下一步该修什么**（文档 §3.1）。但它们仍然有用（容量与成本核对），所以下沉到一个
  * 按需加载的折叠区，而不是删掉。
+ *
+ * 数据来源优先复用外壳 Token 门禁那次 `/admin/overview`（见 admin-shell 的
+ * AdminOverviewContext）：同一端点、同一份数据，展开时不再重复发请求。
+ * 脱离外壳渲染（拿不到 context）时才退回「展开才自己请求」的老行为。
  */
 function LifetimeUsage() {
+  const shellOverview = useContext(AdminOverviewContext);
   const [loaded, setLoaded] = useState(false);
-  const overview = useAdminResource<AdminOverview>("admin-overview", getAdminOverview, loaded);
+  const fallback = useAdminResource<AdminOverview>(
+    "admin-overview",
+    getAdminOverview,
+    loaded && shellOverview === null,
+  );
+  const overview = shellOverview ?? fallback;
 
   return (
     <CollapsibleSection
       title="累计用量（历史总量）"
-      description="历史累计，不是当前时间窗的指标；打开时才请求 /admin/overview。"
+      description="历史累计，不是当前时间窗的指标；复用外壳的 /admin/overview 结果，不额外发请求。"
       onOpenChange={(open) => {
         if (open) setLoaded(true);
       }}

@@ -38,7 +38,7 @@ export function StepTransport({ draft, onChange }: StepTransportProps) {
   }
 
   return (
-    <div className="grid gap-6">
+    <div className="grid gap-5">
       <StepSection title="你更在意怎么去？" hint="选「随便，帮我选」时，系统会按真实价格、门到门时间与接驳稳定判断，不会随机挑。">
         <ChoiceGrid
           ariaLabel="交通方式"
