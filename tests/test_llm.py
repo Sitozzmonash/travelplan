@@ -26,6 +26,12 @@ from app.llm import (
 )
 
 
+@pytest.fixture(autouse=True, scope="session")
+def no_orphan_sweep_on_startup():
+    """LLM 单测不需要 app.api，也不能触发默认数据库初始化。"""
+    yield
+
+
 class _OkModel:
     """最简模型桩：`.invoke(messages)` 返回带 `.content` 的对象。"""
 
@@ -395,3 +401,135 @@ def test_llm_result_ok_is_derived_from_status() -> None:
     assert LLMResult(status=STATUS_OK).ok is True
     for status in (STATUS_UNAVAILABLE, STATUS_TIMEOUT, STATUS_INVALID_RESPONSE):
         assert LLMResult(status=status).ok is False
+
+
+class _NativeModel:
+    model_name = "native-test"
+
+    def __init__(self, response):
+        self.response = response
+        self.bindings = []
+        self.messages = []
+
+    def bind_tools(self, tools, **kwargs):
+        self.bindings.append((tools, kwargs))
+        return self
+
+    def invoke(self, messages):
+        self.messages.append(messages)
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
+
+
+def test_native_tools_preserve_ai_message_and_entire_dialogue(monkeypatch):
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+
+    secret = "sk-test-native-secret-123456"
+    monkeypatch.setenv("MODEL_API_KEY", secret)
+    response = AIMessage(content="", tool_calls=[{"name": "read_guides", "args": {"query": secret}, "id": "call-2"}],
+                         usage_metadata={"input_tokens": 12, "output_tokens": 5, "total_tokens": 17})
+    model = _NativeModel(response)
+    events = []
+    llm = LLM(model=model, emit=lambda *args, **kw: events.append((args, kw)))
+    previous = AIMessage(content="", tool_calls=[{"name": "read_guides", "args": {}, "id": "call-1"}])
+    messages = [SystemMessage(content="sys"), HumanMessage(content="user"), previous,
+                ToolMessage(content=secret, tool_call_id="call-1")]
+    tools = [{"type": "function", "function": {"name": "read_guides", "parameters": {"type": "object", "properties": {}}}}]
+    result = llm.invoke_tools(messages, tools, tag="native", tool_choice="read_guides")
+    assert result.ok and result.value is response
+    assert result.value.tool_calls[0]["id"] == "call-2"
+    assert model.messages[0] == messages
+    assert model.bindings == [(tools, {"tool_choice": "read_guides"})]
+    assert llm.calls == [result]
+    audit = result.to_audit()
+    assert audit["total_tokens"] == 17
+    assert audit["started_at"] and audit["finished_at"]
+    assert "read_guides" in audit["assistant_preview"]
+    assert "call-1" in audit["user_preview"]
+    assert secret not in str(audit) and secret not in str(events)
+    assert [event[0][0] for event in events] == ["llm.started", "llm.finished"]
+
+
+@pytest.mark.parametrize("error,status", [(RuntimeError("bad schema"), STATUS_UNAVAILABLE),
+                                         (TimeoutError("Request timed out"), STATUS_TIMEOUT)])
+def test_native_tool_errors_are_statuses_and_redacted(error, status, monkeypatch):
+    from langchain_core.messages import HumanMessage
+
+    secret = "native-secret-123456"
+    monkeypatch.setenv("MODEL_API_KEY", secret)
+    error.args = (str(error) + " " + secret,)
+    llm = LLM(model=_NativeModel(error))
+    result = llm.invoke_tools([HumanMessage(content="u")], [], tag="native")
+    assert result.status == status and result.value is None
+    assert secret not in str(result.to_audit()) and secret not in result.error
+    assert len(llm.calls) == 1
+
+
+def test_native_tools_unavailable_invalid_and_no_json_disguise():
+    from langchain_core.messages import AIMessage
+
+    assert LLM().invoke_tools([], [], tag="none").status == STATUS_UNAVAILABLE
+    assert LLM(model=_NativeModel({"tool_calls": []})).invoke_tools([], [], tag="bad").status == STATUS_INVALID_RESPONSE
+    malformed = AIMessage(content="", invalid_tool_calls=[{"name": "read_guides", "args": "{broken", "id": "bad", "error": "parse"}])
+    result = LLM(model=_NativeModel(malformed)).invoke_tools([], [], tag="bad")
+    assert result.status == STATUS_INVALID_RESPONSE and result.value is None
+    text = AIMessage(content='{"tool_calls": [{"name": "read_guides"}]}')
+    result = LLM(model=_NativeModel(text)).invoke_tools([], [], tag="text")
+    assert result.value is text and result.value.tool_calls == []
+
+
+def test_native_tools_budget_includes_binding_and_late_completion_is_not_audited():
+    from langchain_core.messages import AIMessage
+
+    release = threading.Event()
+    finished = threading.Event()
+
+    class SlowBind(_NativeModel):
+        def bind_tools(self, tools, **kwargs):
+            release.wait(5)
+            return self
+
+        def invoke(self, messages):
+            finished.set()
+            return self.response
+
+    llm = LLM(model=SlowBind(AIMessage(content="late")), timeout=0.03)
+    try:
+        result = llm.invoke_tools([], [], tag="native")
+        assert result.status == STATUS_TIMEOUT
+    finally:
+        release.set()
+    assert finished.wait(2)
+    assert llm.calls == [result]
+    assert result.status == STATUS_TIMEOUT
+
+
+def test_native_tools_and_plain_calls_share_concurrency_gate():
+    from concurrent.futures import ThreadPoolExecutor
+    from langchain_core.messages import AIMessage
+
+    entered = threading.Event()
+    release = threading.Event()
+    second = threading.Event()
+
+    class Blocking(_NativeModel):
+        def invoke(self, messages):
+            if not entered.is_set():
+                entered.set()
+                release.wait(5)
+            else:
+                second.set()
+            return self.response
+
+    llm = LLM(model=Blocking(AIMessage(content="ok")), max_concurrency=1, timeout=3)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(llm.invoke_tools, [], [], tag="native")
+        assert entered.wait(2)
+        other = pool.submit(llm.invoke, "sys", "user", tag="plain")
+        try:
+            assert not second.wait(0.05), "原生工具调用绕过了共享并发闸门"
+        finally:
+            release.set()
+        assert first.result().ok and other.result().ok
+    assert second.is_set() and len(llm.calls) == 2

@@ -1,42 +1,47 @@
 "use client";
 
-import { Check, Clock3, Database, Hotel, MapPin, Search, UtensilsCrossed } from "lucide-react";
+import { Check, Clock3, Database, Hotel, MapPin, Search, Sparkles, UtensilsCrossed } from "lucide-react";
+import { isDiscoverySettled, isSessionUnusable } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
-import type { HotelArea, SessionView } from "@/types/session";
+import type { DiscoveryStage, HotelArea, SessionView } from "@/types/session";
+import { discoveryPlaces, isFoodCategory } from "./options";
 
 interface DiscoveryResearchProps {
   session: SessionView | null;
   settled: boolean;
 }
 
-/**
- * Discovery 的可见研究进度（F4 / B3）。所有数量只读 Session 实际返回，
- * 缺失就显示进行中，不用前端倒计时或虚构结果数填充。
- */
+/** 只呈现真实阶段和推荐结果；缺失状态不冒充进行中或已完成。 */
 export function DiscoveryResearch({ session, settled }: DiscoveryResearchProps) {
   if (!session) return null;
 
-  const places = session.poi_pools.attraction.length || session.place_candidates.filter((item) => item.category !== "food").length;
-  const food = session.poi_pools.food.length || session.place_candidates.filter((item) => item.category === "food").length;
+  const stopped = settled || isDiscoverySettled(session) || isSessionUnusable(session);
+  const candidates = discoveryPlaces(session);
+  const food = candidates.filter((item) => isFoodCategory(item.category)).length;
+  const places = candidates.length - food;
+  const failed = session.recommendation?.status === "FAILED" || session.discovery_status === "FAILED";
+  const title = isSessionUnusable(session) ? "探索已停止" : stopped ? failed ? "推荐生成失败" : "探索结果" : "正在研究这趟旅行";
   const facts = [
-    { key: "transport", label: session.transport_candidates.length ? `找到 ${session.transport_candidates.length} 个交通候选` : "正在查询交通", done: session.transport_candidates.length > 0, icon: Search },
-    { key: "hotel", label: session.hotel_candidates.length ? `找到 ${session.hotel_candidates.length} 家酒店候选` : "正在比较酒店", done: session.hotel_candidates.length > 0, icon: Hotel },
-    { key: "guide", label: guideLabel(session), done: hasEvent(session, "social"), icon: Database },
-    { key: "places", label: places ? `发现 ${places} 个景点和体验` : "正在归类景点和体验", done: places > 0, icon: MapPin },
-    { key: "food", label: food ? `发现 ${food} 个美食候选` : "正在匹配当地美食", done: food > 0, icon: UtensilsCrossed },
-    { key: "area", label: session.hotel_areas.length ? `找到 ${session.hotel_areas.length} 个推荐住宿区域` : "正在整理住宿区域", done: session.hotel_areas.length > 0, icon: Hotel },
+    { key: "guide", ...stageFact("数据库攻略", discoveryStage(session, ["database", "database_guides", "city_guides", "recall_city_guides", "social"], ["database_guides", "recall_city_guides", "social_discovery", "social"]), stopped), icon: Database },
+    { key: "web", ...stageFact("Web 补充", discoveryStage(session, ["web", "web_guides", "search_web_guides"], ["web_supplement", "search_web_guides", "web_discovery", "web"]), stopped), icon: Search },
+    { key: "recommendation", ...recommendationFact(session, candidates.length, stopped), icon: Sparkles },
+    { key: "places", label: places ? `推荐 ${places} 个景点和体验` : stopped ? "暂无推荐景点和体验" : "尚无推荐景点和体验", done: places > 0, icon: MapPin },
+    { key: "food", label: food ? `推荐 ${food} 个美食地点` : stopped ? "暂无推荐美食" : "尚无推荐美食", done: food > 0, icon: UtensilsCrossed },
+    { key: "area", label: session.hotel_areas.length ? `推荐 ${session.hotel_areas.length} 个住宿区域` : "暂无推荐住宿区域", done: session.hotel_areas.length > 0, icon: Hotel },
   ];
 
   return (
-    <section className="rounded-xl border border-border bg-muted/25 px-3.5 py-3.5 sm:px-4" aria-label="正在研究这趟旅行">
+    <section className="rounded-xl border border-border bg-muted/25 px-3.5 py-3.5 sm:px-4" aria-label={title}>
       <div className="flex items-start justify-between gap-3">
         <div>
-          <p className="text-sm font-medium text-foreground">正在研究这趟旅行</p>
+          <p className="text-sm font-medium text-foreground">{title}</p>
           <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-            {settled ? "探索结果已就绪，下面可以确认你更想要的安排。" : "你可以继续填写偏好；已找到的结果会逐步出现在这里。"}
+            {stopped
+              ? candidates.length && !failed ? "可确认下面的推荐；交通班次与酒店产品将在正式规划时查询。" : "本次暂无可用推荐。可以先填写偏好，再返回重试探索。"
+              : "你可以先填写偏好；推荐就绪后再正式开始。交通和酒店产品届时查询。"}
           </p>
         </div>
-        {!settled ? <Clock3 className="mt-0.5 size-4 shrink-0 text-primary" aria-hidden /> : null}
+        {!stopped ? <Clock3 className="mt-0.5 size-4 shrink-0 text-primary" aria-hidden /> : null}
       </div>
       <ul className="mt-3 grid gap-2 sm:grid-cols-2">
         {facts.map(({ key, label, done, icon: Icon }) => (
@@ -82,7 +87,7 @@ export function HotelAreaRecommendations({ areas }: { areas: HotelArea[] }) {
       <div>
         <h3 id="hotel-area-heading" className="text-sm font-medium text-foreground">推荐住宿区域</h3>
         <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-          已按你的酒店策略排序；正式规划会在这些区域内比较可订酒店。
+          根据攻略与游玩范围推荐；正式规划时再结合酒店偏好比较可订酒店。
         </p>
       </div>
       <div className="grid gap-2.5 sm:grid-cols-3">
@@ -113,13 +118,46 @@ export function HotelAreaRecommendations({ areas }: { areas: HotelArea[] }) {
   );
 }
 
-function guideLabel(session: SessionView): string {
-  const event = session.events.find((item) => item.event === "social");
-  return event?.detail ?? "正在阅读旅行攻略";
+function discoveryStage(session: SessionView, keys: string[], events: string[]): DiscoveryStage | undefined {
+  for (const key of keys) {
+    if (session.discovery?.[key]) return session.discovery[key];
+  }
+  const event = session.events.slice().reverse().find((item) => events.some((name) =>
+    item.event === name || item.event === `${name}_started` || item.event === `${name}_finished` || item.event === `${name}_failed`,
+  ));
+  if (!event) return undefined;
+  const status = event.detail?.match(/status=([A-Z_]+)/i)?.[1]?.toUpperCase();
+  const count = event.detail?.match(/(?:结果\s*|已阅读\s*)(\d+)/)?.[1];
+  return {
+    status: status ?? (event.event?.endsWith("_failed") ? "FAILED" : event.event?.endsWith("_started") ? "RUNNING" : "READY"),
+    result_count: count === undefined ? null : Number(count),
+  };
 }
 
-function hasEvent(session: SessionView, event: string): boolean {
-  return session.events.some((item) => item.event === event);
+function stageFact(label: string, stage: DiscoveryStage | undefined, stopped: boolean): { label: string; done: boolean } {
+  const status = stage?.status?.toUpperCase();
+  const count = stage?.result_count;
+  if (status === "FAILED" || status === "ERROR" || status === "TIMEOUT") return { label: `${label}：未成功获取结果`, done: false };
+  if (status === "SKIPPED" || status === "CANCELLED") return { label: `${label}：本次未执行或已停止`, done: false };
+  if (status === "EMPTY" || status === "NO_RESULTS") return { label: `${label}：无结果`, done: false };
+  if (status && ["READY", "SUCCESS", "OK", "COMPLETED", "PARTIAL", "CACHE", "STALE_CACHE"].includes(status)) {
+    const result = count === 0 ? "无结果" : typeof count === "number" && count > 0 ? `${count} 条结果` : "结果数量未提供";
+    return { label: `${label}：${status === "PARTIAL" ? "部分返回" : "检索结束"}，${result}`, done: typeof count === "number" && count > 0 };
+  }
+  if (stopped) return { label: `${label}：已结束，未返回阶段结果`, done: false };
+  return { label: `${label}：${status === "RUNNING" || status === "DISCOVERING" ? "正在处理" : status === "PENDING" ? "等待处理" : "等待阶段状态"}`, done: false };
+}
+
+function recommendationFact(session: SessionView, count: number, stopped: boolean): { label: string; done: boolean } {
+  const recommendation = session.recommendation;
+  if (recommendation?.status === "FAILED" || session.discovery_status === "FAILED") return { label: "推荐生成：失败，请重试", done: false };
+  if (recommendation?.status === "READY" || recommendation?.status === "PARTIAL") {
+    const source = recommendation.source === "evidence_fallback" ? "证据降级推荐" : recommendation.source === "llm" ? "模型推荐" : "推荐";
+    return { label: count ? `${source}：${count} 个地点${recommendation.status === "PARTIAL" ? "（部分可用）" : ""}` : "推荐生成：无可用地点", done: count > 0 };
+  }
+  if (stopped) return { label: count ? `已有 ${count} 个可选地点` : "推荐生成：无可用地点", done: count > 0 };
+  const stage = discoveryStage(session, ["recommendation"], ["recommendation"]);
+  return stageFact("推荐生成", stage ?? (recommendation ? { status: recommendation.status } : undefined), false);
 }
 
 function ageLabel(value: string): string | null {

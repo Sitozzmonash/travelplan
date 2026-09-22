@@ -82,6 +82,10 @@ PATCHABLE_FIELDS = (
 )
 
 
+class RecommendationInputError(ValueError):
+    """确认事务中的推荐/选择校验失败；抛出后事务回滚，不产生 Run。"""
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -147,12 +151,20 @@ def create_session(
         "degradations": [],
         "events": [_event("session_created", f"{basic.get('origin') or '?'} → {basic.get('destination') or '?'}")],
         "run_id": None,
+        "prefetch": {"recommendation": {
+            "status": "PENDING", "version": 1, "place_ids": [], "source": None,
+        }},
     }
     queued = config.discovery_enabled and submit is not None and bool(basic.get("destination"))
     if queued:
         session["status"] = SESSION_DISCOVERING
         session["discovery_status"] = DISCOVERY_RUNNING
-        session["events"].append(_event("discovery_queued", "已提交后台 Discovery"))
+        session["events"].append(_event("discovery_queued", "已提交攻略推荐；交通与酒店在正式规划时查询"))
+    elif submit is not None:
+        session["status"] = SESSION_READY
+        session["discovery_status"] = DISCOVERY_FAILED
+        session["prefetch"]["recommendation"]["status"] = DISCOVERY_FAILED
+        session["degradations"].append("攻略推荐未启用或缺少目的地，不能直接开始规划")
     store.save_planning_session(session)
     if queued:
         submit(run_discovery, store, session["session_id"])
@@ -265,181 +277,107 @@ def run_discovery(
     hub_factory: Callable[[str], Any] | None = None,
     llm_factory: Callable[[], Any] | None = None,
 ) -> None:
-    """后台 Prefetch：四条线并行取数，结果写回会话。
+    """后台只做攻略双路召回与推荐；实时机酒属于用户确认后的正式规划。
 
-    单条线失败只记降级（`discovery_status=PARTIAL`），绝不让用户卡在加载页 ——
-    用户旅程验收标准里明确要求"社交/酒店/交通失败仍可继续"。
+    原始城市候选不能提前冒充推荐。最终写入只更新发现字段，保留锁内最新的用户选择。
     """
 
     session = get_session(store, session_id)
     if session is None or session["status"] in (SESSION_CANCELLED, SESSION_EXPIRED, SESSION_STARTING):
         return
     intent = intent_from_basic(session.get("basic_intent") or {}, session.get("preferences") or {})
-    # 这里只积累 Discovery 自己的新事件，最后追加到锁内读到的最新事件列表。
-    session["events"] = []
-
     hub = None
-    llm = None
-    degradations: list[str] = []
+    started = _now()
+    bundle = discovery.PrefetchBundle(session_id=session_id)
+
+    def publish_progress(entry: Mapping[str, Any]) -> None:
+        stage = entry.get("stage")
+        if stage not in {"database", "web", "recommendation", "places"}:
+            return
+        def update(current: dict[str, Any]) -> None:
+            if current["status"] in (SESSION_CANCELLED, SESSION_EXPIRED, SESSION_STARTING):
+                return
+            current["status"] = SESSION_DISCOVERING
+            current["discovery_status"] = DISCOVERY_RUNNING
+            prefetch = current.setdefault("prefetch", {})
+            prefetch["recommendation"] = {
+                "status": DISCOVERY_RUNNING, "version": 1, "place_ids": [], "source": None,
+            }
+            prefetch.setdefault("discovery", {})[stage] = {
+                "status": entry.get("status", "RUNNING"), "result_count": entry.get("result_count"),
+            }
+        store.update_planning_session(session_id, update)
+
+    publish_progress({"stage": "recommendation", "status": "RUNNING"})
     try:
         from app.llm import LLM
-        from app.providers import ProviderHub, default_mcp_servers
+        from app.providers import ProviderHub
+        from app.recommendations import recommend_guided
 
-        # store=None：Discovery 的调用不写 sources。它属于会话（可能从没变成正式 run），
-        # 而且 `sources.run_id` 有指向 runs 的外键 —— 写进去要么撞外键、要么污染运行列表。
-        # 调用账本留在内存里，随后写进 provider_calls（观测表，无外键）供 Provider Health 用。
-        if hub_factory is not None:
-            hub = hub_factory(session_id)
-        else:
-            hub = ProviderHub(run_id=session_id, store=None, mcp_servers=default_mcp_servers())
-        config = current_config()
-        events = list(session.get("events") or [])
-        for stage, name in (
-            ("transport", "transport_prefetch"),
-            ("hotels", "hotel_prefetch"),
-            ("social", "social_discovery"),
-            ("places", "place_extraction"),
-        ):
-            events.append(_event(f"{name}_started", stage))
-        session["events"] = events
-        started = _now()
-
-        # 城市攻略/POI 跨会话复用；交通和酒店仍然走本会话的实时 Provider 查询。
-        # allow_stale 实现 stale-while-revalidate：旧候选能立刻展示，后台再补一次城市知识。
-        destination = (intent.destination or [""])[0]
-        cached = city_cache.read_candidates(destination, store=store, allow_stale=True)
-
-        # 每完成一条线就落一次盘：用户在 Discovery 还没跑完时点「开始规划」，
-        # 读到的必须是"已经查好的那部分"，而不是空 —— 这是之前真丢数据的根因
-        # （旧实现只在四条线全部结束时才写一次会话）。
-        def persist_partial(snapshot: dict[str, Any]) -> None:
-            try:
-                partial = _bundle_from(session_id, intent, snapshot, hub)
-                payload = partial.dump()
-                def publish(current: dict[str, Any]) -> None:
-                    if current["status"] in (SESSION_CANCELLED, SESSION_EXPIRED, SESSION_STARTING):
-                        return
-                    current["transport_candidates"] = payload["outbound"] + payload["inbound"]
-                    current["hotel_candidates"] = payload["hotels"]
-                    current["place_candidates"] = _candidate_cards(partial.places, current["poi_selections"])
-                    current["evidence_summary"] = _evidence_summary_of(partial)
-                    current["discovery"] = dict(snapshot.get("stages") or {})
-                    current["prefetch"] = payload
-                store.update_planning_session(session_id, publish)
-            except Exception:  # noqa: BLE001 —— 增量落盘失败不该让 Discovery 挂掉
-                return
-
-        if cached is not None:
-            result, bundle = _prefetch_with_city_cache(
-                session_id, intent, hub, config.discovery_hotel_pages, cached,
-                on_partial=persist_partial,
-            )
-            if cached.stale:
-                city_cache.refresh_in_background(
-                    cached.city,
-                    refresh=lambda city: refresh_city_cache(store, city),
-                )
-        else:
-            # 命中城市缓存不需要攻略检索/地点抽取模型；延迟初始化也让只读缓存不依赖 LLM 凭据。
-            llm = llm_factory() if llm_factory is not None else LLM.from_env()
-            result = discovery.prefetch(
-                hub,
-                llm,
-                intent,
-                hotel_pages=max(1, config.discovery_hotel_pages),
-                workers=max(1, config.discovery_workers),
-                on_partial=persist_partial,
-                store=store,
-            )
-            bundle = _bundle_from(session_id, intent, result, hub)
-            # 缓存落库只是加速层，失败不能把一次 live Discovery 变成失败。
-            try:
-                city_cache.write_candidates(
-                    destination,
-                    bundle.places,
-                    bundle.evidences,
-                    store=store,
-                    social_queries=bundle.social_queries,
-                    social_served_queries=bundle.social_served_queries,
-                )
-            except Exception:  # noqa: BLE001
-                bundle.degradations.append("城市缓存写入失败，本次仍使用实时结果")
-            bundle.city_cache = {"source": "live", "updated_at": _now().isoformat(), "stale": False}
-        stages = result.get("stages") or {}
-        # 调用账本落库：Discovery 的调用发生在会话里，没有 run_id。
-        # Provider Health 要能区分"Discovery 阶段大量超时"与"正式 Run 正常"，
-        # 所以这些调用必须单独留痕（sources 表有 runs 外键，这里进不去）。
-        _record_provider_calls(store, bundle.provider_calls, session_id=session_id)
-        session.update(
-            {
-                "status": SESSION_READY,
-                "transport_candidates": bundle.dump()["outbound"] + bundle.dump()["inbound"],
-                "hotel_candidates": bundle.dump()["hotels"],
-                "place_candidates": _candidate_cards(bundle.places, session.get("poi_selections") or {}),
-                "evidence_summary": _evidence_summary_of(bundle),
-                "discovery": stages,
-                "prefetch": bundle.dump(),
-                "degradations": bundle.degradations,
-            }
+        # 不注册途牛/12306 MCP。允许的推荐工具只读攻略、Web 和地点核验。
+        hub = hub_factory(session_id) if hub_factory else ProviderHub(
+            run_id=session_id, store=None, mcp_servers=[]
         )
-        finished_events = list(session.get("events") or [])
-        for stage, name in (
-            ("transport", "transport_prefetch"),
-            ("hotels", "hotel_prefetch"),
-            ("social", "social_discovery"),
-            ("places", "place_extraction"),
-        ):
-            info = stages.get(stage) or {}
-            finished_events.append(
-                _event(
-                    f"{name}_finished",
-                    f"status={info.get('status') or 'UNKNOWN'}，"
-                    f"结果 {info.get('result_count') or 0} 条，"
-                    f"耗时 {info.get('duration_ms') or '?'}ms"
-                    + (f"，error={info['error']}" if info.get("error") else ""),
-                )
-            )
-        finished_events.append(
-            _event(
-                "discovery_finished",
-                f"交通 {len(bundle.outbound) + len(bundle.inbound)} 个候选，"
-                f"酒店 {len(bundle.hotels)} 个，地点 {len(bundle.places)} 个，"
-                f"总耗时 {round((_now() - started).total_seconds() * 1000)}ms",
-            )
-        )
-        session["events"] = finished_events
-        if bundle.degradations or result.get("errors"):
-            session["discovery_status"] = DISCOVERY_PARTIAL
-            if result.get("errors"):
-                session["degradations"] = [
-                    *session["degradations"],
-                    *[f"{k}: {v}" for k, v in result["errors"].items()],
-                ]
-        else:
-            session["discovery_status"] = DISCOVERY_READY
-    except Exception as exc:  # noqa: BLE001 —— Discovery 崩了也要让用户能继续
-        degradations.append(f"Discovery 失败：{type(exc).__name__}: {exc}")
-        session["status"] = SESSION_READY
-        session["discovery_status"] = DISCOVERY_FAILED
-        session["degradations"] = [*(session.get("degradations") or []), *degradations]
-        session["events"] = [*(session.get("events") or []), _event("discovery_failed", degradations[-1])]
+        llm = llm_factory() if llm_factory else LLM.from_env()
+        bundle = recommend_guided(hub, llm, intent, store=store, session_id=session_id,
+                                  on_progress=publish_progress)
+        bundle.outbound = []
+        bundle.inbound = []
+        bundle.hotels = []
+        recommendation = dict(bundle.extras.get("recommendation") or {})
+        if not recommendation:
+            raise ValueError("攻略推荐缺少结构化提交结果")
+        if not bundle.places:
+            recommendation["status"] = DISCOVERY_FAILED
+        bundle.discovery_status = recommendation.get("status", DISCOVERY_FAILED)
+        if bundle.discovery_status not in (DISCOVERY_READY, DISCOVERY_PARTIAL, DISCOVERY_FAILED):
+            bundle.discovery_status = DISCOVERY_FAILED
+        recommendation["status"] = bundle.discovery_status
+        bundle.extras["recommendation"] = recommendation
+        try:
+            _record_provider_calls(store, bundle.provider_calls, session_id=session_id)
+        except Exception:  # 观测不可用不能把已完成推荐变成失败。
+            bundle.degradations.append("推荐调用审计写入失败")
+    except Exception as exc:  # 失败必须结束加载，且不能退回查机酒或未经筛选的全城候选。
+        from app.redact import scrub
+
+        bundle.discovery_status = DISCOVERY_FAILED
+        bundle.degradations.append(f"攻略推荐失败：{type(exc).__name__}: {scrub(str(exc))[:300]}")
+        bundle.extras["recommendation"] = {
+            "status": DISCOVERY_FAILED, "source": "unavailable", "version": 1, "place_ids": [],
+        }
+        bundle.places = []
+        bundle.hotel_areas = []
     finally:
         if hub is not None:
             try:
                 hub.close()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
+
     def publish_finished(current: dict[str, Any]) -> None:
         if current["status"] in (SESSION_CANCELLED, SESSION_EXPIRED, SESSION_STARTING):
             return
-        # 最终失败也不能用启动时的空快照抹掉已经发布的分支。
-        fields = ("status", "discovery_status", "degradations")
-        if session["discovery_status"] != DISCOVERY_FAILED:
-            fields += ("transport_candidates", "hotel_candidates", "evidence_summary", "discovery", "prefetch")
-            current["place_candidates"] = _candidate_cards(bundle.places, current["poi_selections"])
-        for field in fields:
-            current[field] = session[field]
-        current["events"].extend(session["events"])
+        current["status"] = SESSION_READY
+        current["discovery_status"] = bundle.discovery_status
+        current["transport_candidates"] = []
+        current["hotel_candidates"] = []
+        current["place_candidates"] = _recommendation_cards(bundle, current["poi_selections"])
+        current["evidence_summary"] = _evidence_summary_of(bundle)
+        stages = {**(current.get("prefetch") or {}).get("discovery", {}), **bundle.discovery}
+        for state in stages.values():
+            if state.get("status") in ("RUNNING", "PENDING"):
+                state["status"] = "FAILED" if bundle.discovery_status == DISCOVERY_FAILED else "SKIPPED"
+        stages["recommendation"] = {"status": bundle.discovery_status, "result_count": len(bundle.places)}
+        bundle.discovery = stages
+        current["prefetch"] = bundle.dump()
+        current["degradations"] = list(bundle.degradations)
+        current["events"].append(_event(
+            "recommendation_finished",
+            f"status={bundle.discovery_status}，推荐 {len(bundle.places)} 个地点；"
+            f"耗时 {round((_now() - started).total_seconds() * 1000)}ms；未查询机票酒店",
+        ))
+
     store.update_planning_session(session_id, publish_finished)
 
 
@@ -753,28 +691,56 @@ def _parse_date(value: Any):
 
 
 def _candidate_cards(places: Sequence[Any], selections: Mapping[str, str]) -> list[dict[str, Any]]:
-    """POI 卡片（用户旅程 §8）：分类、推荐理由、攻略条数、可信度。"""
+    """兼容旧候选；POI 来源或合并条数不是攻略证据数。"""
 
+    from collections import Counter
+    from app.planner import dedupe_places
+    from app.selection import selection_of
+
+    unique, _ = dedupe_places(places)
+    names = Counter(place.name for place in unique)
     cards: list[dict[str, Any]] = []
-    for place in places:
+    for place in unique:
         category = place_category(place)
         cards.append(
             {
                 "place_id": place.place_id,
                 "name": place.name,
+                "display_name": f"{place.name}（{place.district or place.business_area or place.place_id}）"
+                if names[place.name] > 1 else place.name,
                 "category": category,
                 "category_label": PLACE_CATEGORY_LABELS.get(category, category),
                 "area": place.business_area,
                 "district": place.district,
                 "reason": place_reason(place),
-                "evidence_count": len(place.merged_from or []) or (1 if place.source_id else 0),
+                "evidence_count": 0,
                 "trust_score": None,
                 "ad_risk": None,
                 "amap_verified": bool(place.amap_verified),
-                "selected": selections.get(place.place_id),
+                "merged_from": list(place.merged_from),
+                "selected": selection_of(place, selections),
             }
         )
-    cards.sort(key=lambda card: (card["category"], card["name"]))
+    return cards
+
+
+def _recommendation_cards(
+    bundle: discovery.PrefetchBundle, selections: Mapping[str, str]
+) -> list[dict[str, Any]]:
+    """最终卡片以核验过的地点为身份，以推荐提交为理由/分类/证据。"""
+
+    proposed = {
+        str(card.get("place_id")): card
+        for card in bundle.extras.get("recommended_cards") or []
+        if isinstance(card, Mapping)
+    }
+    cards = _candidate_cards(bundle.places, selections)
+    for card in cards:
+        recommendation = proposed.get(card["place_id"], {})
+        for key in ("reason", "category", "evidence_count", "evidence_ids", "scope"):
+            if key in recommendation:
+                card[key] = recommendation[key]
+        card["category_label"] = PLACE_CATEGORY_LABELS.get(card["category"], card["category"])
     return cards
 
 
@@ -836,6 +802,8 @@ def session_view(session: Mapping[str, Any]) -> dict[str, Any]:
         "hotel_areas": prefetch.get("hotel_areas") or [],
         "poi_pools": prefetch.get("poi_pools") or {},
         "profile": prefetch.get("profile") or {},
+        "recommendation": prefetch.get("recommendation"),
+        "discovery": prefetch.get("discovery") or {},
         "degradations": session.get("degradations") or [],
         "events": session.get("events") or [],
         # 能力声明：途牛目前不返回星级字段，前端据此把「最低星级」置灰并说明原因，
@@ -861,6 +829,47 @@ def _event(name: str, detail: str = "") -> dict[str, str]:
 # ======================================================================
 # 从这里进入正式规划
 # ======================================================================
+
+
+def _confirm_recommended_places(
+    bundle: discovery.PrefetchBundle, selections: Mapping[str, str]
+) -> tuple[list[Any], dict[str, str], str]:
+    """用户正选优先、推荐兜底、负选始终排除。只接受本次推荐的稳定 ID。"""
+
+    from app.planner import dedupe_places
+    from app.selection import MUST, WANT, REJECT, selection_of
+
+    recommendation = bundle.extras.get("recommendation")
+    if not isinstance(recommendation, Mapping):
+        # 历史会话无推荐快照不能把整个城市池冒充推荐；请重建探索，已启动 Run 仍幂等返回。
+        raise RecommendationInputError("recommendation_unavailable")
+    if recommendation.get("status") in ("PENDING", "RUNNING"):
+        raise RecommendationInputError("recommendation_not_ready")
+    if recommendation.get("status") not in (DISCOVERY_READY, DISCOVERY_PARTIAL) or not bundle.places:
+        raise RecommendationInputError("recommendation_unavailable")
+    ids = recommendation.get("place_ids")
+    if not isinstance(ids, list) or not ids or not all(isinstance(key, str) and key for key in ids):
+        raise RecommendationInputError("recommendation_unavailable")
+    places, _ = dedupe_places(bundle.places)
+    all_ids = {identity for place in places for identity in (place.place_id, *place.merged_from)}
+    if not set(ids) <= all_ids:
+        raise RecommendationInputError("recommendation_unavailable")
+    places = [place for place in places if set(ids) & {place.place_id, *place.merged_from}]
+    known_ids = {identity for place in places for identity in (place.place_id, *place.merged_from)}
+    if any(key not in known_ids for key in selections):
+        raise RecommendationInputError("invalid_place_selection")
+    has_positive = any(value in (MUST, WANT) for value in selections.values())
+    remapped = {place.place_id: selection_of(place, selections) for place in places}
+    chosen = [
+        place for place in places
+        if remapped[place.place_id] != REJECT
+        and (not has_positive or remapped[place.place_id] in (MUST, WANT))
+    ]
+    if not chosen:
+        raise RecommendationInputError("no_selected_places")
+    return chosen, {key: value for key, value in remapped.items() if value in (MUST, WANT, REJECT)}, (
+        "user_selected" if has_positive else "recommended"
+    )
 
 
 def start_run(
@@ -895,6 +904,21 @@ def start_run(
         intent = intent_from_basic(current["basic_intent"], current["preferences"])
         intent.place_selections = normalize_place_selections(current["poi_selections"])
         bundle = discovery.PrefetchBundle.load(current.get("prefetch"))
+        chosen, remapped, source = _confirm_recommended_places(bundle, intent.place_selections)
+        bundle.places = chosen
+        intent.place_selections = remapped
+        bundle.extras["planning_place_ids"] = [place.place_id for place in chosen]
+        bundle.extras["selection_source"] = source
+        bundle.poi_pools = discovery.split_poi_pools(chosen)
+        chosen_ids = {identity for place in chosen for identity in (place.place_id, *place.merged_from)}
+        bundle.hotel_areas = [
+            {**area, "place_ids": [pid for pid in area.get("place_ids", []) if pid in chosen_ids]}
+            for area in bundle.hotel_areas
+            if isinstance(area.get("place_ids"), list) and chosen_ids.intersection(area["place_ids"])
+        ]
+        # 快照留在会话中供审计；正式 run 仅拿所选子集，而非 raw_candidates。
+        current["prefetch"]["planning_place_ids"] = bundle.extras["planning_place_ids"]
+        current["prefetch"]["selection_source"] = source
         bundle.session_id = session_id
         bundle.basic_intent = dict(current["basic_intent"])
         bundle.grace_waited_ms = grace_waited_ms
@@ -910,7 +934,10 @@ def start_run(
         ])
         return query
 
-    session, created = store.start_planning_session_run(session_id, run_id, confirm)
+    try:
+        session, created = store.start_planning_session_run(session_id, run_id, confirm)
+    except RecommendationInputError as exc:
+        return {"error": str(exc)}
     if session is None:
         return {"error": "not_found"}
     if session["status"] in (SESSION_CANCELLED, SESSION_EXPIRED):

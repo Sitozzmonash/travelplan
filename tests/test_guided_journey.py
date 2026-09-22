@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from app import discovery, sessions
+from app import discovery, recommendations, sessions
 from app.models import Place, TripIntent
 from app.selection import (
     MUST,
@@ -28,6 +28,25 @@ from tests.fakes import FakeHub, FakeJev, FakeLLM, make_store
 
 def _place(place_id: str, name: str) -> Place:
     return Place(place_id=place_id, name=name, normalized_name=name, city="成都")
+
+
+def _ready_recommendation(session_id: str) -> discovery.PrefetchBundle:
+    return discovery.PrefetchBundle(
+        session_id=session_id,
+        discovery_status="READY",
+        places=[_place("p1", "熊猫基地"), _place("p2", "宽窄巷子")],
+        extras={"recommendation": {
+            "status": "READY", "version": 1, "source": "llm", "place_ids": ["p1", "p2"],
+        }},
+    )
+
+
+def _seed_ready_recommendation(store: TravelPlanStore, session_id: str) -> None:
+    def publish(current):
+        current["status"] = sessions.SESSION_READY
+        current["discovery_status"] = sessions.DISCOVERY_READY
+        current["prefetch"] = _ready_recommendation(session_id).dump()
+    store.update_planning_session(session_id, publish)
 
 
 class TestUserPlaceSelection:
@@ -121,8 +140,11 @@ class TestSessionService:
             {"origin": "北京", "destination": "成都", "start_date": "2026-10-01", "days": 5, "travelers": 2},
         )
         assert session["status"] == sessions.SESSION_COLLECTING
-        # 没有 submit 就不跑 Discovery（测试里不联后台线程）
+        # 没有 submit 就不跑 Discovery；新会话仍必须明确标记推荐尚未就绪。
         assert session["discovery_status"] == sessions.DISCOVERY_PENDING
+        assert session["prefetch"]["recommendation"]["status"] == "PENDING"
+        assert session["prefetch"]["recommendation"]["place_ids"] == []
+        assert session["place_candidates"] == []
 
         patched = sessions.patch_session(
             store,
@@ -189,6 +211,7 @@ class TestSessionService:
         session = sessions.create_session(
             store, {"origin": "北京", "destination": "成都", "start_date": "2026-10-01", "days": 5}
         )
+        _seed_ready_recommendation(store, session["session_id"])
         jobs: list[tuple] = []
 
         def submit(fn: Any, *args: Any) -> None:
@@ -201,6 +224,61 @@ class TestSessionService:
         run = store.get_run(first["run_id"])
         assert run is not None and run["source"] == "guided"
         assert run["source_session_id"] == session["session_id"]
+        confirmed = jobs[0][1][4]
+        assert [place.place_id for place in confirmed.places] == ["p1", "p2"]
+        assert confirmed.extras["selection_source"] == "recommended"
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_create_without_submit_keeps_recommendation_pending(self, store, monkeypatch, enabled):
+        monkeypatch.setenv("DISCOVERY_ENABLED", "1" if enabled else "0")
+        session = sessions.create_session(store, {"origin": "北京", "destination": "成都"})
+        saved = store.get_planning_session(session["session_id"])
+        assert saved["status"] == sessions.SESSION_COLLECTING
+        assert saved["prefetch"]["recommendation"]["status"] == "PENDING"
+
+    def test_disabled_discovery_with_submit_is_failed(self, store, monkeypatch):
+        monkeypatch.setenv("DISCOVERY_ENABLED", "0")
+        jobs = []
+        session = sessions.create_session(
+            store, {"origin": "北京", "destination": "成都"}, submit=lambda *args: jobs.append(args)
+        )
+        assert session["discovery_status"] == sessions.DISCOVERY_FAILED
+        assert session["prefetch"]["recommendation"]["status"] == "FAILED"
+        assert not jobs
+        outcome = sessions.start_run(store, session["session_id"], submit=lambda *args: jobs.append(args))
+        assert outcome == {"error": "recommendation_unavailable"}
+        assert not jobs
+        assert store.get_planning_session(session["session_id"])["run_id"] is None
+
+    @pytest.mark.parametrize(("state", "error"), [
+        ("legacy", "recommendation_unavailable"),
+        ("PENDING", "recommendation_not_ready"),
+        ("RUNNING", "recommendation_not_ready"),
+        ("FAILED", "recommendation_unavailable"),
+        ("empty", "recommendation_unavailable"),
+    ])
+    def test_unready_recommendation_cannot_start_even_with_raw_candidates(self, store, monkeypatch, state, error):
+        monkeypatch.setenv("DISCOVERY_GRACE_SECONDS", "0")
+        session = sessions.create_session(store, {"origin": "北京", "destination": "成都"})
+        payload = _ready_recommendation(session["session_id"]).dump()
+        payload["raw_candidates"] = list(payload["places"])
+        if state == "legacy":
+            payload.pop("recommendation")
+        elif state == "empty":
+            payload["places"] = []
+            payload["recommendation"]["place_ids"] = []
+        else:
+            payload["recommendation"]["status"] = state
+        session["prefetch"] = payload
+        store.save_planning_session(session)
+        outcome = sessions.start_run(
+            store, session["session_id"], submit=lambda *args: pytest.fail("must not submit")
+        )
+        assert outcome == {"error": error}
+        assert store.get_planning_session(session["session_id"])["run_id"] is None
+        with store._connect() as conn:
+            assert conn.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"] == 0
+            assert conn.execute("SELECT COUNT(*) AS n FROM run_progress").fetchone()["n"] == 0
 
     def test_closed_session_refuses_to_start(self, store: TravelPlanStore):
         session = sessions.create_session(store, {"origin": "北京", "destination": "成都"})
@@ -227,15 +305,26 @@ class TestSessionApi:
 
         store = make_store(tmp_path / "t.db")
         monkeypatch.setattr(api_module, "get_store", lambda: store)
-        # 后台任务直接用同步执行，测试里不等线程
-        monkeypatch.setattr(
-            api_module._RUN_EXECUTOR, "submit", lambda fn, *args: fn(*args)
-        )
-        monkeypatch.setattr(api_module, "_start_job_sync", True, raising=False)
-        return TestClient(api_module.api), store
+        monkeypatch.setenv("DISCOVERY_ENABLED", "1")
+
+        def recommend(hub, llm, intent, *, store, session_id, on_progress):
+            on_progress({"stage": "recommendation", "status": "RUNNING", "result_count": 0})
+            return _ready_recommendation(session_id)
+
+        monkeypatch.setattr(recommendations, "recommend_guided", recommend)
+        jobs = []
+
+        def submit(fn, *args):
+            if fn is sessions.run_discovery:
+                return fn(*args, hub_factory=lambda sid: FakeHub(store=None, run_id=sid), llm_factory=FakeLLM)
+            assert fn is sessions._start_job
+            jobs.append(args)  # API 只验证提交；正式 Workflow 由下方 FakeHub E2E 覆盖。
+
+        monkeypatch.setattr(api_module._RUN_EXECUTOR, "submit", submit)
+        return TestClient(api_module.api), store, jobs
 
     def test_create_get_patch_start(self, client):
-        http, _store = client
+        http, _store, jobs = client
         created = http.post(
             "/api/v1/planning-sessions",
             json={"origin": "北京", "destination": "成都", "start_date": "2026-10-01", "days": 5, "travelers": 2},
@@ -259,12 +348,13 @@ class TestSessionApi:
         started = http.post(f"/api/v1/planning-sessions/{session_id}/start")
         assert started.status_code == 202
         assert started.json()["run_id"]
+        assert len(jobs) == 1, "只有走到 START 才提交正式规划任务"
 
         missing = http.get("/api/v1/planning-sessions/ps-nope")
         assert missing.status_code == 404
 
     def test_cancel_then_start_is_409(self, client):
-        http, _store = client
+        http, _store, _jobs = client
         session_id = http.post(
             "/api/v1/planning-sessions", json={"origin": "北京", "destination": "成都", "days": 3}
         ).json()["session_id"]
@@ -377,3 +467,16 @@ class TestGuidedRunReuse:
         # 真实的那个 MUST 点（宽窄巷子）应该被排进去；幽灵点不参与（不在候选里）
         planned = {item.place_id for day in result.plan.days for item in day.items if item.place_id}
         assert bundle.places[0].place_id in planned
+
+    def test_want_place_ignored_is_reported_when_no_selected_place_is_planned(self, tmp_path):
+        """有计划不代表用户选择已被采用（回归 #badcase-selection-ratio）。"""
+        store = make_store(tmp_path / "t.db")
+        intent, bundle = self._prefetch_bundle(store)
+        intent = intent.model_copy(update={"place_selections": {"ghost-place": "WANT"}})
+
+        result, _hub = self._run_guided(store, intent, bundle, run_id="tp-guided-want-ignored")
+
+        assert result.status == "completed", result.error
+        assert result.audit["user_journey"]["selected_ids"] == ["ghost-place"]
+        categories = {case["category"] for case in store.list_badcases(run_id=result.run_id)[0]}
+        assert "user_preference_ignored" in categories

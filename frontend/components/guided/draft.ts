@@ -27,6 +27,7 @@ import type {
 import {
   BUDGET_MODE_LABELS,
   discoveryPlaces,
+  placeDisplayName,
   HOTEL_PRIORITY_OPTIONS,
   PACE_OPTIONS,
   ROOM_TYPE_OPTIONS,
@@ -311,7 +312,7 @@ export interface SummaryModel {
 }
 
 function group(places: PlaceCandidate[]): PoiNameGroup {
-  return { count: places.length, names: places.map((place) => place.name) };
+  return { count: places.length, names: places.map(placeDisplayName) };
 }
 
 /**
@@ -376,7 +377,7 @@ export function summarize(draft: GuidedDraft, session: SessionView | null): Summ
       : null;
 
   let poiModeLabel: string | null = null;
-  if (draft.poi.bulk === "auto") poiModeLabel = "都随便，帮我安排";
+  if (draft.poi.bulk === "auto") poiModeLabel = "使用这份推荐，帮我安排";
   else if (draft.poi.bulk === "best") poiModeLabel = "只安排最值得去的";
 
   return {

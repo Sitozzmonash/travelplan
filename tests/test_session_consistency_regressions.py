@@ -8,7 +8,7 @@ from threading import Barrier, Event
 
 import pytest
 
-from app import city_cache, discovery, sessions
+from app import city_cache, discovery, recommendations, sessions
 from app.models import Place, TripIntent, utcnow
 from app.store import TravelPlanStore
 from tests.fakes import FakeHub, FakeLLM, make_store
@@ -20,53 +20,68 @@ def store(tmp_path, monkeypatch):
     return make_store(tmp_path / "sessions.db")
 
 
-def create(store):
-    return sessions.create_session(store, {
+def create(store, *, seed=True):
+    """建会话；默认附上一份已就绪的推荐，因为 START 现在必须有可用推荐。"""
+
+    session = sessions.create_session(store, {
         "origin": "北京", "destination": "成都", "start_date": "2026-10-01", "days": 3,
     })
+    if seed:
+        publish_recommendation(store, session["session_id"])
+    return session
 
 
-def place():
-    return Place(place_id="p1", name="宽窄巷子", normalized_name="宽窄巷子", city="成都",
-                 type="风景名胜", lat=30.66, lng=104.05, amap_verified=True, district="青羊区")
+def place(place_id="p1", name="宽窄巷子", **overrides):
+    values = {"place_id": place_id, "name": name, "normalized_name": name, "city": "成都",
+              "type": "风景名胜", "lat": 30.66, "lng": 104.05, "amap_verified": True, "district": "青羊区"}
+    values.update(overrides)
+    return Place(**values)
 
 
-def result():
-    return {
-        "transport": discovery.TransportCandidates(), "hotels": discovery.HotelCandidates(),
-        "social": discovery.SocialEvidence(), "places": discovery.PlaceCandidates(places=[place()]),
-        "stages": {key: {"status": "OK", "result_count": 1} for key in ("transport", "hotels", "social", "places")},
-        "errors": {},
-    }
+def recommendation_bundle(session_id, places=None):
+    places = list(places or [place(), place("p2", "文殊院")])
+    return discovery.PrefetchBundle(
+        session_id=session_id, discovery_status="READY", places=places,
+        extras={"recommendation": {"status": "READY", "version": 1, "source": "llm",
+                                   "place_ids": [item.place_id for item in places]}},
+    )
 
 
-@pytest.mark.parametrize("action", ["patch", "cancel", "start", "expire"])
+def publish_recommendation(store, session_id, places=None):
+    bundle = recommendation_bundle(session_id, places)
+    def publish(current):
+        current["status"] = sessions.SESSION_READY
+        current["discovery_status"] = sessions.DISCOVERY_READY
+        current["prefetch"] = bundle.dump()
+    store.update_planning_session(session_id, publish)
+    return bundle
+
+
+@pytest.mark.parametrize("action", ["patch", "cancel", "expire"])
 @pytest.mark.parametrize("fail", [False, True])
-def test_late_discovery_cannot_overwrite_user_or_closed_session(store, monkeypatch, action, fail):
-    session_id = create(store)["session_id"]
-    monkeypatch.setattr(city_cache, "read_candidates", lambda *a, **kw: None)
-    monkeypatch.setattr(city_cache, "write_candidates", lambda *a, **kw: None)
+def test_late_recommendation_cannot_overwrite_user_or_closed_session(store, monkeypatch, action, fail):
+    session_id = create(store, seed=False)["session_id"]
     observed = {}
 
-    def fake_prefetch(hub, llm, intent, *, on_partial, **kwargs):
-        on_partial(result())
+    def fake_recommend(hub, llm, intent, *, on_progress=None, **kwargs):
+        on_progress({"stage": "database", "status": "OK", "result_count": 1})
         sessions.patch_session(store, session_id, {"pace": "relaxed", "poi_selections": {"p1": "MUST"}})
         if action == "cancel":
             sessions.cancel_session(store, session_id)
-        elif action == "start":
-            sessions.start_run(store, session_id, submit=lambda *a: None)
         elif action == "expire":
             with store._connect() as conn:
                 conn.execute("UPDATE planning_sessions SET expires_at=? WHERE session_id=?",
                              ((utcnow() - timedelta(minutes=1)).isoformat(), session_id))
             sessions.get_session(store, session_id)
         observed.update(deepcopy(store.get_planning_session(session_id)))
-        on_partial(result())  # 晚到的分支回调
+        on_progress({"stage": "web", "status": "OK", "result_count": 1})  # 晚到的阶段回调
         if fail:
             raise RuntimeError("fake finalization failure")
-        return result()
+        return recommendation_bundle(session_id)
 
-    monkeypatch.setattr(discovery, "prefetch", fake_prefetch)
+    monkeypatch.setattr(recommendations, "recommend_guided", fake_recommend)
+    monkeypatch.setattr(discovery, "fetch_transport_candidates", lambda *a, **k: pytest.fail("推荐阶段不能查交通"))
+    monkeypatch.setattr(discovery, "fetch_hotel_candidates", lambda *a, **k: pytest.fail("推荐阶段不能查酒店"))
     sessions.run_discovery(store, session_id,
                            hub_factory=lambda sid: FakeHub(store=None, run_id=sid), llm_factory=FakeLLM)
     saved = store.get_planning_session(session_id)
@@ -76,13 +91,36 @@ def test_late_discovery_cannot_overwrite_user_or_closed_session(store, monkeypat
     for event in observed["events"]:
         assert event in saved["events"]
     if action != "patch":
-        assert saved == observed, "终态会话不能被任何迟到的 Discovery 回写改变"
+        assert saved == observed, "终态会话不能被任何迟到的推荐回写改变"
     else:
         assert saved["status"] == "READY"
-        assert saved["place_candidates"], "失败也应保留已发布候选"
         assert saved["discovery_status"] == ("FAILED" if fail else "READY")
-        if not fail:
+        if fail:
+            # 推荐失败不能拿原始候选充数：宁可空，也不给未筛选的全城清单。
+            assert saved["place_candidates"] == []
+        else:
             assert saved["place_candidates"][0]["selected"] == "MUST"
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_recommendation_in_flight_cannot_overwrite_an_already_started_session(store, monkeypatch, fail):
+    session_id = create(store)["session_id"]
+    jobs = []
+    outcome = sessions.start_run(store, session_id, submit=lambda *a: jobs.append(a))
+    assert outcome["run_id"]
+    frozen = deepcopy(store.get_planning_session(session_id))
+
+    def fake_recommend(hub, llm, intent, *, on_progress=None, **kwargs):
+        on_progress({"stage": "web", "status": "OK", "result_count": 1})
+        if fail:
+            raise RuntimeError("late failure")
+        return recommendation_bundle(session_id)
+
+    monkeypatch.setattr(recommendations, "recommend_guided", fake_recommend)
+    sessions.run_discovery(store, session_id,
+                           hub_factory=lambda sid: FakeHub(store=None, run_id=sid), llm_factory=FakeLLM)
+    assert store.get_planning_session(session_id) == frozen, "START 之后的推荐进度与终稿都不能再改会话"
+    assert len(jobs) == 1
 
 
 def test_concurrent_starts_create_one_run_and_submit_once(store, monkeypatch):
@@ -261,41 +299,44 @@ def test_cache_is_published_before_parallel_live_queries_and_keeps_aggregates(st
         assert final["stages"][key]["started_at"] and final["stages"][key]["finished_at"]
 
 
-def test_start_adopts_published_cache_while_live_queries_are_still_running(store, monkeypatch):
-    session_id = create(store)["session_id"]
-    hit = city_cache.CityCacheHit(city="成都", places=[place()], mentions=[], updated_at=utcnow().isoformat())
-    live_entered, release = Event(), Event()
-    monkeypatch.setattr(city_cache, "read_candidates", lambda *a, **kw: hit)
-    def transport(*args):
-        live_entered.set()
+def test_start_is_rejected_until_recommendation_is_published(store, monkeypatch):
+    """推荐进行中只发布阶段元数据；START 必须等到推荐真正就绪，且不能顺手查机酒。"""
+
+    session_id = create(store, seed=False)["session_id"]
+    entered, release = Event(), Event()
+    ready = recommendation_bundle(session_id, [place()])
+
+    def fake_recommend(hub, llm, intent, *, on_progress=None, **kwargs):
+        on_progress({"stage": "database", "status": "OK", "result_count": 8})
+        entered.set()
         assert release.wait(5)
-        return discovery.TransportCandidates()
-    def hotels(*args, **kwargs):
-        assert release.wait(5)
-        return discovery.HotelCandidates()
-    monkeypatch.setattr(discovery, "fetch_transport_candidates", transport)
-    monkeypatch.setattr(discovery, "fetch_hotel_candidates", hotels)
+        return ready
+
+    monkeypatch.setattr(recommendations, "recommend_guided", fake_recommend)
+    monkeypatch.setattr(discovery, "fetch_transport_candidates", lambda *a, **k: pytest.fail("推荐阶段不能查交通"))
+    monkeypatch.setattr(discovery, "fetch_hotel_candidates", lambda *a, **k: pytest.fail("推荐阶段不能查酒店"))
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(sessions.run_discovery, store, session_id,
-                             hub_factory=lambda sid: FakeHub(store=None, run_id=sid),
-                             llm_factory=lambda: pytest.fail("cache hit must not initialize LLM"))
+                             hub_factory=lambda sid: FakeHub(store=None, run_id=sid), llm_factory=FakeLLM)
         try:
-            assert live_entered.wait(5)
+            assert entered.wait(5)
             current = store.get_planning_session(session_id)
-            assert current["place_candidates"]
-            assert current["prefetch"]["city_cache"]["updated_at"] == hit.updated_at
-            sessions.patch_session(store, session_id, {"poi_selections": {"p1": "MUST"}})
-            jobs = []
-            sessions.start_run(store, session_id, submit=lambda *a: jobs.append(a))
-            bundle = jobs[0][5]
-            assert bundle.places and bundle.poi_pools["attraction"] == ["p1"]
-            assert bundle.discovery["transport"]["status"] == "RUNNING"
-            assert bundle.city_cache["source"] == "city_cache"
-            frozen = deepcopy(store.get_planning_session(session_id))
+            assert current["place_candidates"] == [], "阶段元数据不能冒充推荐清单"
+            assert current["transport_candidates"] == current["hotel_candidates"] == []
+            assert current["prefetch"]["discovery"]["database"]["result_count"] == 8
+            assert sessions.start_run(
+                store, session_id, submit=lambda *a: pytest.fail("推荐未就绪不能开始")
+            ) == {"error": "recommendation_not_ready"}
         finally:
             release.set()
         future.result(timeout=10)
-    assert store.get_planning_session(session_id) == frozen
+
+    saved = store.get_planning_session(session_id)
+    assert saved["status"] == saved["discovery_status"] == "READY"
+    assert saved["transport_candidates"] == saved["hotel_candidates"] == []
+    jobs = []
+    assert sessions.start_run(store, session_id, submit=lambda *a: jobs.append(a))["run_id"]
+    assert [item.place_id for item in jobs[0][5].places] == ["p1"]
 
 
 @pytest.mark.parametrize("reject_insert", [False, True])

@@ -36,18 +36,22 @@ def _discover_all(store, *, spread: float = 0.25):
 
 
 def _bundle(result: dict[str, Any], hub: FakeHub, *, stages=("transport", "hotels", "social", "places"), session_id="ps-handoff"):
+    places = list(result["places"].places) if "places" in stages else []
     return PrefetchBundle(
         session_id=session_id,
         outbound=list(result["transport"].outbound) if "transport" in stages else [],
         inbound=list(result["transport"].inbound) if "transport" in stages else [],
         hotels=list(result["hotels"].items) if "hotels" in stages else [],
         evidences=list(result["social"].evidences) if "social" in stages else [],
-        places=list(result["places"].places) if "places" in stages else [],
+        places=places,
         # 与生产侧 sessions._bundle_from 保持一致：计划 query 与真正搜过的 query 都要过户
         social_queries=list(result["social"].queries) if "social" in stages else [],
         social_served_queries=list(result["social"].served_queries) if "social" in stages else [],
         provider_calls=hub.audit_entries(),
         discovery=dict(result.get("stages") or {}),
+        # 正式 run 只接受本次推荐清单；没有它 START 会被明确拒绝，而不是拿整城重查。
+        extras={"recommendation": {"status": "READY", "source": "llm", "version": 1,
+                                   "place_ids": [item.place_id for item in places]}} if places else {},
     )
 
 
@@ -194,18 +198,22 @@ class TestDiscoveryHandoff:
         _fn, args = jobs[0]
         bundle_arg = next(item for item in args if hasattr(item, "grace_waited_ms"))
         assert bundle_arg.grace_waited_ms >= 200, "grace 内完成必须被等到"
-        assert bundle_arg.outbound and bundle_arg.hotels, "等到的候选必须带进正式 run"
+        assert [item.place_id for item in bundle_arg.places], "等到的推荐必须带进正式 run"
+        assert bundle_arg.extras["selection_source"] == "recommended"
 
-    def test_grace_period_timeout_does_not_block(self, tmp_path, monkeypatch):
+    def test_grace_timeout_refuses_start_instead_of_expanding_to_city_pool(self, tmp_path, monkeypatch):
+        """推荐没就绪时宁可拒绝并提示，也不静默放大成整个城市缓存。"""
+
         store = make_store(tmp_path / "t.db")
         monkeypatch.setenv("DISCOVERY_GRACE_SECONDS", "0.4")
         session = sessions.create_session(
             store, {"origin": "北京", "destination": "成都", "start_date": "2026-10-01", "days": 4}
         )
         session_id = session["session_id"]
-        # Discovery 一直没结束（模拟慢社交源）
+        # 推荐一直没结束（模拟慢社交源 / 模型还在多轮工具调用）
         session.update(
-            {"status": sessions.SESSION_DISCOVERING, "discovery_status": sessions.DISCOVERY_RUNNING}
+            {"status": sessions.SESSION_DISCOVERING, "discovery_status": sessions.DISCOVERY_RUNNING,
+             "prefetch": {"recommendation": {"status": "RUNNING", "version": 1, "place_ids": [], "source": None}}}
         )
         store.save_planning_session(session)
 
@@ -216,17 +224,21 @@ class TestDiscoveryHandoff:
         )
         elapsed = time.perf_counter() - started
 
-        assert outcome.get("run_id")
-        assert elapsed < 3.0, f"grace period 把用户卡住了 {elapsed:.1f}s"
-        _fn, args = jobs[0]
-        bundle_arg = next(item for item in args if hasattr(item, "grace_waited_ms"))
-        assert bundle_arg.grace_waited_ms >= 300
-        assert not bundle_arg.reused, "没有候选时必须带回空 bundle，让 Workflow 自己补查"
-        events = [
-            event["event"]
-            for event in (store.get_planning_session(session_id) or {}).get("events") or []
-        ]
-        assert "discovery_grace_waited" in events
+        assert outcome == {"error": "recommendation_not_ready"}
+        assert 0.3 <= elapsed < 3.0, f"先给 grace 窗口再拒绝，且不能把用户卡住：{elapsed:.1f}s"
+        assert not jobs
+        assert store.get_planning_session(session_id)["run_id"] is None
+
+        # 推荐发布之后同一个会话仍可正常开始，不用重建。
+        _, result, hub = _discover_all(store)
+        row = store.get_planning_session(session_id)
+        row.update({"status": sessions.SESSION_READY, "discovery_status": sessions.DISCOVERY_READY,
+                    "prefetch": _bundle(result, hub, session_id=session_id).dump()})
+        store.save_planning_session(row)
+        jobs.clear()
+        assert sessions.start_run(
+            store, session_id, submit=lambda fn, *a: jobs.append((fn, a)), output_dir=str(tmp_path)
+        ).get("run_id")
 
     def test_reused_lines_are_not_queried_again_and_trace_shows_it(self, tmp_path):
         store = make_store(tmp_path / "t.db")

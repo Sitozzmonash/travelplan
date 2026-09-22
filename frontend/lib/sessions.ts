@@ -20,6 +20,8 @@ import {
   type BasicIntent,
   type CreateSessionInput,
   type DiscoveryStatus,
+  type DiscoveryStage,
+  type SessionRecommendation,
   type EvidenceSummary,
   type DiscoveryProfile,
   type DiscoverySource,
@@ -48,6 +50,30 @@ const START_TIMEOUT_MS = 90_000;
 export { API_BASE_URL };
 
 type HttpMethod = "GET" | "POST" | "PATCH" | "DELETE";
+
+const SESSION_ERROR_MESSAGES: Record<string, string> = {
+  recommendation_not_ready: "推荐还在生成中。可以先填写偏好，返回探索页等待或重试后再开始规划。",
+  recommendation_unavailable: "本次没有可用推荐。请返回探索页重新生成推荐后再开始规划。",
+  no_selected_places: "没有可安排的地点。请返回探索页保留至少一个推荐地点，或使用这份推荐。",
+  invalid_place_selection: "所选地点已不在当前推荐中。请返回探索页重新选择，或使用这份推荐。",
+};
+
+class SessionRequestError extends ApiError {
+  constructor(readonly code: string) {
+    super(SESSION_ERROR_MESSAGES[code], "server");
+  }
+}
+
+function sessionErrorCode(text: string): string | null {
+  try {
+    const payload: unknown = JSON.parse(text);
+    const detail = isRecord(payload) ? payload.detail ?? payload : payload;
+    const code = typeof detail === "string" ? detail : isRecord(detail) ? detail.code ?? detail.error : null;
+    return typeof code === "string" && Object.hasOwn(SESSION_ERROR_MESSAGES, code) ? code : null;
+  } catch {
+    return Object.hasOwn(SESSION_ERROR_MESSAGES, text.trim()) ? text.trim() : null;
+  }
+}
 
 interface RequestOptions {
   method: HttpMethod;
@@ -83,6 +109,8 @@ async function request(path: string, options: RequestOptions): Promise<unknown> 
     }
     if (!response.ok) {
       const text = await response.text().catch(() => "");
+      const code = sessionErrorCode(text);
+      if (code) throw new SessionRequestError(code);
       throw new ApiError(
         "会话服务返回异常",
         "server",
@@ -110,6 +138,7 @@ async function request(path: string, options: RequestOptions): Promise<unknown> 
 
 /** 把异常翻译成向导能直接用的一句话，不暴露内部堆栈，也不把「过期」说成「失败」。 */
 export function describeSessionError(error: unknown): string {
+  if (error instanceof SessionRequestError) return error.message;
   const kind = apiErrorKind(error);
   switch (kind) {
     case "endpoint_missing":
@@ -223,15 +252,43 @@ function normalizeHotelCandidates(value: unknown): HotelCandidate[] {
   }));
 }
 
+function stableIds(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((id): id is string => typeof id === "string" && id.trim().length > 0) : [];
+}
+
+function normalizeRecommendation(value: unknown): SessionRecommendation | undefined {
+  if (value === undefined || value === null) return undefined;
+  const raw = isRecord(value) ? value : {};
+  const status = asString(raw.status)?.toUpperCase();
+  return {
+    // 字段已出现但形状未知时不能回退到原始池，也不能放行正式规划。
+    status: status === "READY" || status === "PARTIAL" || status === "FAILED" || status === "RUNNING" ? status : "PENDING",
+    source: raw.source === "llm" || raw.source === "evidence_fallback" ? raw.source : null,
+    version: asNumber(raw.version),
+    place_ids: stableIds(raw.place_ids),
+  };
+}
+
+function normalizeDiscovery(value: unknown): Record<string, DiscoveryStage> {
+  if (!isRecord(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter(([, stage]) => isRecord(stage)).map(([key, stage]) => {
+    const info = stage as Record<string, unknown>;
+    return [key, { status: asString(info.status)?.toUpperCase() ?? null, result_count: asNumber(info.result_count) }];
+  }));
+}
+
 function normalizePlaceCandidates(value: unknown): PlaceCandidate[] {
   return asRecordArray(value)
     .map((item): PlaceCandidate | null => {
       const place_id = asString(item.place_id);
       const name = asString(item.name);
-      if (!place_id || !name) return null;
+      if (!place_id?.trim() || !name) return null;
       return {
         place_id,
         name,
+        display_name: asString(item.display_name),
+        canonical_place_id: asString(item.canonical_place_id)?.trim() || null,
+        merged_from: stableIds(item.merged_from),
         category: asString(item.category),
         category_label: asString(item.category_label),
         area: asString(item.area),
@@ -536,6 +593,8 @@ export function normalizeSession(payload: unknown): SessionView {
     transport_candidates: normalizeTransportCandidates(raw.transport_candidates),
     hotel_candidates: normalizeHotelCandidates(raw.hotel_candidates),
     place_candidates: normalizePlaceCandidates(raw.place_candidates),
+    recommendation: normalizeRecommendation(raw.recommendation),
+    discovery: normalizeDiscovery(raw.discovery),
     place_categories: normalizePlaceCategories(raw.place_categories),
     hotel_areas: normalizeHotelAreas(raw.hotel_areas),
     poi_pools: normalizePoiPools(raw.poi_pools),
@@ -644,11 +703,12 @@ export async function cancelPlanningSession(sessionId: string): Promise<void> {
 /** Discovery 是否已经「说到能看的程度」：READY / PARTIAL / FAILED 都可以停轮询并展示 POI 区。 */
 export function isDiscoverySettled(session: SessionView | null): boolean {
   if (!session) return false;
-  if (
-    session.discovery_status === "READY" ||
-    session.discovery_status === "PARTIAL" ||
-    session.discovery_status === "FAILED"
-  ) {
+  if (session.discovery_status === "FAILED" || session.recommendation?.status === "FAILED") return true;
+  if (session.recommendation) {
+    if (session.recommendation.status === "PENDING" || session.recommendation.status === "RUNNING") return false;
+    if (["PENDING", "RUNNING", "DISCOVERING"].includes(session.discovery_status)) return false;
+  }
+  if (session.discovery_status === "READY" || session.discovery_status === "PARTIAL") {
     return true;
   }
   return session.status === "READY" || session.status === "STARTING";
@@ -677,6 +737,8 @@ export const SESSION_STATUS_LABELS: Record<PlanningSessionStatus, string> = {
 };
 
 export const DISCOVERY_STATUS_LABELS: Record<DiscoveryStatus, string> = {
+  PENDING: "等待探索",
+  RUNNING: "正在探索",
   DISCOVERING: "正在整理攻略",
   READY: "攻略已就绪",
   PARTIAL: "攻略部分就绪",

@@ -1984,12 +1984,16 @@ def node_search_hotels(state: TravelState) -> dict:
     profile = state.get("profile") or PreferenceProfile.default_profile()
     hotel_areas: list[dict[str, Any]] = []
     if bundle is not None:
-        try:
-            hotel_areas = discovery.extract_hotel_areas(
-                intent, bundle.evidences, bundle.places, profile=profile
-            )
-        except Exception:  # noqa: BLE001 —— 区域聚类失败不该影响酒店选择
-            hotel_areas = []
+        if bundle.extras.get("recommendation"):
+            # 延续确认页有证据的推荐，不再用原始 POI 密度覆盖 LLM 的区域判断。
+            hotel_areas = list(bundle.hotel_areas)
+        else:
+            try:
+                hotel_areas = discovery.extract_hotel_areas(
+                    intent, bundle.evidences, bundle.places, profile=profile
+                )
+            except Exception:  # noqa: BLE001 —— 区域聚类失败不该影响酒店选择
+                hotel_areas = []
     area_key = _preferred_area(hotel_areas) or None
     if area_key:
         _emit_progress_stage(state, STAGE_HOTEL_AREA_SELECTED, f"已确定推荐住宿区域：{area_key}")
@@ -5362,6 +5366,21 @@ def _user_journey_summary(state: TravelState, plan: TripPlan) -> dict[str, Any]:
     bundle = state.get("prefetch")
     planned_ids = [item.place_id for day in plan.days for item in day.items if item.place_id]
 
+    # Bad Case 不能只知道"用户选了几个点"：必须保留可与最终 plan 比对的身份。
+    # 新入口用稳定 ID；旧客户端可能用名称、实体收敛后也可能仍带旧 ID，故按
+    # selection_of 的同一套解析规则折叠到当前代表点。找不到候选的旧键仍保留，
+    # 这样"用户选了但没有进入候选/行程"不会被静默吞掉。
+    selected_ids = {
+        str(key)
+        for key, value in selections.items()
+        if str(value).upper() in (selection.MUST, selection.WANT)
+    }
+    for place in state.get("places") or []:
+        if selection.selection_of(place, selections) not in (selection.MUST, selection.WANT):
+            continue
+        selected_ids.difference_update({place.place_id, *place.merged_from, place.name})
+        selected_ids.add(place.place_id)
+
     bundle_had: set[str] = set()
     if bundle is not None:
         if bundle.outbound or bundle.inbound:
@@ -5463,6 +5482,7 @@ def _user_journey_summary(state: TravelState, plan: TripPlan) -> dict[str, Any]:
             "want": sum(1 for value in selections.values() if str(value).upper() == "WANT"),
             "reject": sum(1 for value in selections.values() if str(value).upper() == "REJECT"),
         },
+        "selected_ids": sorted(selected_ids),
         "prefetch_available": sorted(bundle_had),
         "prefetch_reused": reused,
         "prefetch_reused_any": any(reused.values()),

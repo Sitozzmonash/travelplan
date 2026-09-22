@@ -50,8 +50,8 @@ export function SummaryPanel({ model, className }: SummaryPanelProps) {
           {model.poiModeLabel
             ? `地点：${model.poiModeLabel}`
             : model.must.count + model.want.count + model.food.count === 0
-              ? "没有勾选地点也没关系，系统会按攻略证据自己挑。"
-              : "其他没勾选的地方由系统按证据与路线自动取舍。"}
+              ? "没有勾选时使用这份推荐，并排除不感兴趣的地点。"
+              : "优先安排你选中的推荐地点，并排除不感兴趣的地点。"}
         </span>
       </p>
     </div>

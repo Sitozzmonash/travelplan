@@ -36,7 +36,7 @@ import {
   type GuidedDraft,
   type PoiBulkMode,
 } from "./draft";
-import { bestValueSelections } from "./options";
+import { bestValueSelections, recommendationStartIssue } from "./options";
 import { STEP_META, WizardProgress } from "./wizard-progress";
 import { DiscoveryResearch } from "./discovery-research";
 import { StepPoi } from "./step-poi";
@@ -56,10 +56,11 @@ interface SessionSync {
   action: "create" | "sync" | "finish" | null;
   confirmed: boolean;
   runId: string | null;
+  view: SessionView | null;
 }
 
 function newSessionSync(): SessionSync {
-  return { id: null, tail: Promise.resolve(true), action: null, confirmed: false, runId: null };
+  return { id: null, tail: Promise.resolve(true), action: null, confirmed: false, runId: null, view: null };
 }
 
 /**
@@ -119,6 +120,7 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
   const settled = isDiscoverySettled(session);
   const unusable = isSessionUnusable(session);
   const socialFailed = hasSocialDegradation(session?.degradations ?? []);
+  const startIssue = recommendationStartIssue(session, draft.poi.selections);
   const model = summarize(draft, session);
   const isLast = step === STEP_META.length - 1;
   // draft.basic 在向导里不会再被编辑（基础信息只由首页决定），所以每次渲染重算就够了。
@@ -138,6 +140,7 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
       try {
         const view = await getPlanningSession(sessionId);
         if (!active || scope !== sessionSync.current || scope.confirmed) return;
+        scope.view = view;
         setSession(view);
         failures = 0;
         if (isDiscoverySettled(view) || isSessionUnusable(view)) return;
@@ -260,7 +263,7 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
 
   /**
    * 两个总开关都映射成真实的 poi_selections：
-   *   都随便，帮我安排 → 空映射（全部交给 Planner）
+   *   使用这份推荐 → 空映射（后端使用已筛选的推荐，不是原始候选池）
    *   只安排最值得去的 → 每个类别按证据/可信度取前 3 个标成 WANT
    */
   function selectBulk(mode: PoiBulkMode): void {
@@ -289,6 +292,7 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
       const created = await createPlanningSession(toCreateInput(draftRef.current.basic));
       if (scope !== sessionSync.current) return false;
       scope.id = created.session_id;
+      scope.view = created;
       setSession(created);
       setPollStalled(false);
       if (hasAnyPreference(draftRef.current)) {
@@ -316,6 +320,7 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
       try {
         const view = await patchPlanningSession(id, patch());
         if (scope !== sessionSync.current) return false;
+        scope.view = view;
         setSession(view);
         if (view.status === "STARTING" && view.run_id) scope.runId = view.run_id;
         if (isSessionUnusable(view) || view.status === "STARTING") {
@@ -371,6 +376,11 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
       setStartError("会话还没创建成功，无法开始规划。请先重新创建会话。");
       return;
     }
+    const issue = recommendationStartIssue(scope.view, draftRef.current.poi.selections);
+    if (issue) {
+      setStartError(issue);
+      return;
+    }
     scope.action = "finish";
     cancelPoiSync();
     setStarting(true);
@@ -387,6 +397,11 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
           return;
         }
         setStartError("部分偏好尚未写回会话，请先重试同步后再开始规划。");
+        return;
+      }
+      const latestIssue = recommendationStartIssue(scope.view, draftRef.current.poi.selections);
+      if (latestIssue) {
+        setStartError(latestIssue);
         return;
       }
       // 此后禁止任何 POI / 重试 PATCH 插入，直到 START 失败并由用户重新确认。
@@ -425,6 +440,13 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
   }
 
   function retryDiscovery(): void {
+    const scope = sessionSync.current;
+    if (scope.action || scope.confirmed) return;
+    if (isDiscoverySettled(scope.view) || isSessionUnusable(scope.view)) {
+      // 终态仅重新 GET 不会重跑推荐；显式重建，保留偏好但清理旧地点选择。
+      void handleRestart();
+      return;
+    }
     setPollStalled(false);
     setPollNonce((value) => value + 1);
   }
@@ -437,7 +459,7 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
       : !session && createError
         ? "重新创建会话"
         : discoveryPending
-          ? "都随便，继续"
+          ? "先填写偏好"
           : "继续";
   const busy = creating || syncing || starting;
 
@@ -530,9 +552,9 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
 
             {isLast && socialFailed ? (
               <PartialNotice
-                title="社交攻略缺失，仍然可以继续"
-                description="本次没有拿到小红书 / 抖音内容，正式规划会以高德与网页数据为准。"
-                detail="结果里会标注哪部分信息没有社交来源印证。"
+                title="部分攻略来源不可用"
+                description="可以继续填写偏好；正式开始前请确认已有可用推荐。"
+                detail="推荐卡片会如实显示关联攻略数量。"
               />
             ) : null}
 
@@ -541,11 +563,14 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
                 title="没能开始规划"
                 description={startError}
                 detail={session ? `session_id：${session.session_id}` : undefined}
-                onRetry={() => void handleFinish()}
-                retryLabel="再试一次"
+                onRetry={() => startIssue ? setStep(0) : void handleFinish()}
+                retryLabel={startIssue ? "返回探索页" : "再试一次"}
               />
             ) : null}
 
+            {isLast && startIssue && !startError ? (
+              <InlineWarning title="暂时不能开始规划" description={startIssue} />
+            ) : null}
             {session && isLast ? <DiscoveryResearch session={session} settled={settled} /> : null}
           </div>
 
@@ -587,7 +612,7 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
               // 不写死「会话已经建好」：创建失败时上面已经有错误卡，这里再宣称建好了就是自相矛盾。
               <span className="hidden text-[11px] text-muted-foreground sm:block">
                 {session
-                  ? "会话已经建好，交通、酒店与攻略正在后台继续查；你在这页慢慢挑，点「继续」进入偏好设置。"
+                  ? "先确认攻略推荐，也可以先填写偏好；交通班次与酒店产品将在正式规划时查询。"
                   : "会话还没建好，这页勾选的地点暂时没有落点；先按上面的提示重新创建会话。"}
               </span>
             ) : (
@@ -605,7 +630,7 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
             <Button
               size="lg"
               className="h-11 min-w-[150px] sm:h-9 sm:min-w-[120px]"
-              disabled={busy || unusable}
+              disabled={busy || unusable || (isLast && Boolean(startIssue))}
               onClick={() => {
                 if (isLast) void handleFinish();
                 else void handleContinue();
@@ -634,11 +659,16 @@ export function GuidedWizard({ initialBasic }: GuidedWizardProps) {
 /** 会话状态徽标：措辞与正式 Run 的 RUNNING / SUCCESS 完全分开，避免用户误以为已经在生成行程。 */
 function SessionStatusChip({ session, poiStep }: { session: SessionView; poiStep: boolean }) {
   const showDiscovery = poiStep && session.discovery_status !== "READY";
-  const label = showDiscovery
-    ? DISCOVERY_STATUS_LABELS[session.discovery_status]
-    : SESSION_STATUS_LABELS[session.status];
+  const recommendationIssue = recommendationStartIssue(session, {});
+  const label = isSessionUnusable(session)
+    ? SESSION_STATUS_LABELS[session.status]
+    : recommendationIssue
+      ? isDiscoverySettled(session) ? "推荐暂不可用" : "等待推荐就绪"
+      : showDiscovery
+        ? DISCOVERY_STATUS_LABELS[session.discovery_status]
+        : SESSION_STATUS_LABELS[session.status];
   const tone =
-    session.status === "EXPIRED" || session.status === "CANCELLED"
+    isSessionUnusable(session) || recommendationIssue
       ? "bg-warning-subtle text-warning-subtle-foreground"
       : session.status === "READY"
         ? "bg-success-subtle text-success-subtle-foreground"

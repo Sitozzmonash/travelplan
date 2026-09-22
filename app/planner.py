@@ -350,23 +350,34 @@ CITY_PREFIXES = (
 )
 
 
+# 仅收录常见、明确的繁简对应；不把「里/裏」「台/臺」「后/後」等字义折叠。
+_NAME_VARIANTS = str.maketrans("園館廣場區縣鄉鎮門風遊觀貓龍華寬峽慶陽陰東雲貴蘇莊灣橋廟樓", "园馆广场区县乡镇门风游观猫龙华宽峡庆阳阴东云贵苏庄湾桥庙楼")
+
+
+def _name_text_key(name: str | None) -> str:
+    return basic_name_key(name).translate(_NAME_VARIANTS)
+
+
 def _strip_city_prefix(key: str, city: str | None = None) -> str:
-    """剥掉名字开头的城市名。
+    """先匹配完整行政前缀，避免「成都市人民公园」被截成「市人民公园」。
 
     护栏：只有 city 参数明确匹配、或剩余部分 ≥3 个字时才剥。"重庆火锅"这类
     **以城市名开头的店名**剥完只剩"火锅"，会跟别家撞车。
     """
-    candidates: list[str] = []
-    if city:
-        candidates.append(basic_name_key(city))
-    candidates.extend(CITY_PREFIXES)
-    for prefix in sorted({item for item in candidates if item}, key=len, reverse=True):
+    city_name = _name_text_key(city)
+    candidates = {*CITY_PREFIXES, city_name} - {""}
+    variants: dict[str, bool] = {}
+    for prefix in candidates:
         for variant in (prefix, prefix + "市", prefix + "省"):
-            if not key.startswith(variant):
-                continue
-            remainder = key[len(variant):]
-            if len(remainder) >= 3 or (city and basic_name_key(city) == prefix and len(remainder) >= 2):
-                return remainder
+            variants[variant] = variants.get(variant, False) or prefix == city_name
+    for variant in sorted(variants, key=len, reverse=True):
+        if not key.startswith(variant):
+            continue
+        remainder = key[len(variant):]
+        if len(remainder) >= 3 or (variants[variant] and len(remainder) >= 2):
+            return remainder
+        # 长前缀已经命中但余串太短，不能退回短前缀留下孤立的「市/省」。
+        return key
     return key
 
 
@@ -404,7 +415,7 @@ def normalize_place_name(name: str, city: str | None = None) -> str:
     "宽窄巷子景区"、"成都宽窄巷子"，完全相等永远合并不掉，证据就永远分散在三条上，
     Trust 的"多来源"分量也就永远拿不到分。
     """
-    key = basic_name_key(name)
+    key = _name_text_key(name)
     if not key:
         return ""
     return _strip_suffix(_strip_city_prefix(key, city))
@@ -456,10 +467,19 @@ def dedupe_places(places: Sequence[Place]) -> tuple[list[Place], list[Decision]]
             index = parent[index]
         return index
 
-    def union(left: int, right: int) -> None:
+    groups = {index: [index] for index in range(count)}
+
+    def union(left: int, right: int) -> bool:
         root_left, root_right = find(left), find(right)
-        if root_left != root_right:
-            parent[root_right] = root_left
+        # A-B 与 B-C 有信号，不代表 A-C 没有硬冲突（B 可能缺坐标/城市/分店）。
+        if any(
+            _duplicate_conflict(items[a], items[b])
+            for a in groups[root_left] for b in groups[root_right]
+        ):
+            return False
+        parent[root_right] = root_left
+        groups[root_left].extend(groups.pop(root_right))
+        return True
 
     signals: dict[tuple[int, int], tuple[str, dict]] = {}
     for i in range(count):
@@ -467,8 +487,7 @@ def dedupe_places(places: Sequence[Place]) -> tuple[list[Place], list[Decision]]
             if find(i) == find(j):
                 continue
             signal, detail = _duplicate_signal(items[i], items[j])
-            if signal:
-                union(i, j)
+            if signal and union(i, j):
                 signals[(i, j)] = (signal, detail)
 
     clusters: dict[int, list[int]] = {}
@@ -485,10 +504,11 @@ def dedupe_places(places: Sequence[Place]) -> tuple[list[Place], list[Decision]]
         absorbed = [index for index in members if index != representative_index]
 
         aliases: list[str] = []
-        merged_from: list[str] = []
+        merged_from = list(representative.merged_from)
         for index in absorbed:
             other = items[index]
             aliases.extend(name for name in (other.name, *other.aliases) if name and name != representative.name)
+            merged_from.extend(other.merged_from)
             if other.place_id != representative.place_id:
                 merged_from.append(other.place_id)
             if representative.lat is None and other.lat is not None:
@@ -508,7 +528,7 @@ def dedupe_places(places: Sequence[Place]) -> tuple[list[Place], list[Decision]]
             normalize_place_name(representative.name, representative.city)
             or basic_name_key(representative.name)
         )
-        representative.merged_from = sorted(set(merged_from))
+        representative.merged_from = sorted(set(merged_from) - {representative.place_id, ""})
         merged.append(representative)
 
         if not absorbed:
@@ -542,10 +562,22 @@ def dedupe_places(places: Sequence[Place]) -> tuple[list[Place], list[Decision]]
     return merged, decisions
 
 
+def _duplicate_conflict(left: Place, right: Place) -> dict:
+    # 延迟导入：places 复用本模块的归一化，模块级导入会成环。
+    from app.places import identity_conflict
+
+    if left.place_id and left.place_id == right.place_id:
+        return {}
+    return identity_conflict(left, right)
+
+
 def _duplicate_signal(left: Place, right: Place) -> tuple[str | None, dict]:
-    """判定两个 Place 是否同一地点；返回 (信号码, 依据明细)。"""
+    """判定两个 Place 是否同一地点；所有弱信号共享同一套硬冲突护栏。"""
     if left.place_id and left.place_id == right.place_id:
         return "same_poi_id", {"poi_id": left.place_id}
+    conflict = _duplicate_conflict(left, right)
+    if conflict:
+        return None, conflict
 
     distance = haversine_meters(left.coords, right.coords)
     similarity = name_similarity(left.name, right.name, city=left.city or right.city)
@@ -554,7 +586,7 @@ def _duplicate_signal(left: Place, right: Place) -> tuple[str | None, dict]:
         return "geo_name", {"distance_meters": round(distance, 1), "name_similarity": similarity}
 
     same_key = bool(left.alias_key) and left.alias_key == right.alias_key
-    if same_key and not (distance is not None and distance > GEO_NAME_CONFLICT_METERS):
+    if same_key:
         return "normalized_name", {
             "normalized_name": left.alias_key,
             "distance_meters": None if distance is None else round(distance, 1),

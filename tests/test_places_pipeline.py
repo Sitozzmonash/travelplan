@@ -10,8 +10,12 @@
 
 from __future__ import annotations
 
+import pytest
+
 from app import city_cache, discovery, places
-from app.models import Evidence, TripIntent
+from app.models import Evidence, Place, TripIntent, utcnow
+from app.store import TravelPlanStore
+from tests.test_city_cache import explicit_sqlite_only
 from tests.fakes import FakeHub, FakeLLM, make_store
 
 CITY = "成都"
@@ -240,3 +244,82 @@ class TestWorkflowPathPersistsEntityLayer:
         assert not [
             row for row in saved if places.facility_kind(str(row.get("name")), str(row.get("type")))
         ]
+
+
+@pytest.mark.parametrize("legacy_rows", [False, True])
+def test_cache_uses_existing_provider_identity_and_restores_aliases(tmp_path, monkeypatch, legacy_rows):
+    store = TravelPlanStore(tmp_path / "canonical.db")
+    timestamp = utcnow().isoformat()
+    store.upsert_canonical_places([{
+        "canonical_place_id": "c-1", "canonical_name": "成都大熊猫繁育研究基地",
+        "normalized_name": "大熊猫繁育研究基地", "city": CITY, "lat": 30.73, "lng": 104.14,
+    }])
+    store.upsert_place_provider_refs([
+        {"provider": "amap", "provider_place_id": "main", "canonical_place_id": "c-1", "city": CITY, "provider_name": "成都大熊猫繁育研究基地"},
+        {"provider": "amap", "provider_place_id": "gate", "canonical_place_id": "c-1", "city": CITY, "provider_name": "熊猫基地南门"},
+    ])
+    store.upsert_place_aliases([{
+        "city": CITY, "canonical_place_id": "c-1", "alias": "熊猫乐园", "normalized_alias": "熊猫乐园",
+    }])
+    candidates = [
+        Place(place_id="main", name="成都大熊猫繁育研究基地", city=CITY, lat=30.73, lng=104.14, source_id="poi-source"),
+        Place(place_id="gate", name="熊猫基地南门", city=CITY, lat=30.72, lng=104.14),
+    ]
+    evidence = Evidence(id="e1", text="熊猫基地南门进去，熊猫乐园好玩", place_mentions=["熊猫基地南门", "熊猫乐园"])
+    if legacy_rows:
+        store.upsert_city_pois(CITY, [city_cache._poi_row(place, timestamp) for place in candidates])
+        store.upsert_city_poi_mentions(CITY, [{"place_id": "gate", "raw_name": "熊猫基地南门", "snippet": evidence.text, "updated_at": timestamp}])
+        store.upsert_city_evidences(CITY, city_cache._evidence_rows([evidence], timestamp))
+    else:
+        assert city_cache.write_candidates(CITY, candidates, [evidence], store=store) == 1
+        links = store.get_place_evidence_links(CITY)
+        assert {row["canonical_place_id"] for row in links} == {"c-1"}
+        assert {row["mention_text"] for row in links} == set(evidence.place_mentions)
+
+    before = store.db_path.read_bytes()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("cache read 不得 persist resolver")
+
+    monkeypatch.setattr(places.PlaceResolver, "flush", forbidden)
+    hit = city_cache.read_candidates(CITY, store=store)
+    assert hit is not None and len(hit.places) == 1
+    assert hit.places[0].place_id == "main"
+    assert {"熊猫基地南门", "熊猫乐园"} <= set(hit.places[0].aliases)
+    assert hit.places[0].merged_from == ["gate"]
+    assert hit.places[0].source_id == "poi-source"
+    assert {row["place_id"] for row in hit.mentions} == {"main"}
+    assert len(hit.mentions) == 2
+    assert store.db_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_cache_keeps_far_apart_names_and_disambiguates_mentions(tmp_path, reverse):
+    store = TravelPlanStore(tmp_path / "same-names.db")
+    candidates = [
+        Place(place_id="central", name="人民公园", city=CITY, district="青羊区", lat=30.66, lng=104.05, aliases=["少城公园"]),
+        Place(place_id="remote", name="人民公园", city=CITY, district="新津区", lat=30.16, lng=104.05, aliases=["新津人民公园"]),
+    ]
+    for place in candidates:
+        store.upsert_canonical_places([{"canonical_place_id": "c-" + place.place_id, "canonical_name": place.name, "city": CITY, "district": place.district, "lat": place.lat, "lng": place.lng}])
+        store.upsert_place_provider_refs([{"provider": "amap", "provider_place_id": place.place_id, "provider_name": place.name, "canonical_place_id": "c-" + place.place_id, "city": CITY}])
+    evidences = [
+        Evidence(id="ambiguous", title="随便逛逛", text="人民公园不错", place_mentions=["人民公园"]),
+        Evidence(id="central", title="青羊区一日游", text="人民公园喝茶", place_mentions=["人民公园"]),
+        Evidence(id="remote", text="新津人民公园不错", place_mentions=["人民公园"]),
+        Evidence(id="qualified", text="人民公园不错", place_mentions=["新津区人民公园"]),
+        Evidence(id="both", text="青羊区和新津区都有人民公园", place_mentions=["人民公园"]),
+    ]
+    if reverse:
+        candidates.reverse()
+        evidences.reverse()
+    assert city_cache.write_candidates(CITY, candidates, evidences, store=store) == 2
+    hit = city_cache.read_candidates(CITY, store=store)
+    assert hit is not None and {place.place_id for place in hit.places} == {"central", "remote"}
+    attached = {row["evidence_key"]: row["place_id"] for row in hit.mentions}
+    expected = {"central": "central", "remote": "remote", "qualified": "remote"}
+    assert attached == {city_cache._evidence_key(evidence): expected[evidence.id] for evidence in evidences if evidence.id in expected}
+    assert len(hit.mentions) == 3
+    rows, mentions = store.get_city_cache_rows(CITY)
+    assert len(mentions) == 3
+    assert {row["place_id"]: row["evidence_count"] for row in rows} == {"central": 1, "remote": 2}

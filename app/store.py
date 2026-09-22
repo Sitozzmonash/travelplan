@@ -389,6 +389,7 @@ CREATE TABLE IF NOT EXISTS city_pois (
     amap_verified INTEGER NOT NULL DEFAULT 0,
     trust_score REAL, ad_risk REAL,
     evidence_count INTEGER NOT NULL DEFAULT 0,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
     updated_at TEXT NOT NULL,
     PRIMARY KEY(city, place_id)
 );
@@ -397,6 +398,7 @@ CREATE TABLE IF NOT EXISTS city_poi_mentions (
     city TEXT NOT NULL, place_id TEXT NOT NULL,
     raw_name TEXT NOT NULL, source_type TEXT NOT NULL,
     provider TEXT, source_url TEXT, snippet TEXT,
+    evidence_key TEXT,
     tone TEXT, published_at TEXT, updated_at TEXT NOT NULL,
     PRIMARY KEY(city, source_url, raw_name)
 );
@@ -655,11 +657,25 @@ class TravelPlanStore:
     复用进程内共享连接池。对外方法签名与返回值语义在两种后端下完全一致。
     """
 
-    def __init__(self, db_path: str | Path | None = None, *, database_url: str | None = None) -> None:
+    def __init__(
+        self, db_path: str | Path | None = None, *, database_url: str | None = None,
+        read_only: bool = False,
+    ) -> None:
+        self._read_only = read_only
+        if read_only:
+            if db_path is None and database_url is None:
+                from app.config import database_url as configured_url
+
+                database_url = configured_url()
+            if db_path is not None or not database_url:
+                db_path = Path(db_path) if db_path is not None else default_db_path()
+                if not db_path.is_file():
+                    raise FileNotFoundError(db_path)
         self._backend: SqliteBackend | PostgresBackend = resolve_backend(db_path, database_url)
         #: SQLite 时有值；Postgres 下为 None（真实目标见 ``describe()``）。
         self.db_path: Path | None = getattr(self._backend, "path", None)
-        self.init_schema()
+        if not read_only:
+            self.init_schema()
 
     @property
     def backend_name(self) -> str:
@@ -689,7 +705,25 @@ class TravelPlanStore:
     def _connect(self) -> Any:
         """取一条连接。SQLite 返回原生 ``sqlite3.Connection``；Postgres 返回翻译层包装。"""
 
+        if self._read_only:
+            return self._connect_read_only()
         return self._backend.connect()
+
+    @contextmanager
+    def _connect_read_only(self) -> Iterator[Any]:
+        if self.db_path is not None:
+            import sqlite3
+
+            conn = sqlite3.connect(self.db_path.resolve().as_uri() + "?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                yield conn
+            finally:
+                conn.close()
+        else:
+            with self._backend.connect() as conn:
+                conn.execute("SET TRANSACTION READ ONLY")
+                yield conn
 
     def _migrate_places_scope(self, conn: Any) -> None:
         """把旧的「全局 place_id 主键」表迁到「按 run 建档」的新表。
@@ -741,6 +775,7 @@ class TravelPlanStore:
             # `CREATE INDEX IF NOT EXISTS ... ON canonical_places(parent_place_id)`，
             # 老表缺这一列时索引语句会先炸掉，迁移根本没机会跑。
             self._migrate_canonical_layer(conn)
+            self._migrate_city_cache_metadata(conn)
             # 同一份 SCHEMA 字符串给两种方言用：DDL 只用两边都支持的子集
             # （IF NOT EXISTS / 复合主键 / 复合外键 / 普通类型），方言细节由 backend 翻译。
             conn.executescript(self._backend.schema_ddl(SCHEMA))
@@ -763,6 +798,17 @@ class TravelPlanStore:
             for column, ddl in columns:
                 if column not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+    def _migrate_city_cache_metadata(self, conn: Any) -> None:
+        """仅补兼容列：两种后端共用自省，不重建主键、不更新或删除历史行。"""
+
+        for table, column, ddl in (
+            ("city_pois", "metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("city_poi_mentions", "evidence_key", "TEXT"),
+        ):
+            columns = self._backend.table_columns(conn, table)
+            if columns and column not in columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def _migrate_run_source(self, conn: Any) -> None:
         """给 `runs` 补 `source` / `source_session_id`（`CREATE TABLE IF NOT EXISTS` 不会改老表）。
@@ -1177,6 +1223,7 @@ class TravelPlanStore:
                 row.get("district"), row.get("opening_hours"), row.get("phone"), row.get("rating"),
                 1 if row.get("amap_verified") else 0, row.get("trust_score"), row.get("ad_risk"),
                 int(row.get("evidence_count") or 0), row.get("updated_at") or utcnow().isoformat(),
+                _json(row["metadata"]) if "metadata" in row else row.get("metadata_json"),
             )
             for row in rows if row.get("place_id")
         ]
@@ -1187,28 +1234,38 @@ class TravelPlanStore:
                 "INSERT INTO city_pois"
                 " (city, place_id, name, normalized_name, category, lng, lat, address, business_area,"
                 "  district, opening_hours, phone, rating, amap_verified, trust_score, ad_risk,"
-                "  evidence_count, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                "  evidence_count, updated_at, metadata_json)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, '{}'))"
                 " ON CONFLICT(city, place_id) DO UPDATE SET"
                 " name=excluded.name, normalized_name=excluded.normalized_name, category=excluded.category,"
                 " lng=excluded.lng, lat=excluded.lat, address=excluded.address,"
                 " business_area=excluded.business_area, district=excluded.district,"
                 " opening_hours=excluded.opening_hours, phone=excluded.phone, rating=excluded.rating,"
                 " amap_verified=excluded.amap_verified, trust_score=excluded.trust_score,"
-                " ad_risk=excluded.ad_risk, evidence_count=excluded.evidence_count, updated_at=excluded.updated_at"
+                " ad_risk=excluded.ad_risk, evidence_count=excluded.evidence_count, updated_at=excluded.updated_at,"
+                " metadata_json=CASE WHEN excluded.metadata_json='{}' THEN city_pois.metadata_json"
+                " ELSE excluded.metadata_json END"
                 " WHERE excluded.updated_at >= city_pois.updated_at",
                 values,
             )
         return len(values)
 
     def upsert_city_poi_mentions(self, city: str, rows: Iterable[dict[str, Any]]) -> int:
-        """写入攻略提及；将空 URL 规范成空串以让复合主键真正去重。"""
+        """无 URL 时用内部内容键占用旧 PK 的 URL 槽，读取时还原，不伪造外部来源。
+
+        不破坏旧主键：同 URL / 同 raw_name 的多标题提及仍只能存一行，正文表不受影响。
+        """
 
         values = [
             (
                 city, str(row["place_id"]), str(row["raw_name"]), str(row.get("source_type") or "social"),
-                row.get("provider"), str(row.get("source_url") or ""), row.get("snippet"), row.get("tone"),
+                row.get("provider"),
+                str(row.get("source_url") or (
+                    f"city-evidence:{row['evidence_key']}" if row.get("evidence_key") else ""
+                )),
+                row.get("snippet"), row.get("tone"),
                 row.get("published_at"), row.get("updated_at") or utcnow().isoformat(),
+                row.get("evidence_key"),
             )
             for row in rows if row.get("place_id") and row.get("raw_name")
         ]
@@ -1217,12 +1274,12 @@ class TravelPlanStore:
         with self._connect() as conn:
             conn.executemany(
                 "INSERT INTO city_poi_mentions"
-                " (city, place_id, raw_name, source_type, provider, source_url, snippet, tone, published_at, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " (city, place_id, raw_name, source_type, provider, source_url, snippet, tone, published_at, updated_at, evidence_key)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(city, source_url, raw_name) DO UPDATE SET"
                 " place_id=excluded.place_id, source_type=excluded.source_type, provider=excluded.provider,"
                 " snippet=excluded.snippet, tone=excluded.tone, published_at=excluded.published_at,"
-                " updated_at=excluded.updated_at"
+                " updated_at=excluded.updated_at, evidence_key=COALESCE(excluded.evidence_key, city_poi_mentions.evidence_key)"
                 " WHERE excluded.updated_at >= city_poi_mentions.updated_at",
                 values,
             )
@@ -1238,7 +1295,11 @@ class TravelPlanStore:
             mentions = conn.execute(
                 "SELECT * FROM city_poi_mentions WHERE city=? ORDER BY updated_at DESC, raw_name", (city,)
             ).fetchall()
-        return [dict(row) for row in pois], [dict(row) for row in mentions]
+        decoded_mentions = [dict(row) for row in mentions]
+        for row in decoded_mentions:
+            if row.get("evidence_key") and row.get("source_url") == f"city-evidence:{row['evidence_key']}":
+                row["source_url"] = None
+        return [dict(row) for row in pois], decoded_mentions
 
     def upsert_city_evidences(self, city: str, rows: Iterable[dict[str, Any]]) -> int:
         """写入城市攻略正文；同一篇（city, evidence_key）保留最新一次抓取。"""

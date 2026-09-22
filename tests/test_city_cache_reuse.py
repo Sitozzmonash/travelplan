@@ -22,6 +22,7 @@ from app import city_cache, discovery, sessions
 from app.models import Evidence, Place, TripIntent, utcnow
 from app.workflow import STATUS_CACHED, execute_travel_run
 from tests.fakes import QUERY, FakeHub, FakeJev, FakeLLM, make_store
+from tests.test_city_cache import explicit_sqlite_only
 
 
 def _place() -> Place:
@@ -290,3 +291,49 @@ class TestCrossSessionEvidenceReuse:
         )
         assert all(row["source_id"].startswith("tp-city-1-") for row in first_rows)
         assert all(row["source_id"].startswith("tp-city-2-") for row in second_rows)
+
+
+def test_no_url_full_text_keys_and_mentions_survive_repeated_writes(tmp_path):
+    store = make_store(tmp_path / "no-url.db")
+    timestamp = utcnow().isoformat()
+    first = Evidence(id="session-1", provider="social", source_type="social", title="同一个标题", text="宽窄巷子" * 150 + "早上去", place_mentions=["宽窄巷子"])
+    second = first.model_copy(update={"id": "session-2", "text": "宽窄巷子" * 150 + "晚上去"})
+    assert city_cache._evidence_key(first) != city_cache._evidence_key(second)
+    for _ in range(2):
+        city_cache.write_candidates("成都", [_place()], [first, second], store=store, updated_at=timestamp)
+    rows, mentions = store.get_city_cache_rows("成都")
+    assert rows[0]["evidence_count"] == 2
+    assert len(mentions) == len(store.get_city_evidence_rows("成都")) == 2
+    assert {row["evidence_key"] for row in mentions} == {city_cache._evidence_key(first), city_cache._evidence_key(second)}
+    assert all(row["source_url"] is None for row in mentions)
+    hit = city_cache.read_candidates("成都", store=store)
+    assert hit is not None and len(hit.mentions) == len(hit.evidences) == 2
+    assert {item.text for item in hit.evidences} == {first.text, second.text}
+    city_cache.write_candidates("成都", hit.places, hit.evidences, store=store, updated_at=timestamp)
+    assert store.get_city_cache_rows("成都") == (rows, mentions)
+    assert all(row["source_url"] is None for row in hit.payload()["mentions"])
+
+
+def test_legacy_evidence_key_and_missing_mention_key_remain_readable(tmp_path):
+    store = make_store(tmp_path / "legacy-evidence.db")
+    timestamp = utcnow().isoformat()
+    evidence = Evidence(id="old-run", provider="web", text="宽窄巷子值得去", place_mentions=["宽窄巷子"])
+    row = city_cache._evidence_rows([evidence], timestamp)[0]
+    row["evidence_key"] = "legacy-meta-hash"
+    store.upsert_city_evidences("成都", [row])
+    store.upsert_city_pois("成都", [city_cache._poi_row(_place(), timestamp)])
+    store.upsert_city_poi_mentions("成都", [{"place_id": "amap-1", "raw_name": "宽窄巷子", "provider": "web", "snippet": evidence.text, "updated_at": timestamp}])
+    before = store.db_path.read_bytes()
+    hit = city_cache.read_candidates("成都", store=store, evidence_limit=0)
+    assert hit is not None and hit.evidences == []
+    assert len(hit.mentions) == 1
+    assert hit.mentions[0]["evidence_key"] == "legacy-meta-hash"
+    assert hit.mentions[0]["source_url"] is None
+    assert store.db_path.read_bytes() == before
+    assert store.get_city_evidence_rows("成都")[0]["evidence_key"] == "legacy-meta-hash"
+    full_hit = city_cache.read_candidates("成都", store=store)
+    for _ in range(2):
+        city_cache.write_candidates("成都", full_hit.places, full_hit.evidences, store=store, updated_at=timestamp)
+    assert len(store.get_city_evidence_rows("成都")) == 1
+    assert store.get_city_evidence_rows("成都")[0]["evidence_key"] == "legacy-meta-hash"
+    assert len(city_cache.read_candidates("成都", store=store).mentions) == 1

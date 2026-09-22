@@ -72,7 +72,7 @@ STATUS_TIMEOUT = "TIMEOUT"
 
 @dataclass(slots=True)
 class LLMResult:
-    """一次模型调用的结果 + 留痕。`value` 只在 JSON 模式下有意义。"""
+    """一次调用 + 留痕。`value` 为 JSON 解析值或原生工具调用的 AIMessage。"""
 
     status: str = STATUS_UNAVAILABLE
     text: str = ""
@@ -124,13 +124,13 @@ class LLMResult:
             total_tokens = input_tokens + output_tokens
 
         return {
-            "tag": self.tag,
-            "model": self.model,
+            "tag": scrub(self.tag),
+            "model": scrub(self.model),
             "status": self.status,
             "duration_ms": self.duration_ms,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
-            "error": self.error,
+            "error": _preview_of(self.error),
             "chars": len(self.text or ""),
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -407,8 +407,8 @@ class LLM:
                 "tag": tag,
                 "model": result.model,
                 "duration_ms": result.duration_ms,
-                "decision": f"{result.status}" + (f" · {result.error}" if result.error else ""),
-                "output": result.text[:4000] if result.text else "",
+                "decision": scrub(f"{result.status}" + (f" · {result.error}" if result.error else "")),
+                "output": _preview_of(result.text) or "",
                 **(result.usage or {}),
             },
             status=result.status,
@@ -530,6 +530,102 @@ class LLM:
             result.error = "模型输出不是可解析的 JSON"
             return result
         result.value = parsed
+        return result
+
+    def invoke_tools(
+        self, messages: Sequence[Any], tools: Sequence[Any], *, tag: str,
+        tool_choice: Any | None = None,
+    ) -> LLMResult:
+        """原生 function calling；保留 AIMessage（包括 tool_calls），不解析文本 JSON。
+
+        bind_tools 也在预算内执行。并发闸门、daemon 超时、状态及单次留痕与 invoke
+        一致：超时后放弃等待，迟到的工作线程不能再写 calls。审计包含工具协议预览，
+        而不是只记录通常为空的 content；消息原文不传给观测出口。
+        """
+        started = time.monotonic()
+        result = LLMResult(model=self._model_name, tag=tag)
+        result.started_at = datetime.now(timezone.utc).isoformat()
+        self._emit(EventType.LLM_STARTED, {"model": scrub(self._model_name), "tag": scrub(tag)})
+        try:
+            from langchain_core.messages import AIMessage
+
+            history = list(messages)
+            schemas = list(tools)
+            result.prompt_system = "\n".join(
+                _as_text(getattr(message, "content", "")) for message in history
+                if getattr(message, "type", "") == "system"
+            )
+            result.prompt_user = json.dumps([
+                message.model_dump(mode="json") if hasattr(message, "model_dump") else message
+                for message in history
+            ], ensure_ascii=False, default=str)
+            result.prompt_context = json.dumps(
+                {"tools": schemas, "tool_choice": tool_choice}, ensure_ascii=False, default=str
+            )
+            if self._model is None:
+                result.error = "未配置可用模型（MODEL_NAME / MODEL_BASE_URL / MODEL_API_KEY）"
+            else:
+                box: dict[str, Any] = {}
+
+                def worker() -> None:
+                    try:
+                        kwargs = {} if tool_choice is None else {"tool_choice": tool_choice}
+                        bound = self._model.bind_tools(schemas, **kwargs)
+                        box["response"] = bound.invoke(history)
+                    except BaseException as exc:  # 工作线程只传结果，不写审计
+                        box["error"] = exc
+
+                budget = self._budget_for(tag)
+                thread = threading.Thread(target=worker, daemon=True, name=f"llm-{tag or 'tools'}")
+                with self._semaphore:
+                    thread.start()
+                    thread.join(budget)
+                if thread.is_alive():
+                    result.status = STATUS_TIMEOUT
+                    result.error = f"模型调用超过 {budget:g}s 未返回，已放弃等待并按失败降级"
+                elif "error" in box:
+                    error = box["error"]
+                    message = scrub(f"{type(error).__name__}: {error}")
+                    result.status = (
+                        STATUS_TIMEOUT if any(word in message.lower() for word in ("timeout", "timed out"))
+                        else STATUS_UNAVAILABLE
+                    )
+                    result.error = clip(message, limit=400)
+                else:
+                    response = box.get("response")
+                    if not isinstance(response, AIMessage):
+                        result.status = STATUS_INVALID_RESPONSE
+                        result.error = "原生工具调用未返回 AIMessage"
+                    else:
+                        result.text = _as_text(response.content)
+                        if response.tool_calls or response.invalid_tool_calls:
+                            result.text += "\n" + json.dumps({
+                                "tool_calls": response.tool_calls,
+                                "invalid_tool_calls": response.invalid_tool_calls,
+                            }, ensure_ascii=False, default=str)
+                        result.usage = _usage_of(response)
+                        if response.invalid_tool_calls:
+                            result.status = STATUS_INVALID_RESPONSE
+                            result.error = "模型返回了无法解析的原生 tool_calls"
+                        else:
+                            result.status = STATUS_OK
+                            result.value = response
+        except Exception as exc:  # 缺依赖、bind/invoke 失败都按状态降级，不泄露凭据
+            message = scrub(f"{type(exc).__name__}: {exc}")
+            result.status = (
+                STATUS_TIMEOUT if any(word in message.lower() for word in ("timeout", "timed out"))
+                else STATUS_UNAVAILABLE
+            )
+            result.error = clip(message, limit=400)
+        result.duration_ms = int((time.monotonic() - started) * 1000)
+        result.finished_at = datetime.now(timezone.utc).isoformat()
+        self.calls.append(result)
+        self._emit(EventType.LLM_FINISHED, {
+            "tag": scrub(tag), "model": scrub(result.model),
+            "duration_ms": result.duration_ms,
+            "decision": result.status + (f" · {result.error}" if result.error else ""),
+            "output": _preview_of(result.text) or "", **(result.usage or {}),
+        }, status=result.status)
         return result
 
     def audit_entries(self) -> list[dict[str, Any]]:

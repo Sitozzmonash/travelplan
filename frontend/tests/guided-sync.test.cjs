@@ -1,11 +1,13 @@
 // Run: node --test frontend/tests/guided-sync.test.cjs (from the repository root).
 // Transpile the real client component/data outlet in memory; no browser, server or emitted files.
+/* eslint-disable @typescript-eslint/no-require-imports -- Node's existing .cjs test harness uses CommonJS. */
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const { test } = require("node:test");
 const ts = require("../node_modules/typescript");
+/* eslint-enable @typescript-eslint/no-require-imports */
 
 const root = path.resolve(__dirname, "..");
 const compiled = new Map();
@@ -100,7 +102,8 @@ function harness() {
   const ui = {
     "@/components/ui/button": ["Button"],
     "@/components/section-card": ["SectionCard"],
-    "@/components/state-views": ["ErrorState", "InlineWarning", "PartialNotice"],
+    "@/components/state-views": ["ErrorState", "InlineWarning", "PartialNotice", "EmptyState", "LoadingState"],
+    "@/components/ui/skeleton": ["Skeleton"],
     "./discovery-research": ["DiscoveryResearch"],
     "./step-poi": ["StepPoi"],
     "./step-preferences": ["StepPreferences"],
@@ -134,12 +137,12 @@ function harness() {
         compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, jsx: ts.JsxEmit.ReactJSX },
       }).outputText);
     }
-    const module = { exports: {} };
-    cache.set(relative, module);
+    const loadedModule = { exports: {} };
+    cache.set(relative, loadedModule);
     vm.runInContext(`(function(require, module, exports) {\n${compiled.get(relative)}\n})`, context, {
       filename: path.join(root, relative),
-    })(requireLocal, module, module.exports);
-    return module.exports;
+    })(requireLocal, loadedModule, loadedModule.exports);
+    return loadedModule.exports;
   }
   const { GuidedWizard } = load("components/guided/guided-wizard.tsx");
   function render() {
@@ -185,10 +188,10 @@ function harness() {
     pending("POST").respond(session("session-1", extra));
     await flush();
   }
-  async function preferences() {
+  async function preferences(extra = {}) {
     primary()();
     await flush();
-    pending("PATCH").respond(session());
+    pending("PATCH").respond(session("session-1", extra));
     await flush();
     return props("StepPreferences");
   }
@@ -197,6 +200,23 @@ function harness() {
     patches: () => requests.filter((request) => request.method === "PATCH"),
     starts: () => requests.filter((request) => request.pathname.endsWith("/start")),
     draft: load("components/guided/draft.ts"),
+    sessions: load("lib/sessions.ts"),
+    options: load("components/guided/options.ts"),
+    component(relative, name, props) {
+      function expand(node) {
+        if (Array.isArray(node)) return node.map(expand);
+        if (!node || typeof node !== "object") return node;
+        if (typeof node.type === "function") return expand(node.type(node.props));
+        return { ...node, props: { ...node.props, children: expand(node.props.children) } };
+      }
+      const rendered = expand(load(relative)[name](props));
+      const elements = nodes(rendered);
+      function text(node) {
+        if (Array.isArray(node)) return node.map(text).join(" ");
+        return node && typeof node === "object" ? text(node.props?.children) : typeof node === "string" || typeof node === "number" ? String(node) : "";
+      }
+      return { nodes: elements, text: text(rendered) };
+    },
   };
 }
 
@@ -488,3 +508,275 @@ test("full draft preserves explicit sentinels while nullable hotel resets are pr
   assert.equal(patch.hotel_max_price_per_night, null);
   assert.equal(patch.hotel_room_type, null);
 });
+
+function recommended(extra = {}) {
+  return {
+    recommendation: { status: "READY", source: "llm", version: 1, place_ids: ["park"] },
+    place_candidates: [{ place_id: "park", name: "人民公园", category: "attraction", district: "青羊区", evidence_count: 3 }],
+    ...extra,
+  };
+}
+
+function poiComponent(h, extra, props = {}) {
+  return h.component("components/guided/step-poi.tsx", "StepPoi", {
+    session: h.sessions.normalizeSession(session("s", extra)), settled: false, unusable: false,
+    pollStalled: false, selections: {}, expanded: [], bulk: null,
+    onSelect() {}, onBulk() {}, onToggleExpand() {}, onRetryDiscovery() {}, ...props,
+  });
+}
+
+function researchComponent(h, extra) {
+  return h.component("components/guided/discovery-research.tsx", "DiscoveryResearch", {
+    session: h.sessions.normalizeSession(session("s", extra)), settled: false,
+  });
+}
+
+function primaryDisabled(h) {
+  return h.all("Button").find((button) => button.className?.includes("min-w-")).disabled;
+}
+
+test("normalization preserves optional recommendation, stage states and card identity metadata", () => {
+  const h = harness();
+  const legacy = h.sessions.normalizeSession(session());
+  assert.equal(legacy.recommendation, undefined);
+  assert.equal(h.options.recommendationStartIssue(legacy, {}), null);
+  const current = h.sessions.normalizeSession(session("s", recommended({
+    discovery_status: "RUNNING", discovery: { database: { status: "OK", result_count: "4" } },
+    place_candidates: [{ place_id: "park", name: "公园", display_name: "公园（青羊区）", canonical_place_id: "canonical", district: "青羊区", merged_from: ["alias", null], evidence_count: "2", reason: "适合散步" }],
+  })));
+  assert.equal(current.discovery_status, "RUNNING");
+  assert.equal(current.discovery.database.result_count, 4);
+  assert.equal(current.recommendation.version, 1);
+  assert.equal(current.place_candidates[0].display_name, "公园（青羊区）");
+  assert.equal(current.place_candidates[0].canonical_place_id, "canonical");
+  assert.deepEqual(clone(current.place_candidates[0].merged_from), ["alias"]);
+  assert.equal(current.place_candidates[0].reason, "适合散步");
+  assert.equal(current.place_candidates[0].evidence_count, 2);
+  assert.equal(h.sessions.isDiscoverySettled(current), false);
+  assert.equal(h.sessions.normalizeSession(session("s", { discovery_status: "PENDING" })).discovery_status, "PENDING");
+  const malformed = h.sessions.normalizeSession(session("s", { recommendation: {}, place_candidates: current.place_candidates }));
+  assert.equal(h.options.discoveryPlaces(malformed).length, 0);
+  assert.ok(h.options.recommendationStartIssue(malformed, {}));
+});
+
+test("new cards never fall back to raw pools; dedupe uses IDs only, not names or evidence aliases", () => {
+  const h = harness();
+  const cards = [
+    { place_id: "a", name: "人民公园", district: "青羊区", canonical_place_id: "c", merged_from: ["source-1"] },
+    { place_id: "b", name: "人民公园", district: "双流区", merged_from: ["source-1"] },
+    { place_id: "c", name: "人民公园正门" },
+    { place_id: "d", name: "人民公园餐厅" },
+  ];
+  const view = h.sessions.normalizeSession(session("s", recommended({
+    recommendation: { status: "READY", place_ids: ["a", "b", "c", "d"] },
+    place_candidates: cards,
+    poi_pools: { attraction: [{ place_id: "raw", name: "未经筛选的候选" }] },
+  })));
+  assert.deepEqual(clone(h.options.discoveryPlaces(view).map((place) => place.place_id)), ["a", "b", "d"]);
+  assert.equal(h.options.placeDisplayName(cards[0]), "人民公园（青羊区）");
+  assert.equal(h.options.placeDisplayName({ ...cards[0], display_name: "后端消歧名" }), "后端消歧名");
+  assert.equal("raw" in h.options.bestValueSelections(view), false);
+  view.recommendation.place_ids = [];
+  assert.equal(h.options.discoveryPlaces(view).length, 0);
+  delete view.recommendation;
+  assert.deepEqual(clone(h.options.discoveryPlaces(view).map((place) => place.place_id)), ["raw"]);
+});
+
+test("research shows actual stages, supports social_discovery_finished, and stops all busy text on failure", () => {
+  const h = harness();
+  const running = researchComponent(h, {
+    discovery_status: "RUNNING", recommendation: { status: "PENDING", place_ids: [] },
+    discovery: { database: { status: "OK", result_count: 4 }, web: { status: "RUNNING" } },
+  });
+  assert.match(running.text, /数据库攻略：检索结束，4 条结果/);
+  assert.match(running.text, /Web 补充：正在处理/);
+  assert.match(running.text, /推荐生成：等待处理/);
+  assert.doesNotMatch(running.text, /正在查询交通|正在比较酒店|已完成/);
+  for (const event of ["social", "social_discovery_finished"]) {
+    const result = researchComponent(h, { events: [{ event, detail: "status=OK，结果 5 条" }] });
+    assert.match(result.text, /数据库攻略：检索结束，5 条结果/);
+    assert.doesNotMatch(result.text, /正在/);
+  }
+  for (const status of ["READY", "PARTIAL", "FAILED"]) {
+    const result = researchComponent(h, {
+      discovery_status: status, recommendation: { status, place_ids: [] },
+      discovery: { database: { status: "RUNNING" }, web: { status: "PENDING" } },
+    });
+    assert.doesNotMatch(result.text, /正在|等待处理|已就绪/);
+    assert.match(result.text, /暂无可用推荐/);
+  }
+  const failedEvent = researchComponent(h, { events: [{ event: "social_discovery_finished", detail: "status=FAILED，结果 0 条" }] });
+  assert.match(failedEvent.text, /数据库攻略：未成功获取结果/);
+  const zero = researchComponent(h, { discovery: { database: { status: "OK", result_count: 0 }, web: { status: "SKIPPED" } } });
+  assert.match(zero.text, /无结果/);
+  assert.match(zero.text, /本次未执行/);
+  const fallback = researchComponent(h, recommended({ recommendation: { status: "PARTIAL", source: "evidence_fallback", place_ids: ["park"] } }));
+  assert.match(fallback.text, /证据降级推荐：1 个地点（部分可用）/);
+});
+
+test("cards avoid duplicate busy blocks and skeletons when recommendations exist; empty results stay honest", () => {
+  const h = harness();
+  const result = poiComponent(h, recommended({ discovery_status: "RUNNING" }));
+  assert.equal(result.nodes.some((node) => node.type === "LoadingState" || node.type === "Skeleton"), false);
+  assert.match(result.text, /人民公园（青羊区）/);
+  assert.match(result.text, /来自 3 篇攻略/);
+  assert.match(result.text, /不勾选时使用这份推荐/);
+  assert.equal(result.nodes.filter((node) => node.type === "DiscoveryResearch").length, 1);
+  for (const evidence_count of [undefined, null, 0, -1, "invalid"]) {
+    const card = poiComponent(h, recommended({ place_candidates: [{ place_id: "park", name: "人民公园", display_name: "人民公园·双流", district: "双流区", area: "商圈", evidence_count }] }));
+    assert.match(card.text, /暂无关联攻略/);
+    assert.match(card.text, /人民公园·双流/);
+    assert.match(card.text, /双流区 · 商圈/);
+    assert.doesNotMatch(card.text, /来自 0 篇攻略/);
+  }
+  const waiting = poiComponent(h, { discovery_status: "RUNNING", recommendation: { status: "PENDING", place_ids: [] } });
+  assert.ok(waiting.nodes.some((node) => node.type === "Skeleton"));
+  const empty = poiComponent(h, recommended({ recommendation: { status: "FAILED", place_ids: [] } }));
+  assert.equal(empty.nodes.some((node) => node.type === "Skeleton"), false);
+  assert.match(empty.nodes.find((node) => node.type === "EmptyState").props.hint, /重新生成可用推荐/);
+  const hotel = h.component("components/guided/discovery-research.tsx", "HotelAreaRecommendations", { areas: [{ key: "center", name: "市中心", tags: [] }] });
+  assert.match(hotel.text, /根据攻略与游玩范围推荐/);
+  assert.doesNotMatch(hotel.text, /已按你的酒店策略排序/);
+});
+
+test("tool-named discovery stages expose empty, cached and recommendation-running states", () => {
+  const h = harness();
+  const result = researchComponent(h, {
+    discovery_status: "RUNNING", recommendation: { status: "PENDING", place_ids: [] },
+    discovery: {
+      recall_city_guides: { status: "CACHE", result_count: 7 },
+      search_web_guides: { status: "EMPTY", result_count: 0 },
+      recommendation: { status: "RUNNING" },
+    },
+  });
+  assert.match(result.text, /数据库攻略：检索结束，7 条结果/);
+  assert.match(result.text, /Web 补充：无结果/);
+  assert.match(result.text, /推荐生成：正在处理/);
+  const draft = h.draft.createEmptyDraft();
+  draft.poi.selections = { park: "MUST" };
+  const summary = h.draft.summarize(draft, h.sessions.normalizeSession(session("s", recommended())));
+  assert.deepEqual(clone(summary.must.names), ["人民公园（青羊区）"]);
+});
+
+test("legacy sessions without recommendation retain the historical START behavior even with no discovery results", async () => {
+  const h = harness();
+  const extra = { discovery_status: "FAILED", place_candidates: [] };
+  await h.boot(extra);
+  await h.preferences(extra);
+  assert.equal(primaryDisabled(h), false);
+  h.primary()();
+  await h.flush();
+  h.pending("PATCH").respond(session("session-1", extra));
+  await h.flush();
+  assert.equal(h.starts().length, 1);
+});
+
+for (const status of ["PENDING", "RUNNING"]) {
+  test(`${status} recommendation permits preferences but blocks START, including a direct stale handler`, async () => {
+    const h = harness();
+    const extra = recommended({ discovery_status: "RUNNING", recommendation: { status, place_ids: [] } });
+    await h.boot(extra);
+    assert.equal(primaryDisabled(h), false);
+    await h.preferences(extra);
+    assert.equal(h.props("WizardProgress").current, 1);
+    assert.equal(primaryDisabled(h), true);
+    assert.ok(h.all("InlineWarning").some((warning) => /推荐尚未就绪/.test(warning.description)));
+    h.primary()();
+    await h.flush();
+    assert.equal(h.patches().length, 1);
+    assert.equal(h.starts().length, 0);
+    h.pending("GET").respond(session("session-1", recommended()));
+    await h.flush();
+    assert.equal(primaryDisabled(h), false);
+    h.primary()();
+    await h.flush();
+    h.pending("PATCH").respond(session("session-1", recommended()));
+    await h.flush();
+    assert.equal(h.starts().length, 1);
+  });
+}
+
+for (const extra of [
+  recommended({ recommendation: { status: "FAILED", place_ids: [] } }),
+  recommended({ recommendation: { status: "READY", place_ids: [] } }),
+  recommended({ place_candidates: [] }),
+]) {
+  test(`no usable recommendation IDs blocks formal start (${JSON.stringify(extra)})`, async () => {
+    const h = harness();
+    await h.boot(extra);
+    await h.preferences(extra);
+    assert.equal(primaryDisabled(h), true);
+    h.primary()();
+    await h.flush();
+    assert.equal(h.starts().length, 0);
+    assert.equal(h.props("fieldset").disabled, false);
+    h.props("WizardProgress").onJump(0);
+    await h.flush();
+    h.props("StepPoi").onRetryDiscovery();
+    await h.flush();
+    assert.equal(h.requests.filter((request) => request.method === "POST").length, 2);
+  });
+}
+
+test("final PATCH recommendation is rechecked and the existing final lock is released on rejection", async () => {
+  const h = harness();
+  await h.boot(recommended());
+  await h.preferences(recommended());
+  h.primary()();
+  await h.flush();
+  h.pending("PATCH").respond(session("session-1", recommended({ recommendation: { status: "FAILED", place_ids: [] } })));
+  await h.flush();
+  assert.equal(h.starts().length, 0);
+  assert.equal(h.props("fieldset").disabled, false);
+  assert.equal(primaryDisabled(h), true);
+  const error = h.all("ErrorState").find((item) => item.title === "没能开始规划");
+  assert.equal(error.retryLabel, "返回探索页");
+  error.onRetry();
+  await h.flush();
+  assert.equal(h.props("WizardProgress").current, 0);
+});
+
+test("all-rejected and stale selections block start; auto clears them and uses only this recommendation", async () => {
+  const h = harness();
+  const view = h.sessions.normalizeSession(session("s", recommended()));
+  assert.match(h.options.recommendationStartIssue(view, { park: "REJECT" }), /没有可安排/);
+  assert.match(h.options.recommendationStartIssue(view, { raw: "WANT" }), /不在当前推荐/);
+  assert.equal(h.options.recommendationStartIssue(view, {}), null);
+  await h.boot(recommended());
+  const poi = h.props("StepPoi");
+  poi.onSelect("park", "REJECT");
+  await h.preferences(recommended());
+  assert.equal(primaryDisabled(h), true);
+  poi.onBulk("auto");
+  await h.flush();
+  assert.equal(primaryDisabled(h), false);
+  h.primary()();
+  await h.flush();
+  assert.deepEqual(h.pending("PATCH").body.poi_selections, {});
+  h.pending("PATCH").respond(session("session-1", recommended()));
+  await h.flush();
+  assert.equal(h.starts().length, 1);
+});
+
+for (const [code, expected] of [
+  ["recommendation_not_ready", /推荐还在生成/],
+  ["recommendation_unavailable", /没有可用推荐/],
+  ["no_selected_places", /没有可安排的地点/],
+  ["invalid_place_selection", /已不在当前推荐/],
+]) {
+  test(`real START HTTP response maps ${code} to actionable Chinese`, async () => {
+    const h = harness();
+    await h.boot(recommended());
+    await h.preferences(recommended());
+    h.primary()();
+    await h.flush();
+    h.pending("PATCH").respond(session("session-1", recommended()));
+    await h.flush();
+    h.pending("POST", "/start").respond({ detail: { code, message: "backend message" } }, 409);
+    await h.flush();
+    const error = h.all("ErrorState").find((item) => item.title === "没能开始规划");
+    assert.match(error.description, expected);
+    assert.match(error.description, /返回探索页/);
+    assert.equal(h.props("fieldset").disabled, false);
+  });
+}

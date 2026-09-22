@@ -618,19 +618,24 @@ def resolve_pois(
     searched: list[str] = []
     raw_places: list[Place] = []
     seen_ids: set[str] = set()
+    query_ids: dict[str, list[str]] = {}
     for term in terms:
         result = results.get(term)
         searched.append(term)
         provider_ids: list[str] = []
         for place in getattr(result, "items", None) or []:
-            if not place.place_id or place.place_id in seen_ids:
+            if not place.place_id:
+                continue
+            # 每个检索词都保留完整命中；候选去重不能截断另一个词的查询缓存。
+            if place.place_id not in provider_ids:
+                provider_ids.append(place.place_id)
+            if place.place_id in seen_ids:
                 continue
             seen_ids.add(place.place_id)
             raw_places.append(place)
-            provider_ids.append(place.place_id)
             records.append(places.PoiRecord.from_place(place, source_query=term, order=record_order))
             record_order += 1
-        resolver.record_query(term, provider_result_ids=provider_ids)
+        query_ids[term] = provider_ids
     for place in extra_places:
         if not place.place_id or place.place_id in seen_ids:
             continue
@@ -640,6 +645,9 @@ def resolve_pois(
         record_order += 1
 
     outcome = resolver.ingest(records)
+    # ID 映射由 ingest 建立，必须在它之后记录，否则首次查询永远缓存空列表。
+    for term, provider_ids in query_ids.items():
+        resolver.record_query(term, provider_result_ids=provider_ids)
     resolution = PlaceResolution(
         places=outcome.places,
         outcome=outcome,

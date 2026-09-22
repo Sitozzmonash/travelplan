@@ -25,6 +25,7 @@ import type {
   Pace,
   PreferenceSentinel,
   PlaceCandidate,
+  PoiSelection,
   SessionView,
   TransportConstraint,
   TransportMode,
@@ -227,16 +228,57 @@ export interface PlaceGroup {
   places: PlaceCandidate[];
 }
 
-/** 契约 2 优先使用分池候选；旧后端只回 place_candidates 时无缝回退。 */
+/** 新契约只展示推荐名单对应的卡片；旧会话才回退到分池候选。 */
 export function discoveryPlaces(session: SessionView | null): PlaceCandidate[] {
   if (!session) return [];
   const pooled = [...session.poi_pools.attraction, ...session.poi_pools.food, ...session.poi_pools.experience];
-  const source = pooled.length ? pooled : session.place_candidates;
+  const recommendation = session.recommendation;
+  const allowed = new Set(recommendation?.place_ids ?? []);
+  const source = recommendation
+    ? session.place_candidates.filter((place) => allowed.has(place.place_id) || Boolean(place.canonical_place_id && allowed.has(place.canonical_place_id)))
+    : pooled.length ? pooled : session.place_candidates;
+  // 仅稳定 ID 建立等价关系；绝不按名字、名称包含关系或 merged_from 证据合并。
+  const aliases = new Map<string, string>();
+  const root = (id: string): string => {
+    const parent = aliases.get(id);
+    return parent && parent !== id ? root(parent) : id;
+  };
+  for (const place of source) {
+    if (place.canonical_place_id) aliases.set(root(place.place_id), root(place.canonical_place_id));
+  }
   const unique = new Map<string, PlaceCandidate>();
   for (const place of source) {
-    if (!unique.has(place.place_id)) unique.set(place.place_id, place);
+    if (!place.place_id.trim()) continue;
+    const id = root(place.place_id);
+    if (!unique.has(id)) unique.set(id, place);
   }
   return Array.from(unique.values());
+}
+
+export function placeDisplayName(place: PlaceCandidate): string {
+  return place.display_name || (place.district ? `${place.name}（${place.district}）` : place.name);
+}
+
+/** 中途可填偏好，但正式开始必须有当前推荐内的可用 ID；旧会话不加新限制。 */
+export function recommendationStartIssue(session: SessionView | null, selections: Record<string, PoiSelection>): string | null {
+  if (!session?.recommendation) return null;
+  const recommendation = session.recommendation;
+  if (recommendation.status === "FAILED" || session.discovery_status === "FAILED") {
+    return "本次没有可用推荐，请返回探索页重新生成推荐。";
+  }
+  if (["RUNNING", "PENDING"].includes(recommendation.status) || ["RUNNING", "PENDING", "DISCOVERING"].includes(session.discovery_status)) {
+    return "推荐尚未就绪。可以先填写偏好，返回探索页等待或重试后再开始规划。";
+  }
+  const places = discoveryPlaces(session);
+  if (!places.length) return "本次推荐没有可用地点，请返回探索页重新生成推荐。";
+  const ids = new Set(places.flatMap((place) => [place.place_id, ...(place.canonical_place_id ? [place.canonical_place_id] : [])]));
+  if (Object.keys(selections).some((id) => !ids.has(id))) {
+    return "所选地点已不在当前推荐中，请返回探索页重新选择，或使用这份推荐。";
+  }
+  if (!places.some((place) => selections[place.place_id] !== "REJECT" && (!place.canonical_place_id || selections[place.canonical_place_id] !== "REJECT"))) {
+    return "没有可安排的地点，请返回探索页保留至少一个推荐地点，或使用这份推荐。";
+  }
+  return null;
 }
 
 /**

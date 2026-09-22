@@ -21,10 +21,22 @@ export const PLANNING_SESSION_STATUSES = [
 /** Planning Session 自身的状态（与 RunStatus 无关）。 */
 export type PlanningSessionStatus = (typeof PLANNING_SESSION_STATUSES)[number];
 
-export const DISCOVERY_STATUSES = ["DISCOVERING", "READY", "PARTIAL", "FAILED"] as const;
+export const DISCOVERY_STATUSES = ["PENDING", "RUNNING", "DISCOVERING", "READY", "PARTIAL", "FAILED"] as const;
 
-/** Discovery 子状态：READY / PARTIAL 才算「选够了，可以给用户看」。 */
+/** DISCOVERING 保留给旧会话；新会话区分排队与执行。 */
 export type DiscoveryStatus = (typeof DISCOVERY_STATUSES)[number];
+
+export interface SessionRecommendation {
+  status: "PENDING" | "RUNNING" | "READY" | "PARTIAL" | "FAILED";
+  source?: "llm" | "evidence_fallback" | null;
+  version?: number | null;
+  place_ids: string[];
+}
+
+export interface DiscoveryStage {
+  status?: string | null;
+  result_count?: number | null;
+}
 
 export const TRANSPORT_MODES = ["train", "flight", "any", "auto"] as const;
 export type TransportMode = (typeof TRANSPORT_MODES)[number];
@@ -107,6 +119,9 @@ export interface HotelCandidate {
 export interface PlaceCandidate {
   place_id: string;
   name: string;
+  display_name?: string | null;
+  canonical_place_id?: string | null;
+  merged_from?: string[] | null;
   category?: string | null;
   category_label?: string | null;
   area?: string | null;
@@ -202,6 +217,8 @@ export interface PlanningSessionPayload {
   transport_candidates?: TransportCandidate[] | null;
   hotel_candidates?: HotelCandidate[] | null;
   place_candidates?: PlaceCandidate[] | null;
+  recommendation?: SessionRecommendation | null;
+  discovery?: Record<string, DiscoveryStage> | null;
   place_categories?: PlaceCategory[] | null;
   hotel_areas?: HotelArea[] | null;
   poi_pools?: Partial<PoiPools> | null;
@@ -228,6 +245,9 @@ export interface SessionView {
   transport_candidates: TransportCandidate[];
   hotel_candidates: HotelCandidate[];
   place_candidates: PlaceCandidate[];
+  /** 缺失表示旧契约，不启用新推荐门禁。 */
+  recommendation?: SessionRecommendation | null;
+  discovery?: Record<string, DiscoveryStage>;
   place_categories: PlaceCategory[];
   hotel_areas: HotelArea[];
   poi_pools: PoiPools;

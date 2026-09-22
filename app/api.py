@@ -701,6 +701,16 @@ def start_planning_session(session_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"没有 session_id={session_id} 的会话")
     if outcome.get("error") == "session_closed":
         raise HTTPException(status_code=409, detail="会话已取消或已过期，请重新开始")
+    errors = {
+        "recommendation_not_ready": "攻略推荐尚未完成，请稍后再开始规划",
+        "recommendation_unavailable": "尚无可用的攻略推荐，请返回探索页重试",
+        "no_selected_places": "可规划的地点已全部排除，请至少保留一个地点",
+        "invalid_place_selection": "所选地点已不在本次推荐清单，请返回探索页确认",
+    }
+    if outcome.get("error") in errors:
+        raise HTTPException(status_code=409, detail={
+            "code": outcome["error"], "message": errors[outcome["error"]],
+        })
     return outcome
 
 

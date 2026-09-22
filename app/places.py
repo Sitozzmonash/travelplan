@@ -34,7 +34,7 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -302,8 +302,8 @@ def branch_conflict(left: str, right: str) -> bool:
     不需要知道品牌名在哪里结束。
     """
 
-    left_key = basic_name_key(left)
-    right_key = basic_name_key(right)
+    left_key = planner._name_text_key(left)
+    right_key = planner._name_text_key(right)
     if not left_key or not right_key:
         return False
     prefix_length = _common_prefix_length(left_key, right_key)
@@ -347,7 +347,7 @@ def city_key(city: str | None) -> str:
     只做这一层：把"乐山"与"成都"归并这种事绝不允许发生（那是跨城错并）。
     """
 
-    key = basic_name_key(city)
+    key = planner._name_text_key(city)
     for suffix in ("特别行政区", "自治区", "自治州", "地区", "市", "省"):
         if key.endswith(suffix) and len(key) > len(suffix):
             return key[: -len(suffix)]
@@ -599,6 +599,31 @@ GEO_MEDIUM_METERS = 500.0
 NAME_SIMILARITY_MED = 0.45
 
 
+def identity_conflict(left: PoiRecord | Place, right: PoiRecord | Place) -> dict[str, Any]:
+    """两条记录的硬冲突，供实体层及 run 内去重的所有信号/合簇路径共用。"""
+
+    if left.city and right.city and not city_related(left.city, right.city):
+        return {"reason": "different_city"}
+    if branch_conflict(left.name, right.name):
+        return {
+            "reason": "branch_conflict",
+            "left": branch_signature(left.name),
+            "right": branch_signature(right.name),
+        }
+    distance = planner.haversine_meters(left.coords, right.coords)
+    # 缺坐标不等于同地点。明确跨区且没有近距离佐证时，名字/地址弱信号不能合并。
+    if left.district and right.district and city_key(left.district) != city_key(right.district):
+        if distance is None or distance > planner.GEO_DUPLICATE_METERS:
+            return {"reason": "different_district", "left": left.district, "right": right.district}
+    if distance is not None and distance > planner.GEO_NAME_CONFLICT_METERS:
+        same_key = place_key(left.name, left.city) == place_key(right.name, right.city)
+        return {
+            "reason": "same_name_far_apart" if same_key else "far_apart",
+            "distance_meters": round(distance, 1),
+        }
+    return {}
+
+
 def merge_signal(left: PoiRecord, right: PoiRecord) -> tuple[str | None, dict[str, Any]]:
     """判断两条 POI 记录是不是同一个现实地点；返回 (信号码, 依据)；None = 不合并。
 
@@ -620,12 +645,9 @@ def merge_signal(left: PoiRecord, right: PoiRecord) -> tuple[str | None, dict[st
 
     if not same_city(left.city, right.city) and not city_related(left.city, right.city):
         return None, {"reason": "different_city"}
-    if branch_conflict(left.name, right.name):
-        return None, {
-            "reason": "branch_conflict",
-            "left": branch_signature(left.name),
-            "right": branch_signature(right.name),
-        }
+    conflict = identity_conflict(left, right)
+    if conflict:
+        return None, conflict
     # 子设施与母体**不是**同一个实体（方案 §10）：它们靠 place_relations 关联，
     # 不靠合并。这里只要有一边是设施，就不走"合并成一个"的路。
     left_facility, right_facility = left.facility, right.facility
@@ -644,8 +666,6 @@ def merge_signal(left: PoiRecord, right: PoiRecord) -> tuple[str | None, dict[st
     ) else False
 
     if same_key:
-        if distance is not None and distance > planner.GEO_NAME_CONFLICT_METERS:
-            return None, {"reason": "same_name_far_apart", "distance_meters": round(distance, 1)}
         return "normalized_name", {
             "normalized_name": left.name_key,
             "distance_meters": None if distance is None else round(distance, 1),
@@ -682,9 +702,7 @@ def merge_signal(left: PoiRecord, right: PoiRecord) -> tuple[str | None, dict[st
             "shorter": left.name_key if len(left.name_key) <= len(right.name_key) else right.name_key,
         }
 
-    if address_equal and similarity >= 0.4 and not (
-        distance is not None and distance > planner.GEO_NAME_CONFLICT_METERS
-    ):
+    if address_equal and similarity >= 0.4:
         return "same_address", {"address": left.address, "name_similarity": similarity}
 
     if (
@@ -816,7 +834,7 @@ class PlaceResolver:
         self._query_cache_ttl_days = _query_cache_ttl(query_cache_ttl_days)
         self._loaded = False
         self.entities: dict[str, EntityRecord] = {}
-        self._alias_index: dict[str, str] = {}
+        self._alias_index: dict[str, set[str]] = {}
         self._ref_index: dict[tuple[str, str], str] = {}
         self._query_cache: dict[tuple[str, str], dict[str, Any]] = {}
         self._parent_of: dict[str, str] = {}
@@ -859,9 +877,11 @@ class PlaceResolver:
             )
             self.entities[record.canonical_place_id] = record
         for row in self.store.get_place_aliases(self.city):
-            alias_key = str(row.get("normalized_alias") or "")
-            if alias_key:
-                self._alias_index[alias_key] = str(row["canonical_place_id"])
+            entity = self.entities.get(str(row["canonical_place_id"]))
+            alias = str(row.get("alias") or row.get("normalized_alias") or "")
+            if entity is not None and alias and alias != entity.canonical_name:
+                if alias not in entity.aliases:
+                    entity.aliases.append(alias)
         for row in self.store.get_place_provider_refs(self.city):
             ref = PoiRecord(
                 provider=str(row.get("provider") or ""),
@@ -880,7 +900,10 @@ class PlaceResolver:
             entity = self.entities.get(canonical_id)
             if entity is not None:
                 entity.refs.append(ref)
+                if ref.name and ref.name != entity.canonical_name and ref.name not in entity.aliases:
+                    entity.aliases.append(ref.name)
             self._ref_index[(ref.provider, ref.provider_place_id)] = canonical_id
+        self._rebuild_alias_index()
         # 主引用的顺序决定"复用回来的候选带哪个 Provider ID"，必须稳定：数据库不保证
         # SELECT 的顺序，不排序的话同一个实体在两次会话里会带着不同的 place_id 出现，
         # "同一个地点只有一个身份"就只活在文档里。名字与实体名一致的那条排最前。
@@ -902,6 +925,17 @@ class PlaceResolver:
                 self._query_cache[key] = row
         self._loaded = True
         return self
+
+    def _rebuild_alias_index(self) -> None:
+        """DB 别名表只有单值；从全部实体/引用/别名恢复歧义，不能相信那一个赢家。"""
+
+        self._alias_index.clear()
+        for entity in self.entities.values():
+            names = {entity.canonical_name, *entity.aliases, *(ref.name for ref in entity.refs)}
+            for name in names:
+                key = place_key(name, entity.city)
+                if key and key not in planner.CATEGORY_TERMS:
+                    self._alias_index.setdefault(key, set()).add(entity.canonical_place_id)
 
     # ---------------------------------------------------------------- A3：查询前
 
@@ -935,19 +969,21 @@ class PlaceResolver:
         if not cleaned:
             return QueryResolution(term=cleaned, action="miss", reason="空检索词")
         key = place_key(cleaned, self.city)
-        if key:
-            canonical_id = self._alias_index.get(key)
-            if canonical_id:
-                entity = self.entities.get(canonical_id)
-                if entity is not None:
-                    places = self._places_of(entity)
-                    return QueryResolution(
-                        term=cleaned,
-                        action="alias_hit",
-                        places=places,
-                        canonical_ids=[entity.canonical_place_id],
-                        reason=f"别名索引命中「{entity.canonical_name}」",
-                    )
+        self._rebuild_alias_index()
+        alias_ids = self._alias_index.get(key, set())
+        if len(alias_ids) > 1:
+            return QueryResolution(term=cleaned, action="miss", reason="别名存在歧义，需重新检索候选")
+        if len(alias_ids) == 1:
+            entity = self.entities[next(iter(alias_ids))]
+            places = self._places_of(entity)
+            if places:
+                return QueryResolution(
+                    term=cleaned,
+                    action="alias_hit",
+                    places=places,
+                    canonical_ids=[entity.canonical_place_id],
+                    reason=f"别名索引命中「{entity.canonical_name}」",
+                )
         cached = self._query_cache.get(("search_poi", key)) if key else None
         if cached and self._cache_fresh(cached):
             canonical_ids = _loads_list(cached.get("matched_place_ids_json"))
@@ -1054,6 +1090,7 @@ class PlaceResolver:
 
         # 4) 收尾：子设施挂母体 + 组装用户可见候选。
         self._link_facilities(outcome)
+        self._rebuild_alias_index()
         outcome.places = self._visible_places()
         if outcome.reused_refs:
             outcome.notes.append(
@@ -1078,18 +1115,25 @@ class PlaceResolver:
                 index = parent[index]
             return index
 
-        def union(left: int, right: int) -> None:
+        groups = {index: [index] for index in range(count)}
+
+        def union(left: int, right: int) -> bool:
             root_left, root_right = find(left), find(right)
-            if root_left != root_right:
-                parent[root_right] = root_left
+            if any(
+                identity_conflict(records[a], records[b])
+                for a in groups[root_left] for b in groups[root_right]
+            ):
+                return False
+            parent[root_right] = root_left
+            groups[root_left].extend(groups.pop(root_right))
+            return True
 
         for i in range(count):
             for j in range(i + 1, count):
                 if find(i) == find(j):
                     continue
                 signal, detail = merge_signal(records[i], records[j])
-                if signal:
-                    union(i, j)
+                if signal and union(i, j):
                     self._trace(
                         operation="merge",
                         action="merged",
@@ -1106,6 +1150,31 @@ class PlaceResolver:
         # 保持输入顺序：同一批结果在不同并发下顺序不同，按顺序输出才能让"哪个当母体"稳定。
         return sorted(clusters.values(), key=lambda members: min(item.order for item in members))
 
+    def _matching_entity(self, members: list[PoiRecord]) -> EntityRecord | None:
+        """新 Provider ID 也要与旧实体比对；整个新簇不能与旧实体的任一证据冲突。"""
+
+        matches: list[EntityRecord] = []
+        for entity in self.entities.values():
+            if entity.kind != "place":
+                continue
+            canonical = PoiRecord.from_place(entity.to_place())
+            evidence = [canonical, *entity.refs]
+            # 别名提供名字信号，不提供独立坐标；设施别名不作为同一实体的证据。
+            for alias in entity.aliases:
+                if not facility_kind(alias):
+                    evidence.append(PoiRecord(
+                        provider="", provider_place_id="", name=alias,
+                        amap_type=canonical.amap_type, city=entity.city,
+                        lat=entity.lat, lng=entity.lng, address=entity.address,
+                        district=entity.district, business_area=entity.business_area,
+                    ))
+            if any(identity_conflict(item, old) for item in members for old in evidence):
+                continue
+            if any(merge_signal(item, old)[0] for item in members for old in evidence):
+                matches.append(entity)
+        # 多个旧身份都可能命中时，不能任意选一个，也不能顺手把它们合并。
+        return matches[0] if len(matches) == 1 else None
+
     def _absorb(self, members: list[PoiRecord], outcome: IngestOutcome) -> None:
         """一簇 POI → 一个（或两个）实体。
 
@@ -1118,8 +1187,11 @@ class PlaceResolver:
             for item in members:
                 self._create_entity(item, outcome, kind="facility")
             return
-        representative = _pick_representative(places)
-        entity = self._create_entity(representative, outcome, kind="place")
+        entity = self._matching_entity(places)
+        representative = None
+        if entity is None:
+            representative = _pick_representative(places)
+            entity = self._create_entity(representative, outcome, kind="place")
         for item in places:
             if item is representative:
                 continue
@@ -1132,7 +1204,7 @@ class PlaceResolver:
                 query=item.source_query,
                 canonical_place_id=entity.canonical_place_id,
                 confidence=entity.confidence,
-                reason=f"「{item.name}」并入「{entity.canonical_name}」（同一次查询内的同一实体）",
+                reason=f"「{item.name}」并入「{entity.canonical_name}」（多信号一致且整簇无冲突）",
                 signals={"ref": item.provider_place_id},
             )
         for item in members:
@@ -1155,6 +1227,15 @@ class PlaceResolver:
 
         canonical_id = canonical_id_for(self.city, record.name, record.lat, record.lng)
         entity = self.entities.get(canonical_id)
+        if entity is not None and any(
+            identity_conflict(record, previous)
+            for previous in [PoiRecord.from_place(entity.to_place()), *entity.refs]
+        ):
+            # 旧键只含城市/名称/坐标，两个缺坐标的同名跨区记录会碰撞；不能让取键绕过合并护栏。
+            discriminator = "\x00".join((record.provider, record.provider_place_id,
+                                         record.district or "", record.address or ""))
+            canonical_id += "_" + hashlib.sha1(discriminator.encode("utf-8")).hexdigest()[:10]
+            entity = self.entities.get(canonical_id)
         if entity is None:
             entity = EntityRecord(
                 canonical_place_id=canonical_id,
@@ -1199,8 +1280,27 @@ class PlaceResolver:
 
     def _attach_ref(self, entity: EntityRecord, record: PoiRecord) -> None:
         entity.order = record.order if not entity.refs else min(entity.order, record.order)
-        entity.refs.append(record)
-        self._ref_index[(record.provider, record.provider_place_id)] = entity.canonical_place_id
+        identity = (record.provider, record.provider_place_id or record.name)
+        for index, previous in enumerate(entity.refs):
+            if (previous.provider, previous.provider_place_id or previous.name) != identity:
+                continue
+            if previous.name and previous.name != entity.canonical_name and previous.name not in entity.aliases:
+                entity.aliases.append(previous.name)
+            # 保留主引用位置，刷新已有字段且不让缺失字段覆盖旧详情。
+            updates = {
+                key: getattr(record, key) if getattr(record, key) not in (None, "") else getattr(previous, key)
+                for key in (
+                    "name", "amap_type", "lat", "lng", "address", "city", "district",
+                    "business_area", "opening_hours", "source_query",
+                )
+            }
+            record = replace(record, **updates, order=min(previous.order, record.order))
+            entity.refs[index] = record
+            break
+        else:
+            entity.refs.append(record)
+        if record.provider_place_id:
+            self._ref_index[(record.provider, record.provider_place_id)] = entity.canonical_place_id
         self._dirty.add(entity.canonical_place_id)
         # 字段缺失时用新记录补齐（母体先出现、详情后到的情况）。
         entity.lat = entity.lat if entity.lat is not None else record.lat
@@ -1209,9 +1309,6 @@ class PlaceResolver:
         entity.district = entity.district or record.district
         entity.business_area = entity.business_area or record.business_area
         entity.opening_hours = entity.opening_hours or record.opening_hours
-        name_key = record.name_key
-        if name_key and name_key != entity.normalized_name:
-            self._alias_index.setdefault(name_key, entity.canonical_place_id)
         # 原始名字照留：即便名字键与代表点相同（"杜甫草堂景区" vs "成都杜甫草堂博物馆"，
         # 归一化后都是"杜甫草堂"），用户看到的仍是五花八门的写法，留着他才能认得出来。
         if record.name and record.name != entity.canonical_name and record.name not in entity.aliases:

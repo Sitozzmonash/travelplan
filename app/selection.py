@@ -354,8 +354,16 @@ class PlacePreferenceOutcome:
 
 
 def selection_of(place: Place, selections: Mapping[str, str]) -> str:
-    raw = selections.get(place.place_id) or selections.get(place.name)
-    state = str(raw or "").strip().upper()
+    # 同一实体被收敛后仍需识别旧 ID。负向选择最高优先，不能被代表点正选覆盖。
+    states = {
+        str(selections.get(key) or "").strip().upper()
+        for key in (place.place_id, *place.merged_from)
+    }
+    for state in (REJECT, MUST, WANT):
+        if state in states:
+            return state
+    # 名称只用于旧客户端；新会话入口仅允许清单中的稳定 ID，避免同名异地串选。
+    state = str(selections.get(place.name) or "").strip().upper()
     return state if state in (MUST, WANT, REJECT) else NEUTRAL
 
 

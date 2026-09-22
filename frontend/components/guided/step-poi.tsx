@@ -3,23 +3,15 @@
 import { Ban, Check, ChevronDown, ChevronUp, Heart, LoaderCircle, MapPin, RefreshCw, Sparkles, Star, WandSparkles } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
-import { EmptyState, InlineWarning, LoadingState, PartialNotice } from "@/components/state-views";
-import { hasSocialDegradation } from "@/lib/sessions";
+import { EmptyState, InlineWarning, PartialNotice } from "@/components/state-views";
+import { hasSocialDegradation, isDiscoverySettled } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
 import type { PlaceCandidate, PoiSelection, SessionView } from "@/types/session";
 import type { PoiBulkMode } from "./draft";
-import { categoryIcon, categoryLabel, discoveryPlaces, groupPlaces, poiActionLabels } from "./options";
+import { categoryIcon, categoryLabel, discoveryPlaces, groupPlaces, placeDisplayName, poiActionLabels } from "./options";
 import { DiscoveryResearch, HotelAreaRecommendations } from "./discovery-research";
 
-/**
- * Step 4 想去哪里（§8 / §17）。
- *
- * 硬要求：
- * - 攻略没抓完也绝不能卡住用户：显示 skeleton + 「正在整理攻略，已找到 X 个地点」，
- *   并允许「都随便，继续」。
- * - 社交源全挂时给 Partial 提示，页面照常可用（还能勾已有地点，或全部交给系统）。
- * - 地点来自攻略抽取，不在前端写死；每张卡都能标 MUST / WANT / REJECT。
- */
+/** 推荐确认：只展示已筛选卡片。等待期间可先填偏好，正式开始由向导校验推荐。 */
 
 const VISIBLE_PER_GROUP = 5;
 
@@ -52,6 +44,8 @@ export function StepPoi({
 }: StepPoiProps) {
   const places = discoveryPlaces(session);
   const groups = groupPlaces(session);
+  const stopped = settled || isDiscoverySettled(session) || unusable;
+  const recommendationFailed = session?.recommendation?.status === "FAILED" || session?.discovery_status === "FAILED";
   const evidence = session?.evidence_summary;
   const candidateCount = evidence?.total_candidates ?? places.length;
 
@@ -72,19 +66,19 @@ export function StepPoi({
 
   return (
     <div className="grid gap-5">
-      <DiscoveryResearch session={session} settled={settled} />
+      <DiscoveryResearch session={session} settled={stopped} />
 
-      {settled ? <HotelAreaRecommendations areas={session?.hotel_areas ?? []} /> : null}
+      {stopped ? <HotelAreaRecommendations areas={session?.hotel_areas ?? []} /> : null}
 
       <div className="grid gap-2.5 rounded-xl border border-border bg-muted/30 p-3 sm:p-4">
         <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
           <WandSparkles className="size-3.5 shrink-0" aria-hidden />
-          一条也不想选也可以：下面两个开关会直接把决定交给系统。
+          不勾选时使用这份推荐，不会把原始候选全池交给规划。
         </p>
         <div className="flex flex-col gap-2 sm:flex-row">
           <BulkButton
-            label="都随便，帮我安排"
-            hint="全部交给系统按证据与路线挑"
+            label="使用这份推荐，帮我安排"
+            hint="清除手动选择，按当前推荐安排"
             selected={bulk === "auto"}
             disabled={unusable}
             onClick={() => onBulk("auto")}
@@ -99,16 +93,16 @@ export function StepPoi({
         </div>
         <p className="text-[11px] text-muted-foreground">
           已勾选：必去 {mustCount} · 想去 {wantCount} · 不感兴趣 {rejectCount}
-          {bulk === "auto" ? "（当前为「都随便，帮我安排」）" : ""}
+          {bulk === "auto" ? "（当前使用这份推荐）" : ""}
           {bulk === "best" ? "（当前为「只安排最值得去的」）" : ""}
         </p>
       </div>
 
-      {pollStalled ? (
+      {(pollStalled && !stopped) || (recommendationFailed && places.length > 0) ? (
         <div className="grid gap-2">
           <InlineWarning
-            title="整理攻略的时间比预期长。"
-            description="可以继续往下走：正式规划时会再次尝试抓取，你也可以在这里重试。"
+            title={recommendationFailed ? "本次推荐生成失败。" : "暂未获取到最新探索结果。"}
+            description="可以先填写偏好；正式开始前需要可用推荐，请在这里重试。"
           />
           <div className="flex justify-end">
             <Button variant="outline" size="sm" onClick={onRetryDiscovery}>
@@ -123,38 +117,29 @@ export function StepPoi({
         <PartialNotice
           title="攻略只拿到了一部分"
           description={partialDetail}
-          detail="页面照常可用：已整理出的地点可以先勾选，也可以直接「都随便，继续」，正式规划会继续补齐。"
+          detail="已有推荐可以先确认，也可先填写偏好；正式开始前需要可用推荐。"
         />
       ) : null}
 
       {socialFailed ? (
         <PartialNotice
-          title="没有拿到社交攻略"
-          description="小红书 / 抖音这次没有返回可用内容，已经改用高德与网页数据继续整理，页面照常可用。"
-          detail="可以先勾选已有的地点，或直接点「都随便，继续」，交给系统在正式规划时再试一次。"
+          title="部分攻略来源不可用"
+          description="本次部分攻略未返回可用内容，请以实际推荐及其关联证据为准。"
+          detail="可以先填写偏好；若没有可用推荐，请返回这里重试。"
         />
       ) : null}
 
-      {!settled && !unusable ? (
-        <div className="grid gap-3">
-          <LoadingState
-            title={`正在整理攻略，已找到 ${places.length} 个地点`}
-            description="系统正在把小红书 / 抖音 / 网页攻略里的地点去重、核实并归类。"
-            detail="不用等它跑完：现在就可以点「都随便，继续」，也可以先在已出现的卡片上勾选。"
-          />
-          <SkeletonGroups />
-        </div>
-      ) : null}
+      {!stopped && !pollStalled && places.length === 0 ? <SkeletonGroups /> : null}
 
-      {settled && places.length === 0 ? (
+      {stopped && places.length === 0 ? (
         <EmptyState
           title="这次没有整理出可选的地点"
           description={
             session?.degradations.length
               ? `攻略源本次大多不可用：${session.degradations[0]}`
-              : "攻略里没有抽取到可核实的地点，可能是内容过少或全部被判定为推广。"
+              : "本次探索未返回可用的推荐地点。"
           }
-          hint="不影响继续：正式规划会用高德与网页数据自己找地方，你也可以点「都随便，继续」。"
+          hint={session?.recommendation ? "可以先填写偏好；正式开始前请重新生成可用推荐。" : "可以继续填写偏好，或在这里重新探索。"}
           action={
             <Button variant="outline" size="sm" onClick={onRetryDiscovery}>
               <RefreshCw />
@@ -275,7 +260,7 @@ function PlaceCard({
 }) {
   const labels = poiActionLabels(place.category);
   const cat = categoryLabel(place.category, place.category_label);
-  const area = place.area ?? place.district;
+  const area = [place.district, place.area].filter((value, index, values) => value && values.indexOf(value) === index).join(" · ");
   const risk = adRiskLabel(place.ad_risk);
   const trust = trustLabel(place.trust_score);
 
@@ -290,9 +275,9 @@ function PlaceCard({
       )}
     >
       <div className="flex items-start justify-between gap-2">
-        <h4 className="min-w-0 text-sm font-medium text-foreground">{place.name}</h4>
+        <h4 className="min-w-0 text-sm font-medium text-foreground">{placeDisplayName(place)}</h4>
         <span className="shrink-0 text-[11px] text-muted-foreground">
-          {typeof place.evidence_count === "number" ? `来自 ${place.evidence_count} 篇攻略` : "攻略提及"}
+          {typeof place.evidence_count === "number" && Number.isFinite(place.evidence_count) && place.evidence_count > 0 ? `来自 ${place.evidence_count} 篇攻略` : "暂无关联攻略"}
         </span>
       </div>
 
