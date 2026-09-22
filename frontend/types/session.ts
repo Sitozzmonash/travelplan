@@ -33,6 +33,14 @@ export interface SessionRecommendation {
   place_ids: string[];
 }
 
+/**
+ * 一个探索阶段的状态。
+ *
+ * 新契约只有 `database` / `recommendation` / `places` 三个阶段（推荐引擎只读城市攻略库缓存、不联网），
+ * 但旧会话可能仍带 `web` / `web_guides` / `web_supplement` 等已废弃的键；
+ * 因此阶段表 (`discovery`) 保持开放映射，不做白名单过滤：旧响应照常解析不崩，
+ * 由展示层决定忽略哪些键（见 components/guided/discovery-research.tsx，web 阶段已不再渲染）。
+ */
 export interface DiscoveryStage {
   status?: string | null;
   result_count?: number | null;

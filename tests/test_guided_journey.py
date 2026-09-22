@@ -307,7 +307,7 @@ class TestSessionApi:
         monkeypatch.setattr(api_module, "get_store", lambda: store)
         monkeypatch.setenv("DISCOVERY_ENABLED", "1")
 
-        def recommend(hub, llm, intent, *, store, session_id, on_progress):
+        def recommend(llm, intent, *, store, session_id, on_progress=None):
             on_progress({"stage": "recommendation", "status": "RUNNING", "result_count": 0})
             return _ready_recommendation(session_id)
 
@@ -316,7 +316,8 @@ class TestSessionApi:
 
         def submit(fn, *args):
             if fn is sessions.run_discovery:
-                return fn(*args, hub_factory=lambda sid: FakeHub(store=None, run_id=sid), llm_factory=FakeLLM)
+                # 推荐引擎零网络：只注入假模型，不再注入 ProviderHub。
+                return fn(*args, llm_factory=FakeLLM)
             assert fn is sessions._start_job
             jobs.append(args)  # API 只验证提交；正式 Workflow 由下方 FakeHub E2E 覆盖。
 

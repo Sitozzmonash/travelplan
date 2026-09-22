@@ -63,7 +63,7 @@ def test_late_recommendation_cannot_overwrite_user_or_closed_session(store, monk
     session_id = create(store, seed=False)["session_id"]
     observed = {}
 
-    def fake_recommend(hub, llm, intent, *, on_progress=None, **kwargs):
+    def fake_recommend(llm, intent, *, store=None, session_id=None, on_progress=None, **kwargs):
         on_progress({"stage": "database", "status": "OK", "result_count": 1})
         sessions.patch_session(store, session_id, {"pace": "relaxed", "poi_selections": {"p1": "MUST"}})
         if action == "cancel":
@@ -74,7 +74,7 @@ def test_late_recommendation_cannot_overwrite_user_or_closed_session(store, monk
                              ((utcnow() - timedelta(minutes=1)).isoformat(), session_id))
             sessions.get_session(store, session_id)
         observed.update(deepcopy(store.get_planning_session(session_id)))
-        on_progress({"stage": "web", "status": "OK", "result_count": 1})  # 晚到的阶段回调
+        on_progress({"stage": "places", "status": "OK", "result_count": 1})  # 晚到的阶段回调
         if fail:
             raise RuntimeError("fake finalization failure")
         return recommendation_bundle(session_id)
@@ -83,7 +83,7 @@ def test_late_recommendation_cannot_overwrite_user_or_closed_session(store, monk
     monkeypatch.setattr(discovery, "fetch_transport_candidates", lambda *a, **k: pytest.fail("推荐阶段不能查交通"))
     monkeypatch.setattr(discovery, "fetch_hotel_candidates", lambda *a, **k: pytest.fail("推荐阶段不能查酒店"))
     sessions.run_discovery(store, session_id,
-                           hub_factory=lambda sid: FakeHub(store=None, run_id=sid), llm_factory=FakeLLM)
+                           llm_factory=FakeLLM)
     saved = store.get_planning_session(session_id)
     assert saved["preferences"]["pace"] == "relaxed"
     assert saved["poi_selections"] == {"p1": "MUST"}
@@ -110,15 +110,15 @@ def test_recommendation_in_flight_cannot_overwrite_an_already_started_session(st
     assert outcome["run_id"]
     frozen = deepcopy(store.get_planning_session(session_id))
 
-    def fake_recommend(hub, llm, intent, *, on_progress=None, **kwargs):
-        on_progress({"stage": "web", "status": "OK", "result_count": 1})
+    def fake_recommend(llm, intent, *, store=None, session_id=None, on_progress=None, **kwargs):
+        on_progress({"stage": "places", "status": "OK", "result_count": 1})
         if fail:
             raise RuntimeError("late failure")
         return recommendation_bundle(session_id)
 
     monkeypatch.setattr(recommendations, "recommend_guided", fake_recommend)
     sessions.run_discovery(store, session_id,
-                           hub_factory=lambda sid: FakeHub(store=None, run_id=sid), llm_factory=FakeLLM)
+                           llm_factory=FakeLLM)
     assert store.get_planning_session(session_id) == frozen, "START 之后的推荐进度与终稿都不能再改会话"
     assert len(jobs) == 1
 
@@ -306,7 +306,7 @@ def test_start_is_rejected_until_recommendation_is_published(store, monkeypatch)
     entered, release = Event(), Event()
     ready = recommendation_bundle(session_id, [place()])
 
-    def fake_recommend(hub, llm, intent, *, on_progress=None, **kwargs):
+    def fake_recommend(llm, intent, *, store=None, session_id=None, on_progress=None, **kwargs):
         on_progress({"stage": "database", "status": "OK", "result_count": 8})
         entered.set()
         assert release.wait(5)
@@ -317,7 +317,7 @@ def test_start_is_rejected_until_recommendation_is_published(store, monkeypatch)
     monkeypatch.setattr(discovery, "fetch_hotel_candidates", lambda *a, **k: pytest.fail("推荐阶段不能查酒店"))
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(sessions.run_discovery, store, session_id,
-                             hub_factory=lambda sid: FakeHub(store=None, run_id=sid), llm_factory=FakeLLM)
+                             llm_factory=FakeLLM)
         try:
             assert entered.wait(5)
             current = store.get_planning_session(session_id)

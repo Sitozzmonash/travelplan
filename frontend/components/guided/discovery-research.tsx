@@ -1,10 +1,22 @@
 "use client";
 
-import { Check, Clock3, Database, Hotel, MapPin, Search, Sparkles, UtensilsCrossed } from "lucide-react";
+import { Check, Clock3, Database, Hotel, MapPin, Sparkles, UtensilsCrossed } from "lucide-react";
 import { isDiscoverySettled, isSessionUnusable } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
 import type { DiscoveryStage, HotelArea, SessionView } from "@/types/session";
 import { discoveryPlaces, isFoodCategory } from "./options";
+
+/**
+ * 推荐引擎只读城市攻略库缓存，不再联网检索，因此没有 web 阶段：
+ * 阶段键只有 database / recommendation / places。下面的事件名同样是「读攻略库」这一类，
+ * 旧工具名（database_guides、city_guides、recall_city_guides、social_discovery…）保留只为旧会话仍能落到这一行；
+ * 已废弃的 web 阶段（web、web_guides、search_web_guides、web_supplement、web_discovery）一律不再读取——
+ * 旧会话里残留的 web 状态既不会渲染，也不会被显示成「正在」。
+ */
+const GUIDE_STAGE_KEYS = ["database", "database_guides", "city_guides", "recall_city_guides", "social"];
+const GUIDE_STAGE_EVENTS = ["database", "database_guides", "city_guides", "recall_city_guides", "social_discovery", "social"];
+const RECOMMENDATION_STAGE_KEYS = ["recommendation"];
+const RECOMMENDATION_STAGE_EVENTS = ["recommendation"];
 
 interface DiscoveryResearchProps {
   session: SessionView | null;
@@ -20,10 +32,9 @@ export function DiscoveryResearch({ session, settled }: DiscoveryResearchProps) 
   const food = candidates.filter((item) => isFoodCategory(item.category)).length;
   const places = candidates.length - food;
   const failed = session.recommendation?.status === "FAILED" || session.discovery_status === "FAILED";
-  const title = isSessionUnusable(session) ? "探索已停止" : stopped ? failed ? "推荐生成失败" : "探索结果" : "正在研究这趟旅行";
+  const title = isSessionUnusable(session) ? "探索已停止" : stopped ? failed ? "推荐生成失败" : "探索结果" : "正在读取攻略库并生成推荐";
   const facts = [
-    { key: "guide", ...stageFact("数据库攻略", discoveryStage(session, ["database", "database_guides", "city_guides", "recall_city_guides", "social"], ["database_guides", "recall_city_guides", "social_discovery", "social"]), stopped), icon: Database },
-    { key: "web", ...stageFact("Web 补充", discoveryStage(session, ["web", "web_guides", "search_web_guides"], ["web_supplement", "search_web_guides", "web_discovery", "web"]), stopped), icon: Search },
+    { key: "guide", ...stageFact("数据库攻略", discoveryStage(session, GUIDE_STAGE_KEYS, GUIDE_STAGE_EVENTS), stopped), icon: Database },
     { key: "recommendation", ...recommendationFact(session, candidates.length, stopped), icon: Sparkles },
     { key: "places", label: places ? `推荐 ${places} 个景点和体验` : stopped ? "暂无推荐景点和体验" : "尚无推荐景点和体验", done: places > 0, icon: MapPin },
     { key: "food", label: food ? `推荐 ${food} 个美食地点` : stopped ? "暂无推荐美食" : "尚无推荐美食", done: food > 0, icon: UtensilsCrossed },
@@ -118,6 +129,11 @@ export function HotelAreaRecommendations({ areas }: { areas: HotelArea[] }) {
   );
 }
 
+/**
+ * 阶段状态解析：先读 discovery 里的阶段键，再回退到事件名。
+ * 只认显式给出的 keys/events（新契约的 database / recommendation）；
+ * 认不出的键（旧会话残留的 web / web_supplement…）一律忽略，既不崩也不冒充进行中。
+ */
 function discoveryStage(session: SessionView, keys: string[], events: string[]): DiscoveryStage | undefined {
   for (const key of keys) {
     if (session.discovery?.[key]) return session.discovery[key];
@@ -156,7 +172,7 @@ function recommendationFact(session: SessionView, count: number, stopped: boolea
     return { label: count ? `${source}：${count} 个地点${recommendation.status === "PARTIAL" ? "（部分可用）" : ""}` : "推荐生成：无可用地点", done: count > 0 };
   }
   if (stopped) return { label: count ? `已有 ${count} 个可选地点` : "推荐生成：无可用地点", done: count > 0 };
-  const stage = discoveryStage(session, ["recommendation"], ["recommendation"]);
+  const stage = discoveryStage(session, RECOMMENDATION_STAGE_KEYS, RECOMMENDATION_STAGE_EVENTS);
   return stageFact("推荐生成", stage ?? (recommendation ? { status: recommendation.status } : undefined), false);
 }
 

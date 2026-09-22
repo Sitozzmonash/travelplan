@@ -150,7 +150,7 @@ export function describeSessionError(error: unknown): string {
     case "network":
       return `暂时无法连接会话服务（${API_BASE_URL}）。请确认后端已启动，或稍后重试。`;
     case "timeout":
-      return "会话服务超时未返回。攻略与交通抓取较慢时可能发生，可以稍后重试。";
+      return "会话服务超时未返回。读取城市攻略库较慢时可能发生，可以稍后重试。";
     case "invalid":
       return "会话服务返回的数据不完整，本次无法展示这一步的内容。可以重试或先按「随便」继续。";
     default:

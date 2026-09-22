@@ -188,7 +188,6 @@ def patch_session(
     session_id: str,
     payload: Mapping[str, Any],
     *,
-    hub_factory: Callable[[str], Any] | None = None,
     llm_factory: Callable[[], Any] | None = None,
 ) -> dict[str, Any] | None:
     """更新偏好 / POI 选择。
@@ -274,25 +273,25 @@ def run_discovery(
     store: TravelPlanStore,
     session_id: str,
     *,
-    hub_factory: Callable[[str], Any] | None = None,
     llm_factory: Callable[[], Any] | None = None,
 ) -> None:
-    """后台只做攻略双路召回与推荐；实时机酒属于用户确认后的正式规划。
+    """后台只做攻略推荐（**零网络**：只读注入的城市数据库缓存）；实时机酒属于用户确认后的正式规划。
 
-    原始城市候选不能提前冒充推荐。最终写入只更新发现字段，保留锁内最新的用户选择。
+    推荐引擎不再持有 ProviderHub，也不会查 Web / 核验高德 —— 库里的数据直接交给模型，
+    模型用 function call 交回推荐清单。原始城市候选不能提前冒充推荐。最终写入只更新发现
+    字段，保留锁内最新的用户选择。
     """
 
     session = get_session(store, session_id)
     if session is None or session["status"] in (SESSION_CANCELLED, SESSION_EXPIRED, SESSION_STARTING):
         return
     intent = intent_from_basic(session.get("basic_intent") or {}, session.get("preferences") or {})
-    hub = None
     started = _now()
     bundle = discovery.PrefetchBundle(session_id=session_id)
 
     def publish_progress(entry: Mapping[str, Any]) -> None:
         stage = entry.get("stage")
-        if stage not in {"database", "web", "recommendation", "places"}:
+        if stage not in {"database", "recommendation", "places"}:
             return
         def update(current: dict[str, Any]) -> None:
             if current["status"] in (SESSION_CANCELLED, SESSION_EXPIRED, SESSION_STARTING):
@@ -311,15 +310,10 @@ def run_discovery(
     publish_progress({"stage": "recommendation", "status": "RUNNING"})
     try:
         from app.llm import LLM
-        from app.providers import ProviderHub
         from app.recommendations import recommend_guided
 
-        # 不注册途牛/12306 MCP。允许的推荐工具只读攻略、Web 和地点核验。
-        hub = hub_factory(session_id) if hub_factory else ProviderHub(
-            run_id=session_id, store=None, mcp_servers=[]
-        )
         llm = llm_factory() if llm_factory else LLM.from_env()
-        bundle = recommend_guided(hub, llm, intent, store=store, session_id=session_id,
+        bundle = recommend_guided(llm, intent, store=store, session_id=session_id,
                                   on_progress=publish_progress)
         bundle.outbound = []
         bundle.inbound = []
@@ -348,12 +342,6 @@ def run_discovery(
         }
         bundle.places = []
         bundle.hotel_areas = []
-    finally:
-        if hub is not None:
-            try:
-                hub.close()
-            except Exception:
-                pass
 
     def publish_finished(current: dict[str, Any]) -> None:
         if current["status"] in (SESSION_CANCELLED, SESSION_EXPIRED, SESSION_STARTING):

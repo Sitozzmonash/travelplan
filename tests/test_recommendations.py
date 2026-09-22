@@ -1,568 +1,642 @@
-"""纯离线原生工具对话；所有数据来自替身或 tmp_path SQLite。"""
+"""纯离线：数据只来自 tmp_path SQLite 与原生工具调用替身。
+
+这一版推荐引擎是「只读城市库 + 原生 function call」：没有任何 Web 搜索、正文抽名、
+POI 核验与目的地地理编码。所以本文件里的 `offline_only` fixture 会把
+`city_cache.TravelPlanStore`、`discovery.prefetch`、`app.providers.ProviderHub`
+全部设成失败 —— 任何一个被碰到都会让用例当场炸掉，而不是"跑得通但偷偷出了网"。
+"""
 
 from __future__ import annotations
 
+import itertools
 import json
 from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
-from app import city_cache, discovery, recommendations as rec
+from app import city_cache, discovery, providers, recommendations as rec
 from app.llm import LLM
 from app.models import Evidence, Place, TripIntent
-from app.providers import ProviderResult
+from app.store import TravelPlanStore
 
 
-@pytest.fixture(autouse=True, scope="session")
-def no_orphan_sweep_on_startup():
-    """纯模块测试不导入 app.api，防止其初始化默认数据库。"""
-    yield
+@pytest.fixture(autouse=True)
+def offline_only(monkeypatch):
+    """零网络 + 零默认数据库：触碰即失败。"""
+    monkeypatch.setattr(city_cache, "TravelPlanStore", lambda *a, **k: pytest.fail("不能隐式打开默认数据库"))
+    monkeypatch.setattr(discovery, "prefetch", lambda *a, **k: pytest.fail("不能回退 discovery.prefetch 查机酒"))
+    monkeypatch.setattr(providers, "ProviderHub", lambda *a, **k: pytest.fail("零网络：不能构造 ProviderHub"))
 
 
-def poi(pid="park", name="中心公园", *, district="中心区", area="中心街", lat=30.66, lng=104.07, kind="风景名胜;公园", **kwargs):
+@pytest.fixture
+def store(tmp_path):
+    return TravelPlanStore(tmp_path / "recommendations.sqlite")
+
+
+@pytest.fixture
+def reads(monkeypatch):
+    """统计真实读库次数，并强制调用方传注入的 store 且 allow_stale=True。"""
+    calls = []
+    real = city_cache.read_candidates
+
+    def wrapper(city, **kwargs):
+        calls.append((city, kwargs))
+        assert kwargs.get("store") is not None, "必须用注入的 store 读库"
+        assert kwargs.get("allow_stale") is True
+        return real(city, **kwargs)
+
+    monkeypatch.setattr(city_cache, "read_candidates", wrapper)
+    return calls
+
+
+# ----------------------------------------------------------------------
+# 替身与构造
+# ----------------------------------------------------------------------
+
+
+def poi(pid="park", name="中心公园", *, district="青羊区", area="宽窄巷子", lat=30.66, lng=104.07,
+        kind="风景名胜;公园", **kwargs):
     return Place(place_id=pid, name=name, city="成都", district=district, business_area=area,
                  lat=lat, lng=lng, type=kind, amap_verified=True, source_id="poi-source", **kwargs)
 
 
-def evidence(eid="db-guide", *, text="中心区的中心公园适合散步，推荐住在中心街，出门即可步行前往中心公园。", url="https://guides.test/db", mentions=None):
-    return Evidence(id=eid, text=text, title="城市游攻略", provider="xhs", source_url=url,
-                    place_mentions=["中心公园"] if mentions is None else mentions)
+def guide(eid="g1", *, text="中心公园适合散步，推荐住在宽窄巷子，出门就能走到中心公园。",
+          url="https://guides.test/g1", title="城市游攻略", mentions=None):
+    return Evidence(id=eid, title=title, text=text, provider="xhs", source_url=url,
+                    place_mentions=list(mentions or []))
 
 
-def hit(places=None, evidences=None, mentions=None, stale=False):
-    return city_cache.CityCacheHit(city="成都", places=[poi()] if places is None else places,
-        evidences=[evidence()] if evidences is None else evidences, mentions=mentions or [],
-        updated_at="2026-09-22T00:00:00+00:00", stale=stale)
+def seed(store, places, evidences, city="成都"):
+    city_cache.write_candidates(city, places, evidences, store=store)
+    return store
+
+
+_call_seq = itertools.count(1)
+
+
+def _call_id():
+    return f"call-{next(_call_seq)}"
 
 
 def call(name, args=None, cid=None):
-    return AIMessage(content="", tool_calls=[{"name": name, "args": args or {}, "id": cid or name}])
-
-
-def submit(pid="park", *, eid="db-guide", category="attraction", areas=None):
-    categories = {key: [] for key in rec._CATEGORIES}
-    if pid:
-        categories[category].append({"place_id": pid, "category": category, "reason": "攻略推荐散步休闲", "evidence_ids": [eid]})
-    return {"categories": categories, "hotel_areas": areas or [], "explanation": "依据本次数据库与网页攻略推荐；缺证据类别留空。"}
-
-
-def area(name="中心街", pid="park", eid="db-guide", scope="city_center"):
-    return {"name": name, "reason": "攻略建议住在此区域，可步行到关联活动点", "evidence_ids": [eid], "place_ids": [pid], "scope": scope}
+    """每次调用给一个唯一 ID：重复 ID 会被引擎当作异常批次拒绝。"""
+    return AIMessage(content="", tool_calls=[{"name": name, "args": args or {}, "id": cid or _call_id()}])
 
 
 class NativeModel:
-    """推荐只能 bind_tools；JSON 仅给 discovery 的正文地点抽取。"""
+    """只走原生 bind_tools；非工具调用一律视为替身配置错误。"""
+
     model_name = "offline-native"
 
-    def __init__(self, steps, extraction=None):
+    def __init__(self, steps):
         self.steps = list(steps)
         self.seen = []
         self.bindings = []
-        self.extractions = []
         self.assertion_errors = []
-        self.extraction = extraction
 
     def bind_tools(self, tools, **kwargs):
         self.bindings.append((tools, kwargs))
+
         def invoke(messages):
             self.seen.append(list(messages))
-            # 每个先前原生调用都必须有匹配的 ToolMessage，不接受拼文本伪装。
+            # 每个先前原生调用都必须有匹配的 ToolMessage；内容必须还是合法 JSON。
             pending = set()
             for message in messages:
                 if isinstance(message, AIMessage):
-                    pending.update(c["id"] for c in message.tool_calls)
+                    pending.update(item["id"] for item in message.tool_calls)
                 elif isinstance(message, ToolMessage):
-                    assert message.tool_call_id in pending
-                    pending.remove(message.tool_call_id)
+                    assert message.tool_call_id in pending, "工具结果必须对应一次原生调用"
+                    pending.discard(message.tool_call_id)
                     json.loads(message.content)
-            assert not pending
+            assert not pending, "每个原生调用都必须有匹配的 ToolMessage"
             if not self.steps:
                 raise RuntimeError("script exhausted")
             step = self.steps.pop(0)
             if isinstance(step, Exception):
                 raise step
             return step(messages, tools) if callable(step) else step
+
         def checked(messages):
             try:
                 return invoke(messages)
             except AssertionError as exc:
                 self.assertion_errors.append(str(exc))
                 raise
+
         return SimpleNamespace(invoke=checked)
 
     def invoke(self, messages):
-        self.extractions.append(list(messages))
-        if self.extraction is not None:
-            return self.extraction(messages)
-        return AIMessage(content='{"results": []}')
+        raise AssertionError("攻略推荐只允许原生 function calling")
 
 
-class Hub:
-    def __init__(self, items=None, web_error=None, geocode=True, poi_results=None):
-        self.items = [] if items is None else items
-        self.web_error = web_error
-        self.geo = geocode
-        self.poi_results = poi_results or {}
-        self.web_calls = []
-        self.poi_calls = []
-        self.geo_calls = []
-
-    def web_search(self, query, *, max_results):
-        self.web_calls.append((query, max_results))
-        assert max_results == 5
-        if self.web_error:
-            raise self.web_error
-        return ProviderResult(status="OK", items=self.items, provider="tavily")
-
-    def geocode(self, address, city=None):
-        self.geo_calls.append((address, city))
-        return ProviderResult(status="OK" if self.geo else "UNAVAILABLE", items=[{"longitude": 104.07, "latitude": 30.66, "city": "成都"}] if self.geo else [])
-
-    def search_poi(self, keywords, region, *, page_size):
-        self.poi_calls.append((keywords, region, page_size))
-        return ProviderResult(status="OK", items=self.poi_results.get(keywords, []), provider="amap")
-
-
-@pytest.fixture
-def cache(monkeypatch):
-    state = {"hit": hit(), "calls": [], "error": None}
-    def read(city, **kwargs):
-        state["calls"].append((city, kwargs))
-        assert kwargs["store"] is not None and kwargs["allow_stale"] is True
-        if state["error"]:
-            raise state["error"]
-        return state["hit"]
-    monkeypatch.setattr(city_cache, "read_candidates", read)
-    monkeypatch.setattr(discovery, "prefetch", lambda *a, **k: pytest.fail("不能回退 discovery.prefetch 查询机酒"))
-    monkeypatch.setattr(city_cache, "TravelPlanStore", lambda *a, **k: pytest.fail("不能隐式打开默认数据库"))
-    return state
-
-
-def run(model, hub=None, *, store=None, intent=None, progress=None):
-    bundle = rec.recommend_guided(hub or Hub(), LLM(model=model), intent or TripIntent(destination=["成都"], days=4),
-                                  store=object() if store is None else store, session_id="offline-session", on_progress=progress)
-    assert not model.assertion_errors, "模型桩内断言失败不能被LLM降级掩盖"
+def run(model, store, *, intent=None, progress=None):
+    bundle = rec.recommend_guided(LLM(model=model), intent or TripIntent(destination=["成都"], days=3),
+                                  store=store, session_id="offline-session", on_progress=progress)
+    assert not model.assertion_errors, "模型替身内部断言失败不能被降级掩盖"
     return bundle
 
 
-def usual_steps(args):
-    return [call("recall_city_guides"), call("search_web_guides", {"query": "成都 城市攻略"}), call("submit_recommendations", args)]
+def recall_payload(messages):
+    for message in reversed(messages):
+        if isinstance(message, ToolMessage) and message.name == "recall_city_guides":
+            return json.loads(message.content)
+    raise AssertionError("没有读到 recall_city_guides 的工具结果")
 
 
-def test_real_tool_conversation_two_evidence_routes_and_recommended_only(cache):
-    cache["hit"] = hit(places=[poi(), poi("unused", "城市博物馆", kind="博物馆")])
-    web = {"title": "中心公园游记", "snippet": "中心公园有绿荫小路，适合城市散步。", "url": "https://guides.test/web"}
+def tool_results(messages, name):
+    return [json.loads(m.content) for m in messages if isinstance(m, ToolMessage) and m.name == name]
+
+
+def row_of(payload, pid):
+    return next(item for item in payload["candidates"] if item["place_id"] == pid)
+
+
+def card(pid, category="attraction", reason="攻略里明确提到，适合这次行程", evidence_ids=None):
+    return {"place_id": pid, "category": category, "reason": reason,
+            "evidence_ids": list(evidence_ids)}
+
+
+def card_for(payload, pid, category="attraction", reason="攻略里明确提到，适合这次行程", index=0):
+    row = row_of(payload, pid)
+    return card(pid, category, reason, [row["evidence_ids"][index]])
+
+
+def submit(cards, *, areas=None, explanation="依据本次城市攻略库推荐；缺证据的类别留空。"):
+    categories = {key: [] for key in rec._CATEGORIES}
+    for item in cards:
+        categories[item["category"]].append(
+            {key: item[key] for key in ("place_id", "category", "reason", "evidence_ids")})
+    return {"categories": categories, "hotel_areas": list(areas or []), "explanation": explanation}
+
+
+def submit_step(build):
+    def step(messages, tools):
+        return call("submit_recommendations", submit(build(recall_payload(messages))))
+    return step
+
+
+def area(name="宽窄巷子", place_ids=("park",), evidence_ids=("city-g1",), *, scope="in_city",
+         reason="攻略建议住在宽窄巷子，可步行到中心公园"):
+    return {"name": name, "reason": reason, "evidence_ids": list(evidence_ids),
+            "place_ids": list(place_ids), "scope": scope}
+
+
+# ----------------------------------------------------------------------
+# 正常路径与零网络
+# ----------------------------------------------------------------------
+
+
+def test_two_round_conversation_recommends_only_database_candidates(store, reads):
+    seed(store, [poi(), poi("unused", "城市博物馆", kind="博物馆", lat=30.67, lng=104.06)], [guide()])
     progress = []
-    model = NativeModel(usual_steps(submit(areas=[area()])))
-    bundle = run(model, Hub([web]), progress=progress.append)
+    model = NativeModel([call("recall_city_guides"), submit_step(lambda payload: [card_for(payload, "park")])])
+    bundle = run(model, store, progress=progress.append)
+
     assert bundle.discovery_status == "READY"
-    assert [p.place_id for p in bundle.places] == ["park"]
+    assert [place.place_id for place in bundle.places] == ["park"]
     assert bundle.hotels == bundle.outbound == bundle.inbound == []
-    assert len(bundle.extras["raw_candidates"]) == 2
-    assert bundle.poi_pools == discovery.split_poi_pools(bundle.places)
-    assert bundle.hotel_areas[0]["scope"] == "city_center"
-    assert bundle.extras["recommended_cards"][0]["evidence_count"] == 2
+    assert bundle.provider_calls == []
+    assert len(reads) == 1
     assert bundle.extras["recommendation"]["source"] == "llm"
-    assert len(bundle.extras["llm_calls"]) == 3
-    assert len(cache["calls"]) == 1
-    assert model.bindings[0][1] == {"tool_choice": "recall_city_guides"}
-    offered = [{t["function"]["name"] for t in tools} for tools, _ in model.bindings]
-    assert "submit_recommendations" not in offered[0] | offered[1]
-    assert "submit_recommendations" in offered[2]
-    messages = model.seen[2]
-    results = [m for m in messages if isinstance(m, ToolMessage)]
-    assert [m.name for m in results] == ["recall_city_guides", "search_web_guides"]
-    assert json.loads(results[0].content)["evidences"][0]["text"].startswith("中心区")
-    web_result = json.loads(results[1].content)
-    assert web_result["items"] == [web]
-    assert len(web_result["evidences"]) == 2
-    assert web_result["candidates"][0]["district"] == "中心区"
-    assert web_result["candidates"][0]["source_id"] == "poi-source"
-    assert any(entry["tool"] == "submit_recommendations" and entry["status"] == "OK" for entry in progress)
-    # 推荐定稿后立刻收口 places 阶段，正式 run 不再对同一批证据重复抽取。
-    assert progress[-1]["tool"] == "finalize_places"
-    assert progress[-1]["result_count"] == 1
+    assert bundle.extras["recommendation"]["place_ids"] == ["park"]
+    assert len(bundle.extras["llm_calls"]) == 2
+    assert len(bundle.extras["raw_candidates"]) == 2
+    assert bundle.extras["recommended_cards"][0]["evidence_count"] == 1
+    assert bundle.poi_pools == discovery.split_poi_pools(bundle.places)
     restored = discovery.PrefetchBundle.load(bundle.dump())
     assert restored.extras["recommended_cards"] == bundle.extras["recommended_cards"]
 
-
-def test_parallel_reads_all_results_are_returned_before_submit(cache):
-    both = AIMessage(content="", tool_calls=[
-        {"name": "search_web_guides", "args": {"query": "成都攻略"}, "id": "w"},
-        {"name": "recall_city_guides", "args": {}, "id": "r"}])
-    model = NativeModel([both, call("submit_recommendations", submit())])
-    bundle = run(model)
-    assert bundle.discovery_status == "READY"
-    assert {m.tool_call_id for m in model.seen[1] if isinstance(m, ToolMessage)} == {"r", "w"}
+    # 第 0 轮强制先读库；之后才允许（且只允许）提交。
+    assert model.bindings[0][1] == {"tool_choice": "recall_city_guides"}
+    offered = [{tool["function"]["name"] for tool in tools} for tools, _ in model.bindings]
+    assert offered[0] == {"recall_city_guides"}
+    assert offered[1] == {"recall_city_guides", "submit_recommendations"}
+    assert [message.name for message in model.seen[1] if isinstance(message, ToolMessage)] == ["recall_city_guides"]
 
 
-def test_direct_submit_cannot_skip_read_tools(cache):
-    model = NativeModel([call("submit_recommendations", submit()), AIMessage(content="直接推荐")])
-    hub = Hub()
-    bundle = run(model, hub)
-    assert bundle.discovery_status == "PARTIAL"
-    assert bundle.extras["recommendation"]["source"] == "evidence_fallback"
-    assert len(cache["calls"]) == len(hub.web_calls) == 1
-    assert not any(t["tool"] == "submit_recommendations" and t["status"] == "OK" for t in bundle.extras["recommendation"]["tool_trace"])
+def test_evidence_count_counts_independent_articles_not_merged_from(store):
+    places = [poi(merged_from=["old-1", "old-2", "old-3"])]
+    evidences = [
+        guide("a", url="https://guides.test/a", title="攻略A"),
+        # 同一篇文章换了 utm 参数再抓一次：算同一篇。
+        guide("b", url="https://guides.test/a?utm_source=other#frag", title="攻略A"),
+        guide("c", url="https://guides.test/c", title="攻略C"),
+    ]
+    seed(store, places, evidences)
+    captured = {}
 
+    def step(messages, tools):
+        payload = recall_payload(messages)
+        captured["row"] = row_of(payload, "park")
+        return call("submit_recommendations", submit([card_for(payload, "park", index=0)]))
 
-@pytest.mark.parametrize("bad", ["unknown_id", "foreign_evidence", "closed", "facility", "wrong_shopping", "schema"])
-def test_rejects_invalid_recommendations(cache, bad):
-    args = submit()
-    if bad == "unknown_id":
-        args = submit("invented")
-    elif bad == "foreign_evidence":
-        args = submit(eid="not-this-run")
-    elif bad == "closed":
-        cache["hit"] = hit(places=[poi(opening_hours="暂停营业")])
-    elif bad == "facility":
-        cache["hit"] = hit(places=[poi(name="中心公园停车场", kind="交通设施服务;停车场")],
-                           evidences=[evidence(mentions=["中心公园停车场"])])
-    elif bad == "wrong_shopping":
-        cache["hit"] = hit(places=[poi(name="茗香茶叶专卖店", kind="购物服务;专卖店;茶叶")],
-                           evidences=[evidence(text="茗香茶叶专卖店出售礼品茶叶。", mentions=["茗香茶叶专卖店"])])
-        args = submit(category="shopping")
-    elif bad == "schema":
-        args = {"places": ["park"]}
-    model = NativeModel(usual_steps(args) + [RuntimeError("模型失败")])
-    bundle = run(model)
-    assert bundle.discovery_status == "PARTIAL"
-    assert bundle.extras["recommendation"]["source"] == "evidence_fallback"
-    assert any(t["tool"] == "submit_recommendations" and t["status"] == "ERROR" for t in bundle.extras["recommendation"]["tool_trace"])
-    assert all(p.place_id != "invented" for p in bundle.places)
-    if bad in {"closed", "facility", "wrong_shopping"}:
-        assert bundle.places == []
-
-
-def test_guide_closure_without_poi_status_is_rejected(cache):
-    cache["hit"] = hit(evidences=[evidence(text="中心公园暂停开放，请不要前往。")])
-    bundle = run(NativeModel(usual_steps(submit())))
-    assert bundle.places == []
-    assert bundle.discovery_status == "PARTIAL"
-
-
-@pytest.mark.parametrize("scope", ["outskirts", "city_center"])
-def test_normal_city_trip_never_defaults_to_remote_lodging(cache, scope):
-    cache["hit"] = hit(places=[poi("remote", "山谷公园", district="大邑县", area="山谷镇", lat=30.6, lng=103.3)],
-                       evidences=[evidence(text="山谷公园适合远郊徒步，推荐住在山谷镇，步行可达山谷公园。", mentions=["山谷公园"])])
-    bad = submit("remote", areas=[area("山谷镇", "remote", scope=scope)])
-    good = submit("remote")
-    model = NativeModel(usual_steps(bad) + [call("submit_recommendations", good, cid="fixed")])
-    bundle = run(model)
-    assert bundle.hotel_areas == []
-    assert [p.place_id for p in bundle.places] == ["remote"]
-    assert "远郊" in bundle.extras["recommended_cards"][0]["reason"]
-    assert bundle.discovery_status == "PARTIAL"
-    errors = [json.loads(m.content) for m in model.seen[-1] if isinstance(m, ToolMessage) and m.name == "submit_recommendations"]
-    assert errors[-1]["status"] == "ERROR"
-
-
-def test_explicit_outskirts_stay_still_requires_evidence_and_activities(cache):
-    cache["hit"] = hit(places=[poi("remote", "山谷公园", area="山谷镇", lat=30.6, lng=103.3)],
-                       evidences=[evidence(text="推荐住在山谷镇，方便步行去山谷公园。", mentions=["山谷公园"])])
-    model = NativeModel(usual_steps(submit("remote", areas=[area("山谷镇", "remote", scope="outskirts")])))
-    bundle = run(model, intent=TripIntent(destination=["成都"], hotel_preferences=["山谷镇度假住宿"]))
-    assert bundle.hotel_areas[0]["scope"] == "outskirts"
-
-
-@pytest.mark.parametrize("mutation", ["no_stay_advice", "no_activity", "unknown_center", "density", "bad_scope", "scope_list"])
-def test_lodging_needs_guide_and_geographic_activity_scope(cache, mutation):
-    proposed = area()
-    hub = Hub()
-    if mutation == "no_stay_advice":
-        cache["hit"] = hit(evidences=[evidence(text="中心街有很多POI，中心公园适合散步。")])
-    elif mutation == "no_activity":
-        proposed["place_ids"] = ["invented"]
-    elif mutation == "unknown_center":
-        hub = Hub(geocode=False)
-    elif mutation == "density":
-        proposed["reason"] = "POI密度高，100%的攻略在这里"
-    elif mutation == "bad_scope":
-        proposed["scope"] = "downtown"
-    elif mutation == "scope_list":
-        proposed["scope"] = ["city_center"]
-    bundle = run(NativeModel(usual_steps(submit(areas=[proposed]))), hub)
-    assert bundle.hotel_areas == []
-    assert bundle.discovery_status == "PARTIAL"
-
-
-@pytest.mark.parametrize("failure", [RuntimeError("model down"), AIMessage(content="推荐中心公园"),
-    AIMessage(content='{"tool_calls":[{"name":"submit_recommendations"}]}'),
-    AIMessage(content="", invalid_tool_calls=[{"id": "broken", "name": "recall_city_guides", "args": "{", "error": "invalid"}])])
-def test_model_failure_is_honest_evidence_fallback(cache, failure):
-    cache["hit"] = hit(places=[poi(), poi("far", "遥远公园", lat=31.5)], evidences=[evidence(mentions=["中心公园", "遥远公园"])])
-    bundle = run(NativeModel([failure]))
-    assert bundle.discovery_status == "PARTIAL"
-    assert bundle.extras["recommendation"]["source"] == "evidence_fallback"
-    assert [p.place_id for p in bundle.places] == ["park"]
-    assert "非模型推荐" in bundle.extras["recommended_cards"][0]["reason"]
-    assert bundle.hotel_areas == []
-
-
-def test_web_failure_is_returned_to_model_and_not_ready(cache):
-    model = NativeModel(usual_steps(submit()))
-    bundle = run(model, Hub(web_error=RuntimeError("offline")))
-    assert bundle.discovery_status == "PARTIAL"
-    assert bundle.extras["recommendation"]["source"] == "llm"
-    message = [m for m in model.seen[2] if isinstance(m, ToolMessage) and m.name == "search_web_guides"][0]
-    assert json.loads(message.content)["status"] == "ERROR"
-
-
-def test_both_tools_fail_and_no_evidence_is_empty_failed(cache):
-    cache["error"] = RuntimeError("db offline")
-    bundle = run(NativeModel([RuntimeError("model offline")]), Hub(web_error=RuntimeError("web offline")))
-    assert bundle.discovery_status == "FAILED"
-    assert bundle.places == bundle.hotel_areas == bundle.evidences == []
-    assert bundle.extras["recommendation"]["source"] == "evidence_fallback"
-
-
-def test_successful_reads_are_idempotently_replayed(cache):
-    steps = [call("recall_city_guides", cid="r1"), call("recall_city_guides", cid="r2"),
-             call("search_web_guides", {"query": "成都 攻略"}, cid="w1"),
-             call("search_web_guides", {"query": "成都攻略"}, cid="w2"), call("submit_recommendations", submit())]
-    model = NativeModel(steps)
-    hub = Hub()
-    bundle = run(model, hub)
-    assert len(cache["calls"]) == len(hub.web_calls) == 1
-    assert bundle.discovery_status == "READY"
-    assert sum(t["status"] == "REPLAY" for t in bundle.extras["recommendation"]["tool_trace"]) == 2
-    results = [m for m in model.seen[-1] if isinstance(m, ToolMessage)]
-    assert results[0].content == results[1].content
-    assert results[2].content == results[3].content
-
-
-def test_tool_round_query_and_call_limits(cache):
-    steps = [call("recall_city_guides")]
-    steps.extend(call("search_web_guides", {"query": "成都攻略" + str(i)}, cid=f"w{i}") for i in range(10))
-    hub = Hub()
-    model = NativeModel(steps)
-    bundle = run(model, hub)
-    assert len(model.seen) == rec._MAX_ROUNDS
-    assert len(hub.web_calls) == rec._MAX_WEB_QUERIES
-    assert bundle.discovery_status == "PARTIAL"
-    assert any(t["status"] == "ERROR" for t in bundle.extras["recommendation"]["tool_trace"])
-
-
-def test_oversized_query_never_reaches_provider(cache):
-    model = NativeModel([call("recall_city_guides"), call("search_web_guides", {"query": "x" * 121}), RuntimeError("stop")])
-    hub = Hub()
-    run(model, hub)
-    assert all(len(query) <= 120 for query, _ in hub.web_calls)
-    assert len(hub.web_calls) == 1  # 合法的确定性 fallback，而不是超长模型检索词
-
-
-def test_evidence_count_independent_urls_mentions_not_merged_ids(cache):
-    base = evidence()
-    same_article = evidence("dup", url="https://guides.test/db?utm_source=other#frag")
-    extra = evidence("second", url="https://guides.test/second")
-    original = poi(merged_from=["old-1", "old-2", "old-3", "old-4"])
-    mentions = [{"place_id": "park", "raw_name": "中心公园", "source_url": "https://guides.test/mention", "snippet": "中心公园适合散步", "provider": "xhs"}] * 4
-    cache["hit"] = hit(places=[original], evidences=[base, same_article, extra], mentions=mentions)
-    bundle = run(NativeModel(usual_steps(submit())))
-    assert bundle.extras["recommended_cards"][0]["evidence_count"] == 3
-    # 同一次调用先记 RUNNING 再记终态；审计看最后一次，进度消费者才逐条看到。
-    recall = [t for t in bundle.extras["recommendation"]["tool_trace"] if t["tool"] == "recall_city_guides"]
-    assert recall[-1]["status"] == "OK"
-    assert bundle.discovery["database"]["status"] == "OK"
-    assert bundle.discovery["database"]["result_count"] == 3
-
-
-def test_same_name_cross_district_without_coordinates_is_not_merged_or_linked(cache):
-    east = poi("east", "同名公园", district="东区", area="东街", lat=None, lng=None)
-    west = poi("west", "同名公园", district="西区", area="西街", lat=None, lng=None)
-    guide = evidence(text="东区同名公园适合散步。", mentions=["同名公园"])
-    cache["hit"] = hit(places=[east, west], evidences=[guide])
-    model = NativeModel(usual_steps(submit("east")))
-    bundle = run(model)
-    assert [p.place_id for p in bundle.places] == ["east"]
-    data = json.loads(next(m.content for m in model.seen[1] if isinstance(m, ToolMessage)))
-    assert len(data["candidates"]) == 2
-    assert next(p for p in data["candidates"] if p["place_id"] == "west")["evidence_count"] == 0
-
-
-def test_normalized_dedupe_preserves_sources_and_real_evidence(cache):
-    duplicate = poi("park-copy", "成都中心公园")
-    mentions = [{"place_id": "park-copy", "raw_name": "成都中心公园", "source_url": "https://guides.test/another", "snippet": "成都中心公园适合城市游"}]
-    cache["hit"] = hit(places=[poi(), duplicate], mentions=mentions)
-    def choose(messages, tools):
-        payload = json.loads([m for m in messages if isinstance(m, ToolMessage)][-1].content)
-        candidate = payload["candidates"][0]
-        assert len(payload["candidates"]) == 1
-        assert candidate["evidence_count"] == 2
-        return call("submit_recommendations", submit(candidate["place_id"], eid=candidate["evidence_ids"][0]))
-    bundle = run(NativeModel([*usual_steps(submit())[:2], choose]))
-    assert len(bundle.places) == 1
-    assert len(bundle.extras["raw_candidates"]) == 2
-    assert bundle.places[0].merged_from
+    bundle = run(NativeModel([call("recall_city_guides"), step]), store)
+    assert captured["row"]["evidence_count"] == 2
     assert bundle.extras["recommended_cards"][0]["evidence_count"] == 2
-    assert bundle.extras["recommendation"]["source"] == "llm"
-    assert all(p["source_id"] == "poi-source" for p in bundle.extras["raw_candidates"])
-
-
-def test_web_extracts_only_grounded_concrete_names_and_verifies_exact_poi(cache):
-    cache["hit"] = None
-    text = "城市游可以去花溪公园欣赏水景，也可以休息散步。这份攻略只介绍花溪公园，没有介绍其他景点和住宿区域。"
-    items = [{"title": "公园攻略", "snippet": text, "url": "https://guides.test/new"}]
-    def extraction(messages):
-        match = rec.re.search(r"证据 id：([^\n]+)", messages[-1].content)
-        eid = match.group(1)
-        return AIMessage(content=json.dumps({"results": [{"evidence_id": eid, "places": [{"name": "花溪公园"}, {"name": "幻觉景点"}, {"name": "茶馆"}]}]}, ensure_ascii=False))
-    def choose(messages, tools):
-        payload = json.loads([m for m in messages if isinstance(m, ToolMessage)][-1].content)
-        new = next(p for p in payload["candidates"] if p["place_id"] == "new")
-        return call("submit_recommendations", submit("new", eid=new["evidence_ids"][0]))
-    model = NativeModel([call("recall_city_guides"), call("search_web_guides", {"query": "城市公园攻略"}), choose], extraction)
-    hub = Hub(items, poi_results={"花溪公园": [poi("new", "花溪公园"), poi("unrelated", "别处公园")]})
-    bundle = run(model, hub)
-    assert hub.poi_calls == [("花溪公园", "成都", 5)]
-    assert [p.place_id for p in bundle.places] == ["new"]
-    assert "花溪公园" in bundle.evidences[0].place_mentions
+    assert len(bundle.extras["recommended_cards"][0]["evidence_ids"]) == 1
     assert bundle.discovery_status == "READY"
-    assert len(model.extractions) == 1
-    assert any(c["tag"].startswith("extract_places") for c in bundle.extras["llm_calls"])
 
 
-def test_none_store_never_opens_default_db_and_missing_city_does_not_call_tools(cache):
-    hub = Hub()
-    bundle = rec.recommend_guided(hub, LLM(), TripIntent(destination=["成都"]), store=None, session_id="none")
-    assert bundle.discovery_status == "FAILED" and cache["calls"] == []
-    hub = Hub()
-    bundle = rec.recommend_guided(hub, LLM(), TripIntent(), store=None, session_id="none")
-    assert bundle.discovery_status == "FAILED" and hub.web_calls == hub.geo_calls == []
-
-
-def test_tool_errors_and_callback_are_safe(cache, monkeypatch):
-    secret = "private-api-key-123456"
-    monkeypatch.setenv("MODEL_API_KEY", secret)
-    cache["error"] = RuntimeError("token=" + secret)
-    def broken_progress(_):
-        raise RuntimeError(secret)
-    bundle = run(NativeModel([RuntimeError(secret)]), Hub(web_error=RuntimeError(secret)), progress=broken_progress)
-    assert secret not in json.dumps(bundle.dump())
-    assert bundle.discovery_status == "FAILED"
-
-
-def test_real_cache_tmp_sqlite_is_read_only(tmp_path, monkeypatch):
-    from app.store import TravelPlanStore
-
-    store = TravelPlanStore(tmp_path / "recommendations.db")
-    city_cache.write_candidates("成都", [poi()], [evidence()], store=store)
-    before = store.get_city_cache_rows("成都")
-    monkeypatch.setattr(city_cache, "TravelPlanStore", lambda *a, **k: pytest.fail("不许创建默认数据库"))
-    model = NativeModel(usual_steps(submit()))
-    # 城市缓存重新编号证据，原生模型从工具实际返回ID选，不依赖旧 session ID。
-    def choose(messages, tools):
-        data = json.loads([m for m in messages if isinstance(m, ToolMessage)][-1].content)
-        candidate = data["candidates"][0]
-        return call("submit_recommendations", submit(candidate["place_id"], eid=candidate["evidence_ids"][0]))
-    model.steps[-1] = choose
-    bundle = run(model, store=store)
-    assert [p.place_id for p in bundle.places] == ["park"]
-    assert store.get_city_cache_rows("成都") == before
-    assert bundle.extras["recommended_cards"][0]["evidence_count"] == 1
-
-
-def test_five_explicit_empty_categories_are_valid(cache):
-    bundle = run(NativeModel(usual_steps(submit(pid=None))))
-    assert bundle.discovery_status == "READY"
-    assert bundle.places == bundle.hotel_areas == []
-    assert bundle.extras["recommendation"]["source"] == "llm"
-    assert bundle.extras["recommended_cards"] == []
-    assert bundle.extras["raw_candidates"]
-
-
-def test_poi_only_cache_never_becomes_evidence_fallback(cache):
-    cache["hit"] = hit(places=[poi(merged_from=["fake-count"] * 100)], evidences=[])
-    bundle = run(NativeModel([RuntimeError("offline")]))
-    assert bundle.discovery_status == "FAILED"
-    assert bundle.places == []
-    assert len(bundle.extras["raw_candidates"]) == 1
-
-
-def test_web_verification_has_a_global_concrete_name_budget(cache):
-    cache["hit"] = None
-    names = [f"第{i}文化公园" for i in range(20)]
-    text = "、".join(names) + "。成都茶馆有很多，这是一份市内散步攻略。"
-    def extraction(messages):
-        eid = rec.re.search(r"证据 id：([^\n]+)", messages[-1].content).group(1)
-        return AIMessage(content=json.dumps({"results": [{"evidence_id": eid, "places": [
-            {"name": name} for name in [*names, "成都茶馆"]]}]}, ensure_ascii=False))
-    hub = Hub([{"title": "城市公园", "snippet": text, "url": "https://guides.test/many"}])
-    bundle = run(NativeModel(usual_steps(submit(pid=None)), extraction), hub)
-    assert len(hub.poi_calls) == rec._MAX_POI_QUERIES
-    assert all(query in names for query, _, _ in hub.poi_calls)
-    assert bundle.places == []
-
-
-def test_duplicate_tool_call_ids_and_batch_limit_cannot_spin(cache):
-    response = AIMessage(content="", tool_calls=[{"name": "recall_city_guides", "args": {}, "id": "duplicate"}] * 5)
-    model = NativeModel([response])
-    bundle = run(model)
-    assert len(model.seen) == 1
+@pytest.mark.parametrize("failure", [
+    RuntimeError("model down"),
+    AIMessage(content="推荐中心公园，这里很适合散步"),
+    AIMessage(content='{"tool_calls": [{"name": "submit_recommendations"}]}'),
+    AIMessage(content="", invalid_tool_calls=[{"id": "broken", "name": "recall_city_guides", "args": "{", "error": "invalid"}]),
+])
+def test_natural_language_or_json_text_is_never_a_recommendation(store, failure):
+    """模型失败时退回证据筛一遍：source=evidence_fallback 且必须 PARTIAL；全程零 Provider。"""
+    seed(store, [poi()], [guide()])
+    model = NativeModel([failure])
+    bundle = run(model, store)
+    assert bundle.discovery_status == "PARTIAL"
     assert bundle.extras["recommendation"]["source"] == "evidence_fallback"
+    assert [place.place_id for place in bundle.places] == ["park"]
+    assert "非模型推荐" in bundle.extras["recommended_cards"][0]["reason"]
+    assert bundle.provider_calls == []
+    assert bundle.hotel_areas == []
+    assert any(entry["status"] == "OK" and entry["actor"] == "evidence_fallback"
+               for entry in bundle.extras["recommendation"]["tool_trace"])
+
+
+def test_empty_cache_is_failed_and_never_fakes_success(store, reads):
+    model = NativeModel([call("recall_city_guides")])
+    bundle = run(model, store)
+    assert bundle.discovery_status == "FAILED"
+    assert bundle.places == [] and bundle.hotel_areas == [] and bundle.evidences == []
+    assert bundle.extras["recommendation"]["source"] == "evidence_fallback"
+    assert len(model.seen) == 1, "没有候选就不该再让模型空转一轮"
+    database = bundle.discovery["database"]
+    assert {key: database[key] for key in ("status", "actor", "stage", "result_count")} == {
+        "status": "OK", "actor": "llm", "stage": "database", "result_count": 0}
+    assert len(reads) == 1
+
+
+def test_no_candidate_ever_becomes_a_recommendation(store):
+    """库里只有闭业的点：既不能提交成功，也不能在降级里复活。"""
+    seed(store, [poi(opening_hours="暂停营业")], [guide()])
+    model = NativeModel([call("recall_city_guides"), submit_step(lambda payload: [card_for(payload, "park")])])
+    bundle = run(model, store)
+    assert bundle.discovery_status == "FAILED"
+    assert bundle.places == []
+    assert any("闭业" in entry["error"] for entry in bundle.extras["recommendation"]["tool_trace"]
+               if "error" in entry)
+
+
+# ----------------------------------------------------------------------
+# 校验：地点 / 证据 / 类别 / 重复
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad,expected", [
+    ("unknown_id", "不在本次读到的候选"),
+    ("foreign_evidence", "不属于本次该地点的真实证据"),
+    ("closed", "闭业"),
+    ("facility", "附属设施"),
+    ("tea_shopping", "类别"),
+    ("duplicate", "重复提交"),
+    ("density_reason", "密度"),
+])
+def test_invalid_submissions_are_rejected_with_readable_errors(store, bad, expected):
+    places = [poi(), poi("museum", "城市博物馆", kind="博物馆", lat=30.67, lng=104.06)]
+    evidences = [guide("g1", url="https://guides.test/a", title="攻略A"),
+                 guide("g2", text="城市博物馆值得一看，推荐住在宽窄巷子。",
+                       url="https://guides.test/b", title="攻略B")]
+    if bad == "closed":
+        places = [poi(opening_hours="暂停营业"), places[1]]
+    elif bad == "facility":
+        places = [poi(name="中心公园停车场", kind="交通设施服务;停车场"), places[1]]
+        evidences = [guide("g1", text="中心公园停车场只提供车位。", url="https://guides.test/a", title="攻略A"),
+                     evidences[1]]
+    elif bad == "tea_shopping":
+        places = [poi("tea", "茗香茶叶专卖店", kind="购物服务;专卖店;茶叶"), places[1]]
+        evidences = [guide("g1", text="茗香茶叶专卖店出售礼品茶。", url="https://guides.test/a", title="攻略A"),
+                     evidences[1]]
+    seed(store, places, evidences)
+
+    def build(payload):
+        pid = "tea" if bad == "tea_shopping" else "park"
+        category = "shopping" if bad == "tea_shopping" else "attraction"
+        if bad == "unknown_id":
+            return [card("invented", "attraction", "编造的ID", ["invented-evidence"])]
+        if bad == "foreign_evidence":
+            return [card(pid, category, "引用了别处的证据", [row_of(payload, "museum")["evidence_ids"][0]])]
+        if bad == "duplicate":
+            return [card_for(payload, pid, category), card_for(payload, pid, "food")]
+        if bad == "density_reason":
+            return [card_for(payload, pid, category, reason="POI密度高，攻略比例也高")]
+        return [card_for(payload, pid, category)]
+
+    model = NativeModel([call("recall_city_guides"), submit_step(build), RuntimeError("停止：降级")])
+    bundle = run(model, store)
+    results = tool_results(model.seen[-1], "submit_recommendations")
+    assert results and results[-1]["status"] == "ERROR"
+    assert expected in results[-1]["error"], results[-1]["error"]
+    assert bundle.extras["recommendation"]["source"] == "evidence_fallback"
+    assert bundle.discovery_status == "PARTIAL"
+    rejected_pid = {"tea_shopping": "tea"}.get(bad, "park")
+    if bad in {"closed", "facility", "tea_shopping"}:
+        assert rejected_pid not in {place.place_id for place in bundle.places}, "被拒的地点不能在降级里复活"
+    else:
+        assert bundle.places, "其它候选仍应有证据降级结果"
+
+
+def test_guide_mentioned_closure_blocks_the_card(store):
+    seed(store, [poi()], [guide(text="中心公园暂停开放，请不要前往。")])
+    def build(payload):
+        return [card_for(payload, "park")]
+    model = NativeModel([call("recall_city_guides"), submit_step(build), RuntimeError("停止")])
+    bundle = run(model, store)
+    assert bundle.places == []
+    assert bundle.discovery_status == "FAILED"
+    error = tool_results(model.seen[-1], "submit_recommendations")[-1]["error"]
+    assert "闭业" in error
+
+
+def test_same_name_cross_district_stays_two_entities(store):
+    places = [poi("east", "同名公园", district="东区", area="东街", lat=30.60, lng=104.00),
+              poi("west", "同名公园", district="西区", area="西街", lat=30.85, lng=104.30)]
+    evidences = [guide("e1", text="东区同名公园适合散步。", url="https://guides.test/e", title="东区攻略"),
+                 guide("e2", text="西区同名公园有湖景。", url="https://guides.test/w", title="西区攻略")]
+    seed(store, places, evidences)
+
+    def build(payload):
+        assert len(payload["candidates"]) == 2, "同名不同区必须是两个实体"
+        cards = []
+        for pid in ("east", "west"):
+            row = row_of(payload, pid)
+            assert len(row["evidence_ids"]) == 1, "各区的证据不能互相挂"
+            cards.append(card_for(payload, pid))
+        return cards
+
+    bundle = run(NativeModel([call("recall_city_guides"), submit_step(build)]), store)
+    assert sorted(place.place_id for place in bundle.places) == ["east", "west"]
+    assert len(bundle.extras["recommended_cards"]) == 2
+    assert {item["evidence_count"] for item in bundle.extras["recommended_cards"]} == {1}
+    assert bundle.discovery_status == "READY"
+
+
+def test_repeated_recall_is_replayed_without_rereading_cache(store, reads):
+    seed(store, [poi()], [guide()])
+    def step(messages, tools):
+        results = tool_results(messages, "recall_city_guides")
+        assert len(results) == 2 and results[0] == results[1], "回放必须给同一份库数据"
+        return call("submit_recommendations", submit([card_for(results[0], "park")]))
+
+    model = NativeModel([call("recall_city_guides", cid="r1"), call("recall_city_guides", cid="r2"), step])
+    bundle = run(model, store)
+    assert len(reads) == 1
+    assert bundle.discovery_status == "READY"
+    trace = bundle.extras["recommendation"]["tool_trace"]
+    assert sum(entry["status"] == "REPLAY" for entry in trace) == 1
+
+
+def test_duplicate_call_ids_and_batch_limit_cannot_spin(store, reads):
+    seed(store, [poi()], [guide()])
+    duplicate = AIMessage(content="", tool_calls=[
+        {"name": "recall_city_guides", "args": {}, "id": "same"},
+        {"name": "recall_city_guides", "args": {}, "id": "same"}])
+    model = NativeModel([duplicate, RuntimeError("不该再有下一轮")])
+    bundle = run(model, store)
+    assert len(model.seen) == 1, "非法批次必须当场收口"
+    assert bundle.extras["recommendation"]["source"] == "evidence_fallback"
+    assert [place.place_id for place in bundle.places] == ["park"]
+
+
+def test_submit_before_recall_is_refused(store, reads):
+    seed(store, [poi()], [guide()])
+    early = call("submit_recommendations", submit([card("invented", reason="编造", evidence_ids=["x"])]))
+    model = NativeModel([early, RuntimeError("停止")])
+    bundle = run(model, store)
+    assert len(model.seen) == 1, "第 0 轮就提交失败，不该再空转一轮"
+    refused = [entry for entry in bundle.extras["recommendation"]["tool_trace"]
+               if entry["tool"] == "submit_recommendations" and entry["status"] == "ERROR"]
+    assert refused and "尚未读取城市攻略库" in refused[-1]["error"]
+    assert bundle.extras["recommendation"]["source"] == "evidence_fallback"
+    assert len(reads) == 1, "降级时才真正读库，且只读一次"
+
+
+# ----------------------------------------------------------------------
+# 住宿区域
+# ----------------------------------------------------------------------
+
+@pytest.mark.parametrize("mutation,expected", [
+    ("no_stay_advice", "没有明确建议住这里"),
+    ("activity_outside_area", "不在其关联活动地点的区县/商圈/名称里"),
+    ("density_reason", "密度或攻略比例"),
+    ("bad_scope", "scope 只能是"),
+])
+def test_hotel_area_needs_stay_advice_linked_activity_and_clean_reason(store, mutation, expected):
+    text = "中心公园适合散步，宽窄巷子有很多小店。"
+    if mutation == "activity_outside_area":
+        text = "中心公园适合散步，推荐住在春熙路。"
+    seed(store, [poi()], [guide(text=text)])
+
+    def bad_area(payload):
+        item = area(evidence_ids=row_of(payload, "park")["evidence_ids"])
+        if mutation == "activity_outside_area":
+            item["name"] = "春熙路"
+        elif mutation == "density_reason":
+            item["reason"] = "POI密度高，100%的攻略都在这里"
+        elif mutation == "bad_scope":
+            item["scope"] = "downtown"
+        return item
+
+    def first(messages, tools):
+        payload = recall_payload(messages)
+        return call("submit_recommendations",
+                    submit([card_for(payload, "park")], areas=[bad_area(payload)]))
+
+    model = NativeModel([call("recall_city_guides"), first, submit_step(lambda payload: [card_for(payload, "park")])])
+    bundle = run(model, store)
+    error = tool_results(model.seen[-1], "submit_recommendations")[-1]["error"]
+    assert expected in error, error
+    assert bundle.hotel_areas == []
+    # 修正后的第二次提交成功；第一次被拒留下降级留痕，所以整体是 PARTIAL 而不是 READY。
+    assert bundle.extras["recommendation"]["source"] == "llm"
+    assert [place.place_id for place in bundle.places] == ["park"]
     assert bundle.discovery_status == "PARTIAL"
 
 
-def test_web_only_recommendation_hands_sources_over_without_broken_evidence(cache, tmp_path):
-    """没有城市缓存、纯 Web 推荐时，证据的 source_id 必须能过户到正式 run，否则外键直接断。"""
-
-    from app.providers import ProviderCall
-    from app.store import TravelPlanStore
-    from app.workflow import _adopt_prefetch_sources
-    from datetime import datetime, timezone
-
-    cache["hit"] = None
-    fetched_at = datetime(2026, 9, 22, tzinfo=timezone.utc)
-    text = "成都城市游推荐去花溪公园散步，园区绿荫多、适合慢慢走半天。这份攻略只介绍花溪公园这一个地方，没有提到住宿区域和其他景点。"
-
-    class WebHub(Hub):
-        """真实 Hub 会同时给出 result.calls 与 audit_entries；两处的 source_id 必须一致。"""
-
-        def web_search(self, query, *, max_results):
-            result = super().web_search(query, max_results=max_results)
-            result.calls = [ProviderCall(
-                source_id="web-src-1", provider="tavily", source_type="web", tool="web_search",
-                query={"query": query}, status="OK", fetched_at=fetched_at,
-            )]
-            return result
-
-        def audit_entries(self):
-            return [{
-                "source_id": "web-src-1", "provider": "tavily", "source_type": "web",
-                "tool": "web_search", "arguments": {"query": "成都 城市攻略"}, "status": "OK",
-                "fetched_at": fetched_at.isoformat(), "item_count": 1,
-            }]
-
-    def extraction(messages):
-        eid = rec.re.search(r"证据 id：([^\n]+)", messages[-1].content).group(1)
-        return AIMessage(content=json.dumps({"results": [{"evidence_id": eid, "places": [{"name": "花溪公园"}]}]}, ensure_ascii=False))
-    def choose(messages, tools):
-        payload = json.loads([m for m in messages if isinstance(m, ToolMessage)][-1].content)
-        new = next(p for p in payload["candidates"] if p["place_id"] == "new")
-        return call("submit_recommendations", submit("new", eid=new["evidence_ids"][0]))
-    hub = WebHub([{"title": "公园攻略", "snippet": text, "url": "https://guides.test/only"}],
-                 poi_results={"花溪公园": [poi("new", "花溪公园")]})
-    bundle = run(NativeModel([call("recall_city_guides"), call("search_web_guides", {"query": "成都 城市攻略"}), choose], extraction), hub)
-    assert bundle.extras["recommendation"]["source"] == "llm", bundle.extras["recommendation"]["notes"]
-
-    store = TravelPlanStore(tmp_path / "handoff.db")
-    store.create_run("tp-handoff", source="guided", source_session_id="offline-session")
-    adopted = _adopt_prefetch_sources(store, "tp-handoff", bundle)
-    assert [row["source_id"] for row in adopted] == ["web-src-1"]
-    # 过户之后再写证据：外键打开时这一步必须能过。
-    for item in bundle.evidences:
-        store.save_evidence("tp-handoff", item, source_id=item.source_id)
-    saved = [item for item in bundle.evidences if item.source_id == "web-src-1"]
-    assert saved, "网页证据必须带着真实 source_id"
+def test_area_scope_reflects_real_geography(store):
+    seed(store, [poi()], [guide()])
+    def first(messages, tools):
+        payload = recall_payload(messages)
+        wrong = area(evidence_ids=row_of(payload, "park")["evidence_ids"], scope="outskirts")
+        return call("submit_recommendations", submit([card_for(payload, "park")], areas=[wrong]))
+    model = NativeModel([call("recall_city_guides"), first, submit_step(lambda payload: [card_for(payload, "park")])])
+    bundle = run(model, store)
+    error = tool_results(model.seen[-1], "submit_recommendations")[-1]["error"]
+    assert "不应声明为远郊" in error
+    assert bundle.hotel_areas == []
 
 
-def test_secrets_in_guide_content_are_redacted_in_tools_and_bundle(cache, monkeypatch):
+REMOTE_PLACES = [
+    poi(),
+    poi("museum", "城市博物馆", kind="博物馆", lat=30.67, lng=104.06),
+    poi("valley", "山谷公园", district="大邑县", area="山谷镇", lat=30.60, lng=103.30),
+]
+REMOTE_GUIDES = [
+    guide("g1", text="中心公园与城市博物馆都值得去，推荐住在宽窄巷子。",
+          url="https://guides.test/1", title="市区攻略"),
+    guide("g2", text="山谷公园适合远足，推荐住在山谷镇。", url="https://guides.test/2", title="山谷攻略"),
+]
+
+
+def remote_payload(payload):
+    cards = [card_for(payload, pid) for pid in ("park", "museum", "valley")]
+    return cards
+
+
+@pytest.mark.parametrize("scope,requested,rejected", [
+    ("in_city", False, True),
+    ("outskirts", False, True),
+    ("in_city", True, True),
+    ("outskirts", True, False),
+])
+def test_remote_hotel_area_requires_explicit_outskirts_request(store, scope, requested, rejected):
+    seed(store, REMOTE_PLACES, REMOTE_GUIDES)
+    intent = TripIntent(destination=["成都"], days=3,
+                        hotel_preferences=["山谷镇度假住宿"] if requested else [])
+
+    def first(messages, tools):
+        payload = recall_payload(messages)
+        proposed = area(name="山谷镇", place_ids=["valley"],
+                        evidence_ids=row_of(payload, "valley")["evidence_ids"], scope=scope)
+        return call("submit_recommendations", submit(remote_payload(payload), areas=[proposed]))
+
+    def second(messages, tools):
+        return call("submit_recommendations", submit(remote_payload(recall_payload(messages))))
+
+    model = NativeModel([call("recall_city_guides"), first, second])
+    bundle = run(model, store, intent=intent)
+    if rejected:
+        error = tool_results(model.seen[-1], "submit_recommendations")[-1]["error"]
+        assert "远郊" in error, error
+        assert bundle.hotel_areas == []
+    else:
+        assert bundle.hotel_areas and bundle.hotel_areas[0]["scope"] == "outskirts"
+    # 推荐集合本身不受住宿区域结论影响；远郊卡片如实标注距行程重心。
+    assert sorted(place.place_id for place in bundle.places) == ["museum", "park", "valley"]
+    far = next(item for item in bundle.extras["recommended_cards"] if item["place_id"] == "valley")
+    assert "距行程重心约" in far["reason"]
+
+
+def test_card_reason_says_trip_centroid_never_city_center(store):
+    seed(store, REMOTE_PLACES, REMOTE_GUIDES)
+    model = NativeModel([call("recall_city_guides"), submit_step(remote_payload)])
+    bundle = run(model, store)
+    reasons = " ".join(item["reason"] for item in bundle.extras["recommended_cards"])
+    assert "行程重心" in reasons
+    assert "市中心" not in reasons and "目的地中心" not in reasons
+
+
+# ----------------------------------------------------------------------
+# 上下文瘦身 / 进度 / 只读
+# ----------------------------------------------------------------------
+
+
+def test_context_is_slimmed_from_second_round_and_db_read_once(store, reads):
+    long_text = "中心公园适合散步。" + "很好" * 900
+    seed(store, [poi()], [guide(text=long_text)])
+
+    def retry(messages, tools):
+        payload = recall_payload(messages)
+        assert payload.get("context_slimmed"), "第 2 轮起不应再重复整段攻略正文"
+        assert "很好" not in json.dumps(payload, ensure_ascii=False)
+        return call("submit_recommendations", submit([card_for(payload, "park")]))
+
+    model = NativeModel([
+        call("recall_city_guides"),
+        call("submit_recommendations", {"categories": {key: [] for key in rec._CATEGORIES}}),
+        retry,
+    ])
+    bundle = run(model, store)
+
+    first = recall_payload(model.seen[1])["evidences"][0]
+    assert len(first["text"]) <= rec._EVIDENCE_TEXT_CHARS + 32 and "已截断" in first["text"]
+    last = recall_payload(model.seen[2])["evidences"][0]
+    assert last["text"] == "" and last["text_chars"] == len(long_text)
+    # 第一次提交被拒 → 留下降级留痕，所以整体 PARTIAL；重点是上下文与读库次数。
+    assert bundle.discovery_status == "PARTIAL"
+    assert bundle.extras["recommendation"]["source"] == "llm"
+    assert len(reads) == 1, "上下文瘦身不等于重复读库"
+    assert len(model.seen) == 3
+
+
+def test_candidate_and_evidence_contexts_are_capped(store):
+    places = [poi(f"p{i}", f"测试地点{i}", district=f"区{i}", lat=30.0 + i * 0.02, lng=104.0 + i * 0.02)
+              for i in range(70)]
+    evidences = [guide(f"g{i}", text=f"测试地点{i}值得一去。", url=f"https://guides.test/{i}", title=f"攻略{i}")
+                 for i in range(25)]
+    seed(store, places, evidences)
+    model = NativeModel([call("recall_city_guides"), RuntimeError("停止")])
+    bundle = run(model, store)
+    payload = recall_payload(model.seen[1])
+    assert len(payload["evidences"]) == rec._EVIDENCE_LIMIT
+    assert len(payload["candidates"]) == rec._MAX_CANDIDATES
+    assert len(bundle.extras["raw_candidates"]) == 70, "原始候选仍完整保留在 extras 里"
+
+
+def test_progress_events_and_discovery_keys_only_cover_three_stages(store):
+    seed(store, [poi()], [guide()])
+    events = []
+    model = NativeModel([call("recall_city_guides"), submit_step(lambda payload: [card_for(payload, "park")])])
+    bundle = run(model, store, progress=events.append)
+
+    required = {"tool", "status", "actor", "stage", "result_count"}
+    assert all(required <= set(event) for event in events)
+    assert {event["stage"] for event in events} == {"database", "recommendation", "places"}
+    assert set(bundle.discovery) == {"database", "recommendation", "places"}
+    assert "web" not in bundle.discovery and "web" not in bundle.dump()
+    assert [event["status"] for event in events if event["tool"] == "recall_city_guides"] == ["RUNNING", "OK"]
+    assert [event["status"] for event in events if event["tool"] == "submit_recommendations"] == ["RUNNING", "OK"]
+    assert events[-1]["tool"] == "finalize_places" and events[-1]["stage"] == "places"
+    assert events[-1]["result_count"] == 1
+
+
+def test_cache_rows_are_never_written(store, reads):
+    seed(store, [poi()], [guide()])
+    before = store.get_city_cache_rows("成都")
+    evidence_before = store.get_city_evidence_rows("成都")
+    model = NativeModel([call("recall_city_guides"), submit_step(lambda payload: [card_for(payload, "park")])])
+    bundle = run(model, store)
+    assert [place.place_id for place in bundle.places] == ["park"]
+    assert store.get_city_cache_rows("成都") == before
+    assert store.get_city_evidence_rows("成都") == evidence_before
+    assert len(reads) == 1
+
+
+# ----------------------------------------------------------------------
+# 数据源与脱敏
+# ----------------------------------------------------------------------
+
+
+def test_store_is_required_and_default_db_is_never_opened(monkeypatch):
+    monkeypatch.setattr(city_cache, "read_candidates",
+                        lambda *a, **k: pytest.fail("store=None 时不该读库"))
+    model = NativeModel([])
+    bundle = rec.recommend_guided(LLM(model=model), TripIntent(destination=["成都"]),
+                                  store=None, session_id="none")
+    assert bundle.discovery_status == "FAILED"
+    assert bundle.places == [] and bundle.extras["recommendation"]["source"] == "evidence_fallback"
+    assert model.seen == [], "没有数据源就不该调用模型"
+    assert bundle.extras["recommendation"]["notes"]
+
+
+def test_missing_destination_never_calls_the_model(store):
+    model = NativeModel([])
+    bundle = rec.recommend_guided(LLM(model=model), TripIntent(), store=store, session_id="none")
+    assert bundle.discovery_status == "FAILED" and bundle.places == []
+    assert model.seen == []
+
+
+def test_secrets_in_guide_text_are_redacted(store, monkeypatch):
     secret = "guide-private-secret-123456"
     monkeypatch.setenv("MODEL_API_KEY", secret)
-    cache["hit"] = hit(evidences=[evidence(text="中心公园适合散步。api_key=" + secret)])
-    model = NativeModel(usual_steps(submit()))
-    bundle = run(model)
+    seed(store, [poi()], [guide(text="中心公园适合散步。api_key=" + secret)])
+    model = NativeModel([call("recall_city_guides"), submit_step(lambda payload: [card_for(payload, "park")])])
+    bundle = run(model, store)
     assert secret not in json.dumps(bundle.dump(), ensure_ascii=False)
     for messages in model.seen:
         assert all(secret not in message.content for message in messages if isinstance(message, ToolMessage))

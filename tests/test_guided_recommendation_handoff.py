@@ -126,15 +126,14 @@ def test_session_discovery_never_calls_full_prefetch_or_machine_booking(store, m
     from app import recommendations
 
     sid = seed(store, "RUNNING")
-    def recommend(hub, llm, intent, **kwargs):
-        sessions.patch_session(store, sid, {"pace": "relaxed", "poi_selections": {"p1": "MUST"}})
+    def recommend(llm, intent, *, store, session_id, on_progress=None):
+        sessions.patch_session(store, session_id, {"pace": "relaxed", "poi_selections": {"p1": "MUST"}})
         return bundle()
     monkeypatch.setattr(recommendations, "recommend_guided", recommend)
     monkeypatch.setattr(discovery, "prefetch", lambda *a, **k: pytest.fail("full discovery called"))
     monkeypatch.setattr(discovery, "fetch_transport_candidates", lambda *a, **k: pytest.fail("transport called"))
     monkeypatch.setattr(discovery, "fetch_hotel_candidates", lambda *a, **k: pytest.fail("hotel called"))
-    sessions.run_discovery(store, sid, hub_factory=lambda _: SimpleNamespace(close=lambda: None),
-                           llm_factory=lambda: object())
+    sessions.run_discovery(store, sid, llm_factory=lambda: object())
     saved = store.get_planning_session(sid)
     assert saved["status"] == saved["discovery_status"] == "READY"
     assert saved["transport_candidates"] == saved["hotel_candidates"] == []
@@ -145,15 +144,36 @@ def test_session_discovery_never_calls_full_prefetch_or_machine_booking(store, m
     assert sessions.session_view(saved)["recommendation"]["source"] == "llm"
 
 
+def test_session_discovery_never_constructs_a_provider_hub(store, monkeypatch):
+    """推荐阶段零网络：ProviderHub 只要被构造就直接炸，run_discovery 仍必须成功。"""
+
+    from app import providers, recommendations
+
+    sid = seed(store, "RUNNING")
+
+    def boom(*args, **kwargs):
+        raise AssertionError("推荐阶段不得构造 ProviderHub / 发起任何 Provider 调用")
+
+    def recommend(llm, intent, *, store, session_id, on_progress=None):
+        return bundle()
+
+    monkeypatch.setattr(providers, "ProviderHub", boom)
+    monkeypatch.setattr(recommendations, "recommend_guided", recommend)
+    sessions.run_discovery(store, sid, llm_factory=lambda: object())
+    saved = store.get_planning_session(sid)
+    assert saved["status"] == saved["discovery_status"] == "READY"
+    assert saved["prefetch"]["provider_calls"] == []
+    assert len(saved["place_candidates"]) == 2
+
+
 def test_recommendation_exception_ends_loading_without_raw_candidates(store, monkeypatch):
     from app import recommendations
 
     sid = seed(store, "RUNNING")
-    def fail(*args, **kwargs):
+    def fail(llm, intent, **kwargs):
         raise RuntimeError("provider unavailable")
     monkeypatch.setattr(recommendations, "recommend_guided", fail)
-    sessions.run_discovery(store, sid, hub_factory=lambda _: SimpleNamespace(close=lambda: None),
-                           llm_factory=lambda: object())
+    sessions.run_discovery(store, sid, llm_factory=lambda: object())
     saved = store.get_planning_session(sid)
     assert saved["status"] == "READY"
     assert saved["discovery_status"] == "FAILED"
@@ -200,18 +220,38 @@ def test_only_listed_recommendations_and_related_hotel_areas_reach_run(store):
 def test_progress_publishes_real_metadata_not_raw_candidates(store, monkeypatch):
     from app import recommendations
     sid = seed(store, "RUNNING")
-    def recommend(hub, llm, intent, *, on_progress, **kwargs):
+    def recommend(llm, intent, *, on_progress, **kwargs):
         on_progress({"stage": "database", "status": "OK", "result_count": 8})
-        on_progress({"stage": "web", "status": "RUNNING"})
+        on_progress({"stage": "places", "status": "RUNNING"})
         current = sessions.session_view(store.get_planning_session(sid))
         assert current["discovery"]["database"] == {"status": "OK", "result_count": 8}
         assert current["recommendation"]["status"] == "RUNNING"
         assert current["place_candidates"] == []
         assert sessions.start_run(store, sid, submit=lambda *a: pytest.fail("too early"))["error"] == "recommendation_not_ready"
-        on_progress({"stage": "web", "status": "OK", "result_count": 5})
+        on_progress({"stage": "places", "status": "OK", "result_count": 5})
         return bundle()
     monkeypatch.setattr(recommendations, "recommend_guided", recommend)
-    sessions.run_discovery(store, sid, hub_factory=lambda _: SimpleNamespace(close=lambda: None), llm_factory=lambda: object())
+    sessions.run_discovery(store, sid, llm_factory=lambda: object())
     current = sessions.session_view(store.get_planning_session(sid))
     assert current["recommendation"]["status"] == "READY"
-    assert current["discovery"]["web"] == {"status": "OK", "result_count": 5}
+    assert current["discovery"]["places"] == {"status": "OK", "result_count": 5}
+    # 第二页推荐不再查 Web：进度阶段里不能出现 web。
+    assert "web" not in current["discovery"]
+
+
+def test_progress_ignores_web_stage_because_engine_is_offline(store, monkeypatch):
+    """旧的 web 阶段回调兜底：引擎零网络，web 不再是被承认的进度阶段。"""
+
+    from app import recommendations
+
+    sid = seed(store, "RUNNING")
+
+    def recommend(llm, intent, *, on_progress, **kwargs):
+        on_progress({"stage": "web", "status": "OK", "result_count": 3})
+        return bundle()
+
+    monkeypatch.setattr(recommendations, "recommend_guided", recommend)
+    sessions.run_discovery(store, sid, llm_factory=lambda: object())
+    saved = store.get_planning_session(sid)
+    assert saved["status"] == saved["discovery_status"] == "READY"
+    assert "web" not in (saved["prefetch"].get("discovery") or {})

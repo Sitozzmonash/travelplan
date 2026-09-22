@@ -582,17 +582,18 @@ test("new cards never fall back to raw pools; dedupe uses IDs only, not names or
   assert.deepEqual(clone(h.options.discoveryPlaces(view).map((place) => place.place_id)), ["raw"]);
 });
 
-test("research shows actual stages, supports social_discovery_finished, and stops all busy text on failure", () => {
+test("research shows the guide-library stages only, keeps legacy guide events, and stops all busy text on failure", () => {
   const h = harness();
   const running = researchComponent(h, {
     discovery_status: "RUNNING", recommendation: { status: "PENDING", place_ids: [] },
-    discovery: { database: { status: "OK", result_count: 4 }, web: { status: "RUNNING" } },
+    discovery: { database: { status: "OK", result_count: 4 } },
   });
   assert.match(running.text, /数据库攻略：检索结束，4 条结果/);
-  assert.match(running.text, /Web 补充：正在处理/);
   assert.match(running.text, /推荐生成：等待处理/);
+  // 联网补充阶段已从后端契约移除：既没有这一行，也不会把任何状态说成"正在搜索网页"。
+  assert.doesNotMatch(running.text, /Web 补充|网页|联网/);
   assert.doesNotMatch(running.text, /正在查询交通|正在比较酒店|已完成/);
-  for (const event of ["social", "social_discovery_finished"]) {
+  for (const event of ["social", "social_discovery_finished", "database_finished"]) {
     const result = researchComponent(h, { events: [{ event, detail: "status=OK，结果 5 条" }] });
     assert.match(result.text, /数据库攻略：检索结束，5 条结果/);
     assert.doesNotMatch(result.text, /正在/);
@@ -603,15 +604,41 @@ test("research shows actual stages, supports social_discovery_finished, and stop
       discovery: { database: { status: "RUNNING" }, web: { status: "PENDING" } },
     });
     assert.doesNotMatch(result.text, /正在|等待处理|已就绪/);
+    assert.doesNotMatch(result.text, /Web 补充/);
     assert.match(result.text, /暂无可用推荐/);
   }
   const failedEvent = researchComponent(h, { events: [{ event: "social_discovery_finished", detail: "status=FAILED，结果 0 条" }] });
   assert.match(failedEvent.text, /数据库攻略：未成功获取结果/);
   const zero = researchComponent(h, { discovery: { database: { status: "OK", result_count: 0 }, web: { status: "SKIPPED" } } });
-  assert.match(zero.text, /无结果/);
-  assert.match(zero.text, /本次未执行/);
+  assert.match(zero.text, /数据库攻略：检索结束，无结果/);
+  assert.doesNotMatch(zero.text, /正在|等待处理|Web 补充/);
   const fallback = researchComponent(h, recommended({ recommendation: { status: "PARTIAL", source: "evidence_fallback", place_ids: ["park"] } }));
   assert.match(fallback.text, /证据降级推荐：1 个地点（部分可用）/);
+});
+
+test("legacy sessions carrying a retired web stage never crash and never render it as busy", () => {
+  const h = harness();
+  const running = researchComponent(h, {
+    discovery_status: "RUNNING", recommendation: { status: "PENDING", place_ids: [] },
+    discovery: { database: { status: "OK", result_count: 4 }, web: { status: "RUNNING" }, web_guides: { status: "RUNNING" } },
+    events: [
+      { event: "web_supplement_started", detail: "status=RUNNING" },
+      { event: "web_discovery_finished", detail: "status=RUNNING，结果 3 条" },
+    ],
+  });
+  assert.match(running.text, /数据库攻略：检索结束，4 条结果/);
+  assert.match(running.text, /推荐生成：等待处理/);
+  assert.doesNotMatch(running.text, /Web 补充|正在处理|web_supplement|web_discovery/);
+  const settled = researchComponent(h, {
+    discovery_status: "READY",
+    recommendation: { status: "READY", source: "llm", version: 1, place_ids: ["park"] },
+    place_candidates: [{ place_id: "park", name: "人民公园", category: "attraction", district: "青羊区" }],
+    discovery: { web: { status: "RUNNING" } },
+    events: [{ event: "web_supplement_started", detail: "status=RUNNING" }],
+  });
+  assert.match(settled.text, /推荐 1 个景点和体验/);
+  assert.match(settled.text, /数据库攻略：已结束，未返回阶段结果/);
+  assert.doesNotMatch(settled.text, /正在|等待处理|Web 补充/);
 });
 
 test("cards avoid duplicate busy blocks and skeletons when recommendations exist; empty results stay honest", () => {
@@ -639,19 +666,18 @@ test("cards avoid duplicate busy blocks and skeletons when recommendations exist
   assert.doesNotMatch(hotel.text, /已按你的酒店策略排序/);
 });
 
-test("tool-named discovery stages expose empty, cached and recommendation-running states", () => {
+test("legacy tool-named guide stages still resolve while retired web stages stay hidden", () => {
   const h = harness();
   const result = researchComponent(h, {
     discovery_status: "RUNNING", recommendation: { status: "PENDING", place_ids: [] },
     discovery: {
       recall_city_guides: { status: "CACHE", result_count: 7 },
-      search_web_guides: { status: "EMPTY", result_count: 0 },
       recommendation: { status: "RUNNING" },
     },
   });
   assert.match(result.text, /数据库攻略：检索结束，7 条结果/);
-  assert.match(result.text, /Web 补充：无结果/);
   assert.match(result.text, /推荐生成：正在处理/);
+  assert.doesNotMatch(result.text, /Web 补充|联网|网页/);
   const draft = h.draft.createEmptyDraft();
   draft.poi.selections = { park: "MUST" };
   const summary = h.draft.summarize(draft, h.sessions.normalizeSession(session("s", recommended())));
