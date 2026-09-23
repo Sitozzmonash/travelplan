@@ -286,7 +286,8 @@ def as_payload(raw: Any) -> dict:
 #: 所以测试里那套"摘掉第三方 Key 让 Provider 自然降级"的离线策略拦不住它 ——
 #: 一个没显式注入替身的用例会真的联网，而且 stdio 握手不返回时线程会一直阻塞，
 #: 整套 pytest 会卡死在某个用例上（实测卡在 ~24%，半小时不动）。
-#: 生产不设这个变量，12306 主源照常生效。
+#: 生产设 1 关掉 MCP：12306 用 npx 拉 node 子进程（~115MB）且实测不可用，
+#: 火车走途牛兜底（见 feedback/inbox/2026-09-22-render-内存与并发治理.md）。
 DISABLE_MCP_ENV = "TRAVELPLAN_DISABLE_MCP"
 
 

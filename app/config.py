@@ -139,6 +139,11 @@ class TravelPlanConfig:
     #: 互不依赖的模型调用并发上限。刻意给得很小：并发模型调用换不来多少墙钟时间，
     #: 却会让 token 峰值与限流风险一起上升。
     llm_max_concurrency: int = 2
+    #: API 进程内 `_RUN_EXECUTOR` 的后台线程数（同时跑几个 run/会话/评测）。
+    #: 为什么默认 2 而不是 4：Render 免费档 512MiB + 0.1 CPU 下，多个分钟级长任务
+    #: 并发只会互相拖慢并放大内存峰值（见 feedback/inbox/2026-09-22-render-内存与并发治理.md）。
+    #: 注意执行器是**模块级**创建的，改这个值要**重启进程**才生效。
+    run_workers: int = 2
 
     #: 一次节点内最多拿多少个高德关键词去搜 POI（每个关键词一次 search_poi）
     poi_query_limit: int = 8
@@ -357,6 +362,9 @@ class TravelPlanConfig:
             llm_max_concurrency=max(
                 1, integer("LLM_MAX_CONCURRENCY", defaults.llm_max_concurrency) or 1
             ),
+            run_workers=max(
+                1, integer("MAX_RUN_WORKERS", defaults.run_workers) or 1
+            ),
             poi_query_limit=max(1, integer("POI_QUERY_LIMIT", defaults.poi_query_limit) or 1),
             poi_page_size=max(1, integer("POI_PAGE_SIZE", defaults.poi_page_size) or 1),
             poi_detail_limit=integer("POI_DETAIL_LIMIT", defaults.poi_detail_limit)
@@ -541,6 +549,9 @@ EDITABLE_KEYS: dict[str, tuple[str, float | None, float | None]] = {
     "POI_VERIFY_MAX_CONCURRENCY": ("int", 1, 16),
     "ROUTE_MAX_CONCURRENCY": ("int", 1, 16),
     "LLM_MAX_CONCURRENCY": ("int", 1, 8),
+    #: API 后台执行器并发（一次同时跑几个 run/会话/评测）。上限 8 是护栏：
+    #: 免费档 0.1 CPU 下 4 个长任务并发已经会互相拖慢并放大内存（OOM 根因之一）。
+    "MAX_RUN_WORKERS": ("int", 1, 8),
     # 性能：取数上限（Part D）
     "POI_QUERY_LIMIT": ("int", 1, 30),
     "POI_PAGE_SIZE": ("int", 1, 50),

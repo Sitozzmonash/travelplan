@@ -47,6 +47,7 @@ Python 在这一路里只保留**一件事**：时间冲突验证（返程赶不
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import time
@@ -110,6 +111,68 @@ __all__ = [
     "SubmittedPlan",
     "execute_agent_run",
 ]
+
+
+# ======================================================================
+# SuperHarness 能力瘦身（全局 patch，见 feedback/inbox/2026-09-22 §3.3）
+# ======================================================================
+# `super_harness/superharness/config.py` 里 `memory_enabled=True` /
+# `retrieval_enabled=True` / `log_enabled=True` / `trace_enabled=True` 是**字面量**，
+# 没有环境变量开关。开着它们意味着每次 `create_harness_agent` 都会：
+#   1. 建 MemoryManager（SQLite `data/memory.db`）与 RetrievalManager —— 两个对象
+#      本身就是内存（Render 免费档只有 512MiB，OOM 根因之一）；
+#   2. 每 run 把 rollout 写进 SQLite，攒够 `memory_consolidate_rollouts` 条还会
+#      **再调一次模型**做 consolidation —— 那一次不在任何业务账本里，纯粹浪费。
+#
+# 旅行规划**不需要**长期记忆/检索：事实全部来自当次工具调用，跨 run 复用记忆反而是
+# 正确性风险（上次的候选会污染这次的证据链）。所以这里在**模块顶层**做一次**幂等**
+# patch —— 任何入口（API 规划 / CLI / HybridRunner / 预热 Agent）import 本模块后，
+# `create_harness_agent` 装配时读到的 `superharness.agent.settings` 都是关掉这四个
+# 能力的那一份。样板是 `benchmark/fixtures/world.py::isolated_harness`（用
+# `dataclasses.replace`，同时 patch `superharness.agent.settings` 与
+# `ObservabilityMiddleware.__init__.__defaults__`）；这里是同一件事的**永久**版本。
+# benchmark 的 contextmanager 自己会再 replace 一次，幂等，互不干扰。
+_PATCHED_HARNESS_SETTINGS = False
+
+
+def _disable_harness_memory_and_logs() -> None:
+    """关掉 harness 的 memory/retrieval/log/trace（全局、幂等，只执行一次）。
+
+    这是全局 patch：影响本进程里所有走 `create_harness_agent` 的路径
+    （主规划 Agent Loop、CLI 的 route=AGENT、HybridRunner、预热 Agent），
+    对本项目都合适 —— 理由见上面注释。**重启才生效**是特征而不是限制：
+    本模块一旦被 import，patch 就已生效，`execute_agent_run` 里对
+    `create_harness_agent` 的直接调用（以及 `app/agent.py` 的 `create_harness_app`）
+    装配时读到的都是关掉记忆/检索的那份 settings。
+    """
+
+    global _PATCHED_HARNESS_SETTINGS
+    if _PATCHED_HARNESS_SETTINGS:
+        return
+    from superharness import agent as harness_agent
+    from superharness.config import settings as default_settings
+    from superharness.middleware import ObservabilityMiddleware
+
+    patched = dataclasses.replace(
+        default_settings,
+        memory_enabled=False,
+        retrieval_enabled=False,
+        log_enabled=False,
+        trace_enabled=False,
+    )
+    # `create_harness_agent` / `create_harness_app` 装配时读的是 `superharness.agent`
+    # 模块命名空间里的 `settings`（`from .config import settings` 的模块级绑定），
+    # 所以改这里就够了；`superharness.config.settings` 原样不动，其它使用者不受影响。
+    harness_agent.settings = patched
+    # 终端 Console / Trace 渲染读的是 `ObservabilityMiddleware.__init__` 的**默认参数**
+    # （def 时就绑定好了），改模块属性没用，得改 `__defaults__`。
+    # 关掉的只是终端打印与 Trace 渲染，不影响任何业务事实，
+    # 也不影响 `app/agent_trace.py` 自己的步骤上报（那是另一条链路）。
+    ObservabilityMiddleware.__init__.__defaults__ = (patched,)
+    _PATCHED_HARNESS_SETTINGS = True
+
+
+_disable_harness_memory_and_logs()
 
 #: 终结工具名。写死在常量里：prompt、审计与单测都引用它，改名必须三处一起改。
 SUBMIT_TOOL_NAME = "submit_final_plan"

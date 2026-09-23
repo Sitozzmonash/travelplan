@@ -252,6 +252,8 @@ Agent 路径没有这一段。
   `set_runtime_overrides(...)`，本进程立刻生效。响应里带 `runtime_overrides` 与 `editable_spec`。
 - `override_env()` 生效期间**环境变量优先**（`_source()` / `is_overriding()`）：Benchmark / Evolution
   的对照实验必须能跑在指定配置下，不能被线上覆盖值污染。
+- **例外**：`MAX_RUN_WORKERS` 虽在白名单里，但 Run 执行器线程池在进程启动时创建，
+  管理端写入后**要重启服务才生效**（其余白名单键写入后立即生效）。
 
 ## 4. Provider / 部署相关环境变量
 
@@ -264,6 +266,7 @@ Agent 路径没有这一段。
 | `TUNIU_API_KEY` | 无 | 途牛（机票/酒店/火车/门票） |
 | `TAVILY_API_KEY` | 无 | 通用网页检索（SuperHarness 自带） |
 | `RAILWAY_12306_COMMAND` | `npx` | 12306 MCP 的**可执行文件**。只替换命令本身，`["-y", "12306-mcp"]` 是固定 args（`super_harness/.../capabilities/mcp/railway_12306.py`）；照"整串命令"填成 `npx -y 12306-mcp` 会把它当成一个可执行文件名去拉起，必然失败 |
+| `TRAVELPLAN_DISABLE_MCP` | 未设（默认启用） | 置真（`1`/`true`/`on`）时**不注册任何 MCP Server**（`app/providers.py::mcp_enabled()`）。**生产建议设 1**：12306 MCP 用 `npx` 拉 node 子进程约 115MB 且实测不可用，火车走途牛兜底 |
 | `TUNIU_COMMAND` | `tuniu` | 途牛 CLI 命令（Windows 下会自动找 `tuniu.cmd`） |
 | `MEDIACRAWLER_DIR` | `data/vendors/MediaCrawler` | 本地 MediaCrawler 目录 |
 | `TRAVELPLAN_DB_PATH` | `data/travelplan.db` | SQLite 位置（**未设 `DATABASE_URL` 时**才生效）。`Dockerfile` 里把它设成 `/data/travelplan.db`，但生产的数据落在 Neon（`DATABASE_URL`），容器本地盘只是临时产物目录 |
@@ -271,6 +274,7 @@ Agent 路径没有这一段。
 | `TRAVELPLAN_OUTPUT_DIR` | `outputs/` | 产物目录 |
 | `TRAVELPLAN_CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | 允许的前端来源（逗号分隔） |
 | `TRAVELPLAN_ADMIN_TOKEN` | 无 | 管理端 Token。**不配则所有 `/api/v1/admin/**` 返回 503**（安全默认） |
+| `MAX_RUN_WORKERS` | `2` | API 进程内 Run 执行器（`app/api.py:_RUN_EXECUTOR`）的线程池并发数，范围 **1~8**。线程池在**进程启动时**按该值创建，**重启后生效**；已登记 `EDITABLE_KEYS`，管理端可改，但同样要到下次重启才生效 |
 | `TRAVELPLAN_COMMIT` / `SUPERHARNESS_COMMIT` | 无 | 覆盖版本号（部署环境没有 `.git` 时用） |
 | `TRAVELPLAN_FIXTURE_VERSION` | `fixtures.v1` | Benchmark fixture 版本 |
 

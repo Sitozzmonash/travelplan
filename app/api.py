@@ -182,7 +182,12 @@ def get_store() -> TravelPlanStore:
 
 
 _APP: Any | None = None
-_RUN_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="travelplan-run")
+#: 后台执行器：并发 2（默认）是 Render 免费档 512MiB + 0.1 CPU 的结论 —— 多个分钟级
+#: 长任务并发只会互相拖慢并放大内存峰值（见 feedback/inbox/2026-09-22）。并发数来自
+#: `MAX_RUN_WORKERS` 配置；执行器是**模块级**创建的，所以改配置要**重启进程**才生效。
+_RUN_EXECUTOR = ThreadPoolExecutor(
+    max_workers=current_config().run_workers, thread_name_prefix="travelplan-run"
+)
 
 
 def get_runner() -> Any:

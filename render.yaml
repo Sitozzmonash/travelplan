@@ -56,3 +56,6 @@ services:
         value: /data/outputs
       - key: TRAVELPLAN_DB_PATH
         value: /data/travelplan.db
+      # 生产关 MCP：省 npx node 子进程内存，火车走途牛兜底（12306 实测不可用）
+      - key: TRAVELPLAN_DISABLE_MCP
+        value: "1"

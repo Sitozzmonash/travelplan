@@ -177,10 +177,11 @@ python scripts/verify_deployment.py render https://<你的服务>.onrender.com
 #    脚本会：POST {background:true}（期望 202）→ 每 10s 轮询 /status →
 #            直到 SUCCESS / DEGRADED / FAILED → 再拉 plan.json / audit_report.json
 
-# 3) 容器内真的有 node（12306 MCP 依赖它）
+# 3) 镜像里装了 node（12306 MCP 依赖它；注意生产已关 MCP，此项只证明镜像带 node）
 render logs -r <srv-id> --type build --limit 500 --confirm -o text | grep -E "^.*v20|npm"
 #    构建日志里能直接看到 Dockerfile 的 `node --version && npm --version`：实测 v20.19.2 / 9.2.0
-#    运行时的证据在 run 里：12306 主源返回真实车次即说明 `npx -y 12306-mcp` 在这个容器里起来了
+#    注意：生产自 2026-09-22 起设 `TRAVELPLAN_DISABLE_MCP=1`，容器里不再注册/拉起 MCP，
+#    run 里不会再出现 12306（火车走途牛兜底）。上面命令只证明镜像自带 node，不代表 MCP 在线。
 #    （免费层不允许一次性 job，`render jobs create` 会被拒：new paid services not allowed）
 ```
 
@@ -197,6 +198,7 @@ render logs -r <srv-id> --type build --limit 500 --confirm -o text | grep -E "^.
 | `MODEL_NAME` / `MODEL_BASE_URL` / `MODEL_API_KEY` | 是 | LLM 主干 |
 | `MODEL_*_bk1` / `MODEL_*_bk2` | 建议 | 主模型的备用端点（三件一套：`MODEL_NAME_bk1` / `MODEL_BASE_URL_bk1` / `MODEL_API_KEY_bk1`，`_bk2` 同理）。主模型限流/欠费时按 主 → bk1 → bk2 降级；一项缺就整套跳过 |
 | `MAX_AGENT_STEPS` / `AGENT_RUN_TIMEOUT_SECONDS` | 否 | 主规划 Agent 的步数与墙钟护栏（默认 40 / 600s），可用环境变量或管理端 Config 调 |
+| `MAX_RUN_WORKERS` | 否 | API 进程内 Run 执行器（`_RUN_EXECUTOR`）线程池并发数，默认 `2`（范围 1~4）。免费档 0.1 CPU 下 4 个长任务并发只会互相拖慢并放大内存。**重启生效**（池在进程启动时创建）；管理端 Config 也可改 |
 | `AMAP_API_KEY` | 是 | 地点验证 / 路线 |
 | `TIKHUB_API_TOKEN` | 是 | 攻略主源（失败回退 MediaCrawler → Web Search） |
 | `TUNIU_API_KEY` | 是 | 交通 / 酒店备用源 |
@@ -206,7 +208,7 @@ render logs -r <srv-id> --type build --limit 500 --confirm -o text | grep -E "^.
 | `TRAVELPLAN_CORS_ORIGINS` | 前端上线后必填 | 逗号分隔的允许来源，如 `https://travelplan.vercel.app`；默认放行 `http://localhost:3000` 与 `http://127.0.0.1:3000` 两个来源（`app/api.py:DEFAULT_CORS_ORIGINS`） |
 | `TRAVELPLAN_OUTPUT_DIR` | 否 | 默认 `/data/outputs`（容器内临时目录） |
 | `TRAVELPLAN_DB_PATH` | 否 | 仅"没有 `DATABASE_URL`"时生效；默认 `/data/travelplan.db` |
-| `TRAVELPLAN_DISABLE_MCP` | 否 | 置真时不注册任何 MCP Server（12306 走 `npx` 子进程，不需要密钥，只有这个开关能拦住它）。**生产不要设**；测试默认由 conftest 设为 1 |
+| `TRAVELPLAN_DISABLE_MCP` | 生产建议设 `1` | 置真时不注册任何 MCP Server（12306 走 `npx` 子进程，不需要密钥，只有这个开关能拦住它）。**生产建议设 1**（`render.yaml` 已加，2026-09-22）：12306 MCP 用 `npx` 拉 node 子进程约 115MB 且实测不可用，火车走途牛兜底；测试默认也由 conftest 设为 1 |
 | `TRAVELPLAN_SKIP_ORPHAN_SWEEP` | 否 | 置真时跳过"启动收敛孤儿 run"。**生产不要设**；测试默认由 conftest 设为 1（避免触发启动事件时写到开发库） |
 | `RAILWAY_12306_COMMAND` / `TUNIU_COMMAND` / `MEDIACRAWLER_DIR` | 否 | 自定义外部命令/目录 |
 
@@ -336,12 +338,14 @@ Project ID `makers-dqiuwptx7qmf`，global 区，由 `edgeone makers deploy front
 **`npx 12306-mcp` 拉起的 Node 进程**、TikTok/小红书这类大体积原始 payload、
 以及抽取阶段一次性拼出来的批量 prompt。512Mi 装不下这一整套。
 
+> 2026-09-22 起生产已关 MCP（`TRAVELPLAN_DISABLE_MCP=1`），Node 子进程这项不再贡献内存。
+
 可选的缓解手段（按"改动大小"排）：
 
 1. **把实例升到更大内存档位** —— 最直接，长任务本来就不适合 512Mi。
-2. **在免费层关掉容器内 MCP**（`TRAVELPLAN_DISABLE_MCP=1`，这是测试用的同一个开关）：
-   不再拉起 Node 进程，12306 如实降级为 `UNAVAILABLE`，火车由途牛兜底，
-   行程仍然产出一条明确的降级说明。代价是丢掉 12306 这个主源，**不建议在生产长期这么配**。
+2. **在免费层关掉容器内 MCP**（`TRAVELPLAN_DISABLE_MCP=1`）—— **2026-09-22 已实施**：
+   `render.yaml` 已加该变量、生产生效。不再拉起 node 子进程（省约 115MB）；12306 实测走 MCP
+   时 `UNAVAILABLE` 且单次 107s，火车由途牛兜底，行程仍会产出一条明确的降级说明。
 3. **预热城市知识库**（`scripts/preheat_cities.py`，见 [数据复用与实体](../architecture/DATA_REUSE_ENTITY.md) §9）：
    把 Discovery 里最贵的「社媒检索 + 模型抽取」移到离线，线上只剩机酒火的实时查询，
    热门城市命中缓存后 Discovery 的负载与耗时都大幅下降。
