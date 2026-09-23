@@ -1,9 +1,7 @@
 "use client";
 
-import { ArrowRight, Hotel, Plane, ShieldCheck, Wallet } from "lucide-react";
-import type { LucideIcon } from "lucide-react";
+import { ArrowRight, Hotel, Plane, Wallet } from "lucide-react";
 import type { TransportOption, TripPlan } from "@/types/plan";
-import { cn } from "@/lib/utils";
 import { formatCNY, formatClock } from "@/lib/format";
 
 interface SummaryCardsProps {
@@ -11,160 +9,93 @@ interface SummaryCardsProps {
   onOpenTransport: () => void;
   onOpenHotel: () => void;
   onOpenBudget: () => void;
-  onOpenTrust: () => void;
 }
 
-/** 四张核心卡（FRONTEND_DESIGN §9）。所有数字都直接来自后端返回的 plan。 */
-export function SummaryCards({
-  plan,
-  onOpenTransport,
-  onOpenHotel,
-  onOpenBudget,
-  onOpenTrust,
-}: SummaryCardsProps) {
+/**
+ * 顶部一行摘要（feedback §3 / §5）：酒店 / 交通 / 预计花费 各一行，
+ * 点击进对应抽屉或预算明细。详细内容只完整出现一次（抽屉 / 下方完整区块），
+ * 这里永远只放短摘要，可信度 / 来源这类技术信息不占主视觉。
+ */
+export function SummaryCards({ plan, onOpenTransport, onOpenHotel, onOpenBudget }: SummaryCardsProps) {
   const outbound = plan.transport?.selected ?? null;
-  const inbound = plan.transport?.inbound_selected ?? null;
-  const transportCount =
-    (plan.transport?.alternatives.length ?? 0) +
-    (plan.transport?.inbound_alternatives.length ?? 0) +
-    (plan.transport?.selected ? 1 : 0) +
-    (plan.transport?.inbound_selected ? 1 : 0);
-
   const hotel = plan.hotel?.selected ?? null;
   const budget = plan.budget ?? null;
-  const summary = plan.evidence_summary;
-  const sourcesUsed = summary?.sources_used ?? plan.sources.length;
-  const placesVerified =
-    summary?.places_verified ??
-    new Set(plan.days.flatMap((day) => day.items.map((item) => item.place_id)).filter(Boolean)).size;
-  const filtered = summary?.low_trust_filtered ?? plan.decisions?.filter((d) => d.status === "REJECT").length ?? 0;
 
   return (
-    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4" data-testid="summary-cards">
-      <SummaryCard
-        icon={Plane}
-        title="交通"
-        onClick={onOpenTransport}
-        actionLabel={transportCount ? `查看 ${transportCount} 个候选方案` : "查看交通方案"}
-      >
-        {outbound ? (
-          <>
-            <p className="truncate text-sm font-medium text-foreground">
-              去程 {optionLabel(outbound)} · {formatCNY(outbound.price)} / 人
-            </p>
-            <p className="tabular mt-1 text-xs text-muted-foreground">
-              {stationLabel(outbound, "departure")} {formatClock(outbound.departure_at)} →{" "}
-              {stationLabel(outbound, "arrival")} {formatClock(outbound.arrival_at)}
-            </p>
-            {inbound ? (
-              <p className="mt-1.5 truncate text-xs text-muted-foreground">
-                回程 {optionLabel(inbound)} · {formatClock(inbound.departure_at)} →{" "}
-                {formatClock(inbound.arrival_at)} · {formatCNY(inbound.price)} / 人
-              </p>
-            ) : (
-              <p className="mt-1.5 text-xs text-muted-foreground">回程方案未返回，可稍后重新查询。</p>
-            )}
-          </>
-        ) : (
-          <p className="text-xs leading-5 text-muted-foreground">
-            本次没有查到可用的大交通方案，因此行程中未包含城际交通安排。
-          </p>
-        )}
-      </SummaryCard>
-
-      <SummaryCard
-        icon={Hotel}
-        title="酒店"
-        onClick={onOpenHotel}
-        actionLabel={plan.hotel?.alternatives.length ? `查看其他 ${plan.hotel.alternatives.length} 个候选` : "查看酒店"}
-      >
+    <div className="grid gap-2 sm:grid-cols-3" data-testid="summary-cards">
+      <SummarySegment icon={Hotel} label="酒店" onClick={onOpenHotel}>
         {hotel ? (
           <>
-            <p className="truncate text-sm font-medium text-foreground">{hotel.name}</p>
-            <p className="tabular mt-1 text-xs text-muted-foreground">
-              {hotel.nights ?? 0} 晚 · {formatCNY(hotel.price_per_night)} / 晚 · 合计 {formatCNY(hotel.total_price)}
-            </p>
-            <p className="mt-1.5 truncate text-xs text-muted-foreground">
-              {hotel.business_area ?? "区域未标注"}
-              {hotel.fetched_at ? ` · 查询于 ${formatClock(hotel.fetched_at)}` : ""}
-            </p>
+            <span className="truncate font-medium text-foreground">{hotel.name}</span>
+            <span className="tabular shrink-0 text-muted-foreground">
+              {hotel.business_area ?? ""}
+              {hotel.price_per_night ? ` · ${formatCNY(hotel.price_per_night)}/晚` : ""}
+            </span>
           </>
         ) : (
-          <p className="text-xs leading-5 text-muted-foreground">
-            暂时没有找到符合条件的酒店。已按预算与区域放宽过一次筛选，仍无结果。
-          </p>
+          <span className="text-muted-foreground">暂无可用酒店</span>
         )}
-      </SummaryCard>
+      </SummarySegment>
 
-      <SummaryCard icon={Wallet} title="预算" onClick={onOpenBudget} actionLabel="查看预算明细">
+      <SummarySegment icon={Plane} label="交通" onClick={onOpenTransport}>
+        {outbound ? (
+          <>
+            <span className="truncate font-medium text-foreground">
+              {optionLabel(outbound)} · {formatCNY(outbound.price)} / 人
+            </span>
+            <span className="tabular shrink-0 text-muted-foreground">
+              {formatClock(outbound.departure_at)} → {formatClock(outbound.arrival_at)}
+            </span>
+          </>
+        ) : (
+          <span className="text-muted-foreground">暂无可用大交通</span>
+        )}
+      </SummarySegment>
+
+      <SummarySegment icon={Wallet} label="预计花费" onClick={onOpenBudget}>
         {budget ? (
           <>
-            <p className="tabular text-sm font-medium text-foreground">
-              预计总计 {formatCNY(budget.projected_total)}
-            </p>
-            <p className="tabular mt-1 text-xs text-muted-foreground">
+            <span className="tabular font-medium text-foreground">{formatCNY(budget.projected_total)}</span>
+            <span className="tabular shrink-0 text-muted-foreground">
               预算 {formatCNY(budget.budget_total)} · 剩余 {formatCNY(budget.remaining)}
-            </p>
-            <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
-              <span className="tabular">实时价格 {formatCNY(budget.known_real_cost)}</span>
-              <span className="tabular">估算费用 {formatCNY(budget.estimated_cost)}</span>
-            </div>
-            {budget.status === "over_budget" ? (
-              <p className="tabular mt-1.5 text-xs text-danger-subtle-foreground">
-                预计超出 {formatCNY(Math.abs(budget.remaining ?? 0))}
-              </p>
-            ) : null}
+            </span>
           </>
         ) : (
-          <p className="text-xs leading-5 text-muted-foreground">
-            这次规划没有返回预算汇总，因此这里没有总额与余量。交通、住宿与门票的候选仍然可以查看。
-          </p>
+          <span className="text-muted-foreground">本次未返回预算汇总</span>
         )}
-      </SummaryCard>
-
-      <SummaryCard icon={ShieldCheck} title="可信度" onClick={onOpenTrust} actionLabel="查看来源">
-        <ul className="grid gap-1 text-xs text-muted-foreground">
-          <li className="tabular">使用 {sourcesUsed} 条来源</li>
-          <li className="tabular">{placesVerified} 个地点已验证</li>
-          <li className="tabular">{filtered} 个低可信候选被过滤</li>
-        </ul>
-        {plan.sources.some((source) => source.status !== "OK") ? (
-          <p className="mt-2 text-[11px] leading-5 text-warning-subtle-foreground">
-            有 {plan.sources.filter((source) => source.status !== "OK").length} 个数据源本次为降级返回，已在来源中标注。
-          </p>
-        ) : null}
-      </SummaryCard>
+      </SummarySegment>
     </div>
   );
 }
 
-interface SummaryCardProps {
-  icon: LucideIcon;
-  title: string;
-  actionLabel: string;
+function SummarySegment({
+  icon: Icon,
+  label,
+  onClick,
+  children,
+}: {
+  icon: typeof Hotel;
+  label: string;
   onClick: () => void;
   children: React.ReactNode;
-}
-
-function SummaryCard({ icon: Icon, title, actionLabel, onClick, children }: SummaryCardProps) {
+}) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className={cn(
-        "group flex h-full flex-col rounded-xl border border-border bg-card p-4 text-left shadow-sm transition-colors",
-        "hover:border-primary/35 focus-visible:border-primary/50 focus-visible:outline-none",
-      )}
+      className="group flex min-w-0 items-center gap-3 rounded-xl border border-border bg-card px-3.5 py-3 text-left shadow-sm transition-colors hover:border-primary/35 focus-visible:border-primary/50 focus-visible:outline-none"
     >
-      <span className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
-        <Icon className="size-3.5" aria-hidden />
-        {title}
+      <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+        <Icon className="size-4" aria-hidden />
       </span>
-      <div className="mt-2.5 min-w-0 flex-1">{children}</div>
-      <span className="mt-3 inline-flex items-center gap-1 text-[11px] text-muted-foreground transition-colors group-hover:text-foreground">
-        {actionLabel}
-        <ArrowRight className="size-3" aria-hidden />
+      <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <span className="text-[11px] text-muted-foreground">{label}</span>
+        <span className="flex min-w-0 items-baseline gap-2 text-sm leading-5">{children}</span>
       </span>
+      <ArrowRight
+        className="size-3.5 shrink-0 text-muted-foreground/60 transition-transform group-hover:translate-x-0.5 group-hover:text-foreground"
+        aria-hidden
+      />
     </button>
   );
 }
@@ -172,14 +103,4 @@ function SummaryCard({ icon: Icon, title, actionLabel, onClick, children }: Summ
 function optionLabel(option: TransportOption | null): string {
   if (!option) return "—";
   return option.kind === "flight" ? option.flight_no : option.train_no;
-}
-
-function stationLabel(option: TransportOption | null, which: "departure" | "arrival"): string {
-  if (!option) return "—";
-  if (option.kind === "flight") {
-    const value = which === "departure" ? option.departure_airport : option.arrival_airport;
-    return value ?? "";
-  }
-  const value = which === "departure" ? option.origin_station : option.destination_station;
-  return value ?? "";
 }

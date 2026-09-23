@@ -16,9 +16,6 @@ interface DayTabsProps {
 /** Day 导航（FRONTEND_DESIGN §10）：Tab + 横向滚动，移动端同样横向滚动。 */
 export function DayTabs({ days, activeDayIndex, onChange }: DayTabsProps) {
   const scrollerRef = useRef<HTMLDivElement>(null);
-  const matched = days.findIndex((entry) => entry.day_index === activeDayIndex);
-  const currentPosition = matched >= 0 ? matched : 0;
-  const current = days[currentPosition];
 
   function scrollBy(delta: number) {
     scrollerRef.current?.scrollBy({ left: delta, behavior: "smooth" });
@@ -46,8 +43,8 @@ export function DayTabs({ days, activeDayIndex, onChange }: DayTabsProps) {
                     : "border-border bg-card text-muted-foreground hover:text-foreground",
                 )}
               >
-                <span className={cn("text-xs font-medium", active && "text-foreground")}>Day {index + 1}</span>
-                <span className="tabular mt-0.5 text-[11px]">
+                <span className={cn("text-sm font-medium", active && "text-foreground")}>Day {index + 1}</span>
+                <span className="tabular mt-0.5 text-xs">
                   {formatDateShort(day.date)} {formatWeekday(day.date)}
                 </span>
               </button>
@@ -77,12 +74,6 @@ export function DayTabs({ days, activeDayIndex, onChange }: DayTabsProps) {
           </div>
         ) : null}
       </div>
-
-      {current?.area ? (
-        <p className="mt-2 truncate text-xs text-muted-foreground">
-          Day {currentPosition + 1} · {current.area}
-        </p>
-      ) : null}
     </div>
   );
 }

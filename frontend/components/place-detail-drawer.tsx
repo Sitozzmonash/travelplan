@@ -95,7 +95,7 @@ export function PlaceDetailDrawer({
               </span>
               <div className="min-w-0 space-y-1.5">
                 <p className="text-sm font-medium text-foreground">{item.name}</p>
-                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
                   <span className="inline-flex items-center gap-1">
                     <CalendarClock className="size-3" aria-hidden />
                     <span className="tabular">
@@ -152,7 +152,7 @@ export function PlaceDetailDrawer({
                   <Route className="size-3.5 text-muted-foreground" aria-hidden />
                   {formatMode(leg.mode)} {legMins !== null ? formatDuration(legMins) : "时长未知"}
                 </p>
-                <dl className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-[11px] text-muted-foreground">
+                <dl className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-xs text-muted-foreground">
                   <div className="flex gap-1.5">
                     <dt>距离</dt>
                     <dd className="tabular text-foreground/90">{formatDistance(leg.distance_meters)}</dd>
@@ -177,7 +177,7 @@ export function PlaceDetailDrawer({
                   </div>
                 </dl>
                 {leg.note ? (
-                  <p className="mt-2 flex gap-1.5 text-[11px] leading-5 text-warning-subtle-foreground">
+                  <p className="mt-2 flex gap-1.5 text-xs leading-5 text-warning-subtle-foreground">
                     <Info className="mt-0.5 size-3 shrink-0" aria-hidden />
                     {leg.note}
                   </p>

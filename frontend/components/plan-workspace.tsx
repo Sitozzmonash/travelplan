@@ -1,12 +1,12 @@
 "use client";
 
-import { CircleAlert, Coffee, ListChecks, Map as MapIcon, Route, Sparkles } from "lucide-react";
+import { CircleAlert, Coffee, ListChecks, Map as MapIcon, Sparkles, Wallet } from "lucide-react";
 import { useCallback, useMemo, useState } from "react";
 import type { ReviseRequest, ReviseResult } from "@/types/api";
 import type { Evidence, ItineraryDay, ItineraryItem, MapPoint, TripPlan } from "@/types/plan";
 import { getEvidence, revisePlan } from "@/lib/api";
 import { buildSourceRecords, providerLabel, recordsForItem, sourceStatusLabel } from "@/lib/display";
-import { formatCNY, formatDistance, formatDuration } from "@/lib/format";
+import { formatCNY, formatDistance, formatDuration, formatStamp } from "@/lib/format";
 import { AuditDrawer } from "@/components/audit-drawer";
 import { BudgetCard } from "@/components/budget-card";
 import { DayTabs } from "@/components/day-tabs";
@@ -18,21 +18,25 @@ import { MobileNav } from "@/components/mobile-nav";
 import { PlaceDetailDrawer } from "@/components/place-detail-drawer";
 import { ReviseDialog, type ReviseTarget } from "@/components/revise-dialog";
 import { SectionCard } from "@/components/section-card";
-import { SourcesDrawer, SourcesSummary } from "@/components/sources-drawer";
+import { SourcesDrawer } from "@/components/sources-drawer";
 import { PartialNotice } from "@/components/state-views";
 import { SummaryCards } from "@/components/summary-cards";
 import { TransportCompare } from "@/components/transport-compare";
 import { TravelMap } from "@/components/travel-map";
 import { TripSummary } from "@/components/trip-summary";
+import { Button } from "@/components/ui/button";
 
 interface PlanWorkspaceProps {
   plan: TripPlan;
 }
 
 /**
- * 行程工作区（FRONTEND_DESIGN §7–§21）。
+ * 行程工作区（FRONTEND_DESIGN §7–§21 / feedback §2–§12）。
  * 只负责把后端返回的 plan 组织成各区块并管理交互状态，
  * 不计算 Trust / Ad Risk / 可行性 / 预算，也不生成任何行程内容。
+ *
+ * 布局原则（feedback）：第一屏先回答「怎么玩」（目的地 / 天数 → 一行摘要 →
+ * Day Tabs → 地图 + 时间线），再回答「为什么这么安排」（底部「为什么这样安排？」入口）。
  */
 export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
   // 存的是后端的 day_index 值，不是数组下标：后端不保证 day_index 从 0 开始，
@@ -113,6 +117,32 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
   const sourceRecords = useMemo(() => buildSourceRecords(plan), [plan]);
   const placeRecords = useMemo(() => recordsForItem(sourceRecords, placeItem), [sourceRecords, placeItem]);
 
+  // P0-4：地图选中地点的旅行信息（feedback §11），从选中 itinerary item 计算，
+  // 传给 TravelMap 的新可选 prop `selectedDetail`（order 与地图 marker 编号一致）。
+  const selectedDetail = useMemo(() => {
+    if (!selectedItemId) return null;
+    const item = (day?.items ?? []).find((entry) => entry.id === selectedItemId);
+    if (!item) return null;
+    const order = mapPoints.findIndex((point) => point.id === item.id);
+    return {
+      name: item.name,
+      order: order >= 0 ? order + 1 : 0,
+      startTime: item.start_time ?? null,
+      stayMinutes: item.duration_minutes ?? null,
+      distanceFromPreviousMeters: item.travel_from_previous?.distance_meters ?? null,
+      area: item.area ?? null,
+    };
+  }, [selectedItemId, day, mapPoints]);
+
+  // P1-6：可信度 / 来源统计收进「为什么这样安排？」，不再占第一屏。
+  const summary = plan.evidence_summary;
+  const sourcesUsed = summary?.sources_used ?? plan.sources.length;
+  const placesVerified =
+    summary?.places_verified ??
+    new Set(plan.days.flatMap((d) => d.items.map((item) => item.place_id)).filter(Boolean)).size;
+  const filtered = summary?.low_trust_filtered ?? plan.decisions?.filter((d) => d.status === "REJECT").length ?? 0;
+  const degradedSources = plan.sources.filter((source) => source.status !== "OK").length;
+
   function openEvidence(item: ItineraryItem) {
     setEvidenceItem(item);
     setEvidenceOpen(true);
@@ -130,6 +160,16 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
 
   function scrollTo(id: string) {
     document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  // P2-8：点时间线项 → 地图 marker 高亮；若地图已滚出视野则把地图带回来。
+  function revealMap() {
+    const element = document.getElementById("map");
+    if (!element) return;
+    const rect = element.getBoundingClientRect();
+    if (rect.top < 0 || rect.bottom > window.innerHeight) {
+      element.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
   }
 
   function requestRevise(item: ItineraryItem, action: ReviseTarget["action"]) {
@@ -160,11 +200,10 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
   );
 
   const dayLabel = day ? `Day ${activeDayPosition + 1}` : "";
+  const unresolvedCount = warnings.filter((warning) => !warning.resolved).length;
 
   return (
     <div className="space-y-5 pb-24 lg:pb-6">
-      <TripSummary plan={plan} onOpenAudit={() => setAuditOpen(true)} onOpenSources={() => openSources()} />
-
       {degradedProviders.length ? (
         <PartialNotice
           title={`${degradedProviders.join("、")} 本次为降级返回`}
@@ -173,13 +212,17 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
         />
       ) : null}
 
+      <TripSummary plan={plan} />
+
       <SummaryCards
         plan={plan}
         onOpenTransport={() => setTransportOpen(true)}
         onOpenHotel={() => setHotelOpen(true)}
         onOpenBudget={() => scrollTo("budget")}
-        onOpenTrust={() => openSources()}
       />
+
+      {/* P0-1：Day Tabs 放到地图与时间线共同的最上层；切换同时控制地图 / 时间线 / 今日美食 / 当天可行性。 */}
+      <DayTabs days={days} activeDayIndex={day?.day_index ?? activeDayIndex} onChange={setActiveDayIndex} />
 
       <div className="grid gap-5 lg:grid-cols-[minmax(0,1.7fr)_minmax(0,1fr)]">
         <div className="space-y-5" id="itinerary">
@@ -187,31 +230,31 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
             <SectionCard
               title={`${dayLabel} 路线总览`}
               icon={MapIcon}
-              description="酒店、景点和餐饮都在同一张路线图里；切换日期会同步更新当天动线。"
+              titleClassName="text-base"
+              description="酒店、景点和餐饮都在同一张路线图里；点击编号可高亮对应安排。"
             >
-              <RouteBriefing day={day} totalMinutes={mapTotals.minutes} onSelect={setSelectedItemId} />
-              <div className="mt-4">
-                <TravelMap
-                  points={mapPoints}
-                  hotel={mapHotel}
-                  dayLabel={dayLabel}
-                  areaLabel={day?.area ?? ""}
-                  selectedId={selectedItemId}
-                  onSelect={setSelectedItemId}
-                  totalDistanceMeters={mapTotals.distance}
-                  totalMinutes={mapTotals.minutes}
-                />
-              </div>
+              <TravelMap
+                points={mapPoints}
+                hotel={mapHotel}
+                dayLabel={dayLabel}
+                areaLabel={day?.area ?? ""}
+                selectedId={selectedItemId}
+                onSelect={setSelectedItemId}
+                totalDistanceMeters={mapTotals.distance}
+                totalMinutes={mapTotals.minutes}
+                selectedDetail={selectedDetail}
+              />
             </SectionCard>
           </div>
 
           <SectionCard
             title={`${dayLabel} 行程`}
             icon={ListChecks}
+            titleClassName="text-base"
             description="按时间顺序走完这一天；点击地点可查看完整说明或调整安排。"
           >
-            <DayTabs days={days} activeDayIndex={day?.day_index ?? activeDayIndex} onChange={setActiveDayIndex} />
-            <DayIntent day={day} totalMinutes={mapTotals.minutes} />
+            {/* P0-2：合并「今天的动线」与 Day Intent 为一行 Day Header，重复信息收敛。 */}
+            <DayHeader day={day} dayLabel={dayLabel} totalMinutes={mapTotals.minutes} />
             <div className="mt-4">
               <ItineraryTimeline
                 day={day}
@@ -219,9 +262,11 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
                 selectedItemId={selectedItemId}
                 lockedItemIds={lockedItemIds}
                 onSelectItem={(item) => {
-                  // 点开一条安排 = 查看它的完整详情（推荐理由 / 停留 / 路线 / 价格 / 证据 / 风险）。
+                  // 点开一条安排 = 查看它的完整详情（推荐理由 / 停留 / 路线 / 价格 / 证据 / 风险），
+                  // 同时让地图 marker 高亮；地图不在视野内时自动滚回地图。
                   setSelectedItemId(item.id);
                   openDetail(item);
+                  revealMap();
                 }}
                 onOpenEvidence={openEvidence}
                 onOpenDetail={openDetail}
@@ -230,24 +275,11 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
               />
             </div>
           </SectionCard>
-
-          <div id="feasibility">
-            <FeasibilityAlert
-              warnings={warnings}
-              days={days}
-              onJumpToItem={(dayIndex, itemId) => {
-                // dayIndex 是 warning.day_index（后端值），必须按值选中，
-                // 不能当成数组下标，否则 day_index 不从 0 开始时跳到别的一天。
-                setActiveDayIndex(dayIndex);
-                setSelectedItemId(itemId);
-                scrollTo("itinerary");
-              }}
-            />
-          </div>
-
         </div>
 
-        <div className="space-y-5">
+        {/* P1-5：右列 Sticky，只保留 住宿 / 今日美食 / 预算摘要 / 关键 Warning；
+            交通完整详情收进 TransportCompare，右栏不再放完整交通卡与来源卡。 */}
+        <aside className="space-y-5 lg:sticky lg:top-4 lg:self-start">
           <SelectedHotelCard
             hotel={plan.hotel}
             sources={sources}
@@ -257,35 +289,34 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
 
           <FoodStops items={foodStops} onSelect={(item) => { setSelectedItemId(item.id); openDetail(item); }} />
 
-          <SectionCard
-            title="交通方案"
-            icon={Route}
-            description="去程与回程的选定方案，完整对比在交通比较中。"
-            action={
-              <button
-                type="button"
-                onClick={() => setTransportOpen(true)}
-                className="text-xs text-primary hover:underline"
-              >
-                比较 {plan.transport ? plan.transport.alternatives.length + plan.transport.inbound_alternatives.length + 2 : 0} 个方案
-              </button>
-            }
-          >
-            <TransportSummary plan={plan} />
-          </SectionCard>
+          {plan.budget ? (
+            <BudgetBrief budget={plan.budget} onOpenDetail={() => scrollTo("budget")} />
+          ) : null}
 
-          <SourcesSummary records={sourceRecords} onOpenAll={() => openSources()} />
-
-          {warnings.filter((warning) => !warning.resolved).length ? (
+          {unresolvedCount ? (
             <div className="flex items-start gap-2 rounded-xl border border-warning/25 bg-warning-subtle/70 px-3.5 py-3 text-xs leading-5">
               <CircleAlert className="mt-0.5 size-3.5 shrink-0 text-warning-subtle-foreground" aria-hidden />
               <span className="text-warning-subtle-foreground">
-                本次有 {warnings.filter((warning) => !warning.resolved).length} 项未解决的问题，
+                本次有 {unresolvedCount} 项未解决的问题，
                 已在「时间与可行性检查」中逐条说明，并给出原计划与调整建议。
               </span>
             </div>
           ) : null}
-        </div>
+        </aside>
+      </div>
+
+      <div id="feasibility">
+        <FeasibilityAlert
+          warnings={warnings}
+          days={days}
+          onJumpToItem={(dayIndex, itemId) => {
+            // dayIndex 是 warning.day_index（后端值），必须按值选中，
+            // 不能当成数组下标，否则 day_index 不从 0 开始时跳到别的一天。
+            setActiveDayIndex(dayIndex);
+            setSelectedItemId(itemId);
+            scrollTo("map");
+          }}
+        />
       </div>
 
       {plan.budget ? (
@@ -296,6 +327,36 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
           description="交通、住宿与门票的候选仍然可见，但无法给出总额与预算余量。可以重新规划一次以获取完整预算。"
         />
       )}
+
+      {/* P1-6：来源 / 可信度 / 规划依据 / Run ID 下沉到单个「为什么这样安排？」入口。 */}
+      <SectionCard
+        title="为什么这样安排？"
+        icon={Sparkles}
+        titleClassName="text-base"
+        description="数据来源、可信度与规划依据都在这里，默认不占主界面。"
+        action={
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" size="sm" onClick={() => openSources()}>
+              来源与可信度
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => setAuditOpen(true)}>
+              规划依据
+            </Button>
+          </div>
+        }
+      >
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+          <span className="tabular">使用 {sourcesUsed} 条来源</span>
+          <span className="tabular">{placesVerified} 个地点已验证</span>
+          <span className="tabular">{filtered} 个低可信候选被过滤</span>
+          {degradedSources ? (
+            <span className="text-warning-subtle-foreground">{degradedSources} 个数据源本次降级返回</span>
+          ) : null}
+        </div>
+        <p className="mt-2 text-[11px] leading-5 text-muted-foreground/80">
+          查询时间 {formatStamp(fetchedAt)} · 行程编号 {plan.run_id}
+        </p>
+      </SectionCard>
 
       <TransportCompare
         open={transportOpen}
@@ -373,99 +434,72 @@ export function PlanWorkspace({ plan }: PlanWorkspaceProps) {
   );
 }
 
-function TransportSummary({ plan }: { plan: TripPlan }) {
-  const transport = plan.transport;
-  if (!transport?.selected) {
-    return (
-      <p className="text-xs leading-5 text-muted-foreground">
-        本次没有返回选定的大交通方案，通常是因为出行日期或路线暂无可售结果。可以调整日期后重新规划。
-      </p>
-    );
-  }
-
-  const rows = [
-    { label: "去程", option: transport.selected },
-    { label: "回程", option: transport.inbound_selected },
-  ].filter((row): row is { label: string; option: NonNullable<typeof transport.selected> } => Boolean(row.option));
-
-  return (
-    <div className="space-y-3">
-      {rows.map(({ label, option }) => {
-        const title =
-          option.kind === "flight"
-            ? `${option.flight_no}${option.airline ? ` · ${option.airline}` : ""}`
-            : `${option.train_no}${option.train_type ? ` · ${option.train_type}` : ""}`;
-        return (
-          <div key={label} className="rounded-lg border border-border/80 bg-card px-3.5 py-3">
-            <div className="flex items-baseline justify-between gap-3">
-              <span className="text-[11px] text-muted-foreground">{label}</span>
-              <span className="text-xs font-medium text-foreground">{title}</span>
-            </div>
-            <p className="tabular mt-1.5 text-xs text-muted-foreground">
-              {option.departure_at?.slice(11, 16) ?? "--:--"} – {option.arrival_at?.slice(11, 16) ?? "--:--"}
-              {option.duration_minutes ? ` · ${formatDuration(option.duration_minutes)}` : ""}
-            </p>
-            {option.selection_reason ? (
-              <p className="mt-1.5 text-xs leading-5 text-muted-foreground">{option.selection_reason}</p>
-            ) : null}
-          </div>
-        );
-      })}
-      <p className="text-xs leading-5 text-muted-foreground">{transport.selection_reason}</p>
-    </div>
-  );
-}
-
-function RouteBriefing({
+/** P0-2：Day Header —— 合并「今天的动线」与 Day Intent，一行说清当天怎么玩。 */
+function DayHeader({
   day,
+  dayLabel,
   totalMinutes,
-  onSelect,
 }: {
   day: ItineraryDay | null;
+  dayLabel: string;
   totalMinutes: number;
-  onSelect: (itemId: string) => void;
 }) {
-  const places = day?.items.filter((item) => item.type !== "transport" && item.type !== "free_time") ?? [];
-  if (!places.length) return null;
-
-  return (
-    <div className="overflow-hidden rounded-xl border border-primary/15 bg-[linear-gradient(110deg,var(--color-accent),transparent)] px-3.5 py-3">
-      <div className="flex items-center justify-between gap-3">
-        <p className="text-xs font-medium text-foreground">今天的动线</p>
-        {totalMinutes > 0 ? <span className="text-[11px] text-muted-foreground">路上约 {formatDuration(totalMinutes)}</span> : null}
-      </div>
-      <div className="mt-2.5 flex gap-1.5 overflow-x-auto pb-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-        {places.map((item, index) => (
-          <button
-            key={item.id}
-            type="button"
-            onClick={() => onSelect(item.id)}
-            className="group inline-flex shrink-0 items-center gap-1.5 text-left text-[11px] text-muted-foreground hover:text-foreground"
-          >
-            <span className="flex size-5 shrink-0 items-center justify-center rounded-full border border-primary/25 bg-card text-[10px] font-medium text-primary group-hover:bg-primary group-hover:text-primary-foreground">
-              {index + 1}
-            </span>
-            <span className="max-w-24 truncate">{item.name}</span>
-            {index < places.length - 1 ? <span className="text-border">→</span> : null}
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function DayIntent({ day, totalMinutes }: { day: TripPlan["days"][number] | null; totalMinutes: number }) {
   if (!day) return null;
   const places = day.items.filter((item) => item.type === "attraction" || item.type === "activity").length;
   const meals = day.items.filter((item) => item.type === "food").length;
+  const parts = [
+    places ? `${places} 个地点` : null,
+    meals ? `${meals} 顿饭` : null,
+    totalMinutes > 0 ? `移动约 ${formatDuration(totalMinutes)}` : null,
+  ].filter(Boolean);
+
   return (
-    <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-lg border border-border/70 bg-muted/25 px-3 py-2.5 text-xs text-muted-foreground">
-      <Sparkles className="size-3.5 shrink-0 text-primary" aria-hidden />
-      <span>{day.area ? `今天以 ${day.area} 为主` : "今天按时间顺序安排活动"}</span>
-      <span>{places} 个游览安排</span>
-      {meals ? <span>{meals} 顿当地用餐</span> : null}
-      {totalMinutes > 0 ? <span>移动约 {formatDuration(totalMinutes)}</span> : null}
+    <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 rounded-lg border border-primary/20 bg-accent/30 px-3.5 py-2.5">
+      <p className="text-base font-semibold text-foreground">
+        {dayLabel}
+        {day.area ? ` · ${day.area}` : ""}
+      </p>
+      {parts.length ? <p className="text-xs text-muted-foreground">{parts.join(" · ")}</p> : null}
     </div>
+  );
+}
+
+/** P1-5：右栏预算摘要 —— 只给一行核心数字，完整明细在下方 BudgetCard。 */
+function BudgetBrief({
+  budget,
+  onOpenDetail,
+}: {
+  budget: NonNullable<TripPlan["budget"]>;
+  onOpenDetail: () => void;
+}) {
+  const overBudget = budget.status === "over_budget";
+  return (
+    <SectionCard
+      title="预算摘要"
+      icon={Wallet}
+      titleClassName="text-base"
+      action={
+        <button
+          type="button"
+          onClick={onOpenDetail}
+          className="text-xs text-primary transition-colors hover:underline"
+        >
+          查看明细
+        </button>
+      }
+    >
+      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 text-sm">
+        <span className="tabular font-medium text-foreground">{formatCNY(budget.projected_total)}</span>
+        <span className="text-xs text-muted-foreground">
+          预算 {formatCNY(budget.budget_total)} · 剩余 {formatCNY(budget.remaining)}
+        </span>
+        {overBudget ? (
+          <span className="rounded bg-danger-subtle px-1.5 py-0.5 text-[11px] font-medium text-danger-subtle-foreground">
+            超出预算
+          </span>
+        ) : null}
+      </div>
+    </SectionCard>
   );
 }
 
@@ -473,7 +507,12 @@ function FoodStops({ items, onSelect }: { items: ItineraryItem[]; onSelect: (ite
   if (!items.length) return null;
 
   return (
-    <SectionCard title="今日美食" icon={Coffee} description="按当天位置和营业时间匹配；点开可查看推荐内容与来源。">
+    <SectionCard
+      title="今日美食"
+      icon={Coffee}
+      titleClassName="text-base"
+      description="按当天位置和营业时间匹配；点开可查看推荐内容与来源。"
+    >
       <div className="space-y-2.5">
         {items.map((item) => (
           <button
@@ -484,10 +523,10 @@ function FoodStops({ items, onSelect }: { items: ItineraryItem[]; onSelect: (ite
           >
             <div className="flex items-baseline justify-between gap-3">
               <span className="min-w-0 truncate text-sm font-medium text-foreground">{item.name}</span>
-              <span className="tabular shrink-0 text-[11px] text-muted-foreground">{item.start_time ?? "用餐时间待定"}</span>
+              <span className="tabular shrink-0 text-xs text-muted-foreground">{item.start_time ?? "用餐时间待定"}</span>
             </div>
             <p className="mt-1.5 line-clamp-2 text-xs leading-5 text-muted-foreground">{item.reason || "已根据当天动线匹配。"}</p>
-            <div className="mt-2 flex flex-wrap gap-x-2.5 gap-y-1 text-[11px] text-muted-foreground">
+            <div className="mt-2 flex flex-wrap gap-x-2.5 gap-y-1 text-xs text-muted-foreground">
               {item.travel_from_previous?.distance_meters ? <span>距上一站 {formatDistance(item.travel_from_previous.distance_meters)}</span> : null}
               {item.opening_hours ? <span>{item.opening_hours}</span> : null}
               {typeof item.price === "number" ? <span>人均约 {formatCNY(item.price)}</span> : null}

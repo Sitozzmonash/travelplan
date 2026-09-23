@@ -12,6 +12,8 @@ interface SectionCardProps {
   children: ReactNode;
   className?: string;
   contentClassName?: string;
+  /** 覆盖标题字号（feedback §9：Section 标题统一 16px），默认保持 text-sm。 */
+  titleClassName?: string;
 }
 
 /** 白色内容卡片：浅色背景上的信息分区（FRONTEND_DESIGN §3、§31）。 */
@@ -24,12 +26,13 @@ export function SectionCard({
   children,
   className,
   contentClassName,
+  titleClassName,
 }: SectionCardProps) {
   return (
     <Card id={id} className={cn("gap-0 overflow-hidden border-border/80 py-0 shadow-none", className)}>
       <CardHeader className="flex flex-row items-center justify-between gap-3 border-b border-border/70 px-4 py-3 sm:px-5">
         <div className="min-w-0">
-          <h2 className="flex items-center gap-2 text-sm font-medium text-foreground">
+          <h2 className={cn("flex items-center gap-2 text-sm font-medium text-foreground", titleClassName)}>
             {Icon ? <Icon className="size-4 shrink-0 text-muted-foreground" aria-hidden /> : null}
             <span className="truncate">{title}</span>
           </h2>

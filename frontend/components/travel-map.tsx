@@ -1,9 +1,35 @@
 "use client";
 
-import { BedDouble, Info, MapPinned, Route } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  BedDouble,
+  Clock,
+  Hourglass,
+  Info,
+  LoaderCircle,
+  MapPin,
+  MapPinned,
+  Route,
+} from "lucide-react";
 import type { MapPoint } from "@/types/plan";
 import { cn } from "@/lib/utils";
 import { formatDistance, formatDuration } from "@/lib/format";
+import {
+  loadAmap,
+  type AMapMapInstance,
+  type AMapMarkerInstance,
+  type AMapNamespace,
+} from "@/lib/amap-loader";
+
+/** 地图选中地点的旅行信息（feedback §11：弹窗展示这些，不再显示经纬度）。 */
+interface TravelMapSelectedDetail {
+  name: string;
+  order: number;
+  startTime?: string | null;
+  stayMinutes?: number | null;
+  distanceFromPreviousMeters?: number | null;
+  area?: string | null;
+}
 
 interface TravelMapProps {
   points: MapPoint[];
@@ -17,14 +43,16 @@ interface TravelMapProps {
   totalMinutes?: number | null;
   heightClassName?: string;
   className?: string;
+  /** 选中地点的旅行信息；缺失时（旧调用方）弹窗退化为只显示名称与编号。 */
+  selectedDetail?: TravelMapSelectedDetail | null;
 }
 
 /**
- * 地图面板占位实现（FRONTEND_DESIGN §14）。
+ * 地图面板（FRONTEND_DESIGN §14 / feedback §4）。
  *
- * 这里不使用任何真实地图 SDK，也不需要任何 Key：用 SVG 画出一个示意地图，
- * 但组件接口与真实高德 JS SDK 一致（MapPoint + 选中态 + 路线 + 汇总），
- * 未来替换实现时页面结构不需要改。
+ * 配了 `NEXT_PUBLIC_AMAP_KEY` 时用真实高德 JS SDK v2（真实道路 / 路线 / 点位编号 /
+ * 住宿标记），没有 Key 或 SDK 加载失败时整体回落为下面的 SVG 示意地图。两套分支的
+ * 接口一致（MapPoint + 选中态 + 路线 + 汇总），页面结构不因实现切换而改变。
  */
 export function TravelMap({
   points,
@@ -37,9 +65,133 @@ export function TravelMap({
   totalMinutes,
   heightClassName = "h-[280px] sm:h-[320px]",
   className,
+  selectedDetail,
 }: TravelMapProps) {
-  const layout = project(points, hotel);
+  const amapKey = process.env.NEXT_PUBLIC_AMAP_KEY;
+  const canLoadAmap = typeof amapKey === "string" && amapKey.trim().length > 0;
+
+  const [amapState, setAmapState] = useState<"loading" | "ready" | "failed">("loading");
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const mapCtxRef = useRef<{ api: AMapNamespace; map: AMapMapInstance } | null>(null);
+  const markersRef = useRef<Map<string, AMapMarkerInstance>>(new Map());
+  const overlayCacheRef = useRef<unknown[]>([]);
+  const fittedKeyRef = useRef("");
+  const onSelectRef = useRef(onSelect);
+
+  useEffect(() => {
+    onSelectRef.current = onSelect;
+  }, [onSelect]);
+
+  // 只在浏览器里注入 SDK 并初始化地图；任何一步失败都回落 SVG，绝不让页面白屏。
+  useEffect(() => {
+    if (!canLoadAmap || amapState !== "loading" || !amapKey) return;
+    let cancelled = false;
+    loadAmap(amapKey)
+      .then((api) => {
+        if (cancelled || !containerRef.current) return;
+        try {
+          mapCtxRef.current = { api, map: new api.Map(containerRef.current, { viewMode: "2D" }) };
+          setAmapState("ready");
+        } catch {
+          setAmapState("failed");
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setAmapState("failed");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [canLoadAmap, amapKey, amapState]);
+
+  // 卸载时销毁地图实例，避免内存泄漏与重复初始化。
+  useEffect(() => {
+    return () => {
+      mapCtxRef.current?.map.destroy();
+      mapCtxRef.current = null;
+    };
+  }, []);
+
+  // 把点位 / 酒店 / 选中态重画到高德图上；只在点位集合变化时 fitView，避免选中即跳动。
+  const renderOverlays = useCallback(() => {
+    const ctx = mapCtxRef.current;
+    if (!ctx || amapState !== "ready") return;
+
+    if (overlayCacheRef.current.length) {
+      ctx.map.remove(overlayCacheRef.current);
+      overlayCacheRef.current = [];
+    }
+    markersRef.current = new Map();
+
+    const path: [number, number][] = points.map((point) => [point.lng, point.lat]);
+    const hasSelection = Boolean(selectedId);
+
+    if (path.length > 1) {
+      const base = new ctx.api.Polyline({
+        path,
+        strokeColor: "var(--color-primary)",
+        strokeWeight: 5,
+        strokeOpacity: hasSelection ? 0.18 : 0.4,
+        lineJoin: "round",
+      });
+      const highlight = new ctx.api.Polyline({
+        path,
+        strokeColor: "var(--color-primary)",
+        strokeWeight: 5,
+        strokeOpacity: hasSelection ? 0.9 : 0,
+        lineJoin: "round",
+      });
+      overlayCacheRef.current.push(base, highlight);
+    }
+
+    points.forEach((point) => {
+      const active = point.id === selectedId;
+      const marker = new ctx.api.Marker({
+        position: [point.lng, point.lat],
+        content: pointMarkerHtml(point.order, active),
+        title: `${point.order}. ${point.name}`,
+        anchor: "center",
+        zIndex: active ? 120 : 100,
+      });
+      marker.on("click", () => onSelectRef.current?.(point.id));
+      markersRef.current.set(point.id, marker);
+      overlayCacheRef.current.push(marker);
+    });
+
+    let hotelMarker: AMapMarkerInstance | null = null;
+    if (hotel) {
+      hotelMarker = new ctx.api.Marker({
+        position: [hotel.lng, hotel.lat],
+        content: hotelMarkerHtml(),
+        title: `住宿中心：${hotel.name}`,
+        anchor: "center",
+        zIndex: 110,
+      });
+      overlayCacheRef.current.push(hotelMarker);
+    }
+
+    ctx.map.add(overlayCacheRef.current);
+
+    const fitKey = points.map((point) => point.id).join("|") + (hotel ? `|h:${hotel.name}` : "");
+    if (fittedKeyRef.current !== fitKey) {
+      fittedKeyRef.current = fitKey;
+      const overlays: AMapMarkerInstance[] = [...markersRef.current.values()].filter(
+        (marker): marker is AMapMarkerInstance => Boolean(marker),
+      );
+      if (hotelMarker) overlays.push(hotelMarker);
+      ctx.map.setFitView(overlays, false, [40, 40, 40, 40]);
+    }
+  }, [points, hotel, amapState, selectedId]);
+
+  useEffect(() => {
+    renderOverlays();
+  }, [renderOverlays]);
+
   const selected = points.find((point) => point.id === selectedId) ?? null;
+  const useAmap = canLoadAmap && amapState !== "failed";
+  const isEmpty = points.length === 0 && !hotel;
+  // 仅示意图分支用到的投影布局。
+  const layout = project(points, hotel);
 
   return (
     <div className={cn("overflow-hidden rounded-xl border border-border bg-card", className)} data-testid="travel-map">
@@ -50,108 +202,132 @@ export function TravelMap({
         </div>
         <span className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-muted/50 px-1.5 py-0.5 text-[11px] text-muted-foreground">
           <Info className="size-3" aria-hidden />
-          示意地图
+          {useAmap ? "高德地图" : "示意地图"}
         </span>
       </div>
 
-      <div className={cn("relative bg-[oklch(0.978_0.006_140)]", heightClassName)}>
-        <svg
-          viewBox="0 0 100 62"
-          preserveAspectRatio="xMidYMid slice"
-          className="absolute inset-0 size-full"
-          role="img"
-          aria-label={`${dayLabel} ${areaLabel} 路线示意`}
-        >
-          <MapBackdrop seed={hashSeed(areaLabel + dayLabel)} />
-
-          {layout.routePath ? (
-            <polyline
-              points={layout.routePath}
-              fill="none"
-              stroke="var(--color-primary)"
-              strokeWidth={1.1}
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              opacity={0.55}
-            />
-          ) : null}
-
-          {layout.hotel ? (
-            <g transform={`translate(${layout.hotel.x} ${layout.hotel.y})`}>
-              <title>住宿中心：{layout.hotel.name}</title>
-              <circle r={4.8} fill="var(--color-card)" stroke="var(--color-primary)" strokeWidth={0.9} />
-              <path d="M-2.1 1.8V-1.2h4.2v3M-2.7 1.8h5.4M-1.2-1.2v1.5M1.2-1.2v1.5" fill="none" stroke="var(--color-primary)" strokeWidth={0.75} strokeLinecap="round" />
-              <text y={6.4} textAnchor="middle" fontSize={2.35} fill="var(--color-foreground)" opacity={0.82}>
-                住宿
-              </text>
-            </g>
-          ) : null}
-
-          {layout.points.map((point) => {
-            const active = point.id === selectedId;
-            return (
-              <g
-                key={point.id}
-                transform={`translate(${point.x} ${point.y})`}
-                className={onSelect ? "cursor-pointer" : undefined}
-                onClick={() => onSelect?.(point.id)}
-              >
-                <title>{`${point.order}. ${point.name}`}</title>
-                {active ? (
-                  <circle r={5.4} fill="var(--color-primary)" opacity={0.16} />
-                ) : null}
-                <circle
-                  r={active ? 3.2 : 2.6}
-                  fill={active ? "var(--color-primary)" : "var(--color-card)"}
-                  stroke={active ? "var(--color-primary)" : "var(--color-primary)"}
-                  strokeWidth={0.7}
-                  strokeOpacity={active ? 1 : 0.5}
-                />
-                <text
-                  y={0.95}
-                  textAnchor="middle"
-                  fontSize={2.9}
-                  fontWeight={600}
-                  fill={active ? "var(--color-primary-foreground)" : "var(--color-primary)"}
-                >
-                  {point.order}
-                </text>
-                {active ? (
-                  <g transform="translate(0 -6.2)">
-                    <text
-                      textAnchor="middle"
-                      fontSize={2.7}
-                      fill="var(--color-foreground)"
-                      className="select-none"
-                      opacity={0.85}
-                    >
-                      {truncate(point.name, 12)}
-                    </text>
-                  </g>
-                ) : null}
-              </g>
-            );
-          })}
-        </svg>
-
-        {points.length === 0 && !hotel ? (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 px-6 text-center">
-            <MapPinned className="size-5 text-muted-foreground" aria-hidden />
-            <p className="text-sm font-medium text-foreground">这一天的安排没有可定位的地点</p>
-            <p className="text-xs leading-5 text-muted-foreground">
-              当天以交通或自由活动为主，因此没有可以标注在地图上的地点。
-            </p>
+      <div className="relative">
+        {useAmap ? (
+          <div ref={containerRef} className={cn("relative w-full overflow-hidden", heightClassName)}>
+            {amapState === "loading" ? <MapLoadingHint /> : null}
+            {isEmpty ? <EmptyState /> : null}
           </div>
-        ) : null}
+        ) : (
+          <div className={cn("relative bg-[oklch(0.978_0.006_140)]", heightClassName)}>
+            <svg
+              viewBox="0 0 100 62"
+              preserveAspectRatio="xMidYMid slice"
+              className="absolute inset-0 size-full"
+              role="img"
+              aria-label={`${dayLabel} ${areaLabel} 路线示意`}
+            >
+              <MapBackdrop seed={hashSeed(areaLabel + dayLabel)} />
+
+              {layout.routePath ? (
+                <polyline
+                  points={layout.routePath}
+                  fill="none"
+                  stroke="var(--color-primary)"
+                  strokeWidth={1.1}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  opacity={0.55}
+                />
+              ) : null}
+
+              {layout.hotel ? (
+                <g transform={`translate(${layout.hotel.x} ${layout.hotel.y})`}>
+                  <title>住宿中心：{layout.hotel.name}</title>
+                  <circle r={4.8} fill="var(--color-card)" stroke="var(--color-primary)" strokeWidth={0.9} />
+                  <path d="M-2.1 1.8V-1.2h4.2v3M-2.7 1.8h5.4M-1.2-1.2v1.5M1.2-1.2v1.5" fill="none" stroke="var(--color-primary)" strokeWidth={0.75} strokeLinecap="round" />
+                  <text y={6.4} textAnchor="middle" fontSize={2.35} fill="var(--color-foreground)" opacity={0.82}>
+                    住宿
+                  </text>
+                </g>
+              ) : null}
+
+              {layout.points.map((point) => {
+                const active = point.id === selectedId;
+                return (
+                  <g
+                    key={point.id}
+                    transform={`translate(${point.x} ${point.y})`}
+                    className={onSelect ? "cursor-pointer" : undefined}
+                    onClick={() => onSelect?.(point.id)}
+                  >
+                    <title>{`${point.order}. ${point.name}`}</title>
+                    {active ? (
+                      <circle r={5.4} fill="var(--color-primary)" opacity={0.16} />
+                    ) : null}
+                    <circle
+                      r={active ? 3.2 : 2.6}
+                      fill={active ? "var(--color-primary)" : "var(--color-card)"}
+                      stroke={active ? "var(--color-primary)" : "var(--color-primary)"}
+                      strokeWidth={0.7}
+                      strokeOpacity={active ? 1 : 0.5}
+                    />
+                    <text
+                      y={0.95}
+                      textAnchor="middle"
+                      fontSize={2.9}
+                      fontWeight={600}
+                      fill={active ? "var(--color-primary-foreground)" : "var(--color-primary)"}
+                    >
+                      {point.order}
+                    </text>
+                    {active ? (
+                      <g transform="translate(0 -6.2)">
+                        <text
+                          textAnchor="middle"
+                          fontSize={2.7}
+                          fill="var(--color-foreground)"
+                          className="select-none"
+                          opacity={0.85}
+                        >
+                          {truncate(point.name, 12)}
+                        </text>
+                      </g>
+                    ) : null}
+                  </g>
+                );
+              })}
+            </svg>
+
+            {isEmpty ? <EmptyState /> : null}
+          </div>
+        )}
 
         {selected ? (
-          <div className="absolute inset-x-3 bottom-3 rounded-lg border border-border bg-card/95 px-3 py-2 shadow-sm backdrop-blur-sm">
+          <div className="absolute inset-x-3 bottom-3 z-20 rounded-lg border border-border bg-card/95 px-3 py-2 shadow-sm backdrop-blur-sm">
             <p className="truncate text-xs font-medium text-foreground">
-              {selected.order}. {selected.name}
+              {selectedDetail?.order ?? selected.order}. {selectedDetail?.name ?? selected.name}
             </p>
-            <p className="tabular mt-0.5 text-[11px] text-muted-foreground">
-              {selected.lat.toFixed(4)}, {selected.lng.toFixed(4)}
-            </p>
+            {selectedDetail ? (
+              <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+                {selectedDetail.startTime ? (
+                  <span className="inline-flex items-center gap-1">
+                    <Clock className="size-3" aria-hidden /> {selectedDetail.startTime} 到达
+                  </span>
+                ) : null}
+                {selectedDetail.stayMinutes != null ? (
+                  <span className="inline-flex items-center gap-1">
+                    <Hourglass className="size-3" aria-hidden /> 预计停留{" "}
+                    {formatDuration(selectedDetail.stayMinutes)}
+                  </span>
+                ) : null}
+                {selectedDetail.distanceFromPreviousMeters != null ? (
+                  <span className="inline-flex items-center gap-1">
+                    <Route className="size-3" aria-hidden /> 距上一站{" "}
+                    {formatDistance(selectedDetail.distanceFromPreviousMeters)}
+                  </span>
+                ) : null}
+                {selectedDetail.area ? (
+                  <span className="inline-flex items-center gap-1">
+                    <MapPin className="size-3" aria-hidden /> {selectedDetail.area}
+                  </span>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         ) : null}
       </div>
@@ -173,6 +349,40 @@ export function TravelMap({
       </div>
     </div>
   );
+}
+
+function MapLoadingHint() {
+  return (
+    <div className="absolute inset-0 z-10 flex items-center justify-center gap-2 bg-muted/20 text-xs text-muted-foreground">
+      <LoaderCircle className="size-4 animate-spin" aria-hidden />
+      正在加载高德地图…
+    </div>
+  );
+}
+
+function EmptyState() {
+  return (
+    <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-1.5 px-6 text-center">
+      <MapPinned className="size-5 text-muted-foreground" aria-hidden />
+      <p className="text-sm font-medium text-foreground">这一天的安排没有可定位的地点</p>
+      <p className="text-xs leading-5 text-muted-foreground">
+        当天以交通或自由活动为主，因此没有可以标注在地图上的地点。
+      </p>
+    </div>
+  );
+}
+
+// ==================================================
+// 高德 marker 的 HTML 内容（编号打点 / 住宿标记）
+// ==================================================
+
+function pointMarkerHtml(order: number, active: boolean): string {
+  const size = active ? 26 : 22;
+  return `<div style="display:flex;align-items:center;justify-content:center;width:${size}px;height:${size}px;box-sizing:border-box;border-radius:9999px;font-size:12px;font-weight:600;line-height:1;background:${active ? "var(--color-primary)" : "var(--color-card)"};color:${active ? "var(--color-primary-foreground)" : "var(--color-primary)"};border:${active ? "none" : "2px solid var(--color-primary)"};box-shadow:${active ? "0 0 0 4px color-mix(in srgb, var(--color-primary) 16%, transparent)" : "0 1px 4px rgba(0,0,0,.25)"}">${order}</div>`;
+}
+
+function hotelMarkerHtml(): string {
+  return `<div style="display:flex;flex-direction:column;align-items:center;gap:2px"><span style="display:flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:8px;background:var(--color-primary);color:var(--color-primary-foreground);box-shadow:0 1px 4px rgba(0,0,0,.25)"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4v16"/><path d="M2 8h18a2 2 0 0 1 2 2v10"/><path d="M2 17h20"/><path d="M6 8v9"/></svg></span><span style="font-size:10px;line-height:1;color:var(--color-muted-foreground);background:var(--color-card);padding:1px 4px;border-radius:4px;border:1px solid var(--color-border)">住宿</span></div>`;
 }
 
 // ==================================================
