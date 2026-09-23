@@ -18,7 +18,6 @@ from datetime import timedelta
 from app import city_cache, discovery, sessions
 from app.models import Evidence, Place, TripIntent, utcnow
 from tests.fakes import FakeHub, FakeLLM, make_store
-from tests.test_city_cache import explicit_sqlite_only
 
 
 def _place() -> Place:
@@ -48,9 +47,20 @@ def _discover(store, intent: TripIntent, *, session_id: str):
 
 
 def _cache_from(store, intent: TripIntent, result, hub, *, session_id: str, updated_at: str | None = None):
-    """按生产的写法把一次 Discovery 的可复用部分落进城市缓存。"""
+    """按生产的写法把一次 Discovery 的可复用部分落进城市缓存。
 
-    bundle = sessions._bundle_from(session_id, intent, result, hub)
+    直接按 PrefetchBundle 的字段形状构造（只带缓存真正要的四样），
+    不再依赖 sessions 里已删除的旧 `_bundle_from`。
+    """
+
+    social = result["social"]
+    bundle = discovery.PrefetchBundle(
+        session_id=session_id,
+        places=list(getattr(result.get("places"), "places", []) or []),
+        evidences=list(getattr(social, "evidences", []) or []),
+        social_queries=list(getattr(social, "queries", []) or []),
+        social_served_queries=list(getattr(social, "served_queries", []) or []),
+    )
     city_cache.write_candidates(
         "成都",
         bundle.places,
@@ -216,3 +226,56 @@ def test_legacy_evidence_key_and_missing_mention_key_remain_readable(tmp_path):
     assert len(store.get_city_evidence_rows("成都")) == 1
     assert store.get_city_evidence_rows("成都")[0]["evidence_key"] == "legacy-meta-hash"
     assert len(city_cache.read_candidates("成都", store=store).mentions) == 1
+
+
+class TestRefreshCityCacheLightweightPath:
+    """预热 / 管理员刷新的唯一入口 `sessions.refresh_city_cache` 只查攻略 + POI。
+
+    旧实现走完整 `discovery.prefetch`（会并发启动交通 / 酒店两条线），对城市缓存毫无
+    用处却白烧 Provider 额度。这里钉住：**不**调 `fetch_transport_candidates` /
+    `fetch_hotel_candidates` / `discovery.prefetch`，且落库结果能被 `read_candidates` 命中。
+    """
+
+    def test_no_transport_or_hotels_and_writes_candidates(self, tmp_path, monkeypatch):
+        store = make_store(tmp_path / "refresh.db")
+        fake_hub = FakeHub(store=None, run_id="city-cache:成都")
+        called: dict[str, int] = {"transport": 0, "hotels": 0, "prefetch": 0}
+
+        def _transport(*a, **k):
+            called["transport"] += 1
+            return discovery.TransportCandidates()
+
+        def _hotels(*a, **k):
+            called["hotels"] += 1
+            return discovery.HotelCandidates()
+
+        def _prefetch(*a, **k):
+            called["prefetch"] += 1
+            return {}
+
+        monkeypatch.setattr("app.providers.ProviderHub", lambda *args, **kwargs: fake_hub)
+        monkeypatch.setattr("app.providers.default_mcp_servers", list)
+        monkeypatch.setattr("app.llm.LLM.from_env", classmethod(lambda cls: FakeLLM()))
+        monkeypatch.setattr(discovery, "fetch_transport_candidates", _transport)
+        monkeypatch.setattr(discovery, "fetch_hotel_candidates", _hotels)
+        monkeypatch.setattr(discovery, "prefetch", _prefetch)
+
+        summary = sessions.refresh_city_cache(store, "成都")
+
+        # 轻量路径：攻略 + POI 照常跑，但一条机酒线都不碰。
+        assert called == {"transport": 0, "hotels": 0, "prefetch": 0}
+        assert summary["city"] == "成都"
+        assert summary["places"] > 0
+        assert summary["evidences"] > 0
+        assert summary["queries"] > 0
+        assert set(summary) >= {"city", "places", "evidences", "social_evidences", "queries", "notes", "degradations"}
+        # 落库产物必须真的可读（rebuild_city_cache.py 的自检也走这里）。
+        hit = city_cache.read_candidates("成都", store=store, now=utcnow())
+        assert hit is not None and hit.places and hit.evidences
+        assert hit.social_queries
+
+    def test_empty_city_name_is_reported_not_raised(self, tmp_path):
+        store = make_store(tmp_path / "empty.db")
+        summary = sessions.refresh_city_cache(store, "   ")
+        assert summary["places"] == 0
+        assert any("城市名为空" in note for note in summary["degradations"])

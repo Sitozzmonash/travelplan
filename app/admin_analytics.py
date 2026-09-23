@@ -438,28 +438,9 @@ def run_contexts(store: TravelPlanStore, runs: Sequence[Mapping[str, Any]]) -> l
             )
     return contexts
 
-#: 质量分权重。为什么把这些软指标合成一个分：页面上总得有一个可排序的数，
-#: 但"哪个分值多少"必须明说（payload 里带回 weights），不能让读者猜。
-QUALITY_WEIGHTS: dict[str, float] = {
-    "preference_coverage": 0.25,
-    "pace_match": 0.2,
-    "category_diversity": 0.15,
-    "backtracking_score": 0.15,
-    "daily_load_balance": 0.1,
-    "meal_time_quality": 0.1,
-    "route_efficiency": 0.05,
-}
-
-
-def _quality_score(quality: Mapping[str, Any]) -> float:
-    total = 0.0
-    weight_sum = 0.0
-    for key, weight in QUALITY_WEIGHTS.items():
-        value = quality.get(key)
-        if isinstance(value, (int, float)):
-            total += float(value) * weight
-            weight_sum += weight
-    return round(total / weight_sum, 4) if weight_sum else 0.0
+#: 质量分权重与合成公式在 `planner.QUALITY_WEIGHTS` / `planner.quality_score`（口径单点）：
+#: `plan_snapshot`（解析 plan_json）与 `agent_runner._save_metrics`（run 完成即存）共用同一份，
+#: 保证"列值直接读"与"旧 run 退回解析"两条路对同一份计划给出同一个数。
 
 
 def plan_snapshot(store: TravelPlanStore, run_id: str) -> PlanSnapshot:
@@ -495,7 +476,7 @@ def plan_snapshot(store: TravelPlanStore, run_id: str) -> PlanSnapshot:
 
     quality = planner.plan_quality(plan.days, plan.intent).to_dict()
     snapshot = PlanSnapshot(
-        run_id=run_id, plan=plan, quality=quality, score=_quality_score(quality)
+        run_id=run_id, plan=plan, quality=quality, score=planner.quality_score(quality)
     )
     _PLANS.put(run_id, snapshot)
     return snapshot
@@ -915,14 +896,21 @@ def dashboard(store: TravelPlanStore, *, window: Window, quality_sample: int = 1
 
     badcase_open = gathered["badcase_open"] or 0
 
-    # 质量只抽最近若干个有计划的 run：一次列表 50 条 = 5–10MB 的 plan_json，
-    # 全量算会让首屏白等。抽样时如实标 sampled。
+    # 质量只抽最近若干个 run。优先读 run 完成时写进 run_metrics 的 quality_score：
+    # 有列值就不再解析 100–220KB 的 plan_json（冷加载慢的根因就是逐个解计划）。
+    # 缺列值的旧 run 才退回 plan_snapshot 解析（顺带把决策健康的事实一起算出来，
+    # 免得为了三个计数再去查一遍会话）。样本量为 0 时这一段完全不发请求。
     sampled_plans: list[float] = []
     sampled_facts: list[dict[str, Any]] = []
     sample_runs = current_runs[: max(0, quality_sample)]
-    # 复用质量页同一份换算：抽样运行既然已经解了计划，就把决策健康一起算出来，
-    # 免得为了三个计数再去查一遍会话。样本量为 0 时这一段完全不发请求。
-    for context in run_contexts(store, sample_runs):
+    for run in sample_runs:
+        score = run.get("quality_score")
+        if isinstance(score, (int, float)) and not isinstance(score, bool):
+            sampled_plans.append(float(score))
+    fallback_runs = [
+        run for run in sample_runs if not isinstance(run.get("quality_score"), (int, float))
+    ]
+    for context in run_contexts(store, fallback_runs):
         if context.snapshot.plan is None:
             continue
         sampled_facts.append(
@@ -1957,7 +1945,7 @@ def travel_quality(
             "score": overall,
             "grade": grade(overall),
             "grade_label": GRADE_LABELS[grade(overall)],
-            "weights": QUALITY_WEIGHTS,
+            "weights": planner.QUALITY_WEIGHTS,
             "note": "总分 = 六个维度得分的等权平均；单 run 分 = quality 软指标的加权和",
         },
         "dimensions": dimensions,

@@ -92,14 +92,14 @@ class ControlledLLM(FakeLLM):
         self.fail_profile = fail_profile
         self.profile_attempts = 0
 
-    def invoke_json(self, system, user, *, tag=""):
+    def invoke_json(self, system, user, *, tag="", context=None):
         if tag == "preference_profile":
             self.profile_attempts += 1
             if self.profile_gate is not None:
                 self.profile_gate.wait()
             if self.fail_profile:
                 raise RuntimeError("fake profile failure")
-        return super().invoke_json(system, user, tag=tag)
+        return super().invoke_json(system, user, tag=tag, context=context)
 
 
 def start_prefetch(hub, llm, intent, **kwargs):

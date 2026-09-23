@@ -3550,3 +3550,36 @@ def plan_quality(
         active_minutes=active_minutes,
         playable_days=len(playable),
     )
+
+
+#: 质量软指标 → 单 run 质量分的合成权重（口径单点：管理端与 run_metrics 落库共用这一份）。
+#: 页面总得有一个可排序的数，"哪个分值多少"必须明说（payload 里带回 weights），
+#: 不能让读者猜 —— 所以权重只在这里定义一次，`admin_analytics.plan_snapshot` 与
+#: `agent_runner._save_metrics` 都从本模块取，避免两处口径打架。
+QUALITY_WEIGHTS: dict[str, float] = {
+    "preference_coverage": 0.25,
+    "pace_match": 0.2,
+    "category_diversity": 0.15,
+    "backtracking_score": 0.15,
+    "daily_load_balance": 0.1,
+    "meal_time_quality": 0.1,
+    "route_efficiency": 0.05,
+}
+
+
+def quality_score(quality: Mapping[str, Any]) -> float:
+    """把 `plan_quality` 的软指标合成为一个可排序的分。
+
+    与 `plan_quality` 同层：输入只有指标字典，没有任何 LLM / 网络调用，可脱网单测。
+    除不尽的权重补零处理与历史 `admin_analytics._quality_score` 完全一致，
+    保证新旧口径（列值 vs 解析 plan_json）对同一份计划给出同一个数。
+    """
+
+    total = 0.0
+    weight_sum = 0.0
+    for key, weight in QUALITY_WEIGHTS.items():
+        value = quality.get(key)
+        if isinstance(value, (int, float)):
+            total += float(value) * weight
+            weight_sum += weight
+    return round(total / weight_sum, 4) if weight_sum else 0.0

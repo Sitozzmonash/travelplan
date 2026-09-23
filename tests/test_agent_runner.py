@@ -387,6 +387,10 @@ def test_submit_final_plan_is_the_plan_and_pipeline_persists(tmp_path):
     assert metrics["llm_calls"] == 3
     assert metrics["total_tokens"] == 3 * 40
     assert metrics["tool_calls"] == 1  # 只有 search_trains 真的打了 Provider
+    # Run 完成即存质量摘要：dashboard 有列值就直接读，不再逐个解 plan_json
+    assert metrics["quality_score"] is not None
+    assert isinstance(metrics["quality_score"], float)
+    assert 0.0 <= metrics["quality_score"] <= 1.0
     # audit 的 llm_calls 与 trace 上的模型调用同形可读
     # （run_metrics 只落固定列，prompt 版本在 trace 与 audit 里，不在这里）
     assert len(result.audit["llm_calls"]) == 3

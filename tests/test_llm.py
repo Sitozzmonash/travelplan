@@ -245,6 +245,41 @@ def test_invoke_json_passes_context_through() -> None:
     assert llm.audit_entries()[0]["context_preview"] == "CTX"
 
 
+def test_extract_places_batch_sends_evidence_body_as_context() -> None:
+    """extract_places 的攻略正文必须走 context（而非拼进 user）——Trace 的 Context 行靠它取值。
+
+    直接调 `discovery.extract_places_from_evidences`（生产里由 refresh_city_cache 触发）：
+    审计里 user_preview 只是定位需求的一句话，context_preview 才是真的攻略正文。
+    """
+    from app.discovery import extract_places_from_evidences
+    from app.models import Evidence
+
+    class _RecorderModel:
+        def __init__(self) -> None:
+            self.seen: list[list[object]] = []
+
+        def invoke(self, messages):
+            self.seen.append(messages)
+            return type("_Response", (), {"content": '{"results": [{"evidence_id": "e-1", "places": []}]}'})()
+
+    evidence = Evidence(
+        id="e-1", source_type="social", provider="tikhub",
+        title="成都三日游", text="宽窄巷子值得去" * 30,
+    )
+    model = _RecorderModel()
+    llm = LLM(model=model)
+    items, degradations = extract_places_from_evidences(llm, [evidence])
+
+    assert items == [] and degradations == []
+    entry = llm.audit_entries()[0]
+    assert entry["tag"].startswith("extract_places")
+    # user 是固定指令，正文进 context —— 这样 Context 预览不再恒为 null。
+    assert entry["context_preview"] is not None
+    assert "### 证据 id：e-1" in entry["context_preview"]
+    assert "宽窄巷子" in entry["context_preview"]
+    assert "宽窄巷子" not in (entry["user_preview"] or "")
+
+
 def test_audit_tokens_stay_empty_when_there_is_no_usage() -> None:
     """token 口径与 run_metrics 一致：没有数据就是 None，有数据就是 input+output。"""
     entry = LLM(model=_OkModel("好")).invoke("s", "u", tag="t").to_audit()

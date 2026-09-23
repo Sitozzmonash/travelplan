@@ -636,6 +636,7 @@ def invoke_json_in_batches(
     llm: LLM,
     *,
     system: str,
+    user: str,
     batches: Sequence[tuple[Sequence[str], str]],
     tag: str,
     max_workers: int = 1,
@@ -646,8 +647,12 @@ def invoke_json_in_batches(
     各写一遍，两处的批大小与并发上限迟早会漂移 —— 而这两个数字正是性能开关，只能有一处
     实现。并发上限由调用方从 config 传入；`LLM` 客户端自身还有一道闸门，两道都生效。
 
-    ``batches`` 是 ``(批内 id 列表, 该批的 user payload)``；返回值的顺序与传入顺序一致，
+    ``batches`` 是 ``(批内 id 列表, 该批注入的内容)``；返回值的顺序与传入顺序一致，
     因此"哪条结果属于哪个 id"不依赖线程完成顺序，同一份输入在任何调度下产出同一份结果。
+
+    ``user`` 是固定的一句话需求（每个 batch 相同）；每批的注入内容（抽取场景里就是
+    攻略正文）走 ``context=`` 传给模型 —— 与调用方自己拼进 user **语义等价**，只是
+    审计（Trace 的 Context 行）能把"用户需求"和"带进来的正文"分开。
     """
 
     ordered = list(batches)
@@ -655,10 +660,11 @@ def invoke_json_in_batches(
         return []
     workers = max(1, int(max_workers))
 
-    def run(index: int, ids: Sequence[str], payload: str) -> tuple[list[str], LLMResult]:
+    def run(index: int, ids: Sequence[str], content: str) -> tuple[list[str], LLMResult]:
         # tag 保留调用方前缀（``extract_places:b0``），这样按用途取预算、按前缀分派的
         # 假模型与真实审计口径都仍然只看前缀。
-        return [*ids], llm.invoke_json(system, payload, tag=f"{tag}:b{index}" if tag else "")
+        return [*ids], llm.invoke_json(system, user, tag=f"{tag}:b{index}" if tag else "",
+                                       context=content)
 
     if workers == 1 or len(ordered) == 1:
         return [run(index, ids, payload) for index, (ids, payload) in enumerate(ordered)]

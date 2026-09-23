@@ -254,6 +254,7 @@ CREATE TABLE IF NOT EXISTS run_metrics (
     provider_failures   INTEGER,
     badcase_count       INTEGER,
     cost                REAL,
+    quality_score       REAL,
     updated_at          TEXT NOT NULL
 );
 
@@ -781,6 +782,7 @@ class TravelPlanStore:
             conn.executescript(self._backend.schema_ddl(SCHEMA))
             self._migrate_run_source(conn)
             self._migrate_session_prefetch(conn)
+            self._migrate_run_metrics_quality(conn)
 
     def _migrate_canonical_layer(self, conn: Any) -> None:
         """给 canonical 实体层的表补齐后加的列。
@@ -831,6 +833,18 @@ class TravelPlanStore:
             conn.execute("ALTER TABLE planning_sessions ADD COLUMN prefetch_json TEXT")
         if columns and "discovery_json" not in columns:
             conn.execute("ALTER TABLE planning_sessions ADD COLUMN discovery_json TEXT")
+
+    def _migrate_run_metrics_quality(self, conn: Any) -> None:
+        """给 run_metrics 补 `quality_score`（老库没有这一列，`CREATE TABLE IF NOT EXISTS` 不会改老表）。
+
+        为什么需要：Dashboard 冷加载要对抽样 run 逐个解 plan_json 算质量分（Neon 上单次
+        1~2s），Run 完成时把质量分写进这一列之后，dashboard 有列值就直接读，不再解析计划。
+        老库没有这列时写入会 `UndefinedColumn`，所以必须显式 ALTER（幂等：有了就跳过）。
+        """
+
+        columns = self._backend.table_columns(conn, "run_metrics")
+        if columns and "quality_score" not in columns:
+            conn.execute("ALTER TABLE run_metrics ADD COLUMN quality_score REAL")
 
     # ------------------------------------------------------------------
     # run
@@ -994,14 +1008,15 @@ class TravelPlanStore:
         fields = (
             "duration_ms", "input_tokens", "output_tokens", "cached_tokens", "total_tokens",
             "llm_calls", "jev_calls", "tool_calls", "provider_failures", "badcase_count", "cost",
+            "quality_score",
         )
         values = [metrics.get(field) for field in fields]
         with self._connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO run_metrics"
                 " (run_id, duration_ms, input_tokens, output_tokens, cached_tokens, total_tokens,"
-                " llm_calls, jev_calls, tool_calls, provider_failures, badcase_count, cost, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " llm_calls, jev_calls, tool_calls, provider_failures, badcase_count, cost, quality_score, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (run_id, *values, utcnow().isoformat()),
             )
 
@@ -1041,7 +1056,7 @@ class TravelPlanStore:
                 f" COALESCE(r.original_query, '') AS original_query, {_STATUS_EXPR} AS status,"
                 " COALESCE(r.source, 'quick') AS source, r.source_session_id,"
                 " p.current_stage, p.message, p.started_at, p.updated_at, p.finished_at,"
-                " m.duration_ms, m.total_tokens, m.llm_calls, m.jev_calls, m.tool_calls, m.provider_failures, m.badcase_count, m.cost"
+                " m.duration_ms, m.total_tokens, m.llm_calls, m.jev_calls, m.tool_calls, m.provider_failures, m.badcase_count, m.cost, m.quality_score"
                 " FROM runs r LEFT JOIN run_progress p ON p.run_id=r.run_id"
                 " LEFT JOIN run_metrics m ON m.run_id=r.run_id"
                 + where

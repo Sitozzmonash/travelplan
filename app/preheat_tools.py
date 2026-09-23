@@ -33,7 +33,7 @@ POI 身份它一个字都改不了（不认识的 id 直接拒绝，并告诉它
         city_pois / city_poi_mentions / city_evidences / city_cache_meta（含提及匹配与 TTL 清理）
 
 所以预热写出来的行与"真实用户踩出来"的行同结构、同口径，`city_cache.read_candidates`
-的复用路径（`sessions._prefetch_with_city_cache`）不需要任何改动。
+的复用路径不需要任何改动。
 
 提交只在 Agent 循环正常结束后发生：超时 / 抛错时这座城市**原样不动**，不会留半座城的脏数据。
 """

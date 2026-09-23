@@ -461,6 +461,14 @@ def _dedupe_queries(queries: Sequence[str]) -> list[str]:
 # 地点
 # ======================================================================
 
+#: 地点抽取调用的固定 user 段。完整指令在系统提示（EXTRACT_PLACES_BATCH_PROMPT）里，
+#: 这里只给一句定位需求的话；每批的攻略正文走 ``context=`` 注入，Trace 的 Context 行
+#: 才能看见"注入的正文"（而不是被拼进 user 里混成一段）。
+_EXTRACT_PLACES_USER = (
+    "以下是要逐篇抽取地点的攻略正文（多篇，每篇以 `### 证据 id：<id>` 开头标记归属），"
+    "请按系统提示逐篇输出结构化 JSON。"
+)
+
 
 def extract_places_from_evidences(
     llm: LLM,
@@ -504,9 +512,12 @@ def extract_places_from_evidences(
         chunk = targets[start : start + batch_size]
         batches.append(([evidence.id for evidence in chunk], "\n\n".join(single_payload[e.id] for e in chunk)))
 
+    # user 只留一句定位需求的话，攻略正文走 context：语义等价（模型收到的还是同一段），
+    # 但审计的 Trace 能把"用户需求"与"注入的正文"分开（context_preview 不再是 null）。
     batch_results = invoke_json_in_batches(
         llm,
         system=EXTRACT_PLACES_BATCH_PROMPT,
+        user=_EXTRACT_PLACES_USER,
         batches=batches,
         tag="extract_places",
         max_workers=cfg.llm_max_concurrency,
@@ -533,6 +544,7 @@ def extract_places_from_evidences(
             *invoke_json_in_batches(
                 llm,
                 system=EXTRACT_PLACES_BATCH_PROMPT,
+                user=_EXTRACT_PLACES_USER,
                 batches=retry_batches,
                 tag="extract_places_retry",
                 max_workers=cfg.llm_max_concurrency,

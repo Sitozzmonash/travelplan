@@ -136,13 +136,13 @@ class TestBatchedExtractionRetry:
         def __init__(self) -> None:
             self.tags: list[str] = []
 
-        def invoke_json(self, system: str, user: str, *, tag: str = ""):
+        def invoke_json(self, system: str, user: str, *, tag: str = "", context: str | None = None):
             from app.llm import LLMResult
 
             self.tags.append(tag)
             ids = [
                 line.split("：", 1)[1].strip()
-                for line in user.splitlines()
+                for line in (context or user).splitlines()
                 if line.startswith("### 证据 id：") and line.split("：", 1)[1].strip()
             ]
             if len(ids) > 1:
@@ -193,11 +193,11 @@ class TestBatchedExtractionRetry:
             def __init__(self) -> None:
                 self.tags: list[str] = []
 
-            def invoke_json(self, system: str, user: str, *, tag: str = ""):
+            def invoke_json(self, system: str, user: str, *, tag: str = "", context: str | None = None):
                 self.tags.append(tag)
                 ids = [
                     line.split("：", 1)[1].strip()
-                    for line in user.splitlines()
+                    for line in (context or user).splitlines()
                     if line.startswith("### 证据 id：") and line.split("：", 1)[1].strip()
                 ]
                 return LLMResult(

@@ -8,10 +8,10 @@ from threading import Barrier, Event
 
 import pytest
 
-from app import city_cache, discovery, recommendations, sessions
-from app.models import Place, TripIntent, utcnow
+from app import discovery, recommendations, sessions
+from app.models import Place, utcnow
 from app.store import TravelPlanStore
-from tests.fakes import FakeHub, FakeLLM, make_store
+from tests.fakes import FakeLLM, make_store
 
 
 @pytest.fixture()
@@ -251,54 +251,6 @@ def test_expiry_event_only_belongs_to_the_expired_session(store):
     assert all(event["event"] != "session_expired" for event in live["events"])
 
 
-@pytest.mark.parametrize("stale", [False, True])
-def test_cache_is_published_before_parallel_live_queries_and_keeps_aggregates(store, monkeypatch, stale):
-    session_id = create(store)["session_id"]
-    hit = city_cache.CityCacheHit(city="成都", places=[place()], mentions=[], updated_at=utcnow().isoformat(), stale=stale)
-    published = Event()
-    transport_entered, hotels_entered, release = Event(), Event(), Event()
-    snapshots = []
-    def transport(*args):
-        assert published.is_set(), "静态缓存必须先发布"
-        transport_entered.set()
-        assert release.wait(5)
-        return discovery.TransportCandidates()
-    def hotels(*args, **kwargs):
-        assert published.is_set()
-        hotels_entered.set()
-        assert release.wait(5)
-        return discovery.HotelCandidates()
-    def partial(snapshot):
-        snapshots.append(deepcopy(snapshot))
-        published.set()
-    monkeypatch.setattr(discovery, "fetch_transport_candidates", transport)
-    monkeypatch.setattr(discovery, "fetch_hotel_candidates", hotels)
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(sessions._prefetch_with_city_cache, session_id, TripIntent(destination=["成都"]),
-                             FakeHub(store=None, run_id=session_id), 1, hit, on_partial=partial)
-        try:
-            assert transport_entered.wait(5)
-            assert hotels_entered.wait(5), "酒店不能等待交通结束"
-            first = snapshots[0]
-            assert first["places"].places
-            assert first["profile"]["source"] == "fallback"
-            assert first["hotel_areas"]
-            assert "p1" in first["poi_pools"]["attraction"]
-            assert first["stages"]["transport"]["status"] == "RUNNING"
-            initial_bundle = sessions._bundle_from(session_id, TripIntent(destination=["成都"]), first, None)
-            assert initial_bundle.city_cache["updated_at"] == hit.updated_at
-            assert initial_bundle.city_cache["stale"] == stale
-        finally:
-            release.set()
-        final, bundle = future.result(timeout=10)
-    assert len(snapshots) == 3
-    for key in ("profile", "hotel_areas", "poi_pools"):
-        assert getattr(bundle, key) == final[key]
-    for key in ("transport", "hotels"):
-        assert final["stages"][key]["duration_ms"] is not None
-        assert final["stages"][key]["started_at"] and final["stages"][key]["finished_at"]
-
-
 def test_start_is_rejected_until_recommendation_is_published(store, monkeypatch):
     """推荐进行中只发布阶段元数据；START 必须等到推荐真正就绪，且不能顺手查机酒。"""
 
@@ -394,14 +346,3 @@ def test_session_transaction_uses_postgres_adapter_and_commits_or_rolls_back(sto
         assert released == [driver]
     finally:
         raw.close()
-
-
-def test_cache_live_failure_preserves_candidates_and_other_stage(store, monkeypatch):
-    hit = city_cache.CityCacheHit(city="成都", places=[place()], mentions=[], updated_at=utcnow().isoformat())
-    monkeypatch.setattr(discovery, "fetch_transport_candidates", lambda *a: (_ for _ in ()).throw(ValueError("transport fail")))
-    monkeypatch.setattr(discovery, "fetch_hotel_candidates", lambda *a, **kw: discovery.HotelCandidates())
-    final, bundle = sessions._prefetch_with_city_cache("ps-test", TripIntent(destination=["成都"]), None, 1, hit)
-    assert bundle.places and bundle.profile
-    assert final["stages"]["transport"]["status"] == "FAILED"
-    assert final["stages"]["hotels"]["status"] == "EMPTY"
-    assert any("transport fail" in message for message in bundle.degradations)

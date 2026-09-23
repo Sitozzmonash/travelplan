@@ -1518,7 +1518,7 @@ def execute_agent_run(
         degradations=degradations,
     )
     metrics["agent"]["plan_origin"] = origin
-    _save_metrics(resolved_store, resolved_run_id, metrics)
+    _save_metrics(resolved_store, resolved_run_id, metrics, plan=plan)
     if degradations:
         # 保留 runs.status="completed" 兼容旧 API，只把管理端状态提升为 DEGRADED。
         try:
@@ -1609,7 +1609,19 @@ def _record_prompt_version(store: Any, run_id: str, *, tools: list[Any]) -> None
         logger.debug("prompt 版本未写入 trace", exc_info=True)
 
 
-def _save_metrics(store: Any, run_id: str, metrics: dict[str, Any]) -> None:
+def _save_metrics(store: Any, run_id: str, metrics: dict[str, Any], plan: Any | None = None) -> None:
+    """run 级指标落库；有 plan 时把质量摘要一并写进去（dashboard 有列值就直接读，不再解 plan_json）。
+
+    质量分只在 Run 完成、拿到 plan 时算：算不出来（失败 run / 解析异常）就留 null，
+    绝不写 0 冒充 —— 0 会被读成"质量真的为零"，那是另一个意思。
+    """
+
+    if plan is not None:
+        try:
+            quality = planner.plan_quality(plan.days, plan.intent).to_dict()
+            metrics["quality_score"] = planner.quality_score(quality)
+        except Exception:  # noqa: BLE001 —— 质量分算不出来不能改变 run 的结论
+            metrics["quality_score"] = None
     try:
         store.save_run_metrics(run_id, metrics)
     except Exception:

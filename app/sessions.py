@@ -19,7 +19,6 @@ from __future__ import annotations
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Sequence
 
 from app import city_cache, discovery
@@ -369,103 +368,15 @@ def run_discovery(
     store.update_planning_session(session_id, publish_finished)
 
 
-def _prefetch_with_city_cache(
-    session_id: str,
-    intent: TripIntent,
-    hub: Any,
-    hotel_pages: int,
-    cached: city_cache.CityCacheHit,
-    *,
-    on_partial: Callable[[dict[str, Any]], None] | None = None,
-) -> tuple[dict[str, Any], discovery.PrefetchBundle]:
-    """先发布静态缓存，再并发补实时机酒；缓存命中不新增模型调用。"""
-
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from app.models import PreferenceProfile
-
-    profile = PreferenceProfile.default_profile()
-    profile.reason = "城市缓存路径采用均衡基线；正式规划按用户最终偏好生成画像"
-    social = SimpleNamespace(
-        evidences=list(cached.evidences), queries=list(cached.social_queries),
-        served_queries=list(cached.social_served_queries), degradations=[],
-    )
-    places = SimpleNamespace(places=cached.places, degradations=[])
-    stages = {
-        name: {"status": "RUNNING", "result_count": 0, "duration_ms": None,
-               "degraded": False, "error": None}
-        for name in ("transport", "hotels")
-    }
-    for name, count in (("social", len(cached.evidences)), ("places", len(cached.places))):
-        stages[name] = {
-            "status": "STALE_CACHE" if cached.stale else "CACHE",
-            "result_count": count, "duration_ms": 0, "degraded": cached.stale,
-            "error": None, "updated_at": cached.updated_at,
-        }
-    stages["social"]["mention_count"] = len(cached.mentions)
-    result: dict[str, Any] = {
-        "transport": None, "hotels": None, "social": social, "places": places,
-        "errors": {}, "stages": stages, "ledger": {"city_cache_hits": 1},
-        **discovery.aggregate_candidate_metadata(intent, cached.evidences, cached.places, profile=profile),
-        "city_cache": {
-            "source": "city_cache", "updated_at": cached.updated_at, "stale": cached.stale,
-            "evidences": len(cached.evidences), "mentions": len(cached.mentions),
-            "social_queries": len(cached.social_queries),
-        },
-        "degradations": ["城市攻略缓存已过期；当前先展示最近可用结果"] if cached.stale else [],
-    }
-    def publish() -> None:
-        if on_partial is not None:
-            try:
-                on_partial({**result, "errors": dict(result["errors"]),
-                            "stages": {key: dict(value) for key, value in stages.items()}})
-            except Exception:  # noqa: BLE001
-                pass
-
-    publish()  # 必须在发起任何实时查询之前，让静态候选立刻可读。
-
-    def fetch(name: str) -> tuple[Any, dict[str, Any]]:
-        started = time.perf_counter()
-        began = _now().isoformat()
-        error = None
-        try:
-            value = (
-                discovery.fetch_transport_candidates(hub, intent) if name == "transport"
-                else discovery.fetch_hotel_candidates(hub, intent, pages=max(1, hotel_pages))
-            )
-        except Exception as exc:  # noqa: BLE001
-            error = f"{type(exc).__name__}: {exc}"
-            value = discovery.TransportCandidates() if name == "transport" else discovery.HotelCandidates()
-            value.degradations.append(error)
-        info = _cached_stage(value, "all_options" if name == "transport" else "items", error,
-                             round((time.perf_counter() - started) * 1000))
-        info.update(started_at=began, finished_at=_now().isoformat())
-        return value, info
-
-    # 只有协调线程写 result/发布，杜绝分支回调乱序覆盖已完成的候选。
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="tp-cache-live") as pool:
-        futures = {pool.submit(fetch, name): name for name in ("transport", "hotels")}
-        for future in as_completed(futures):
-            name = futures[future]
-            value, info = future.result()
-            result[name] = value
-            stages[name] = info
-            if info["error"]:
-                result["errors"][name] = info["error"]
-            publish()
-    return result, _bundle_from(session_id, intent, result, hub)
-
-
-def _cached_stage(value: Any, count_attr: str, error: str | None, elapsed: int) -> dict[str, Any]:
-    candidates = getattr(value, count_attr, []) or []
-    return {
-        "status": "FAILED" if error else ("OK" if candidates else "EMPTY"),
-        "result_count": len(candidates), "duration_ms": elapsed, "degraded": bool(getattr(value, "degradations", [])),
-        "error": error,
-    }
-
-
 def refresh_city_cache(store: TravelPlanStore, city: str) -> dict[str, Any]:
-    """只刷新可复用的城市攻略/POI；没有出发地和日期时机酒函数会自然跳过。
+    """只刷新可复用的城市攻略/POI（轻量路径，**不查实时机酒**）。
+
+    预热（`scripts/rebuild_city_cache.py`）与管理员异步刷新（`app/api.py`）的唯一入口。
+    旧实现走完整 `discovery.prefetch`，会把交通、酒店、画像这些对缓存毫无用处的线一起
+    跑起来白烧 Provider 额度；现在只做两件事：攻略证据（小红书 → 抖音 → 网页）与
+    地点抽取/POI 核验，再把可复用的 POI、攻略正文与检索词写进城市缓存。
+    不查 `discovery.fetch_transport_candidates` / `fetch_hotel_candidates`，
+    也不生成画像 —— 这两者都只服务"本次正式排程"，城市缓存用不到。
 
     返回一份摘要，供调用方（预热的 `scripts/preheat_cities.py`）如实报告。预热是把结果
     写进**所有人共用**的库，所以"这次其实是降级的"必须能被看见 —— 典型情形是社媒全部
@@ -479,26 +390,29 @@ def refresh_city_cache(store: TravelPlanStore, city: str) -> dict[str, Any]:
             "city": city, "places": 0, "evidences": 0, "social_evidences": 0,
             "queries": 0, "notes": [], "degradations": ["城市名为空"],
         }
+    from app.discovery import discover_social_evidence, extract_place_candidates
     from app.llm import LLM
+    from app.observability import CallLedger
     from app.providers import ProviderHub, default_mcp_servers
 
     hub = ProviderHub(run_id=f"city-cache:{normalized}", store=None, mcp_servers=default_mcp_servers())
     try:
         intent = TripIntent(destination=[normalized], days=1, source="city_cache_refresh")
-        config = current_config()
-        result = discovery.prefetch(
-            hub, LLM.from_env(), intent,
-            hotel_pages=1, workers=max(1, config.discovery_workers),
-            store=store,
+        llm = LLM.from_env()
+        # 攻略证据与地点抽取共用同一本账，保证同一座城市里重复关键词只打一次高德。
+        ledger = CallLedger(scope="city_cache_refresh")
+        social = discover_social_evidence(hub, llm, intent, ledger=ledger)
+        candidates = extract_place_candidates(
+            hub, llm, intent, social.evidences,
+            queries=social.queries, ledger=ledger, store=store,
         )
-        bundle = _bundle_from(f"city-cache:{normalized}", intent, result, hub)
         written = city_cache.write_candidates(
             normalized,
-            bundle.places,
-            bundle.evidences,
+            candidates.places,
+            social.evidences,
             store=store,
-            social_queries=bundle.social_queries,
-            social_served_queries=bundle.social_served_queries,
+            social_queries=social.queries,
+            social_served_queries=social.served_queries,
         )
     finally:
         try:
@@ -506,18 +420,17 @@ def refresh_city_cache(store: TravelPlanStore, city: str) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             pass
 
-    social = result.get("social")
-    evidences = list(getattr(social, "evidences", []) or [])
+    evidences = list(social.evidences or [])
     return {
         "city": normalized,
         "places": written,
         "evidences": len(evidences),
         "social_evidences": sum(1 for item in evidences if is_social_evidence(item)),
-        "queries": len(list(getattr(social, "queries", []) or [])),
+        "queries": len(list(social.queries or [])),
         # `notes` 里记着"小红书「X」：调用失败（已按无结果处理）"这类事实。它们不进
         # `degradations`，但正是解释"为什么一条社媒证据都没有"的关键，所以要带出来。
         "notes": list(getattr(social, "notes", []) or [])[:5],
-        "degradations": list(bundle.degradations),
+        "degradations": [*social.degradations, *candidates.degradations],
     }
 
 
@@ -579,50 +492,6 @@ def _evidence_summary_of(bundle: discovery.PrefetchBundle) -> dict[str, Any]:
         "hotel_candidates": len(bundle.hotels),
         "evidence_count": len(bundle.evidences),
     }
-
-
-def _bundle_from(session_id: str, intent: TripIntent, result: Mapping[str, Any], hub: Any) -> discovery.PrefetchBundle:
-    transport = result.get("transport")
-    hotels = result.get("hotels")
-    social = result.get("social")
-    places = result.get("places")
-    degradations: list[str] = list(result.get("degradations") or [])
-    for part in (transport, hotels, social, places):
-        degradations.extend(getattr(part, "degradations", []) or [])
-    return discovery.PrefetchBundle(
-        discovery=dict(result.get("stages") or {}),
-        session_id=session_id,
-        basic_intent={
-            "origin": intent.origin,
-            "destination": (intent.destination or [None])[0],
-            "start_date": intent.start_date.isoformat() if intent.start_date else None,
-            "end_date": intent.end_date.isoformat() if intent.end_date else None,
-            "days": intent.days,
-            "travelers": intent.travelers,
-            "budget_total": intent.budget_total,
-        },
-        outbound=list(getattr(transport, "outbound", []) or []),
-        inbound=list(getattr(transport, "inbound", []) or []),
-        hotels=list(getattr(hotels, "items", []) or []),
-        evidences=list(getattr(social, "evidences", []) or []),
-        places=list(getattr(places, "places", []) or []),
-        # 把 Discovery 计划要搜的检索词与真正搜过的检索词一并过户给正式 run：
-        # 少了前者，run 会为了重新算出同样的 queries 再付一次 query_expansion 模型调用；
-        # 少了后者，run 无法只补差集（全量重搜/全量复用都不对）。
-        social_queries=list(getattr(social, "queries", []) or []),
-        social_served_queries=list(getattr(social, "served_queries", []) or []),
-        provider_calls=list(hub.audit_entries()) if hub is not None else [],
-        degradations=degradations,
-        # Discovery 的复用/降级计数（Part C）：正式 run 的 perf 摘要要用它回答
-        # "Prefetch 到底省了多少次重复查询"。
-        ledger=dict(result.get("ledger") or {}),
-        # B 的聚合产物必须随 prefetch_json 一起落盘；不能因 A 的会话搬运而丢失。
-        hotel_areas=list(result.get("hotel_areas") or []),
-        poi_pools=dict(result.get("poi_pools") or {}),
-        profile=dict(result.get("profile") or {}),
-        city_cache=dict(result.get("city_cache") or {}),
-        discovery_status=DISCOVERY_READY,
-    )
 
 
 # ======================================================================

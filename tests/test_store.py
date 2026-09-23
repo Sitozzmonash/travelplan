@@ -146,6 +146,66 @@ class TestSchema:
             store.save_evidence("run1", _evidence(source_id="不存在的来源"))
 
 
+class TestRunMetricsQuality:
+    """A15：run_metrics.quality_score 的迁移与读写（老库 ALTER 补列，新库建表即有）。"""
+
+    def test_save_and_read_quality_score_roundtrip(self, store):
+        store.create_run("run1")
+        store.finish_run("run1", "completed")
+
+        store.save_run_metrics("run1", {"duration_ms": 1200, "quality_score": 0.8234})
+
+        metrics = store.get_run_metrics("run1")
+        assert metrics["quality_score"] == 0.8234
+
+    def test_missing_quality_score_stays_null(self, store):
+        store.create_run("run1")
+        store.finish_run("run1", "completed")
+
+        store.save_run_metrics("run1", {"duration_ms": 1200})
+
+        metrics = store.get_run_metrics("run1")
+        assert metrics["quality_score"] is None
+
+    def test_old_database_is_altered_in_place(self, tmp_path):
+        """老库（没有 quality_score 列）构造后，init_schema 必须 ALTER 补列，不能报 UndefinedColumn。"""
+        import sqlite3
+
+        path = tmp_path / "legacy.db"
+        with sqlite3.connect(path) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE runs (run_id TEXT PRIMARY KEY);
+                CREATE TABLE run_metrics (
+                    run_id TEXT PRIMARY KEY,
+                    duration_ms INTEGER,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cached_tokens INTEGER,
+                    total_tokens INTEGER,
+                    llm_calls INTEGER,
+                    jev_calls INTEGER,
+                    tool_calls INTEGER,
+                    provider_failures INTEGER,
+                    badcase_count INTEGER,
+                    cost REAL,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute("INSERT INTO runs (run_id) VALUES ('legacy-1')")
+            conn.execute(
+                "INSERT INTO run_metrics (run_id, duration_ms, updated_at) VALUES ('legacy-1', 900, '2026-09-20T10:00:00+00:00')"
+            )
+
+        store = TravelPlanStore(path)  # 构造即 init_schema → 触发 _migrate_run_metrics_quality
+        metrics = store.get_run_metrics("legacy-1")
+
+        assert metrics["quality_score"] is None  # 老 run 没有列值：如实回 null
+        store.save_run_metrics("legacy-1", {"duration_ms": 900, "quality_score": 0.5})
+        assert store.get_run_metrics("legacy-1")["quality_score"] == 0.5
+
+
 class TestRunLifecycle:
     def test_create_and_get_run(self, store):
         store.create_run("run1", user_id="u1", original_query="成都三日")

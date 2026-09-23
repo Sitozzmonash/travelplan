@@ -43,7 +43,7 @@ def _bundle(result: dict[str, Any], hub: FakeHub, *, stages=("transport", "hotel
         hotels=list(result["hotels"].items) if "hotels" in stages else [],
         evidences=list(result["social"].evidences) if "social" in stages else [],
         places=places,
-        # 与生产侧 sessions._bundle_from 保持一致：计划 query 与真正搜过的 query 都要过户
+        # 与生产侧 PrefetchBundle 的过户口径保持一致：计划 query 与真正搜过的 query 都要过户
         social_queries=list(result["social"].queries) if "social" in stages else [],
         social_served_queries=list(result["social"].served_queries) if "social" in stages else [],
         provider_calls=hub.audit_entries(),

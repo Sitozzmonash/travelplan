@@ -368,6 +368,80 @@ class TestDashboardCache:
         assert counts["list_runs"] > calls_after_first
 
 
+class TestDashboardQualityScore:
+    """A15：质量分优先读 run_metrics 列值，缺列值的旧 run 才退回解析 plan_json。"""
+
+    @pytest.fixture(autouse=True)
+    def fresh_caches(self, monkeypatch):
+        """每个用例一份全新的缓存：避免用例之间共享 dashboard / plan 缓存状态。"""
+        from app import admin_analytics
+
+        monkeypatch.setattr(admin_analytics, "_DASHBOARDS", admin_analytics._DashboardCache(ttl_seconds=45.0))
+        monkeypatch.setattr(admin_analytics, "_PLANS", admin_analytics._PlanCache())
+
+    def test_column_value_is_used_and_plan_is_not_parsed(self, tmp_path, monkeypatch):
+        """有列值时不解析 plan_json：plan_snapshot 一旦被调用就立刻失败，dashboard 仍正常出数。"""
+        from app import admin_analytics
+
+        store = make_store(tmp_path / "qs.db")
+        for index, score in enumerate((0.6, 0.8, 0.9)):
+            run_id = f"tp-qs-{index}"
+            store.create_run(run_id, original_query="北京→成都")
+            store.finish_run(run_id, "completed")
+            store.save_run_metrics(run_id, {"duration_ms": 1000 + index, "quality_score": score})
+
+        def _no_plan_parse(*args, **kwargs):
+            raise AssertionError("有列值不该解析 plan_json")
+
+        monkeypatch.setattr(admin_analytics, "plan_snapshot", _no_plan_parse)
+
+        body = admin_analytics.dashboard(store, window=admin_analytics._window("24h"), quality_sample=10)
+        kpi = next(item for item in body["kpis"] if item["key"] == "quality_score")
+        # 三个 run 的列值 (0.6+0.8+0.9)/3
+        assert kpi["value"] == round((0.6 + 0.8 + 0.9) / 3, 4)
+        assert body["quality"]["sampled_runs"] == 3
+        assert "抽样 3 个运行" in kpi["hint"]
+
+    def test_old_run_without_column_falls_back_to_plan_parse(self, tmp_path, monkeypatch):
+        """缺列值的旧 run 仍退回解析 plan_json：plan_snapshot 真的被调用，且用解析结果出数。"""
+        from app import admin_analytics
+        from app.models import BudgetSummary, TripIntent, TripPlan
+
+        store = make_store(tmp_path / "qs-fallback.db")
+        run_id = "tp-qs-old"
+        store.create_run(run_id, original_query="北京→成都")
+        store.finish_run(run_id, "completed")
+        store.save_run_metrics(run_id, {"duration_ms": 1000})  # 不写 quality_score → 列值为 NULL
+        # 落一份真实 plan：退回路径要靠它解析出质量分
+        plan = TripPlan(
+            run_id=run_id,
+            query="成都两天",
+            intent=TripIntent(destination=["成都"], days=2, travelers=2),
+            days=[],
+            budget=BudgetSummary(),
+        )
+        store.save_plan(plan)
+
+        calls: dict[str, int] = {"plan_snapshot": 0}
+        real_snapshot = admin_analytics.plan_snapshot
+
+        def _counting_snapshot(store_, run_id_):
+            calls["plan_snapshot"] += 1
+            return real_snapshot(store_, run_id_)
+
+        monkeypatch.setattr(admin_analytics, "plan_snapshot", _counting_snapshot)
+
+        body = admin_analytics.dashboard(store, window=admin_analytics._window("24h"), quality_sample=10)
+        kpi = next(item for item in body["kpis"] if item["key"] == "quality_score")
+        assert calls["plan_snapshot"] == 1
+        # 分数来自退回解析的 plan，而不是列值（该 run 无列值）
+        expected = admin_analytics.planner.quality_score(
+            admin_analytics.planner.plan_quality(plan.days, plan.intent).to_dict()
+        )
+        assert kpi["value"] == expected
+        assert body["quality"]["sampled_runs"] == 1
+
+
 class TestBadcases:
     def test_list_has_items_facets_and_total(self, client, world):
         body = client.get("/api/v1/admin/badcases", headers=AUTH).json()
