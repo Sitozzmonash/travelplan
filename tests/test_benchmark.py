@@ -283,6 +283,10 @@ def _hostile_case(**overrides: Any) -> dict[str, Any]:
 
     1. 把用户 REJECT 的 B0FF2 排进行程；
     2. 给一个假世界里从来没有过的价格（9999）；
+       注意这里用 `price_type="estimated"`：`submit_final_plan` 会清掉**realtime**
+       且无逐项 source_id 的价格（E18，`_remove_unattributed_realtime_prices`），
+       那样判卷器根本看不到编造的价格。估算价不清洗，正好继续验证
+       `grounded_numbers` 判卷器对"编造数字"的红线。
     3. 带着一条**未解决**的 error 级时间问题交卷（行程里没有它的说明）。
 
     为什么第 3 条用"自己报的 error warning"而不是构造一个排不下的时间：`_apply_time_pass`
@@ -302,7 +306,7 @@ def _hostile_case(**overrides: Any) -> dict[str, Any]:
             "start_time": "14:30",
             "end_time": "16:00",
             "price": 9999,  # 假世界里从来没有这个价格
-            "price_type": "realtime",
+            "price_type": "estimated",  # 不用 realtime：E18 会清掉无来源的实时价，judge 就看不到了
             "reason": "编的",
         }
     ]
@@ -314,7 +318,7 @@ def _hostile_case(**overrides: Any) -> dict[str, Any]:
             "start_time": "10:00",
             "end_time": "12:00",
             "price": 0,
-            "price_type": "realtime",
+            "price_type": "estimated",  # 与上一项一致避开 E18 的实时价清洗，免费项本身不参与 grounding
             "reason": "正常排法",
         }
     ]
@@ -375,7 +379,11 @@ def test_judge_fails_a_hostile_plan(tmp_path: Path):
 
 
 def test_judge_flags_numbers_that_were_never_returned(tmp_path: Path):
-    """只改一处：把一个真实价格换成编造的价格 —— 判分必须立刻变红。"""
+    """只改一处：把一个真实价格换成编造的价格 —— 判分必须立刻变红。
+
+    同样用 `estimated` 而非 `realtime`：E18 会清掉无来源的实时价（judge 看不到），
+    估算价不清洗，编造值原样进 plan，`grounded_numbers` 才能抓到它。
+    """
 
     from benchmark.fixtures.world import minimal_plan
     from benchmark.runner import run_case
@@ -384,6 +392,7 @@ def test_judge_flags_numbers_that_were_never_returned(tmp_path: Path):
     store.init_schema()
     plan = minimal_plan(days=1)
     plan["days"][0]["items"][0]["price"] = 8888
+    plan["days"][0]["items"][0]["price_type"] = "estimated"
     poisoned = plan["days"][0]["items"][0]["price"]
     assert poisoned == 8888
     case = _hostile_case(submit=plan, intent={}, expect={"expect_status": "completed",
