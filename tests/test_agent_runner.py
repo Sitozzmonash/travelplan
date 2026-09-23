@@ -244,6 +244,7 @@ def _submit_args(*, days: int = 3, reject: bool = False) -> dict[str, Any]:
             "end_time": "11:00",
             "price": 0,
             "price_type": "realtime",
+            "source_ids": ["src-0"],
             "reason": "高德核实的真实地点",
         }
     ]
@@ -469,6 +470,7 @@ def test_budget_breakdown_is_rebuilt_with_chinese_keys(tmp_path):
             "end_time": "11:00",
             "price": 50,
             "price_type": "realtime",
+            "source_ids": ["src-0"],
             "reason": "高德核实的真实地点",
         }
     ]
@@ -493,6 +495,24 @@ def test_budget_breakdown_is_rebuilt_with_chinese_keys(tmp_path):
     assert result.plan.budget.breakdown_price_type["门票"] == "realtime"
     assert result.plan.budget.breakdown_price_type["餐饮估算"] == "estimated"
 
+
+def test_unattributed_realtime_price_is_removed_before_plan_and_budget(tmp_path):
+    """没有逐项来源的数字不能被 Agent 伪装成实时价格。"""
+
+    store, hub, output_dir = _make_env(tmp_path)
+    payload = _submit_args(days=1)
+    item = payload["days"][0]["items"][0]
+    item.update({"price": 11, "price_type": "realtime", "source_ids": []})
+    model = ScriptedPlannerModel(script=[{"tool": SUBMIT_TOOL_NAME, "args": payload}])
+
+    result = _run(store, hub, output_dir, model)
+
+    assert result.status == "completed", result.error
+    assert result.plan is not None
+    actual = result.plan.days[0].items[0]
+    assert actual.price is None
+    assert actual.price_type == "unknown"
+    assert "可追溯的工具来源" in actual.risk_note
 
 def test_budget_breakdown_is_rebuilt_when_agent_left_it_empty(tmp_path):
     """Agent 没填 budget.breakdown（甚至只给了预算额）时，预算卡也必须有中文分类行。"""

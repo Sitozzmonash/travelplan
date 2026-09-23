@@ -286,7 +286,12 @@ class PlanItemArgs(BaseModel):
     price_type: PriceType = Field(default="unknown", description="realtime=工具给的实时价 / estimated=估算 / unknown=未知")
     reason: str = Field(default="", description="为什么把它排在这里")
     risk_note: str = Field(default="", description="风险提示（证据薄弱、营销嫌疑、营业时间未知…）")
+
     evidence_ids: list[str] = Field(default_factory=list, description="支撑这一项的攻略/网页证据 id")
+    source_ids: list[str] = Field(
+        default_factory=list,
+        description="这项价格/时刻对应的真实工具来源 id；price_type=realtime 时必须填写",
+    )
     transport_mode: str | None = Field(default=None, description="type=transport 时的方式：flight/train/transit")
     lat: float | None = Field(default=None, description="纬度（GCJ-02）")
     lng: float | None = Field(default=None, description="经度（GCJ-02）")
@@ -406,7 +411,9 @@ def _to_item(args: PlanItemArgs, *, fallback_id: str) -> ItineraryItem:
         price_type=args.price_type,
         reason=coerce_str(args.reason),
         risk_note=coerce_str(args.risk_note),
+
         evidence_ids=[coerce_str(x) for x in args.evidence_ids if coerce_str(x)],
+        source_ids=[coerce_str(x) for x in args.source_ids if coerce_str(x)],
         transport_mode=coerce_str(args.transport_mode) or None,
     )
 
@@ -569,6 +576,27 @@ def _rebuild_budget(plan: TripPlan, budget: BudgetSummary, intent: TripIntent) -
     return _fill_budget(merged, intent)
 
 
+def _remove_unattributed_realtime_prices(plan: TripPlan) -> None:
+    """不让 Agent 未引用来源的数字以“实时价”进入用户行程或预算。
+
+    ``submit_final_plan`` 的来源清单是 Agent 对本次工具事实的显式交代；某一 item
+    报价没有逐项 source_id，或指向了清单外的 id，就无法审计。此时保留数值并改叫
+    “估算”仍会把未经证实的金额展示给用户，因此直接清空，按 unknown 处理。
+    """
+
+    known_source_ids = {source.source_id for source in plan.sources if source.source_id}
+    for day in plan.days:
+        for item in day.items:
+            if item.price is None or item.price_type != "realtime":
+                continue
+            item.source_ids = [source_id for source_id in item.source_ids if source_id in known_source_ids]
+            if item.source_ids:
+                continue
+            item.price = None
+            item.price_type = "unknown"
+            note = "金额未保留可追溯的工具来源，已清除并按价格未知处理。"
+            item.risk_note = f"{item.risk_note}；{note}" if item.risk_note else note
+
 def _to_trip_plan(
     submitted: SubmittedPlan, *, run_id: str, query: str, reference_intent: TripIntent | None
 ) -> TripPlan:
@@ -621,6 +649,7 @@ def _to_trip_plan(
         ],
         decisions=list(submitted.decisions),
     )
+    _remove_unattributed_realtime_prices(plan)
     # 预算的 breakdown 系列字段用最终 plan 重算（中文分类 key + 真实/估算拆分），
     # 总额/结余/状态仍由 _fill_budget 合并 —— 见 _rebuild_budget 的 docstring。
     plan.budget = _rebuild_budget(plan, submitted.budget, intent)
