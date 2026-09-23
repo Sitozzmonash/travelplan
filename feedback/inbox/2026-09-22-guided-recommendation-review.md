@@ -101,3 +101,42 @@
 - `sessions._prefetch_with_city_cache`、`_bundle_from` 已不在引导页路径上（只有测试与管理员预热在用），属于需要后续清理的死代码，留在仓库里容易被误接回第二页。
 - 管理员预热 `sessions.refresh_city_cache` 仍走完整 `discovery.prefetch`（含交通/酒店查询）来生成城市缓存。它不在用户第二页的链路上，但会白烧 Provider 额度，建议单独排期改为只查攻略与 POI。
 - 缓存表新增了兼容列 `city_pois.metadata_json`、`city_poi_mentions.evidence_key`，迁移是幂等 `ALTER TABLE ADD COLUMN`，不重建主键、不改写历史行，SQLite 已实测、Postgres 仅做离线方言校验，**未在生产执行**。
+
+## 加多第二页推荐量（2026-09-23 用户拍板，待实施）
+
+背景（已查证）：第二页只显示推荐卡片（成都实测 2 个），瓶颈三层——每城候选池 `city_pois` 恰好 20（`USER_VISIBLE_POI_LIMIT=20`，可调 4~60）、模型只交 2 个（`_MAX_CARDS=10/类×5类` 没被用满）、前端 `discoveryPlaces` 按 `recommendation.place_ids` 过滤只显示推荐集合。数据不是问题：成都 canonical_places 有 101 个。
+
+用户拍板方案：
+- [x] **1. `USER_VISIBLE_POI_LIMIT` = 40**：管理端运行时可改（EDITABLE_KEYS 4~60），**需重新预热受影响城市**让 `city_pois` 从 20 → 40（预热是联网任务，走 `scripts/preheat_cities.py` 或 GitHub Actions，注意配额/耗时）。（2026-09-23 已实施：`app/config.py` 默认改 40；**重新预热尚未做**）
+- [x] **2. 模型每类多交 10 个**：改 `app/recommendations.py` 的 `_SYSTEM` prompt，明确要求每类至少给足（顶满现有 `_MAX_CARDS=10`），不再只给顶流 2-3 个。（2026-09-23 已实施：prompt 加"每类尽量给足 + 数量多不是目的"两句）
+
+实施注意（风险/连带）：
+- 每类 10 个 → 校验失败面变大（每个卡片必须真实证据引用 + 类别匹配 + 不闭业/非子设施/非停车场），`benchmark/` 里断言推荐数量/类别的用例（`expect_*`）要同步改，别让评测假失败。
+- 推荐变多后第二页 UI 变长、用户点选负担变大 —— 用户已知情接受（从"精选"变"清单"）。
+- 前端「候选池展示区」（此前建议的 C 方案）用户未选，不实施，保持只显示推荐集合。
+
+## 酒店候选过少 / 结果页「其他候选」为空（2026-09-23 查证，待改）
+
+现象：计划结果页酒店区只有 1 个选中酒店，「其他候选(0)」。
+
+根因（两层，已实测）：
+1. **交卷契约没有备选字段**（agent 化的回归）：`app/agent_runner.py::PlanHotelArgs` 只有单个
+   `selected` 酒店，**没有 alternatives**；`_to_trip_plan` 只填 `HotelPlan(selected=...)`。
+   前端 `frontend/components/hotel-compare.tsx:44/:84` 的「其他候选(N)」读的正是
+   `plan.hotel.alternatives` → 永远 0。对比：transport 有 `transport_alternatives`
+   （`_to_trip_plan` 会 `[:4]` 填），酒店当初就是漏了。旧 12 步流程的 `_select_hotel` 会产出
+   带 alternatives 的 `hotel_plan`。
+2. **数据源就少且不稳**：酒店只有途牛单源，实测每次返回 **8 条/页**（只查第 1 页），且偶发
+   `UNAVAILABLE/0 条`（连测三次：一次 13.6s 超时 0 条，两次 OK/8 条）。
+
+待改方案（用户拍板后续做）：
+- [x] **A. 补契约**：`PlanHotelArgs` 加 `alternatives: list[...]`（照 transport 现成模式，最多 4 个），
+      prompt 要求 agent 把 `search_hotels` 返回的其它候选一并交上，`_to_trip_plan` 映射进
+      `HotelPlan.alternatives`。契约改动 = 同步 `TRAVEL_PLANNER_SYSTEM_PROMPT` 自查清单 + 测试。
+      （2026-09-23 已实施；另把预算 breakdown 改为按最终 plan 用 `planner.build_budget` 重算，
+      保证中文分类 + 真实/估算拆分。）
+- [x] **B. 数据源**：途牛翻页多查几页凑候选（现在 page_num=1）；失败如实降级标注（ProviderResult
+      已有 UNAVAILABLE 语义）。（2026-09-23 已实施：`search_hotels` 默认翻 2 页合并去重）
+
+关联：结果页前端布局整体优化建议见 `feedback/inbox/2026-09-23-结果页前端布局-优化建议.md`
+（附件 `D:\Downloads\TravelPlan_结果页前端布局_Feedback.md` 已收入，P0 含"酒店候选比较"信息层级调整）。

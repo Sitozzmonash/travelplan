@@ -159,8 +159,10 @@ class TravelPlanConfig:
     discovery_max_places: int = 20
     #: Discovery 阶段最多对多少个 POI 做详情核实
     discovery_poi_verify_limit: int = 20
-    #: 用户可见的 POI 候选上限（用户旅程 §8：12~20 个，不要一次丢 50 个）
-    user_visible_poi_limit: int = 20
+    #: 用户可见的 POI 候选上限：推荐池每城最多 40，来自用户拍板 2026-09-23
+    #: （第二页推荐太少，从 12~20 放宽到 40，但「不要一次丢 50 个」的护栏仍在；
+    #: EDITABLE_KEYS 里的合法区间仍是 4~60）
+    user_visible_poi_limit: int = 40
     #: 进入 Planner 的深度候选上限（规格：8~15）。超过这个数的候选不参与深度验证
     #: （不查 POI 详情、不参与路线计算），但仍然保留在候选集合里由 Trust/AdRisk 打分。
     planner_poi_limit: int = 15

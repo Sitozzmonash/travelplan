@@ -187,6 +187,18 @@ def area(name="宽窄巷子", place_ids=("park",), evidence_ids=("city-g1",), *,
 # ----------------------------------------------------------------------
 
 
+def test_prompt_asks_for_up_to_max_cards_per_category(store):
+    """2026-09-23 拍板：每类尽量给足到 _MAX_CARDS（10）个，但校验仍不可放松。"""
+    assert rec._MAX_CARDS == 10, "契约变了要同步改这条用例"
+    assert "每类都要尽量给足" in rec._SYSTEM and f"{rec._MAX_CARDS} 个" in rec._SYSTEM
+    assert "不要只挑 2-3 个顶流" in rec._SYSTEM
+    assert "数量多不是目的" in rec._SYSTEM
+    assert "地点/证据/类别/营业状态校验" in rec._SYSTEM
+    submit = next(tool for tool in [rec._SUBMIT]
+                  if tool["function"]["name"] == "submit_recommendations")
+    assert f"每类最多 {rec._MAX_CARDS} 个" in submit["function"]["description"]
+
+
 def test_two_round_conversation_recommends_only_database_candidates(store, reads):
     seed(store, [poi(), poi("unused", "城市博物馆", kind="博物馆", lat=30.67, lng=104.06)], [guide()])
     progress = []

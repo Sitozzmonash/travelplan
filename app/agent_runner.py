@@ -320,16 +320,22 @@ class PlanTransportArgs(BaseModel):
 
 
 class PlanHotelArgs(BaseModel):
-    """选中的住宿。"""
+    """选中的住宿（alternatives 里复用同一模型，字段都填，selection_reason 可以留空）。"""
 
     name: str = Field(description="酒店名")
     provider: str = Field(default="unknown", description="数据来源名")
+    hotel_id: str | None = Field(default=None, description="search_hotels 返回的酒店 id")
+    source_id: str | None = Field(default=None, description="search_hotels 返回条目的来源 id")
     room_type: str | None = Field(default=None, description="房型")
     price_per_night: float | None = Field(default=None, description="每晚价格（元）；途牛给的是起价")
     price_note: str | None = Field(default=None, description="价格口径说明，如 '420 起价/晚'")
     address: str | None = Field(default=None)
     rating: float | None = Field(default=None)
-    selection_reason: str = Field(default="", description="为什么选它")
+    selection_reason: str = Field(default="", description="为什么选它；alternatives 里的候选不需要填")
+    alternatives: list[PlanHotelArgs] = Field(
+        default_factory=list,
+        description="其它酒店候选，最多 4 条；必须来自 search_hotels 返回的其它真实结果，不许编造",
+    )
 
 
 class PlanSourceArgs(BaseModel):
@@ -470,6 +476,27 @@ def _merge_intent(submitted: TripIntent, reference: TripIntent | None) -> TripIn
     return TripIntent.model_validate(merged)
 
 
+def _to_hotel_option(args: PlanHotelArgs) -> HotelOption:
+    """把交卷参数里的一个酒店（selected 或 alternative）映射成 HotelOption。
+
+    `hotel_id / source_id` 原样带过：前端"来源"面板与候选比较需要能指回 search_hotels
+    的真实结果。其余字段与原来的 selected 映射逐字等价。
+    """
+
+    return HotelOption(
+        provider=coerce_str(args.provider, "unknown") or "unknown",
+        source_id=coerce_str(args.source_id) or None,
+        hotel_id=coerce_str(args.hotel_id) or None,
+        name=coerce_str(args.name),
+        address=coerce_str(args.address) or None,
+        room_type=coerce_str(args.room_type) or None,
+        price_per_night=coerce_float(args.price_per_night),
+        rating=coerce_float(args.rating),
+        price_note=coerce_str(args.price_note) or None,
+        selection_reason=coerce_str(args.selection_reason) or None,
+    )
+
+
 def _fill_budget(budget: BudgetSummary, intent: TripIntent) -> BudgetSummary:
     """只补**能算出来的**缺项，不改 Agent 给的数字。
 
@@ -489,6 +516,57 @@ def _fill_budget(budget: BudgetSummary, intent: TripIntent) -> BudgetSummary:
     return budget.model_copy(
         update={"budget_total": budget_total, "remaining": remaining, "status": status}
     )
+
+
+def _rebuild_budget(plan: TripPlan, budget: BudgetSummary, intent: TripIntent) -> BudgetSummary:
+    """用最终 plan 重算预算的 breakdown 系列字段（中文分类 key + 真实/估算拆分）。
+
+    为什么在契约层重算：`SubmittedPlan.budget.breakdown` 是**自由 key**，Agent 可能填英文
+    key 或漏填，前端预算卡就看不到「交通 / 住宿 / 门票…」这类中文行。`planner.build_budget`
+    按固定分类（交通/住宿/门票/餐饮估算/市内交通/其他）产出中文 key，并把真实报价与估算
+    分开（breakdown_price_type + known_real_cost / estimated_cost）。
+
+    合并规则：
+    - `breakdown / breakdown_price_type / known_real_cost / estimated_cost / projected_total`
+      用重算值覆盖（这是本次要修的用户可见问题）；
+    - `budget_total / remaining / status` 照 `_fill_budget` 的既有逻辑合并 —— Agent 显式填了
+      就保留，否则回退 intent / 按重算后的 projected 算，不代劳 Agent 自己的判断；
+    - `optimization_suggestions / price_notes` 保留 Agent 交的原文，不拿代码的备注顶替。
+
+    门票价从哪来：优先 `build_budget` 直接读 days 里 `item.price`（price_type=realtime），
+    这里再补一个 `place_id/name → price` 的兜底映射 —— Agent 若把 price_type 标成
+    estimated/unknown，门票也能按 plan 的 item 价格汇总进真实部分，而不是白白记 0。
+    """
+
+    ticket_prices: dict[str, float] = {}
+    for day in plan.days:
+        for item in day.items:
+            if item.type != "attraction" or item.price is None:
+                continue
+            if item.place_id:
+                ticket_prices[item.place_id] = item.price
+            if item.name:
+                ticket_prices.setdefault(item.name, item.price)
+    recomputed = planner.build_budget(
+        intent,
+        plan.transport,
+        plan.hotel.selected if plan.hotel is not None else None,
+        plan.days,
+        ticket_prices,
+        city=intent.destination[0] if intent.destination else None,
+        day_count=len(plan.days),
+        hotel_alternatives=list(plan.hotel.alternatives) if plan.hotel is not None else (),
+    )
+    merged = budget.model_copy(
+        update={
+            "breakdown": recomputed.breakdown,
+            "breakdown_price_type": recomputed.breakdown_price_type,
+            "known_real_cost": recomputed.known_real_cost,
+            "estimated_cost": recomputed.estimated_cost,
+            "projected_total": recomputed.projected_total,
+        }
+    )
+    return _fill_budget(merged, intent)
 
 
 def _to_trip_plan(
@@ -511,19 +589,15 @@ def _to_trip_plan(
         )
     hotel_plan = None
     if submitted.hotel is not None:
-        hotel = HotelOption(
-            provider=coerce_str(submitted.hotel.provider, "unknown") or "unknown",
-            name=coerce_str(submitted.hotel.name),
-            address=coerce_str(submitted.hotel.address) or None,
-            room_type=coerce_str(submitted.hotel.room_type) or None,
-            price_per_night=coerce_float(submitted.hotel.price_per_night),
-            rating=coerce_float(submitted.hotel.rating),
-            price_note=coerce_str(submitted.hotel.price_note) or None,
-            selection_reason=coerce_str(submitted.hotel.selection_reason) or None,
+        hotel_plan = HotelPlan(
+            selected=_to_hotel_option(submitted.hotel),
+            # 候选只留展示用的前 4 条（与 transport_alternatives 同量级），且必须是
+            # search_hotels 的真实返回 —— 见 PlanHotelArgs.alternatives 的字段说明。
+            alternatives=[_to_hotel_option(item) for item in submitted.hotel.alternatives[:4]],
+            selection_reason=coerce_str(submitted.hotel.selection_reason),
         )
-        hotel_plan = HotelPlan(selected=hotel, selection_reason=coerce_str(submitted.hotel.selection_reason))
 
-    return TripPlan(
+    plan = TripPlan(
         run_id=run_id,
         query=query,
         intent=intent,
@@ -547,6 +621,10 @@ def _to_trip_plan(
         ],
         decisions=list(submitted.decisions),
     )
+    # 预算的 breakdown 系列字段用最终 plan 重算（中文分类 key + 真实/估算拆分），
+    # 总额/结余/状态仍由 _fill_budget 合并 —— 见 _rebuild_budget 的 docstring。
+    plan.budget = _rebuild_budget(plan, submitted.budget, intent)
+    return plan
 
 
 # ======================================================================

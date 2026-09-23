@@ -19,6 +19,50 @@ const CATEGORY_STYLE: Record<string, { bar: string; dot: string }> = {
 
 const FALLBACK_STYLE = { bar: "bg-foreground/25", dot: "bg-foreground/25" };
 
+/**
+ * 预算分类英文 → 中文兜底。后端正在把 breakdown 的 key 归一成中文
+ * （交通/住宿/门票/餐饮估算/市内交通/其他），但在归一完成前 LLM 仍可能给出英文 key，
+ * 这里保证前端**一定**显示中文分类名。目标值尽量对齐后端中文 key 与 CATEGORY_STYLE。
+ */
+const BUDGET_CATEGORY_LABELS: Record<string, string> = {
+  // 大交通
+  transport: "交通",
+  transportation: "交通",
+  flights: "交通",
+  // 住宿
+  hotel: "住宿",
+  hotels: "住宿",
+  accommodation: "住宿",
+  lodging: "住宿",
+  // 门票
+  ticket: "门票",
+  tickets: "门票",
+  scenic: "门票",
+  entrance: "门票",
+  "scenic_ticket": "门票",
+  // 餐饮估算
+  meal: "餐饮估算",
+  meals: "餐饮估算",
+  food: "餐饮估算",
+  dining: "餐饮估算",
+  餐饮: "餐饮估算",
+  // 市内交通估算
+  city_transport: "市内交通估算",
+  city_transportation: "市内交通估算",
+  local_transport: "市内交通估算",
+  市内: "市内交通估算",
+  // 其他
+  other: "其他",
+  others: "其他",
+  misc: "其他",
+  其他: "其他",
+};
+
+/** 分类展示名：英文/残缺 key 兜成中文，已是中文的 key 原样返回。 */
+function budgetCategoryLabel(category: string): string {
+  return BUDGET_CATEGORY_LABELS[category] ?? category;
+}
+
 interface BudgetCardProps {
   budget: BudgetSummary;
   /** 换算比例：单独占一行展示的标注，例如「2 人合计」。 */
@@ -58,7 +102,7 @@ export function BudgetCard({ budget, scopeLabel, className }: BudgetCardProps) {
               key={category}
               className={cn("h-full", (CATEGORY_STYLE[category] ?? FALLBACK_STYLE).bar)}
               style={{ width: `${(value / total) * 100}%` }}
-              title={`${category} ${formatCNY(value)}`}
+              title={`${budgetCategoryLabel(category)} ${formatCNY(value)}`}
             />
           ))}
         </div>
@@ -101,7 +145,7 @@ export function BudgetCard({ budget, scopeLabel, className }: BudgetCardProps) {
               <li key={category} className="flex items-center justify-between gap-3 text-xs">
                 <span className="flex min-w-0 items-center gap-2 text-muted-foreground">
                   <span className={cn("size-2 shrink-0 rounded-full", style.dot)} aria-hidden />
-                  <span className="truncate">{category}</span>
+                  <span className="truncate">{budgetCategoryLabel(category)}</span>
                   <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px]">
                     {priceType === "realtime" ? "实时价格" : "估算费用"}
                   </span>

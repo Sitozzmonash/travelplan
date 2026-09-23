@@ -403,3 +403,157 @@ def test_对冲_备胎提前返回空_不得提前提交_跟随主源结论(monk
     assert result.provider == "12306"
     assert [item.train_no for item in result.items] == ["G321"]
 
+
+# ==================================================
+# 住宿：途牛翻页凑候选
+# ==================================================
+
+
+def _hotel_call(status: str, items: list, error=None):
+    """模拟一次 `_plugin_call` 返回（信封 item 尚未映射成 HotelOption）。"""
+    return SimpleNamespace(
+        source_id="run1-src-hotel-1",
+        status=status,
+        items=items,
+        error=error,
+        fetched_at=utcnow(),
+    )
+
+
+def _hotel_paging_hub(monkeypatch, per_page, *, status="OK", error=None):
+    """Hub：`_plugin_call` 按 page_num 查表返回，供翻页用例离线验证。"""
+    hub = ProviderHub(run_id="run1", store=None, mcp_servers=[])
+    requested: list[int] = []
+
+    def fake_plugin_call(**kwargs):
+        page = int(kwargs["args"]["page_num"])
+        requested.append(page)
+        if page not in per_page:
+            return _hotel_call("UNAVAILABLE", [], error=f"第 {page} 页无响应")
+        return _hotel_call(status, per_page[page], error=error)
+
+    monkeypatch.setattr(hub, "_plugin_call", fake_plugin_call)
+    hub._requested_pages = requested
+    return hub
+
+
+def test_酒店翻页_两页不同酒店_合并去重条数正确(monkeypatch):
+    """page 2 里 H1 是 page 1 的重复项：合并后应去掉，只剩 3 家。"""
+    hub = _hotel_paging_hub(
+        monkeypatch,
+        {
+            1: [
+                {"hotel_id": "H1", "name": "A 酒店", "address": "锦江区 1 号", "price_per_night": 420},
+                {"hotel_id": "H2", "name": "B 酒店", "address": "锦江区 2 号", "price_per_night": 380},
+            ],
+            2: [
+                {"hotel_id": "H1", "name": "A 酒店", "address": "锦江区 1 号", "price_per_night": 420},
+                {"hotel_id": "H3", "name": "C 酒店", "address": "锦江区 3 号", "price_per_night": 350},
+            ],
+        },
+    )
+
+    result = hub.search_hotels("成都", date(2026, 10, 1), date(2026, 10, 3))
+
+    assert result.status == "OK"
+    assert {item.hotel_id for item in result.items} == {"H1", "H2", "H3"}
+    assert len(result.items) == 3, "重复的 H1 必须被去掉，候选不能翻倍"
+    assert result.calls and len(result.calls) == 2, "默认翻 2 页，calls 要留 2 条审计记录"
+    assert hub._requested_pages == [1, 2]
+
+
+def test_酒店翻页_没有id_按name_address去重(monkeypatch):
+    """途牛 item 偶尔缺 hotel_id：退回 name+address 判重，同址同名不重复计入。"""
+    hub = _hotel_paging_hub(
+        monkeypatch,
+        {
+            1: [
+                {"name": "X 酒店", "address": "武侯区 1 号", "price_per_night": 300},
+            ],
+            2: [
+                {"name": "X 酒店", "address": "武侯区 1 号", "price_per_night": 300},
+                {"name": "X 酒店", "address": "武侯区 2 号", "price_per_night": 320},
+            ],
+        },
+    )
+
+    result = hub.search_hotels("成都", date(2026, 10, 1), date(2026, 10, 3))
+
+    assert result.status == "OK"
+    assert len(result.items) == 2, "同址同名合并；同址不同名（武侯区 2 号）保留"
+
+
+def test_酒店翻页_全部页失败_保持UNAVAILABLE_0条(monkeypatch):
+    """全部页都失败：与单页时代一致，UNAVAILABLE / 0 条，不拿估算值冒充。"""
+    hub = _hotel_paging_hub(monkeypatch, {})
+
+    result = hub.search_hotels("成都", date(2026, 10, 1), date(2026, 10, 3))
+
+    assert result.status == "UNAVAILABLE"
+    assert result.items == []
+    assert result.error
+    assert len(result.calls) == 2
+
+
+def test_酒店翻页_部分页成功_用成功的(monkeypatch):
+    """第 2 页失败不应把第 1 页的成功结果清零。"""
+    hub = _hotel_paging_hub(
+        monkeypatch,
+        {
+            1: [
+                {"hotel_id": "H1", "name": "A 酒店", "address": "锦江区 1 号", "price_per_night": 420},
+            ],
+        },
+    )
+
+    result = hub.search_hotels("成都", date(2026, 10, 1), date(2026, 10, 3))
+
+    assert result.status == "OK"
+    assert [item.hotel_id for item in result.items] == ["H1"]
+    assert len(result.calls) == 2, "失败的那页也要留痕"
+
+
+def test_酒店翻页_各页都OK但没有酒店_如实返回OK空(monkeypatch):
+    """"这天没房"是结论不是失败：各页都 OK 但 0 条 → OK / 0 条（与单页语义一致）。"""
+    hub = _hotel_paging_hub(monkeypatch, {1: [], 2: []})
+
+    result = hub.search_hotels("成都", date(2026, 10, 1), date(2026, 10, 3))
+
+    assert result.status == "OK"
+    assert result.items == []
+    assert len(result.calls) == 2
+
+
+def test_酒店翻页_pages可调_只查一页(monkeypatch):
+    """`pages=1` 时退回单页行为：只打一次途牛。"""
+    hub = _hotel_paging_hub(
+        monkeypatch,
+        {
+            1: [{"hotel_id": "H1", "name": "A 酒店", "address": "锦江区 1 号", "price_per_night": 420}],
+            2: [{"hotel_id": "H2", "name": "B 酒店", "address": "锦江区 2 号", "price_per_night": 380}],
+        },
+    )
+
+    result = hub.search_hotels("成都", date(2026, 10, 1), date(2026, 10, 3), pages=1)
+
+    assert result.status == "OK"
+    assert [item.hotel_id for item in result.items] == ["H1"]
+    assert hub._requested_pages == [1]
+
+
+def test_酒店翻页_page_num指定起始页(monkeypatch):
+    """`page_num` 兼容调用方继续翻后面的页：从第 2 页起查 2 页 → 页码 2、3。"""
+    hub = _hotel_paging_hub(
+        monkeypatch,
+        {
+            2: [{"hotel_id": "H2", "name": "B 酒店", "address": "锦江区 2 号", "price_per_night": 380}],
+            3: [{"hotel_id": "H3", "name": "C 酒店", "address": "锦江区 3 号", "price_per_night": 350}],
+        },
+    )
+
+    result = hub.search_hotels("成都", date(2026, 10, 1), date(2026, 10, 3), page_num=2)
+
+    assert result.status == "OK"
+    assert {item.hotel_id for item in result.items} == {"H2", "H3"}
+    assert hub._requested_pages == [2, 3]
+

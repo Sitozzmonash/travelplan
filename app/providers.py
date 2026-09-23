@@ -1618,41 +1618,72 @@ class ProviderHub:
         *,
         travelers: int = 1,
         page_num: int = 1,
+        pages: int = 2,
     ) -> ProviderResult[HotelOption]:
-        """查酒店（途牛）。price_per_night 是**起价**，必须原样保留这个语义。"""
+        """查酒店（途牛，默认翻 2 页凑候选）。price_per_night 是**起价**，必须原样保留这个语义。
+
+        途牛单页约 8 条，`pages > 1` 时把 `page_num .. page_num+pages-1` 各页的
+        `tuniu_search_hotels` 结果**合并去重**（按 hotel_id，没有 id 按 name+address），
+        候选池明显变大。失败语义与单页时代一致：只要有一页成功就返回它的酒店
+        （status=OK），只有**全部**页都没拿到数据才如实返回失败（UNAVAILABLE / 0 条），
+        绝不拿估算值冒充。每一页的调用都留在 `calls` 里供审计。
+        """
         start = check_in.isoformat() if isinstance(check_in, date) else str(check_in)
         end = check_out.isoformat() if isinstance(check_out, date) else str(check_out)
-        call = self._plugin_call(
-            plugin="tuniu_travel",
-            tool_name="tuniu_search_hotels",
-            args={
-                "city": city,
-                "check_in": start,
-                "check_out": end,
-                "page_num": page_num,
-            },
-            provider="tuniu",
-            source_type="hotel",
-            kind="hotel",
-        )
         check_in_date = check_in if isinstance(check_in, date) else None
         check_out_date = check_out if isinstance(check_out, date) else None
-        items = [
-            HotelOption.from_item(
-                item,
+
+        calls: list[ProviderCall] = []
+        seen: set[tuple[str, ...]] = set()
+        items: list[HotelOption] = []
+        for page in range(page_num, page_num + max(1, pages)):
+            call = self._plugin_call(
+                plugin="tuniu_travel",
+                tool_name="tuniu_search_hotels",
+                args={
+                    "city": city,
+                    "check_in": start,
+                    "check_out": end,
+                    "page_num": page,
+                },
                 provider="tuniu",
-                fetched_at=call.fetched_at,
-                source_id=call.source_id,
-                source_url="https://www.tuniu.com/",
-                check_in=check_in_date,
-                check_out=check_out_date,
-                travelers=travelers,
+                source_type="hotel",
+                kind="hotel",
             )
-            for item in call.items
-        ]
-        return ProviderResult(
-            status=call.status, items=items, calls=[call], error=call.error, provider="tuniu"
-        )
+            calls.append(call)
+            if call.status != "OK":
+                continue  # 这一页失败：不混进 items，留给下面的失败语义收尾
+            for item in call.items:
+                key = _hotel_dedup_key(item)
+                if key is not None and key in seen:
+                    continue
+                if key is not None:
+                    seen.add(key)
+                items.append(
+                    HotelOption.from_item(
+                        item,
+                        provider="tuniu",
+                        fetched_at=call.fetched_at,
+                        source_id=call.source_id,
+                        source_url="https://www.tuniu.com/",
+                        check_in=check_in_date,
+                        check_out=check_out_date,
+                        travelers=travelers,
+                    )
+                )
+
+        if items:
+            return ProviderResult(status="OK", items=items, calls=calls, error=None, provider="tuniu")
+
+        # 没有任何酒店可用。失败语义与单页时代保持一致：
+        #   * 只要有一页是失败状态 → 用那一页的 status（通常 UNAVAILABLE）+ 0 条；
+        #   * 各页都 OK 但确实没有酒店 → 如实返回 OK / 0 条（"这天没房"也是结论）。
+        failed = next((call for call in calls if call.status != "OK"), None)
+        if failed is not None:
+            return ProviderResult(
+                status=failed.status, items=[], calls=calls, error=failed.error, provider="tuniu"
+            )
+        return ProviderResult(status="OK", items=[], calls=calls, error=None, provider="tuniu")
 
     # ==================================================================
     # 门票
@@ -2064,6 +2095,24 @@ def _format_coord(value: tuple[float, float] | str) -> str:
     if isinstance(value, str):
         return value
     return f"{value[0]:.6f},{value[1]:.6f}"
+
+
+def _hotel_dedup_key(item: Mapping[str, Any]) -> tuple[str, ...] | None:
+    """酒店去重键：优先 hotel_id，缺失时退回 name+address（都没有时返回 None）。
+
+    途牛翻页后同一家酒店可能出现在多页，靠这个键把重复项并掉。操作的是信封里的
+    原始 item（还没映射成 HotelOption），键名与 `HotelOption.from_item` 读的一致。
+    连名字都没有的 item 没有可辨认身份，返回 None 表示"不参与去重"——
+    否则所有无名酒店会被并成一条，反而把候选变少。
+    """
+    hotel_id = coerce_str(item.get("hotel_id"))
+    if hotel_id:
+        return ("id", hotel_id)
+    name = coerce_str(item.get("name"), "").strip()
+    address = coerce_str(item.get("address"), "").strip()
+    if not name:
+        return None
+    return ("name", name, address)
 
 
 #: 车次首字母 → 车型。**这是对车次编号规则的确定性解释**（G 就是高铁），

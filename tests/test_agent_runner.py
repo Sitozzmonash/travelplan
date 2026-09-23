@@ -343,11 +343,19 @@ def test_submit_final_plan_is_the_plan_and_pipeline_persists(tmp_path):
     assert result.plan.transport is not None
     assert result.plan.transport.selected.train_no == "G89"  # type: ignore[union-attr]
     assert result.plan.hotel is not None and result.plan.hotel.selected.price_per_night == 420  # type: ignore[union-attr]
-    # 预算总额来自用户（intent），缺项由代码补齐；结余是算出来的
+    # 预算总额来自用户（intent），缺项由代码补齐；结余是算出来的。
+    # breakdown 系列字段由最终 plan 重算（中文 key + real/estimated 拆分，见 _rebuild_budget）：
+    # 交通 = (780+780)×2 人 = 3120，住宿 = 420/晚×2 晚×1 间 = 840，餐饮估算 = 120/人/天×2人×3天 = 720。
     assert result.plan.budget.budget_total == 6000
-    assert result.plan.budget.remaining == 3000
+    assert result.plan.budget.remaining == 1320
     assert result.plan.budget.status == "within_budget"
+    assert result.plan.budget.breakdown["交通"] == 3120
+    assert result.plan.budget.breakdown["住宿"] == 840
+    assert result.plan.budget.known_real_cost == 3960
+    assert result.plan.budget.estimated_cost == 720
     assert result.plan.sources[0].source_id == "src-0"
+    # agent 没交酒店 alternatives → 空（前端"其他候选"不出现假数据）
+    assert result.plan.hotel.alternatives == []
 
     # 落库：save_plan / finish_run 真的被调用了
     assert [name for name, *_ in store.calls] == ["save_plan", "finish_run"]
@@ -381,6 +389,128 @@ def test_submit_final_plan_is_the_plan_and_pipeline_persists(tmp_path):
     # audit 的 llm_calls 与 trace 上的模型调用同形可读
     # （run_metrics 只落固定列，prompt 版本在 trace 与 audit 里，不在这里）
     assert len(result.audit["llm_calls"]) == 3
+
+
+def test_hotel_alternatives_are_mapped(tmp_path):
+    """agent 交 1 个酒店 + 2 个 alternatives → plan.hotel.alternatives 有 2 条，字段原样映射。"""
+
+    store, hub, output_dir = _make_env(tmp_path)
+    payload = _submit_args(days=1)
+    payload["hotel"] = {
+        "name": "春熙路某酒店",
+        "provider": "fake",
+        "hotel_id": "H-1",
+        "source_id": "src-h1",
+        "price_per_night": 420,
+        "alternatives": [
+            {
+                "name": "备选酒店A",
+                "provider": "fake",
+                "hotel_id": "H-2",
+                "source_id": "src-h2",
+                "price_per_night": 380,
+                "rating": 4.5,
+            },
+            {"name": "备选酒店B", "provider": "fake", "hotel_id": "H-3", "price_per_night": 450},
+        ],
+    }
+    model = ScriptedPlannerModel(script=[{"tool": SUBMIT_TOOL_NAME, "args": payload}])
+
+    result = _run(store, hub, output_dir, model)
+
+    assert result.status == "completed", result.error
+    assert result.plan is not None and result.plan.hotel is not None
+    assert result.plan.hotel.selected.name == "春熙路某酒店"
+    assert result.plan.hotel.selected.hotel_id == "H-1"
+    assert result.plan.hotel.selected.source_id == "src-h1"
+    assert [alt.name for alt in result.plan.hotel.alternatives] == ["备选酒店A", "备选酒店B"]
+    assert result.plan.hotel.alternatives[0].price_per_night == 380
+    assert result.plan.hotel.alternatives[0].hotel_id == "H-2"
+    assert result.plan.hotel.alternatives[0].source_id == "src-h2"
+    assert result.plan.hotel.alternatives[0].rating == 4.5
+    assert result.plan.hotel.alternatives[1].price_per_night == 450
+
+
+def test_hotel_alternatives_are_capped_at_four(tmp_path):
+    """超过 4 条候选只留前 4 条（与 transport_alternatives 同量级），不把多余候选灌进 plan。"""
+
+    store, hub, output_dir = _make_env(tmp_path)
+    payload = _submit_args(days=1)
+    payload["hotel"] = {
+        "name": "春熙路某酒店",
+        "provider": "fake",
+        "price_per_night": 420,
+        "alternatives": [
+            {"name": f"备选{i}", "provider": "fake", "price_per_night": 300 + i} for i in range(5)
+        ],
+    }
+    model = ScriptedPlannerModel(script=[{"tool": SUBMIT_TOOL_NAME, "args": payload}])
+
+    result = _run(store, hub, output_dir, model)
+
+    assert result.status == "completed", result.error
+    assert result.plan is not None and result.plan.hotel is not None
+    assert len(result.plan.hotel.alternatives) == 4
+    assert [alt.name for alt in result.plan.hotel.alternatives] == [f"备选{i}" for i in range(4)]
+
+
+def test_budget_breakdown_is_rebuilt_with_chinese_keys(tmp_path):
+    """预算卡必须有中文分类行：breakdown 由最终 plan 重算，real/estimated 与 item 价格对得上。"""
+
+    store, hub, output_dir = _make_env(tmp_path)
+    payload = _submit_args(days=2)
+    # 门票给一个真实价（50 元/人）；大交通 G89+G90 各 780/人，酒店 420/晚 × 1 晚 × 1 间
+    payload["days"][0]["items"] = [
+        {
+            "name": "宽窄巷子",
+            "type": "attraction",
+            "place_id": "B0FF1",
+            "start_time": "09:00",
+            "end_time": "11:00",
+            "price": 50,
+            "price_type": "realtime",
+            "reason": "高德核实的真实地点",
+        }
+    ]
+    model = ScriptedPlannerModel(script=[{"tool": SUBMIT_TOOL_NAME, "args": payload}])
+
+    result = _run(store, hub, output_dir, model)
+
+    assert result.status == "completed", result.error
+    assert result.plan is not None
+    breakdown = result.plan.budget.breakdown
+    # 中文分类 key：只要有大交通/住宿/门票，预算卡就一定有这几行
+    assert breakdown["交通"] == 3120  # (780 + 780) × 2 人
+    assert breakdown["住宿"] == 420  # 420/晚 × 1 晚 × 1 间
+    assert breakdown["门票"] == 100  # 50/人 × 2 人
+    assert breakdown["餐饮估算"] == 480  # 120/人/天 × 2 人 × 2 天（成都 tier2）
+    # real 与 estimated 分开，且与上面的 item 价格对得上
+    assert result.plan.budget.known_real_cost == 3120 + 420 + 100
+    assert result.plan.budget.estimated_cost == 480
+    assert result.plan.budget.projected_total == 3120 + 420 + 100 + 480
+    assert result.plan.budget.breakdown_price_type["交通"] == "realtime"
+    assert result.plan.budget.breakdown_price_type["住宿"] == "realtime"
+    assert result.plan.budget.breakdown_price_type["门票"] == "realtime"
+    assert result.plan.budget.breakdown_price_type["餐饮估算"] == "estimated"
+
+
+def test_budget_breakdown_is_rebuilt_when_agent_left_it_empty(tmp_path):
+    """Agent 没填 budget.breakdown（甚至只给了预算额）时，预算卡也必须有中文分类行。"""
+
+    store, hub, output_dir = _make_env(tmp_path)
+    payload = _submit_args(days=1)
+    payload["budget"] = {"budget_total": 6000}
+    model = ScriptedPlannerModel(script=[{"tool": SUBMIT_TOOL_NAME, "args": payload}])
+
+    result = _run(store, hub, output_dir, model)
+
+    assert result.status == "completed", result.error
+    assert result.plan is not None
+    breakdown = result.plan.budget.breakdown
+    assert "交通" in breakdown and "住宿" in breakdown and "餐饮估算" in breakdown
+    assert result.plan.budget.known_real_cost > 0
+    assert result.plan.budget.budget_total == 6000
+    assert result.plan.budget.status in ("within_budget", "over_budget")
 
 
 def test_all_travel_tools_are_visible_to_the_model(tmp_path):

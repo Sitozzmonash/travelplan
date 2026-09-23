@@ -62,7 +62,9 @@ class TestCapsAreConfigDriven:
         assert config.route_max_concurrency >= 1
         assert config.max_route_lookups >= 1
         assert config.planner_poi_limit >= 1
-        assert 1 <= config.user_visible_poi_limit <= config.discovery_max_places
+        # 用户可见候选上限（推荐池每城最多 40，2026-09-23 拍板）不再受 discovery_max_places
+        # （原始地名核实上限）约束，只要求落在 EDITABLE_KEYS 的合法区间（USER_VISIBLE_POI_LIMIT：4~60）。
+        assert 4 <= config.user_visible_poi_limit <= 60
 
     def test_provider_timeouts_are_per_provider_and_bounded(self) -> None:
         from app.config import provider_timeouts

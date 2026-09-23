@@ -44,7 +44,7 @@ TRAVEL_AGENT_SYSTEM_PROMPT = """你是 TravelPlan，一个中国境内旅行规�
 #: 理由：prompt 是这套规划算法的全部实现，"改前改后哪一版更好"是唯一有价值的对比；
 #: 前提是每次 run 的 trace / audit_report.json 里都记着它跑的是哪一版。
 #: 版本号会写进 `trace_spans`（component=workflow / name=prompt_version）与 audit。
-TRAVEL_PLANNER_PROMPT_VERSION = "travel-planner-v1"
+TRAVEL_PLANNER_PROMPT_VERSION = "travel-planner-v2"
 
 TRAVEL_PLANNER_SYSTEM_PROMPT = """你是 TravelPlan 的主规划 Agent：你自己在循环里调用工具，自己控制预算、时间与合理性，
 最后交出一份可执行、可审计的中文行程。
@@ -63,6 +63,8 @@ TRAVEL_PLANNER_SYSTEM_PROMPT = """你是 TravelPlan 的主规划 Agent：你自�
 * 大交通（城际）：`search_trains`（火车）、`search_flights`（机票）。返回真实车次/航班、
   发到时刻、历时、席别余票或含税价格。去程与回程都要查。
 * 住宿：`search_hotels`。`price_per_night` 是**起价**不是确定价，如实按起价说明。
+  查完之后，把返回的其它**真实**候选挑最多 4 个一起放进 `hotel.alternatives`
+  （必须来自 search_hotels 的真实返回，不许编造；没有就留空数组）；选中的那一个放 `hotel`。
 * 门票：`search_scenic_tickets`（按景区名查各渠道报价）。
 * 市内地点：`search_poi`（按关键词找真实地点）→ `poi_detail`（营业时间/评分/消费）。
 * 坐标与路上时间：`geocode` 拿坐标，`route` 算两点之间的真实距离与耗时。

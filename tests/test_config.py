@@ -39,6 +39,36 @@ class TestRunWorkers:
             validate_override("MAX_RUN_WORKERS", 9)
 
 
+class TestUserVisiblePoiLimit:
+    """`USER_VISIBLE_POI_LIMIT`：推荐池每城上限，默认 40（用户拍板 2026-09-23）。"""
+
+    def test_default_is_forty(self) -> None:
+        assert current_config().user_visible_poi_limit == 40
+
+    def test_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("USER_VISIBLE_POI_LIMIT", "25")
+        assert current_config().user_visible_poi_limit == 25
+
+    def test_legacy_alias_still_overrides(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DISCOVERY_PLACE_LIMIT", "30")
+        assert current_config().user_visible_poi_limit == 30
+
+    def test_invalid_env_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("USER_VISIBLE_POI_LIMIT", "很多")
+        assert current_config().user_visible_poi_limit == 40
+
+    def test_editable_keys_declare_the_key_and_bounds(self) -> None:
+        assert EDITABLE_KEYS["USER_VISIBLE_POI_LIMIT"] == ("int", 4, 60)
+
+    def test_validate_override_enforces_bounds(self) -> None:
+        assert validate_override("USER_VISIBLE_POI_LIMIT", 40) == 40
+        assert validate_override("USER_VISIBLE_POI_LIMIT", "60") == 60
+        with pytest.raises(ValueError):
+            validate_override("USER_VISIBLE_POI_LIMIT", 3)
+        with pytest.raises(ValueError):
+            validate_override("USER_VISIBLE_POI_LIMIT", 61)
+
+
 class TestAgentRunnerHarnessPatch:
     """`app/agent_runner` 模块顶层的 harness 瘦身 patch。
 
