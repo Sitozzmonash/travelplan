@@ -17,7 +17,7 @@ from langchain.agents.middleware.types import (
     ToolCallRequest,
 )
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
 from app.agent_trace import (
@@ -304,6 +304,39 @@ def test_model_call_records_tokens_and_accumulates():
     assert totals["llm_calls"] == 2
     # 模型调用的 steps 也落 run_stages，供轮询
     assert store.current_stage == MODEL_STEP_LABEL
+
+
+def test_model_call_records_scrubbed_200_character_previews():
+    store = RecordingStore()
+    reporter = build_step_reporter(store, RUN_ID)
+    request = ModelRequest(
+        model=SimpleNamespace(model_name="gpt-test"),
+        messages=[
+            HumanMessage(content="用户需求" * 80),
+            AIMessage(content="上一轮模型回复"),
+            ToolMessage(content="工具结果", tool_call_id="call-x"),
+        ],
+        tools=[],
+        state={},
+        runtime=None,
+        system_message=SystemMessage(content="系统规则"),
+        tool_choice=None,
+        response_format=None,
+        model_settings=None,
+    )
+    response = ModelResponse(
+        result=[AIMessage(content="模型输出" * 80, usage_metadata={"input_tokens": 12, "output_tokens": 4})]
+    )
+
+    reporter.middleware.wrap_model_call(request, lambda _: response)
+
+    attributes = store.spans_of("llm")[0]["attributes"]
+    assert attributes["system_preview"] == "系统规则"
+    assert attributes["user_preview"].startswith("用户需求")
+    assert "已截断" in attributes["user_preview"]
+    assert attributes["context_preview"] == "上一轮模型回复\n\n工具结果"
+    assert attributes["assistant_preview"].startswith("模型输出")
+    assert "已截断" in attributes["assistant_preview"]
 
 
 def test_current_stage_is_model_label_while_model_thinks():

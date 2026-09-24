@@ -764,11 +764,16 @@ def _user_journey_summary(state: Mapping[str, Any], plan: TripPlan) -> dict[str,
     #   fallback_query  —— 本次自己补查了，并且查到了东西
     #   unavailable     —— 本次自己补查了，但仍然没有可用结果（要如实说出来）
     stage_info = dict(getattr(bundle, "discovery", None) or {}) if bundle is not None else {}
+    # Agent 路径会把工具结果收敛进最终 plan / sources，而不是填回固定流程的
+    # state["evidences"] / state["places"]。只看后者会把已有攻略和地点误报成「无可用结果」。
+    source_providers = {str(source.provider or "").lower() for source in plan.sources}
     resolved = {
         "transport": bool(plan.transport is not None and plan.transport.selected is not None),
         "hotels": bool(plan.hotel is not None and plan.hotel.selected is not None),
-        "social": bool(state.get("evidences")),
-        "places": bool(state.get("places")),
+        "social": bool(state.get("evidences"))
+        or bool(source_providers & {"tikhub", "mediacrawler", "tavily"}),
+        "places": bool(state.get("places"))
+        or any(item.place_id for day in plan.days for item in day.items),
     }
     handoff: dict[str, Any] = {}
     for key, label in (

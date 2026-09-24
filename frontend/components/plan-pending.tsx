@@ -6,7 +6,7 @@ import type { RunProgress, RunStatus } from "@/types/api";
 import { describeApiError, planningStepsFromProgress, runDegradations, waitForRun } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { PlanningProgress } from "@/components/planning-progress";
-import { ErrorState, LoadingState, PartialNotice, RunStatusBadge } from "@/components/state-views";
+import { ErrorState, PartialNotice, RunStatusBadge } from "@/components/state-views";
 
 interface PlanPendingProps {
   runId: string;
@@ -125,11 +125,6 @@ function PlanPoll({
 
   return (
     <div className="mx-auto max-w-3xl space-y-4">
-      <LoadingState
-        title={progress?.current_stage ?? "行程仍在生成中"}
-        description="页面会每隔一秒左右查询一次状态，完成后自动展示行程。"
-        detail="Agent 会根据需要自己决定先查交通还是先查住宿，中途还可能回头补查，因此步骤顺序每次都不一样。"
-      />
       <div className="flex items-center justify-between gap-3">
         <p className="text-xs text-muted-foreground">规划进度（Agent 实际执行步骤）</p>
         <RunStatusBadge status={progress?.status ?? "RUNNING"} />

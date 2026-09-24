@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any
 
 from app import discovery, sessions
 from app.discovery import PrefetchBundle
 from app.models import TripIntent
+from app.workflow import _user_journey_summary
 from tests.fakes import FakeHub, FakeLLM, make_store
 
 
@@ -180,3 +182,30 @@ class TestSocialQueryHandoff:
         assert bundle.social_served_queries == list(social.served_queries)
         # 差集只补缺的那条，已搜过的（含空白变体）不回锅
         assert bundle.missing_social_queries([*social.queries, "成都 夜市"]) == ["成都 夜市"]
+
+
+def test_agent_results_are_not_reported_as_unavailable_discovery_handoff():
+    """Agent 路径不回填固定流程 state，但最终来源和地点已证明本次补查有结果。"""
+
+    plan = SimpleNamespace(
+        intent=SimpleNamespace(place_selections={}),
+        transport=None,
+        hotel=None,
+        days=[SimpleNamespace(items=[SimpleNamespace(place_id="poi-1")])],
+        sources=[SimpleNamespace(provider="tavily")],
+    )
+    summary = _user_journey_summary(
+        {
+            "prefetch": None,
+            "hub": None,
+            "evidences": [],
+            "places": [],
+            "source": "guided",
+            "source_session_id": "ps-agent",
+        },
+        plan,
+    )
+
+    assert summary["source"] == "guided"
+    assert summary["discovery"]["social"]["handoff"] == "fallback_query"
+    assert summary["discovery"]["places"]["handoff"] == "fallback_query"

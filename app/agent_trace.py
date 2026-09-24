@@ -111,8 +111,10 @@ MODEL_STEP_LABEL = "在思考行程"
 #: 没有映射的工具的文案前缀。
 UNKNOWN_TOOL_PREFIX = "在调用"
 
-#: 落进 facts / attributes 的文本预览上限（trace 是给人看的，不是全量归档）。
+#: 工具 facts 的文本预览上限（trace 是给人看的，不是全量归档）。
 PREVIEW_CHARS = 400
+#: 用户明确允许管理端保留的模型交互预览上限。每段先脱敏，再最多保留 200 字符。
+LLM_PREVIEW_CHARS = 200
 
 # ======================================================================
 # 兜底脱敏 / 截断
@@ -143,6 +145,69 @@ def _preview(value: Any, *, limit: int = PREVIEW_CHARS) -> str:
         except Exception:  # noqa: BLE001 —— 预览失败不该让上报失败
             text = str(value)
     return _redact_clip(_redact_scrub(text), limit=limit)
+
+
+def _llm_preview(value: Any) -> str | None:
+    """LLM 正文仅保存用户已授权的脱敏 200 字预览；空内容不伪造为空串。"""
+
+    text = _preview(value, limit=LLM_PREVIEW_CHARS)
+    return text or None
+
+
+def _message_text(message: Any) -> str:
+    """兼容 LangChain 的字符串与 content-block 消息形状，不读取其他对象属性。"""
+
+    if message is None:
+        return ""
+    return _preview(getattr(message, "content", message), limit=LLM_PREVIEW_CHARS)
+
+
+def _message_role(message: Any) -> str:
+    role = getattr(message, "role", None) or getattr(message, "type", None)
+    if role:
+        return str(role).lower()
+    name = type(message).__name__.lower()
+    if "system" in name:
+        return "system"
+    if "human" in name or "user" in name:
+        return "user"
+    if "tool" in name:
+        return "tool"
+    return "assistant" if "ai" in name or "assistant" in name else "context"
+
+
+def _request_model_previews(request: Any) -> dict[str, str | None]:
+    """把模型实际收到的消息按 system / user / context 分段，之后统一脱敏截断。"""
+
+    system_parts = [_message_text(getattr(request, "system_message", None))]
+    user_parts: list[str] = []
+    context_parts: list[str] = []
+    for message in getattr(request, "messages", None) or []:
+        text = _message_text(message)
+        if not text:
+            continue
+        role = _message_role(message)
+        if role == "system":
+            system_parts.append(text)
+        elif role in {"human", "user"}:
+            user_parts.append(text)
+        else:
+            context_parts.append(text)
+
+    def combine(parts: list[str]) -> str | None:
+        unique = list(dict.fromkeys(part for part in parts if part))
+        return _llm_preview("\n\n".join(unique)) if unique else None
+
+    return {
+        "system_preview": combine(system_parts),
+        "user_preview": combine(user_parts),
+        "context_preview": combine(context_parts),
+    }
+
+
+def _response_preview(response: Any) -> str | None:
+    messages = getattr(response, "result", None) or []
+    return _llm_preview(_message_text(messages[-1])) if messages else None
 
 
 def display_name_for(tool: str) -> str:
@@ -193,6 +258,9 @@ class ModelStep:
     span_id: str
     started_at: str
     start_perf: float
+    system_preview: str | None = None
+    user_preview: str | None = None
+    context_preview: str | None = None
 
 
 # ======================================================================
@@ -422,6 +490,9 @@ class StepReporter:
         *,
         span_id: str | None = None,
         started_at: str | None = None,
+        system_preview: Any = None,
+        user_preview: Any = None,
+        context_preview: Any = None,
     ) -> ModelStep:
         """模型调用开始：current_stage 记为「在思考行程」。"""
 
@@ -435,7 +506,14 @@ class StepReporter:
         started = started_at or now_iso()
         sid = span_id or build_span_id(run_id or "run", SpanKind.LLM, name, suffix=str(seq))
         step = ModelStep(
-            model=name, seq=seq, span_id=sid, started_at=started, start_perf=time.perf_counter()
+            model=name,
+            seq=seq,
+            span_id=sid,
+            started_at=started,
+            start_perf=time.perf_counter(),
+            system_preview=_llm_preview(system_preview),
+            user_preview=_llm_preview(user_preview),
+            context_preview=_llm_preview(context_preview),
         )
 
         self._write_stage(
@@ -458,7 +536,15 @@ class StepReporter:
             name=name,
             status=StageStatus.RUNNING,
             started_at=started,
-            attributes={"model": name, "tag": name, "status": str(StageStatus.RUNNING), "seq": seq},
+            attributes={
+                "model": name,
+                "tag": name,
+                "status": str(StageStatus.RUNNING),
+                "seq": seq,
+                "system_preview": step.system_preview,
+                "user_preview": step.user_preview,
+                "context_preview": step.context_preview,
+            },
         )
         return step
 
@@ -473,6 +559,7 @@ class StepReporter:
         error: BaseException | str | None = None,
         duration_ms: float | None = None,
         finished_at: str | None = None,
+        assistant_preview: Any = None,
     ) -> None:
         """模型调用结束：写 llm span（token 累计）＋ 收口「在思考行程」这一步。"""
 
@@ -539,6 +626,10 @@ class StepReporter:
                 "output_tokens": max(0, int(output_tokens or 0)),
                 "cached_tokens": max(0, int(cached_tokens or 0)),
                 "total_tokens": call_total,
+                "system_preview": step.system_preview,
+                "user_preview": step.user_preview,
+                "context_preview": step.context_preview,
+                "assistant_preview": _llm_preview(assistant_preview),
                 # 累计值：admin 看「到这一步为止花了多少」不必自己加。
                 **{f"cumulative_{key}": value for key, value in totals.items()},
             },
@@ -589,7 +680,13 @@ class StepReporter:
             step = self._pending_tools.pop(sid or "", None) or self._synthetic_tool(data, sid, duration, stamp)
             self.fail_tool(step, _event_error(data), duration_ms=duration, finished_at=stamp)
         elif event_type == EventType.LLM_STARTED:
-            step = self.begin_model(data.get("model") or "", span_id=sid)
+            step = self.begin_model(
+                data.get("model") or "",
+                span_id=sid,
+                system_preview=data.get("system_preview"),
+                user_preview=data.get("user_preview"),
+                context_preview=data.get("context_preview"),
+            )
             if sid:
                 self._pending_models[sid] = step
         elif event_type in (EventType.LLM_FINISHED, EventType.LLM_ERROR):
@@ -605,6 +702,7 @@ class StepReporter:
                     cached_tokens=_int_or_zero(data.get("cached_tokens")),
                     duration_ms=duration,
                     finished_at=stamp,
+                    assistant_preview=data.get("assistant_preview") or data.get("output"),
                 )
 
     def _synthetic_tool(self, data: Mapping[str, Any], sid: str | None, duration: Any, finished: str) -> ToolStep:
@@ -779,7 +877,7 @@ class StepReporterMiddleware(AgentMiddleware):
         except Exception as exc:
             self._finish_model(step, status=StageStatus.FAILED, error=exc)
             raise
-        self._finish_model(step, usage=_response_usage(response))
+        self._finish_model(step, usage=_response_usage(response), assistant_preview=_response_preview(response))
         return response
 
     async def awrap_model_call(self, request: Any, handler: Any) -> Any:
@@ -789,7 +887,7 @@ class StepReporterMiddleware(AgentMiddleware):
         except Exception as exc:
             self._finish_model(step, status=StageStatus.FAILED, error=exc)
             raise
-        self._finish_model(step, usage=_response_usage(response))
+        self._finish_model(step, usage=_response_usage(response), assistant_preview=_response_preview(response))
         return response
 
     # ---- 内部：把上报动作再包一层，连属性访问异常也不许冒出去 ----
@@ -816,7 +914,7 @@ class StepReporterMiddleware(AgentMiddleware):
 
     def _begin_model(self, request: Any) -> ModelStep | None:
         try:
-            return self.reporter.begin_model(_request_model_name(request))
+            return self.reporter.begin_model(_request_model_name(request), **_request_model_previews(request))
         except Exception:  # noqa: BLE001
             logger.debug("模型步骤上报（开始）失败", exc_info=True)
             return None
@@ -828,6 +926,7 @@ class StepReporterMiddleware(AgentMiddleware):
         usage: Mapping[str, Any] | None = None,
         status: str | StageStatus = StageStatus.SUCCESS,
         error: BaseException | str | None = None,
+        assistant_preview: str | None = None,
     ) -> None:
         usage = usage or {}
         try:
@@ -838,6 +937,7 @@ class StepReporterMiddleware(AgentMiddleware):
                 cached_tokens=_int_or_zero(usage.get("cached_tokens")),
                 status=status,
                 error=error,
+                assistant_preview=assistant_preview,
             )
         except Exception:  # noqa: BLE001
             logger.debug("模型步骤上报（结束）失败", exc_info=True)

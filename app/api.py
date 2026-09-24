@@ -897,6 +897,26 @@ def _admin_session_row(session: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _admin_decisions(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把存储层的列名归一成管理端决策链契约，避免已落库的结论显示为未知。"""
+
+    rows: list[dict[str, Any]] = []
+    for decision in decisions:
+        scores = decision.get("scores")
+        rows.append(
+            {
+                "entity_id": str(decision.get("entity_id") or "—"),
+                "status": str(decision.get("status") or decision.get("decision") or "UNKNOWN"),
+                # Agent 在 submit_final_plan 时一次性交卷；旧行没有逐步 stage 时如实标注这个边界。
+                "agent_or_stage": str(decision.get("agent_or_stage") or decision.get("stage") or "Agent 交卷"),
+                "reason_codes": list(decision.get("reason_codes") or []),
+                "reason_text": str(decision.get("reason_text") or decision.get("reason") or ""),
+                "scores": scores if isinstance(scores, dict) else None,
+            }
+        )
+    return rows
+
+
 @api.get("/api/v1/admin/runs/{run_id}", dependencies=[Depends(require_admin)])
 def admin_run_detail(run_id: str) -> dict[str, Any]:
     store = get_store()
@@ -940,7 +960,7 @@ def admin_run_detail(run_id: str) -> dict[str, Any]:
         "stages": _stage_details(store, run_id),
         "progress": store.get_run_progress(run_id),
         "trace": spans,
-        "decisions": store.get_decisions(run_id),
+        "decisions": _admin_decisions(store.get_decisions(run_id)),
         "provider_calls": store.list_sources(run_id),
         # 明细从 span 还原：它与管理端看到的 trace 是同一份事实，不会出现两套数字。
         "llm_calls": _llm_calls_from_spans(spans),
@@ -1676,6 +1696,10 @@ def _user_journey(store: TravelPlanStore, run: dict[str, Any], stored_plan: dict
     rich = (_load_audit(str(run.get("run_id") or "")) or {}).get("user_journey")
     if isinstance(rich, dict):
         base.update({key: value for key, value in rich.items() if value is not None})
+    # `runs` 是来源的权威账本。旧 Agent audit 没把 source 放进 state，会用默认 quick 覆盖它；
+    # 这里始终以创建 run 时保存的来源和会话为准，历史 guided run 也能立即正确显示。
+    base["source"] = str(run.get("source") or base.get("source") or "quick")
+    base["source_session_id"] = session_id
     return base
 
 

@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import sessions
+from app.models import Decision
 from app.store import TravelPlanStore
 from tests.fakes import make_store
 
@@ -136,6 +137,41 @@ class TestAdminPlanningSessions:
         detail = client.get("/api/v1/admin/runs/tp-guided-1", headers=AUTH).json()
         assert detail["run"]["source"] == "guided"
         assert detail["run"]["source_session_id"] == session_id
+
+
+class TestAdminRunDetailNormalization:
+    def test_decisions_and_guided_source_use_the_admin_contract(self, client, store, monkeypatch):
+        from app import api as api_module
+
+        run_id = "tp-guided-normalized"
+        store.create_run(run_id, original_query="北京→成都", source="guided", source_session_id="ps-1")
+        store.save_decision(
+            run_id,
+            Decision(
+                entity_id="place-1",
+                status="KEEP",
+                reason_codes=["match_preferences"],
+                reason_text="符合用户偏好",
+            ),
+        )
+        store.finish_run(run_id, "completed")
+        # 旧 Agent audit 可能错误写 quick；详情页必须以 runs 表的创建来源为准。
+        monkeypatch.setattr(api_module, "_load_audit", lambda _: {"user_journey": {"source": "quick"}})
+
+        body = client.get(f"/api/v1/admin/runs/{run_id}", headers=AUTH).json()
+
+        assert body["user_journey"]["source"] == "guided"
+        assert body["user_journey"]["source_session_id"] == "ps-1"
+        assert body["decisions"] == [
+            {
+                "entity_id": "place-1",
+                "status": "KEEP",
+                "agent_or_stage": "Agent 交卷",
+                "reason_codes": ["match_preferences"],
+                "reason_text": "符合用户偏好",
+                "scores": {},
+            }
+        ]
 
 
 class TestRunTimelineLlmPreview:

@@ -1058,6 +1058,10 @@ class _AgentModelLedger:
                 input_tokens=attributes.get("input_tokens"),
                 output_tokens=attributes.get("output_tokens"),
                 cached_tokens=attributes.get("cached_tokens"),
+                system_preview=attributes.get("system_preview"),
+                user_preview=attributes.get("user_preview"),
+                context_preview=attributes.get("context_preview"),
+                assistant_preview=attributes.get("assistant_preview"),
             )
             self.calls.append(result)
 
@@ -1074,7 +1078,9 @@ class _LLMResultLike:
     """
 
     __slots__ = (
+        "assistant_preview",
         "cached_tokens",
+        "context_preview",
         "duration_ms",
         "error",
         "finished_at",
@@ -1082,6 +1088,8 @@ class _LLMResultLike:
         "model",
         "output_tokens",
         "started_at",
+        "system_preview",
+        "user_preview",
         "status",
         "tag",
     )
@@ -1129,8 +1137,10 @@ class _LLMResultLike:
             "output_tokens": output_tokens,
             "cached_tokens": cached_tokens,
             "total_tokens": total,
-            "system_preview": None,
-            "user_preview": None,
+            "system_preview": self.system_preview,
+            "user_preview": self.user_preview,
+            "context_preview": self.context_preview,
+            "assistant_preview": self.assistant_preview,
         }
 
 
@@ -1327,6 +1337,8 @@ def execute_agent_run(
         "run_id": resolved_run_id,
         "query": query,
         "user_id": user_id,
+        "source": source,
+        "source_session_id": source_session_id,
         "status": STATUS_COMPLETED,
         "output_dir": str(output_dir),
         "store": resolved_store,

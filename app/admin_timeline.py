@@ -1455,7 +1455,7 @@ def run_timeline(store: TravelPlanStore, run_id: str) -> dict[str, Any]:
     fallbacks = [event for event in events if event.get("fallback")]
     errors = [event for event in events if event["event_type"] == "ERROR"]
     notes = [
-        "ASSISTANT 事件的 Prompt/输出正文是**脱敏 + 截断**后的预览（单段上限 2000 字符）；"
+        "ASSISTANT 事件的 Prompt/输出正文是**脱敏 + 截断**后的预览（单段最多保留前 200 字符）；"
         "早期版本记录的 run 的 span 里没有预览字段，此时预览为空并在该事件上标注",
         "逐次调用的 token 来自模型回报的 usage（取不到留白，不是 0）；成本仍按整次 run 统计"
         "（单价是用户填的估计值）",
