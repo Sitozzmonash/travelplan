@@ -390,6 +390,56 @@ def test_top_n_可以调大但被上限夹住(tools):
     assert len(negative["items"]) == DEFAULT_TOP_N, "非法 top_n 退回默认值而不是报错中断"
 
 
+def test_search_trains_同参数重复查询命中缓存(tools, hub):
+    """同 run 内相同 (出发, 到达, 日期, top_n) 只打一次 Provider，第二次直接返回缓存文本。"""
+    first = _invoke(tools, "search_trains", {"origin": "重庆", "destination": "成都", "depart_date": "2026-10-01"})
+    second = _invoke(tools, "search_trains", {"origin": "重庆", "destination": "成都", "depart_date": "2026-10-01"})
+    assert second == first
+    assert [name for name, _, _ in hub.calls].count("search_trains") == 1
+
+
+def test_search_trains_参数归一化后命中同一缓存(tools, hub):
+    """两端名带空白/全角空格、日期带空格时，与已查过的键等价，不重复打 Provider。"""
+    _invoke(tools, "search_trains", {"origin": "重庆", "destination": "成都", "depart_date": "2026-10-01"})
+    _invoke(tools, "search_trains", {"origin": " 重庆 ", "destination": "成都\u3000", "depart_date": " 2026-10-01 "})
+    assert [name for name, _, _ in hub.calls].count("search_trains") == 1
+
+
+def test_search_trains_top_n不同则重新查询(tools, hub):
+    """top_n 不同 → 返回条数语义不同，不能复用缓存，必须重新打 Provider。"""
+    small = _invoke(
+        tools, "search_trains", {"origin": "重庆", "destination": "成都", "depart_date": "2026-10-01", "top_n": 5}
+    )
+    large = _invoke(
+        tools, "search_trains", {"origin": "重庆", "destination": "成都", "depart_date": "2026-10-01", "top_n": 20}
+    )
+    assert len(large["items"]) > len(small["items"])
+    assert [name for name, _, _ in hub.calls].count("search_trains") == 2
+
+
+def test_search_trains_返回可用车站汇总(tools):
+    """available_stations 把本次车次的发到站去重汇总，Agent 一次看全、不用挨个试站。"""
+    payload = _invoke(tools, "search_trains", {"origin": "重庆", "destination": "成都", "depart_date": "2026-10-01"})
+    # 测试替身的车次固定发到站是 北京西 / 成都东（见 _trains），机制断言去重汇总生效
+    assert payload["available_stations"] == {"origin": ["北京西"], "destination": ["成都东"]}
+    assert "available_stations" in payload["hint"]
+
+
+def test_search_trains_失败结果不缓存(tools, hub, monkeypatch):
+    """取数失败返回可读失败且不写缓存：下次同参数还会重试，不会把失败当结果。"""
+    real = hub.search_trains
+
+    def _explode(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(hub, "search_trains", _explode)
+    first = _invoke(tools, "search_trains", {"origin": "重庆", "destination": "成都", "depart_date": "2026-10-01"})
+    assert first["status"] == "ERROR"
+    monkeypatch.setattr(hub, "search_trains", real)
+    second = _invoke(tools, "search_trains", {"origin": "重庆", "destination": "成都", "depart_date": "2026-10-01"})
+    assert second["status"] == "OK", "失败没被缓存，恢复后同参数能重新取到数据"
+
+
 def test_长文本被截断(tools):
     payload = _invoke(tools, "search_xiaohongshu", {"keyword": "成都三日游"})
     assert payload["total"] == 9 and payload["shown"] == DEFAULT_TOP_N

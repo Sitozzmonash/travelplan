@@ -45,6 +45,7 @@ SuperHarness Agent Loop（feedback/inbox/2026-09-22 的主规划改造）要求 
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
@@ -58,6 +59,11 @@ DEFAULT_TOP_N = 5
 
 #: 单条工具结果的上限（agent 显式传 top_n 也不能越过它，防止把上下文一次性拉爆）。
 MAX_TOP_N = 20
+
+#: search_trains 的同 run 短 TTL 缓存（秒）。工具实例随每次 run 重新装配（agent_runner /
+#: preheat 各自调 build_travel_tools），闭包里这个 dict 天然是 per-run 作用域；TTL 只兜底
+#: 防止超长 run 里复用太久之前的时刻表。键 = 归一化 (origin, destination, depart_date, top_n)。
+_TRAIN_CACHE_TTL_SECONDS = 300.0
 
 #: 单个文本字段（攻略正文、网页摘要、地址）保留的最大字符数。
 MAX_TEXT_CHARS = 240
@@ -407,6 +413,32 @@ def build_travel_tools(hub: ProviderHub) -> list[Any]:
     # 大交通
     # ------------------------------------------------------------------
 
+    #: search_trains 的同 run 短 TTL 缓存（见模块级 _TRAIN_CACHE_TTL_SECONDS 注释）。
+    train_cache: dict[tuple[str, str, str, int], tuple[float, str]] = {}
+
+    def _normalize_od(value: str) -> str:
+        """归一化城市/站名：去空白（含全角空格），让 " 重庆 " 与 "重庆" 命中同一缓存键。"""
+        return "".join(str(value or "").split())
+
+    def _available_stations(result: Any) -> dict[str, list[str]]:
+        """从本次车次结果里收集两端出现过的车站，让 Agent 一次看全、不必挨个试站。
+
+        查询是方向性的：items 的 origin_station 属于出发城市、destination_station 属于
+        到达城市，所以分两组去重返回；没结果时返回空 dict（不污染 envelope）。
+        """
+        origins: set[str] = set()
+        destinations: set[str] = set()
+        for item in getattr(result, "items", None) or []:
+            origin = getattr(item, "origin_station", None)
+            destination = getattr(item, "destination_station", None)
+            if origin:
+                origins.add(str(origin))
+            if destination:
+                destinations.add(str(destination))
+        if not origins and not destinations:
+            return {}
+        return {"origin": sorted(origins), "destination": sorted(destinations)}
+
     @tool
     def search_trains(
         origin: str, destination: str, depart_date: str, top_n: int = DEFAULT_TOP_N
@@ -424,18 +456,37 @@ def build_travel_tools(hub: ProviderHub) -> list[Any]:
 
         返回：JSON 文本，含 status / total / shown / truncated / items；
             items 每项保留车次号、车型、始发到达站、发到时间、历时分钟、席别余票、
-            票价区间（price_range.min 为最低价）。查不到时 status 非 OK 且 items 为空。
+            票价区间（price_range.min 为最低价）。available_stations 汇总本次车次
+            两端出现过的车站（origin/destination 两组），选站参考，不必为确认站点反复
+            查询。同一 (出发, 到达, 日期, top_n) 的重复查询命中同 run 短时缓存，直接
+            返回上次结果。查不到时 status 非 OK 且 items 为空。
         """
-        return _run(
-            "search_trains",
-            hub.search_trains,
-            origin,
-            destination,
-            depart_date,
-            top_n=top_n,
-            fields=TRAIN_FIELDS,
-            hint=_HINT_TRAIN,
+        key = (
+            _normalize_od(origin),
+            _normalize_od(destination),
+            str(depart_date).strip(),
+            int(top_n),
         )
+        now = time.time()
+        hit = train_cache.get(key)
+        if hit is not None and now - hit[0] <= _TRAIN_CACHE_TTL_SECONDS:
+            return hit[1]
+        try:
+            result = hub.search_trains(origin, destination, depart_date)
+        except Exception as exc:  # noqa: BLE001 —— 取数失败必须变成"可读的失败"，不能中断 Agent 循环
+            return _failure("search_trains", exc)
+        envelope = truncate_result(result, top_n=top_n, fields=TRAIN_FIELDS)
+        envelope["hint"] = _HINT_TRAIN
+        stations = _available_stations(result)
+        if stations:
+            envelope["available_stations"] = stations
+            envelope["hint"] += (
+                " available_stations 是本次车次中出现过的两端车站，选站参考；"
+                "同参数重复查询会命中短时缓存。"
+            )
+        text = json.dumps(envelope, ensure_ascii=False)
+        train_cache[key] = (now, text)
+        return text
 
     @tool
     def search_flights(
