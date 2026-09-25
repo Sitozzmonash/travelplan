@@ -391,7 +391,7 @@ def test_top_n_可以调大但被上限夹住(tools):
 
 
 def test_search_trains_同参数重复查询命中缓存(tools, hub):
-    """同 run 内相同 (出发, 到达, 日期, top_n) 只打一次 Provider，第二次直接返回缓存文本。"""
+    """同 run 内相同 (出发, 到达, 日期) 只打一次 Provider，第二次从缓存按当前 top_n 重新切片。"""
     first = _invoke(tools, "search_trains", {"origin": "重庆", "destination": "成都", "depart_date": "2026-10-01"})
     second = _invoke(tools, "search_trains", {"origin": "重庆", "destination": "成都", "depart_date": "2026-10-01"})
     assert second == first
@@ -405,16 +405,25 @@ def test_search_trains_参数归一化后命中同一缓存(tools, hub):
     assert [name for name, _, _ in hub.calls].count("search_trains") == 1
 
 
-def test_search_trains_top_n不同则重新查询(tools, hub):
-    """top_n 不同 → 返回条数语义不同，不能复用缓存，必须重新打 Provider。"""
+def test_search_trains_top_n不同则命中同一缓存按各自条数切片(tools, hub):
+    """top_n 不同 → 命中同一份 Provider 缓存（hub 只打一次），按当前 top_n 各自切片。
+
+    缓存存的是完整 ProviderResult 而非渲染文本：top_n=5 先查、top_n=20 再查时，后者
+    不重新打 Provider，total 仍是全量条数、shown=20。
+    """
     small = _invoke(
         tools, "search_trains", {"origin": "重庆", "destination": "成都", "depart_date": "2026-10-01", "top_n": 5}
     )
     large = _invoke(
         tools, "search_trains", {"origin": "重庆", "destination": "成都", "depart_date": "2026-10-01", "top_n": 20}
     )
-    assert len(large["items"]) > len(small["items"])
-    assert [name for name, _, _ in hub.calls].count("search_trains") == 2
+    assert len(small["items"]) == 5
+    assert len(large["items"]) == 20
+    assert large["total"] == 30, "total 是 Provider 全量条数，不随 top_n 变化"
+    assert large["shown"] == 20
+    assert large["truncated"] is True
+    assert small["items"][:5] == large["items"][:5], "同一份 Provider 结果，小 top_n 是大 top_n 的前缀"
+    assert [name for name, _, _ in hub.calls].count("search_trains") == 1, "不同 top_n 共享同一份 Provider 结果"
 
 
 def test_search_trains_返回可用车站汇总(tools):

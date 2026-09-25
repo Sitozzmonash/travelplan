@@ -62,7 +62,9 @@ MAX_TOP_N = 20
 
 #: search_trains 的同 run 短 TTL 缓存（秒）。工具实例随每次 run 重新装配（agent_runner /
 #: preheat 各自调 build_travel_tools），闭包里这个 dict 天然是 per-run 作用域；TTL 只兜底
-#: 防止超长 run 里复用太久之前的时刻表。键 = 归一化 (origin, destination, depart_date, top_n)。
+#: 防止超长 run 里复用太久之前的时刻表。键 = 归一化 (origin, destination, depart_date)，
+#: 不含 top_n —— 值缓存完整 ProviderResult，按当前 top_n 现场切片，top_n 不同也共享
+#: 同一份 Provider 结果、只打一次 12306。
 _TRAIN_CACHE_TTL_SECONDS = 300.0
 
 #: 单个文本字段（攻略正文、网页摘要、地址）保留的最大字符数。
@@ -414,7 +416,10 @@ def build_travel_tools(hub: ProviderHub) -> list[Any]:
     # ------------------------------------------------------------------
 
     #: search_trains 的同 run 短 TTL 缓存（见模块级 _TRAIN_CACHE_TTL_SECONDS 注释）。
-    train_cache: dict[tuple[str, str, str, int], tuple[float, str]] = {}
+    #: 键 = 归一化 (origin, destination, depart_date)，**不含 top_n**；值 = (时间戳,
+    #: ProviderResult 对象) —— 不缓存渲染文本，命中时按当前 top_n 现场切片，让不同
+    #: top_n 共享同一份 Provider 结果。
+    train_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
 
     def _normalize_od(value: str) -> str:
         """归一化城市/站名：去空白（含全角空格），让 " 重庆 " 与 "重庆" 命中同一缓存键。"""
@@ -425,6 +430,8 @@ def build_travel_tools(hub: ProviderHub) -> list[Any]:
 
         查询是方向性的：items 的 origin_station 属于出发城市、destination_station 属于
         到达城市，所以分两组去重返回；没结果时返回空 dict（不污染 envelope）。
+        始终遍历完整 `result.items`（缓存里存的就是完整 ProviderResult），与 top_n
+        切片无关。
         """
         origins: set[str] = set()
         destinations: set[str] = set()
@@ -458,34 +465,38 @@ def build_travel_tools(hub: ProviderHub) -> list[Any]:
             items 每项保留车次号、车型、始发到达站、发到时间、历时分钟、席别余票、
             票价区间（price_range.min 为最低价）。available_stations 汇总本次车次
             两端出现过的车站（origin/destination 两组），选站参考，不必为确认站点反复
-            查询。同一 (出发, 到达, 日期, top_n) 的重复查询命中同 run 短时缓存，直接
-            返回上次结果。查不到时 status 非 OK 且 items 为空。
+            查询。同一 (出发, 到达, 日期) 的重复查询命中同 run 短时缓存，按当前
+            top_n 切片返回 —— top_n=5 与 top_n=20 共享同一份 Provider 结果、各自拿到
+            对应条数。查不到时 status 非 OK 且 items 为空。
         """
+        def _render_train(result: Any) -> str:
+            """用完整 ProviderResult 按当前 top_n 现场切片渲染（命中缓存与首查共用）。"""
+            envelope = truncate_result(result, top_n=top_n, fields=TRAIN_FIELDS)
+            envelope["hint"] = _HINT_TRAIN
+            stations = _available_stations(result)
+            if stations:
+                envelope["available_stations"] = stations
+                envelope["hint"] += (
+                    " available_stations 是本次车次中出现过的两端车站，选站参考；"
+                    "同参数重复查询会命中短时缓存。"
+                )
+            return json.dumps(envelope, ensure_ascii=False)
+
         key = (
             _normalize_od(origin),
             _normalize_od(destination),
             str(depart_date).strip(),
-            int(top_n),
         )
         now = time.time()
         hit = train_cache.get(key)
         if hit is not None and now - hit[0] <= _TRAIN_CACHE_TTL_SECONDS:
-            return hit[1]
+            return _render_train(hit[1])
         try:
             result = hub.search_trains(origin, destination, depart_date)
         except Exception as exc:  # noqa: BLE001 —— 取数失败必须变成"可读的失败"，不能中断 Agent 循环
             return _failure("search_trains", exc)
-        envelope = truncate_result(result, top_n=top_n, fields=TRAIN_FIELDS)
-        envelope["hint"] = _HINT_TRAIN
-        stations = _available_stations(result)
-        if stations:
-            envelope["available_stations"] = stations
-            envelope["hint"] += (
-                " available_stations 是本次车次中出现过的两端车站，选站参考；"
-                "同参数重复查询会命中短时缓存。"
-            )
-        text = json.dumps(envelope, ensure_ascii=False)
-        train_cache[key] = (now, text)
+        text = _render_train(result)
+        train_cache[key] = (now, result)
         return text
 
     @tool
