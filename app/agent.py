@@ -74,12 +74,16 @@ def travel_checkpointer():
     return create_dev_checkpointer()
 
 
-def _chat_model(endpoint: ModelEndpoint) -> Any:
+def _chat_model(endpoint: ModelEndpoint, *, timeout: float | None = None) -> Any:
     """按一个端点构造 ChatOpenAI。构造参数与 `superharness.create_model()` 保持一致。
 
     为什么 `max_retries=0`：SuperHarness 的 `ModelRetryMiddleware` 已经负责重试。SDK 层再叠
     一层默认重试（3 次）会让"主模型失败"在切到备用之前先等满三次超时 —— 降级链的意义就是
     尽快换路，不是在同一条坏路上多等几倍时间。
+
+    为什么 timeout 用 `request_timeout` 传：langchain_openai 1.6.0 的 ChatOpenAI 里这个
+    字段的 canonical 名是 `request_timeout`（`timeout` 只是它的 alias），`None` = 不设超时
+    （交给 SDK/Provider 默认）。调用方按业务预算传入 `config.llm_timeout_seconds`。
 
     为什么在 app 侧自己构造、而不是改 `superharness.create_model()`：那个函数是全仓共用的
     默认路径，改它的行为会波及所有使用者；备用模型实例只属于本业务。
@@ -92,6 +96,7 @@ def _chat_model(endpoint: ModelEndpoint) -> Any:
         base_url=endpoint.base_url,
         api_key=endpoint.api_key,
         max_retries=0,
+        request_timeout=timeout,
     )
 
 
@@ -135,8 +140,13 @@ def build_model_with_fallbacks() -> tuple[Any | None, list[Any]]:
     if not endpoints:
         return None, []
 
-    primary = _chat_model(endpoints[0])
-    backups = [_chat_model(endpoint) for endpoint in endpoints[1:]]
+    # 单次模型调用的超时预算：agent 路径没有按用途（tag）分档，统一用
+    # `llm_timeout_seconds`（默认 180s）。放函数内 import 避免模块级循环依赖。
+    from app.config import current_config
+
+    timeout = current_config().llm_timeout_seconds
+    primary = _chat_model(endpoints[0], timeout=timeout)
+    backups = [_chat_model(endpoint, timeout=timeout) for endpoint in endpoints[1:]]
     if not backups:
         return primary, []
     return primary, [ModelFallbackMiddleware(*backups)]

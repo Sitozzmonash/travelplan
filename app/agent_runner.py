@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from langchain.agents.middleware import AgentMiddleware
+from langchain_core.exceptions import ModelError
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
@@ -774,8 +775,16 @@ class _AlwaysVisibleTools(AgentMiddleware):
         return await handler(self._merged(request))
 
 
-class _TokenBudgetExceeded(RuntimeError):
-    """累计 token 超过 `max_run_tokens` 时由 `_TokenBudgetGuard` 抛出。"""
+class _TokenBudgetExceeded(ModelError, RuntimeError):
+    """累计 token 超过 `max_run_tokens` 时由 `_TokenBudgetGuard` 抛出。
+
+    为什么同时继承 `ModelError`：`ModelRetryMiddleware` 的 `default_retry_on` 对
+    非 `ModelError` 一律返回 True（会重试），而这里是在**模型调用之外**抛出的控制流异常，
+    重试毫无意义 —— 只会让被拦下的那一次模型调用多试 `model_max_retries` 次、白等
+    backoff、并把一次本不该发生的调用记进 llm_calls / trace。`ModelError.is_retryable`
+    默认为 False，`default_retry_on` 直接返回 False → 不重试、原样向上抛，由
+    `execute_agent_run` 识别成截断。继承 RuntimeError 保持「它是普通运行时错误」的契约。
+    """
 
 
 class _TokenBudgetGuard(AgentMiddleware):
@@ -803,6 +812,114 @@ class _TokenBudgetGuard(AgentMiddleware):
             raise _TokenBudgetExceeded(
                 f"本次 run 累计 token 已达 {used}，超过 max_run_tokens={self._limit}，循环已停止"
             )
+
+    def wrap_model_call(self, request: Any, handler: Any) -> Any:
+        self._check()
+        return handler(request)
+
+    async def awrap_model_call(self, request: Any, handler: Any) -> Any:
+        self._check()
+        return await handler(request)
+
+
+class _SubmissionAccepted(ModelError, RuntimeError):
+    """`submit_final_plan` 已通过校验（holder 已写入）后由 `_SubmissionEndGuard` 抛出。
+
+    含义是「循环该干净结束了」：不是失败、不是降级，只是**交卷之后的那一轮模型调用
+    不再需要**。
+
+    基类同时取 `ModelError` 与 `RuntimeError`：`ModelError.is_retryable=False` 让
+    `ModelRetryMiddleware.default_retry_on` 返回 False（不重试、原样向上抛），否则被拦下
+    的那一次模型调用会按 `model_max_retries` 重试 —— 白等 backoff，还把 FAILED 的
+    「在思考行程」span 记进 trace（正是本轮要消灭的现象）；RuntimeError 保持
+    「控制流异常」的普通语义。`_truncation_kind` 用 `isinstance(..., _SubmissionAccepted)`
+    识别，与基类无关。
+    """
+
+
+class _SubmissionEndGuard(AgentMiddleware):
+    """交卷即停：发现 holder 里已有通过校验的 plan，就在下一次模型调用前停下循环。
+
+    为什么在**模型调用前**检查：`submit_final_plan` 工具执行完、`holder["submitted"]`
+    写入后，LangGraph 通常还会让 Agent 再走一轮去说一句收尾话 —— 那一轮没有任何业务
+    价值（trace 实测交卷后还有一次「在思考行程」），却白花 token。在这里拦住它，
+    交卷 → 循环干净结束。
+
+    与 `_TokenBudgetGuard` 相同的安全性：异常在**模型调用之外**抛出（`wrap_model_call`
+    在真正调模型之前），且 `_SubmissionAccepted` 继承 `ModelError`（`is_retryable=False`），
+    `ModelRetryMiddleware` 不会重试它、更不会吞掉它。`execute_agent_run` 会把
+    `_SubmissionAccepted` 识别成 `truncation_kind == "submitted"`，**不算失败也不算降级**
+    —— 已交卷的 plan 本来就在 holder 里，后续逻辑照常落库。
+    """
+
+    def __init__(self, holder: dict[str, Any]) -> None:
+        self._holder = holder
+
+    def _check(self) -> None:
+        if self._holder.get("submitted") is not None:
+            raise _SubmissionAccepted(
+                "submit_final_plan 已通过校验并写入 holder，交卷后循环干净结束"
+                "（不再发起多余的模型调用）"
+            )
+
+    def wrap_model_call(self, request: Any, handler: Any) -> Any:
+        self._check()
+        return handler(request)
+
+    async def awrap_model_call(self, request: Any, handler: Any) -> Any:
+        self._check()
+        return await handler(request)
+
+
+class _CallBudgetExceeded(ModelError, RuntimeError):
+    """模型/工具调用次数超过 `max_llm_calls` / `max_tool_calls` 时由 `_CallBudgetGuard` 抛出。
+
+    基类说明同 `_TokenBudgetExceeded`：同时继承 `ModelError`（`is_retryable=False`，
+    不会被 ModelRetryMiddleware 重试，原样向上抛）与 `RuntimeError`。
+    """
+
+
+class _CallBudgetGuard(AgentMiddleware):
+    """调用次数护栏：模型调用前检查累计模型/工具调用数，超了就让循环停下来。
+
+    与 `_TokenBudgetGuard` 同构：都在**模型调用前**检查，超了抛 `_CallBudgetExceeded`，
+    由 `execute_agent_run` 识别成 `truncation_kind == "calls"` 如实截断 —— 已交卷的
+    plan 保留、未交卷如实 FAILED（文案与 `"tokens"` 同一条路径）。
+
+    模型调用数在**本实例**里自增：`reporter.token_totals()` 的 `llm_calls` 是「已结束」
+    的调用数，此刻正要发生的这次还没记账；这里先自增再比（`>`），正好是「第 N 次调用
+    能不能发出去」—— 允许 1..max，拦下 max+1。
+
+    工具调用数从 `StepReporter.token_totals()` 取（它在 `begin_tool` 累计，每次工具调用
+    都计，包括 `submit_final_plan`）：用 `>=` 比，一旦已达到预算就拦下下一次模型调用
+    （它很可能再触发一次工具调用），给的是「最多 N 次工具调用」的精确语义。
+    不自己估计「每轮 × 工具数」——那只会给出错误计数。
+
+    默认 `None` = 不启用（与 `max_run_tokens` 一致），别在代码里塞一个默认值。
+    安全性同 `_TokenBudgetGuard`（异常在模型调用之外抛出，ModelRetryMiddleware 不会吞）。
+    """
+
+    def __init__(self, max_llm_calls: int | None, max_tool_calls: int | None, totals: Any) -> None:
+        self._max_llm_calls = max_llm_calls
+        self._max_tool_calls = max_tool_calls
+        self._totals = totals
+        #: 本实例已放行的模型调用数（每次 wrap_model_call 先自增再比）。
+        self._llm_calls = 0
+
+    def _check(self) -> None:
+        self._llm_calls += 1
+        if self._max_llm_calls is not None and self._llm_calls > self._max_llm_calls:
+            raise _CallBudgetExceeded(
+                f"本次 run 模型调用次数已达 {self._llm_calls}，"
+                f"超过 max_llm_calls={self._max_llm_calls}，循环已停止"
+            )
+        if self._max_tool_calls is not None:
+            used_tools = int(self._totals().get("tool_calls") or 0)
+            if used_tools >= self._max_tool_calls:
+                raise _CallBudgetExceeded(
+                    f"本次 run 工具调用次数已达 {used_tools}，"
+                    f"超过 max_tool_calls={self._max_tool_calls}，循环已停止"
+                )
 
     def wrap_model_call(self, request: Any, handler: Any) -> Any:
         self._check()
@@ -881,8 +998,9 @@ def _prefetch_digest(
         return {}
 
     def _place_rows(places: list[Any]) -> list[dict[str, Any]]:
-        return [
-            {
+        rows: list[dict[str, Any]] = []
+        for place in list(getattr(prefetch, "places", None) or [])[:limit]:
+            row = {
                 "place_id": getattr(place, "place_id", None),
                 "name": getattr(place, "name", ""),
                 "type": getattr(place, "type", None),
@@ -890,8 +1008,14 @@ def _prefetch_digest(
                 "amap_verified": getattr(place, "amap_verified", None),
                 "selection": selections.get(str(getattr(place, "place_id", ""))),
             }
-            for place in list(getattr(prefetch, "places", None) or [])[:limit]
-        ]
+            # 坐标/地址/营业时间/区划：有值才加 —— 把这些字段带进 context，Agent 就不必
+            # 对已预热的点重复 search_poi / geocode / poi_detail；None 灌进去只会读到空字段。
+            for key in ("lat", "lng", "address", "opening_hours", "district"):
+                value = getattr(place, key, None)
+                if value is not None:
+                    row[key] = value
+            rows.append(row)
+        return rows
 
     def _option_rows(options: list[Any]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -1212,8 +1336,12 @@ def _truncation_kind(error: BaseException | None) -> str | None:
     current = error
     while current is not None and id(current) not in seen:
         seen.add(id(current))
+        if isinstance(current, _SubmissionAccepted):
+            return "submitted"
         if isinstance(current, _TokenBudgetExceeded):
             return "tokens"
+        if isinstance(current, _CallBudgetExceeded):
+            return "calls"
         if type(current).__name__ == "GraphRecursionError":
             return "steps"
         current = current.__cause__ or current.__context__
@@ -1394,10 +1522,14 @@ def execute_agent_run(
     manual_tools = [item for item in travel_tools if getattr(item, "name", None) != "web_search"]
     visible_tools = [*travel_tools, submit_tool]
     middleware = [
+        # 交卷即停放最外层：它在 reporter 开始记录模型步骤之前就抛 `_SubmissionAccepted`，
+        # 交卷后那一轮"在思考行程"根本不会被记进 trace（否则会留下一个误导性的 FAILED 步骤）。
+        _SubmissionEndGuard(holder),
         reporter.middleware,
         *fallback_middleware,
         _AlwaysVisibleTools(visible_tools),
         _TokenBudgetGuard(config.max_run_tokens, reporter.token_totals),
+        _CallBudgetGuard(config.max_llm_calls, config.max_tool_calls, reporter.token_totals),
     ]
 
     from superharness import HarnessContext
@@ -1437,10 +1569,16 @@ def execute_agent_run(
         truncation = f"Agent 循环超时（超过 {config.agent_run_timeout_seconds:g} 秒）被中止"
     elif outcome == "error":
         kind = _truncation_kind(error_payload)
-        if kind == "steps":
+        if kind == "submitted":
+            # 交卷即停：不算失败也不算降级。holder 里已有通过校验的 plan，
+            # 不设 truncation 文案、不 finish_failed，走下方正常 finalize。
+            pass
+        elif kind == "steps":
             truncation = f"Agent 达到最大步数（{config.max_agent_steps} 步）仍未收尾"
         elif kind == "tokens":
             truncation = f"成本护栏触发：{error_payload}"
+        elif kind == "calls":
+            truncation = f"调用次数护栏触发：{error_payload}"
         else:
             return finish_failed(f"{type(error_payload).__name__}: {error_payload}")
     else:

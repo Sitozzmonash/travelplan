@@ -382,10 +382,13 @@ def test_submit_final_plan_is_the_plan_and_pipeline_persists(tmp_path):
     progress = store.get_run_progress(RUN_ID)
     assert progress is not None
 
-    # 模型调用与 token 进 run_metrics（键名与旧流程一致）
+    # 模型调用与 token 进 run_metrics（键名与旧流程一致）。
+    # 交卷即停（_SubmissionEndGuard，放在 middleware 最外层）后真实完成 2 次模型调用
+    # （search_trains + submit）；交卷后的第三次"在思考行程"在 reporter 开始记录之前就
+    # 被护栏拦下 —— 不计入 llm_calls、也没有 token，因此两个数都只算 2 次。
     metrics = store.get_run_metrics(RUN_ID)
-    assert metrics["llm_calls"] == 3
-    assert metrics["total_tokens"] == 3 * 40
+    assert metrics["llm_calls"] == 2
+    assert metrics["total_tokens"] == 2 * 40
     assert metrics["tool_calls"] == 1  # 只有 search_trains 真的打了 Provider
     # Run 完成即存质量摘要：dashboard 有列值就直接读，不再逐个解 plan_json
     assert metrics["quality_score"] is not None
@@ -393,7 +396,8 @@ def test_submit_final_plan_is_the_plan_and_pipeline_persists(tmp_path):
     assert 0.0 <= metrics["quality_score"] <= 1.0
     # audit 的 llm_calls 与 trace 上的模型调用同形可读
     # （run_metrics 只落固定列，prompt 版本在 trace 与 audit 里，不在这里）
-    assert len(result.audit["llm_calls"]) == 3
+    # 交卷即停后只发生 2 次真实模型调用（search_trains + submit），第 3 次被拦下不记
+    assert len(result.audit["llm_calls"]) == 2
 
 
 def test_hotel_alternatives_are_mapped(tmp_path):
@@ -726,6 +730,14 @@ def test_token_budget_stops_the_loop(tmp_path, monkeypatch):
 
 
 def test_token_budget_keeps_a_submitted_plan(tmp_path, monkeypatch):
+    """已交卷时交卷即停放最外层 → 干净完成，不再落到 token 截断路径。
+
+    交卷成功是终态（_SubmissionEndGuard 优先于预算护栏），所以这段脚本虽然设了极低的
+    MAX_RUN_TOKENS 且交卷后还有一步，run 仍以 completed 结束、plan 保留、无"成本护栏"
+    降级；交卷后的 search_poi 步骤根本没有执行。预算护栏只管"没交卷还继续烧"的循环
+    （见 test_token_budget_stops_the_loop）。
+    """
+
     monkeypatch.setenv("MAX_RUN_TOKENS", "50")
     store, hub, output_dir = _make_env(tmp_path)
     model = ScriptedPlannerModel(
@@ -740,11 +752,10 @@ def test_token_budget_keeps_a_submitted_plan(tmp_path, monkeypatch):
 
     assert result.status == "completed", result.error
     assert result.plan is not None
-    assert any("成本护栏" in note for note in result.degradations)
-    # 降级要同时体现在"对外状态"与"本次 run 的说明"上
+    assert not any("成本护栏" in note for note in result.degradations)
     progress = store.get_run_progress(RUN_ID)
-    assert progress["status"] == "DEGRADED"
-    assert result.audit["agent"]["truncation"] is not None
+    assert progress["status"] == "SUCCESS"
+    assert result.audit["agent"]["truncation"] is None
 
 
 # ======================================================================
@@ -894,8 +905,9 @@ def test_submit_tool_reports_invalid_args_instead_of_failing_the_run(tmp_path):
 
     assert result.status == "completed", result.error
     assert result.plan is not None and len(result.plan.days) == 1
-    # 第一次非法参数没有打断循环，Agent 改对之后才交卷成功
-    assert model.turns == 3
+    # 第一次非法参数没有打断循环，Agent 改对之后才交卷成功；
+    # 交卷后的收尾话（第三步 text）被 _SubmissionEndGuard 拦下，不再发生模型调用。
+    assert model.turns == 2
 
 
 def test_empty_days_is_not_a_plan(tmp_path):
