@@ -309,11 +309,15 @@ def run_discovery(
     publish_progress({"stage": "recommendation", "status": "RUNNING"})
     try:
         from app.llm import LLM
-        from app.recommendations import recommend_guided
+        from app.recommendations import recommend_guided, recommendation_from_cache
 
-        llm = llm_factory() if llm_factory else LLM.from_env()
-        bundle = recommend_guided(llm, intent, store=store, session_id=session_id,
-                                  on_progress=publish_progress)
+        cached = recommendation_from_cache(intent, store, session_id)
+        if cached is None:
+            llm = llm_factory() if llm_factory else LLM.from_env()
+            bundle = recommend_guided(llm, intent, store=store, session_id=session_id,
+                                      on_progress=publish_progress)
+        else:
+            bundle = cached
         bundle.outbound = []
         bundle.inbound = []
         bundle.hotels = []

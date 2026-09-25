@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 # 方言差异（占位符 / INSERT OR REPLACE / PRAGMA / 连接池）**全部**在 app/db.py 里，
 # 本模块的方法体继续只写 SQLite 原生 SQL —— 想看"两种库差在哪"，只需要读 app/db.py。
@@ -629,6 +629,15 @@ CREATE TABLE IF NOT EXISTS runtime_config (
     value_json  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
     updated_by  TEXT
+);
+
+-- 城市推荐缓存：同一目的地 LLM 给出的第二页推荐清单落库，命中后整页零 LLM。
+-- 与 city_cache 的区别：city_cache 存"攻略/POI 事实"，这张表存"LLM 选出来的推荐本身"。
+CREATE TABLE IF NOT EXISTS city_recommendations (
+    city TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 """
 
@@ -1428,6 +1437,54 @@ class TravelPlanStore:
                 )
                 removed += int(cursor.rowcount or 0)
         return removed
+
+    # ------------------------------------------------------------------
+    # 城市推荐缓存（第二页 LLM 推荐清单）
+    # ------------------------------------------------------------------
+    # 与上面 city_cache 系表的区别：那里存"攻略/POI 事实"，这里存"LLM 选出来的推荐本身"。
+    # 命中 TTL 内同城推荐时整页零 LLM；`created_at` 记录首次生成，`updated_at` 每次覆盖刷新。
+
+    def save_city_recommendation(self, city: str, payload: Mapping[str, Any]) -> None:
+        """upsert 城市推荐缓存：created_at 保留首次创建时间，updated_at 每次覆盖都刷新为 now。"""
+
+        timestamp = utcnow().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO city_recommendations (city, payload_json, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(city) DO UPDATE SET"
+                " payload_json=excluded.payload_json, updated_at=excluded.updated_at",
+                (city, _json(payload), timestamp, timestamp),
+            )
+
+    def get_city_recommendation(self, city: str) -> dict[str, Any] | None:
+        """读城市推荐缓存。返回 {"city":..., "payload": <dict>, "created_at": <iso>, "updated_at": <iso>}，
+        payload 是从 payload_json 反序列化的 dict；没有行返回 None。"""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM city_recommendations WHERE city=?", (city,)
+            ).fetchone()
+        if row is None:
+            return None
+        record = dict(row)
+        try:
+            payload = json.loads(record["payload_json"])
+        except (TypeError, ValueError):
+            # 行存在但 payload_json 损坏：按"未命中"处理，绝不把读缓存的异常抛给上层。
+            return None
+        return {
+            "city": record["city"],
+            "payload": payload,
+            "created_at": record["created_at"],
+            "updated_at": record["updated_at"],
+        }
+
+    def invalidate_city_recommendation(self, city: str) -> None:
+        """删除该城市的推荐缓存。"""
+
+        with self._connect() as conn:
+            conn.execute("DELETE FROM city_recommendations WHERE city=?", (city,))
 
     # ------------------------------------------------------------------
     # canonical place 实体层

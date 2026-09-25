@@ -22,6 +22,7 @@ import json
 import math
 import re
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from statistics import median
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -29,13 +30,14 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from app import city_cache, discovery, places as place_rules
+from app.config import current_config
 from app.llm import LLM
 from app.models import Evidence, Place, TripIntent
 from app.planner import dedupe_places, haversine_meters, normalize_place_name
 from app.redact import clip, scrub
 from app.selection import place_category
 
-__all__ = ["recommend_guided"]
+__all__ = ["recommend_guided", "recommendation_from_cache"]
 
 #: 有界轮次：第 0 轮读库，后面最多两次提交机会。
 _MAX_ROUNDS = 3
@@ -724,4 +726,110 @@ def recommend_guided(
     on_progress: Any = None,
 ) -> discovery.PrefetchBundle:
     """唯一入口：只读注入的 store，产出攻略推荐 bundle（零网络、零 Provider 调用）。"""
-    return _Run(llm, intent, store, session_id, on_progress).run()
+    bundle = _Run(llm, intent, store, session_id, on_progress).run()
+    _cache_llm_recommendation(store, intent, bundle)
+    return bundle
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    """宽松解析缓存行里的 ISO 时间；解析失败返回 None（调用方按过期处理）。"""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+
+def _cache_llm_recommendation(store: Any, intent: TripIntent, bundle: discovery.PrefetchBundle) -> None:
+    """LLM 推荐成功后按城市落库，供同城下一次零 LLM 直接命中。
+
+    只缓存 source=="llm" 且 place_ids 非空的推荐；证据降级（evidence_fallback）
+    与空推荐都不落库，绝不让非模型产物冒充 LLM 推荐。写缓存失败绝不能影响已成功的推荐。
+    """
+    if store is None:
+        return
+    recommendation = bundle.extras.get("recommendation") or {}
+    place_ids = recommendation.get("place_ids")
+    if not isinstance(place_ids, list) or not place_ids or recommendation.get("source") != "llm":
+        return
+    city = intent.destination[0] if intent.destination else ""
+    if not city:
+        return
+    payload = {
+        "recommendation": recommendation,
+        "recommended_cards": bundle.extras.get("recommended_cards") or [],
+        "hotel_areas": list(bundle.hotel_areas or []),
+    }
+    try:
+        store.save_city_recommendation(city, payload)
+    except Exception:  # noqa: BLE001 —— 写缓存失败绝不能拖垮已成功的推荐
+        pass
+
+
+def recommendation_from_cache(intent: TripIntent, store: Any, session_id: str) -> discovery.PrefetchBundle | None:
+    """同城缓存命中时直接读库组装 bundle，全程零 LLM、零 Provider。
+
+    任一条件不满足就返回 None（回退到真实 LLM 推荐）：
+    TTL 过期、城市攻略池比推荐新、过半推荐地点在池里失效等。
+    """
+    if store is None:
+        return None
+    city = intent.destination[0] if intent.destination else ""
+    if not city:
+        return None
+    row = store.get_city_recommendation(city)
+    if row is None:
+        return None
+    payload = row.get("payload")
+    recommendation = payload.get("recommendation") if isinstance(payload, dict) else None
+    if not isinstance(recommendation, dict):
+        return None
+    place_ids = recommendation.get("place_ids")
+    if not isinstance(place_ids, list) or not place_ids or not all(isinstance(pid, str) and pid for pid in place_ids):
+        return None
+    config = current_config()
+    ttl_days = getattr(config, "city_recommendation_ttl_days", 15)
+    created_at = _parse_iso(row.get("created_at"))
+    if created_at is None or (datetime.now(timezone.utc) - created_at) > timedelta(days=max(0, int(ttl_days))):
+        return None
+    cached = city_cache.read_candidates(city, store=store, allow_stale=True)
+    if cached is None:
+        return None
+    rec_updated = _parse_iso(row.get("updated_at"))
+    pool_updated = _parse_iso(cached.updated_at)
+    if rec_updated is not None and pool_updated is not None and pool_updated > rec_updated:
+        return None
+    pool = {place.place_id: place for place in cached.places}
+    valid = [pid for pid in place_ids if pid in pool]
+    if not valid or len(valid) * 2 < len(place_ids):
+        return None
+    cards = payload.get("recommended_cards")
+    if not isinstance(cards, list):
+        cards = []
+    valid_set = set(valid)
+    bundle = discovery.PrefetchBundle(session_id=session_id, basic_intent=intent.model_dump(mode="json"))
+    bundle.places = [pool[pid] for pid in valid]
+    bundle.poi_pools = discovery.split_poi_pools(bundle.places)
+    bundle.hotel_areas = list(payload.get("hotel_areas") or [])
+    bundle.discovery_status = "READY"
+    bundle.discovery = {
+        "database": {"status": "CACHE", "result_count": len(bundle.places)},
+        "recommendation": {"status": "CACHE", "result_count": len(valid)},
+        "places": {"status": "CACHE", "result_count": len(bundle.places)},
+    }
+    bundle.ledger = {"city_cache_hits": 1, "recommendation_cache_hits": 1}
+    bundle.city_cache = {"city": city, "stale": cached.stale, "updated_at": cached.updated_at, "source": cached.source}
+    bundle.provider_calls = []
+    bundle.degradations = []
+    bundle.extras["recommendation"] = {
+        **recommendation, "status": "READY",
+        "source": recommendation.get("source") or "llm", "cached": True,
+    }
+    bundle.extras["recommended_cards"] = [
+        card for card in cards
+        if isinstance(card, dict) and card.get("place_id") in valid_set
+    ]
+    bundle.extras["raw_candidates"] = []
+    return bundle

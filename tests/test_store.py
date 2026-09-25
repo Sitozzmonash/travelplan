@@ -542,3 +542,68 @@ class TestCanonicalLayerMigration:
             ]
         ) == 1
         assert store.get_canonical_places("成都")[0]["opening_hours"] == "全天"
+
+
+class TestCityRecommendations:
+    """城市推荐缓存（第二页 LLM 推荐清单落库）：存取、覆盖语义与失效。"""
+
+    @pytest.fixture()
+    def rec_store(self, tmp_path) -> TravelPlanStore:
+        store = TravelPlanStore(db_path=tmp_path / "city_recs.db")
+        store.init_schema()
+        return store
+
+    @staticmethod
+    def _payload() -> dict:
+        return {
+            "city": "成都",
+            "recommendations": [
+                {"name": "宽窄巷子", "reason": "市井烟火气", "tags": ["街区"]},
+                {"name": "都江堰", "reason": "世界遗产", "tags": ["水利"]},
+            ],
+            "model": "deepseek-v4",
+            "count": 2,
+        }
+
+    def test_save_and_get_roundtrip(self, rec_store):
+        payload = self._payload()
+
+        rec_store.save_city_recommendation("成都", payload)
+
+        got = rec_store.get_city_recommendation("成都")
+        assert got is not None
+        assert got["city"] == "成都"
+        assert got["payload"] == payload  # payload dict 完整还原（含中文）
+        assert got["created_at"]
+        assert got["updated_at"]
+
+    def test_second_save_preserves_created_at_and_overwrites_payload(self, rec_store):
+        rec_store.save_city_recommendation("成都", self._payload())
+        first = rec_store.get_city_recommendation("成都")
+        assert first is not None
+
+        new_payload = {"recommendations": [{"name": "武侯祠", "reason": "三国文化"}], "count": 1}
+        rec_store.save_city_recommendation("成都", new_payload)
+        second = rec_store.get_city_recommendation("成都")
+        assert second is not None
+
+        assert second["created_at"] == first["created_at"]  # created_at 保留首次创建时间
+        assert second["updated_at"] >= first["updated_at"]  # updated_at 每次覆盖都刷新
+        assert second["payload"] == new_payload  # payload 被覆盖
+        # upsert 语义：同城只允许一行，不允许累积两份互相矛盾的推荐。
+        with sqlite3.connect(rec_store.db_path) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM city_recommendations WHERE city='成都'"
+            ).fetchone()[0]
+        assert count == 1
+
+    def test_invalidate_removes_row(self, rec_store):
+        rec_store.save_city_recommendation("成都", self._payload())
+        assert rec_store.get_city_recommendation("成都") is not None
+
+        rec_store.invalidate_city_recommendation("成都")
+
+        assert rec_store.get_city_recommendation("成都") is None
+
+    def test_get_unknown_city_is_none(self, rec_store):
+        assert rec_store.get_city_recommendation("不存在的城市") is None

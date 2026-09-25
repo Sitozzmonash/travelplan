@@ -292,6 +292,9 @@ class TravelPlanConfig:
     # 7 天太短，会让刚预热好的城市过一周就失效、白白重付一次社媒检索 + 模型抽取。
     city_cache_guide_ttl_days: int = 15
     city_cache_poi_ttl_days: int = 15
+    #: 城市推荐缓存（LLM 选出的第二页推荐清单）的存活天数。命中 TTL 内同城推荐直接读库、
+    #: 不调 LLM；过期后由上层重新生成并覆盖。与 city_cache 的攻略/POI 事实缓存分开配置。
+    city_recommendation_ttl_days: int = 15
 
     @classmethod
     def from_env(cls) -> "TravelPlanConfig":
@@ -495,6 +498,13 @@ class TravelPlanConfig:
             city_cache_poi_ttl_days=max(
                 1, integer("CITY_CACHE_POI_TTL_DAYS", defaults.city_cache_poi_ttl_days) or 1
             ),
+            city_recommendation_ttl_days=max(
+                1,
+                integer(
+                    "CITY_RECOMMENDATION_TTL_DAYS", defaults.city_recommendation_ttl_days
+                )
+                or 1,
+            ),
         )
 
     def public_dict(self) -> dict[str, Any]:
@@ -545,6 +555,7 @@ EDITABLE_KEYS: dict[str, tuple[str, float | None, float | None]] = {
     "PLANNING_SESSION_TTL_MINUTES": ("int", 5, 1440),
     "CITY_CACHE_GUIDE_TTL_DAYS": ("int", 1, 90),
     "CITY_CACHE_POI_TTL_DAYS": ("int", 1, 180),
+    "CITY_RECOMMENDATION_TTL_DAYS": ("int", 1, 90),
     # 性能：受控并发（Part A / L）。上限给到 16 是有意的护栏 ——
     # 再往上就不是"调参"而是拿 Provider 的限流去赌一次 run 能不能跑完。
     "PROVIDER_MAX_CONCURRENCY": ("int", 1, 16),
