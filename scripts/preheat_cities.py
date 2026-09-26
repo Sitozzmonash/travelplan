@@ -55,8 +55,8 @@
 * 因"新鲜 / 未过期"跳过的城市**不占**额度，只有真的调了 `preheat_agent.preheat_city` 才算；
 * 与 `--force` 互斥：定时任务不该强制重跑全部城市，两个一起给会直接报错。
 
-退出码：0 = 全部成功 / daily 正常截断到额度（降级不算失败，但会打印警告）；
-1 = 有城市失败 / 未落库。
+退出码：0 = 全部成功 / daily 正常截断到额度 / **部分城市失败但其余已落库**（降级不算失败，
+但会打印警告）；1 = 所有尝试预热的城市都未落库（额度耗尽 / 数据源全挂 / 代码故障）。
 """
 
 from __future__ import annotations
@@ -317,8 +317,23 @@ def main(argv: list[str] | None = None) -> int:
             "      python scripts/preheat_cities.py --retry-degraded --cities " + " ".join(degraded),
             file=sys.stderr,
         )
-    if failed:
+    # 退出码语义：个别城市失败不该让每天的定时任务（GitHub Actions）报红、发邮件刷屏。
+    # 只要"至少有一座城市落库"就算部分成功（退出 0，失败明细仍打在 stderr 可复盘）；
+    # 只有**所有尝试预热的城市都未落库**（额度耗尽 / 数据源全挂 / 代码故障）才退出 1。
+    landed = attempted - len(failed)
+    if failed and landed == 0:
+        print(
+            "本次尝试预热的城市**全部**未落库——额度耗尽 / 数据源不可用 / 代码故障，"
+            "按失败处理。",
+            file=sys.stderr,
+        )
         return 1
+    if failed:
+        print(
+            f"\n{len(failed)} 座城市未成功，但其余 {landed} 座已正常落库——按部分成功处理"
+            "（失败城市明细见上，日志可复盘）。",
+            file=sys.stderr,
+        )
     print("\n全部完成。")
     return 0
 

@@ -10,8 +10,10 @@
 * `--daily` 定时模式：每天最多真正尝试 `--limit` 座城市（默认 15）、起点按
   day-of-year 轮转、跳过的城市不占额度、与 `--force` 互斥。
 
-* 失败语义：一座城市失败（抛错 / 没落库）不该中断整批，但退出码必须是 1 —— 这条在
-  "每城内部换成预热 Agent"（P6）之后必须保持不变。
+* 失败语义：一座城市失败（抛错 / 没落库）不该中断整批；退出码区分"部分成功"与"真故障"——
+  只要至少一座城市落库就算部分成功（退出 0，失败明细打 stderr 可复盘），只有**所有尝试的
+  城市都未落库**（额度耗尽 / 数据源全挂 / 代码故障）才退出 1。这条让每天定时任务不会因为
+  个别城市失败就发失败邮件刷屏。
 
 这些用例全部用替身跑 `main()` —— monkeypatch 掉 `load_dotenv` / `TravelPlanStore` /
 `_row` / `preheat_agent.preheat_city`，不真连库、不真调 Provider、不真起 Agent。
@@ -232,8 +234,8 @@ def test_force_and_daily_are_mutually_exclusive(preheat, monkeypatch, capsys):
     assert "互斥" in capsys.readouterr().err, "报错信息要说明互斥"
 
 
-def test_failed_city_sets_exit_code_1_and_batch_continues(preheat, monkeypatch, capsys):
-    """一座城市的 Agent 失败：标失败、整批继续跑完、退出码 1（P6 之后语义不变）。"""
+def test_partial_failure_is_partial_success_and_batch_continues(preheat, monkeypatch, capsys):
+    """一座城市失败但其余落库：整批跑完、退出码 0（部分成功，不让 CI 判失败刷邮件）。"""
 
     call_log: list[str] = []
     cities = ["a", "b", "c"]
@@ -243,10 +245,25 @@ def test_failed_city_sets_exit_code_1_and_batch_continues(preheat, monkeypatch, 
         states={}, call_log=call_log, fail={"b"},
     )
     assert call_log == ["a", "b", "c"], "一座城市失败不该中断整批"
-    assert rc == 1, "有城市失败必须退出码 1（GitHub Actions 靠它判断 job 失败）"
+    assert rc == 0, "只要还有城市落库就算部分成功，退出码必须是 0（避免 CI 天天判失败）"
     err = capsys.readouterr().err
     assert "1 座城市未成功：b" in err
     assert "测试替身：b 的 Agent 失败" in err, "失败原因要如实打出来，不能只说'失败'"
+    assert "部分成功" in err, "部分成功要明说，失败明细仍留在日志里可复盘"
+
+
+def test_all_attempted_cities_failed_returns_1(preheat, monkeypatch, capsys):
+    """所有尝试的城市都未落库（额度/数据源/代码故障）→ 退出码 1，才让 CI 判失败。"""
+
+    call_log: list[str] = []
+    rc = _run_main(
+        preheat, monkeypatch,
+        ["--cities", "a", "b"],
+        states={}, call_log=call_log, fail={"a", "b"},
+    )
+    assert call_log == ["a", "b"]
+    assert rc == 1, "全部未落库 = 真故障，必须退出码 1"
+    assert "全部" in capsys.readouterr().err
 
 
 def test_city_without_pois_is_a_failure_and_prints_agent_notes(preheat, monkeypatch, capsys):
